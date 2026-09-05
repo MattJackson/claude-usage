@@ -1211,9 +1211,6 @@ fn notify(msg: &str) {
 // History logging + reporting
 // ---------------------------------------------------------------------------
 
-/// Rotate a log file once it grows past this size (~1 MB).
-const HISTORY_MAX_BYTES: u64 = 1_000_000;
-
 fn history_path() -> Result<std::path::PathBuf> {
     Ok(store::config_dir()?.join("history.jsonl"))
 }
@@ -1224,8 +1221,9 @@ fn log_event(v: &serde_json::Value) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // Rotate if it has grown too large (keep one previous generation).
-    logging::rotate_if_large(&path, HISTORY_MAX_BYTES);
+    // Rotate if it has grown too large (keep one previous generation), using the
+    // same threshold as the debug log so the policy can't drift.
+    logging::rotate_if_large(&path, logging::MAX_BYTES);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

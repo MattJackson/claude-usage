@@ -8,8 +8,9 @@ use std::io::Write;
 
 use crate::store;
 
-/// Rotate the log once it grows past this size (~1 MB).
-const MAX_BYTES: u64 = 1_000_000;
+/// Rotate a rotating file once it grows past this size (~1 MB). Shared by the
+/// debug log and history.jsonl so their threshold genuinely can't drift.
+pub const MAX_BYTES: u64 = 1_000_000;
 
 /// If `path` has grown past `max_bytes`, rename it to `<path>.1` (keeping one
 /// previous generation). Best-effort. Shared by the debug log and history.jsonl
