@@ -17,6 +17,7 @@ ureq = { version = "2", features = ["json", "tls"] }
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+self-replace = "1"
 tray-icon = "0.24.2"
 tao = "0.37.0"
 

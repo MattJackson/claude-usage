@@ -83,6 +83,12 @@ pub struct State {
     /// Menu-bar: swap trigger threshold percent (defaults to 95).
     #[serde(default)]
     pub trigger_pct: Option<f64>,
+    /// Auto-update is on unless this is set (defaults to enabled).
+    #[serde(default)]
+    pub autoupdate_disabled: bool,
+    /// Unix epoch seconds of the last background update check.
+    #[serde(default)]
+    pub last_update_check: Option<i64>,
 }
 
 pub fn config_dir() -> Result<PathBuf> {

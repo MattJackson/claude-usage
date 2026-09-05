@@ -49,6 +49,7 @@ struct Snapshot {
     autoswap: bool,
     threshold: f64,
     start_at_login: bool,
+    autoupdate: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -139,6 +140,7 @@ fn poll_loop(
 fn do_poll(guard: &mut SwapGuard) -> Snapshot {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
+    let autoupdate = !st.autoupdate_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
@@ -175,6 +177,7 @@ fn do_poll(guard: &mut SwapGuard) -> Snapshot {
         autoswap,
         threshold,
         start_at_login,
+        autoupdate,
     }
 }
 
@@ -254,6 +257,14 @@ fn build_menu(snap: &Snapshot) -> Menu {
     add(
         &menu,
         MenuItem::with_id("refresh", "Refresh now", true, None),
+    );
+    add(
+        &menu,
+        MenuItem::with_id("update", "Check for updates…", true, None),
+    );
+    add_check(
+        &menu,
+        CheckMenuItem::with_id("autoupdate", "Auto-update", true, snap.autoupdate, None),
     );
     add_check(
         &menu,
@@ -350,6 +361,11 @@ fn handle_click(id: &str, poll_tx: &mpsc::Sender<()>, control_flow: &mut Control
             toggle_login_item();
             let _ = poll_tx.send(());
         }
+        "autoupdate" => {
+            toggle_autoupdate();
+            let _ = poll_tx.send(());
+        }
+        "update" => check_for_updates(),
         "capture" => {
             if let Some(name) = ask_name() {
                 if let Err(e) = do_capture(&name) {
@@ -376,6 +392,24 @@ fn toggle_autoswap() {
     if let Ok(mut st) = State::load() {
         st.autoswap_disabled = !st.autoswap_disabled;
         let _ = st.save();
+    }
+}
+
+fn toggle_autoupdate() {
+    if let Ok(mut st) = State::load() {
+        st.autoupdate_disabled = !st.autoupdate_disabled;
+        let _ = st.save();
+    }
+}
+
+fn check_for_updates() {
+    match crate::update::run_update(false) {
+        Ok(crate::update::Outcome::Updated(v)) => {
+            notify(&format!("Updated to v{v} — relaunching"));
+            crate::update::relaunch();
+        }
+        Ok(crate::update::Outcome::UpToDate) => notify("claude-usage is up to date"),
+        Err(e) => notify(&format!("Update failed: {e}")),
     }
 }
 

@@ -27,6 +27,7 @@ that interrupts your work.
 
 - [Why](#why)
 - [Install](#install)
+- [Onboarding accounts](#onboarding-accounts)
 - [Quick start](#quick-start)
 - [Commands](#commands)
 - [Auto-swap daemon](#auto-swap-daemon)
@@ -67,6 +68,43 @@ cargo build --release
 # binary at target/release/claude-usage — copy it onto your PATH:
 cp target/release/claude-usage /usr/local/bin/
 ```
+
+## Onboarding accounts
+
+`claude-usage` onboards accounts by **capture**: you log into each account the
+normal way once, and it snapshots that login into its own store. After that it can
+switch between them freely.
+
+**Why capture?** macOS holds exactly one Claude login in the Keychain at a time. So
+you log into an account, capture it (copying its credentials into
+`~/.config/claude-usage/state.json`), then log into the next one and capture that.
+Once all are captured, switching just rewrites that single Keychain item — no more
+logins needed.
+
+```sh
+# 1. Log into your first account, then capture it.
+claude                      # /login as account A in the browser, back to the prompt
+claude-usage capture work   # snapshots it, names it "work"  ->  Captured 'work' (you@work.com)
+
+# 2. Log into your second account (this replaces the Keychain), then capture it.
+claude                      # /login as account B
+claude-usage capture personal
+
+# 3. Confirm both are onboarded.
+claude-usage                # dashboard shows both; ▶ marks the active one
+```
+
+Add more accounts anytime by repeating with a new name. From the **menu-bar app**
+you can do the same without the terminal: `claude` → `/login` as the new account,
+then click the icon → **Capture current login…** → type a name.
+
+Notes:
+
+- You log in **once per account** — after capture, `claude-usage` refreshes each
+  account's token itself, so you're never sent back through `/login`.
+- The **active** account's tokens rotate as you use `claude`; the tool re-syncs it
+  from the Keychain automatically so nothing goes stale.
+- Remove an account with `claude-usage rm <name>`.
 
 ## Quick start
 

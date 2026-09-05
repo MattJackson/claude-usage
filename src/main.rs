@@ -7,6 +7,7 @@ mod config;
 mod menubar;
 mod oauth;
 mod store;
+mod update;
 mod usage;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -55,6 +56,7 @@ fn run() -> Result<()> {
         #[cfg(target_os = "macos")]
         Some("menubar") => menubar::run(),
         Some("report") => cmd_report(&args[1..]),
+        Some("update") => cmd_update(),
         Some("install") => cmd_install(),
         Some("uninstall") => cmd_uninstall(),
         Some("rm") | Some("remove") => cmd_rm(args.get(1)),
@@ -85,6 +87,7 @@ fn print_help() {
          claude-usage install           Run the menu-bar app at every login (via launchd)\n  \
          claude-usage uninstall         Stop running the menu-bar app at login\n  \
          claude-usage report            Usage patterns by weekday / hour / account\n  \
+         claude-usage update            Update to the latest release from GitHub\n  \
          claude-usage rm <name>         Forget an account\n\n\
          With no [name], switch/start/continue auto-pick the account that has room\n  \
          and whose weekly limit resets soonest (use it before the quota resets).\n\n\
@@ -551,6 +554,9 @@ struct CycleOutcome {
 /// active account if it has reached `trigger` and a healthy target exists.
 /// Shared by the CLI `watch` loop and the menu-bar poller so they can't diverge.
 fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<CycleOutcome> {
+    // Once a day, self-update in the background (may re-exec and never return).
+    maybe_daily_update();
+
     let mut state = State::load()?;
     if state.accounts.is_empty() {
         return Ok(CycleOutcome {
@@ -689,6 +695,56 @@ fn active_label(state: &State, name: &str) -> String {
         .find(name)
         .and_then(|a| a.email.clone())
         .unwrap_or_else(|| name.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// self-update
+// ---------------------------------------------------------------------------
+
+/// Check GitHub and update to the latest release now (one-shot CLI command).
+fn cmd_update() -> Result<()> {
+    match update::run_update(false)? {
+        update::Outcome::Updated(v) => {
+            println!("Updated to v{v}. Restart any running claude-usage to pick it up.");
+        }
+        update::Outcome::UpToDate => {
+            println!("Already up to date (v{}).", update::current_version());
+        }
+    }
+    Ok(())
+}
+
+/// At most once per 24h, check for a newer release and — if auto-update is
+/// enabled — install it and re-exec onto the new version. Best-effort: any
+/// failure is swallowed so it never disrupts the daemon.
+fn maybe_daily_update() {
+    let Ok(mut state) = State::load() else {
+        return;
+    };
+    let now = Utc::now().timestamp();
+    if let Some(last) = state.last_update_check {
+        if now - last < 86_400 {
+            return;
+        }
+    }
+    state.last_update_check = Some(now);
+    let _ = state.save();
+
+    if state.autoupdate_disabled {
+        return;
+    }
+    match update::check_latest() {
+        Ok(Some(_)) => match update::run_update(true) {
+            Ok(update::Outcome::Updated(v)) => {
+                notify(&format!("Updated to v{v} — relaunching"));
+                update::relaunch();
+            }
+            Ok(update::Outcome::UpToDate) => {}
+            Err(e) => eprintln!("auto-update failed: {e:#}"),
+        },
+        Ok(None) => {}
+        Err(e) => eprintln!("update check failed: {e:#}"),
+    }
 }
 
 /// Fire a native macOS notification (best effort).
