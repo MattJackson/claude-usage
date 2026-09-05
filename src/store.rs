@@ -169,3 +169,7 @@ fn set_owner_only(path: &std::path::Path) -> Result<()> {
 fn set_owner_only(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "store_tests.rs"]
+mod tests;

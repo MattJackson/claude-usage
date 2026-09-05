@@ -61,3 +61,7 @@ fn post_token(body: &serde_json::Value) -> Result<TokenResponse> {
         Err(e) => Err(anyhow!("token request failed: {e}")),
     }
 }
+
+#[cfg(test)]
+#[path = "oauth_tests.rs"]
+mod tests;

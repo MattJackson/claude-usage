@@ -104,3 +104,7 @@ pub fn oauth_account_from_profile(profile: &serde_json::Value) -> Option<serde_j
         "subscriptionCreatedAt": get(org, "subscription_created_at"),
     }))
 }
+
+#[cfg(test)]
+#[path = "usage_tests.rs"]
+mod tests;

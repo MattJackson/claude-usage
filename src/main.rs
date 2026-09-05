@@ -62,6 +62,10 @@ fn run() -> Result<()> {
             print_help();
             Ok(())
         }
+        Some("-V") | Some("--version") | Some("version") => {
+            println!("claude-usage {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some(other) => {
             eprintln!("unknown command: {other}\n");
             print_help();
@@ -256,7 +260,11 @@ fn cmd_rm(name: Option<&String>) -> Result<()> {
     let name = name.context("usage: claude-usage rm <name>")?;
     let mut state = State::load()?;
     if state.remove(name) {
-        if state.active.as_deref() == Some(name.as_str()) {
+        if state
+            .active
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(name))
+        {
             state.active = None;
         }
         state.save()?;
@@ -525,10 +533,17 @@ fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str
         obj.insert("userID".into(), serde_json::Value::String(uid.to_string()));
     }
     obj.remove("cachedUsageUtilization");
-    // Write atomically to avoid corrupting the file if we're interrupted.
+    // Write atomically to avoid corrupting the file if we're interrupted, and
+    // preserve the original file's permissions so we never widen them.
     let json = serde_json::to_vec_pretty(&v)?;
     let tmp = path.with_extension("json.claude-usage.tmp");
     std::fs::write(&tmp, &json).context("writing ~/.claude.json.tmp")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o777).unwrap_or(0o600);
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+    }
     std::fs::rename(&tmp, &path).context("replacing ~/.claude.json")?;
     Ok(())
 }
@@ -1139,3 +1154,7 @@ fn prompt(msg: &str) -> Result<String> {
         .context("reading input")?;
     Ok(buf.trim_end_matches(['\n', '\r']).to_string())
 }
+
+#[cfg(test)]
+#[path = "main_tests.rs"]
+mod tests;
