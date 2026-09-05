@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-05
+
+### Fixed
+- **The menu-bar menu no longer closes on its own.** Dropped the `tao` dependency
+  and drive the app on a native `NSApplication` run loop with an `NSTimer`
+  scheduled in the default run-loop mode, so the open status menu (which runs in
+  `NSEventTrackingRunLoopMode`) is never dismissed by the event loop. Root cause:
+  tao registered its run-loop observer/timer/source in `kCFRunLoopCommonModes`
+  (upstream: tauri-apps/tao#1324, PR #1325).
+- "updated Xm ago" now actually ticks — the menu re-renders from cached state
+  every second instead of only on a poll.
+
+### Added
+- Auto-swap submenu: **"Switch to best account now"** — immediately move to the
+  account that has room and whose weekly limit resets soonest (stays put if you're
+  already on the best one).
+
+### Changed
+- Account headers in the menu read `email   xx% / xx%` (dropped the S/W prefixes).
+
 ## [0.1.6] - 2026-09-05
 
 ### Fixed
@@ -141,7 +161,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/MattJackson/claude-usage/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/MattJackson/claude-usage/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/MattJackson/claude-usage/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/MattJackson/claude-usage/compare/v0.1.2...v0.1.4

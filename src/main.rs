@@ -503,6 +503,23 @@ fn candidate_order(a: &Row, b: &Row) -> std::cmp::Ordering {
     )
 }
 
+/// Switch to the account auto-pick considers best right now (the one with room
+/// whose weekly window resets soonest, so its quota is used before it resets).
+/// Uses cached usage only — no network. Returns `Some(email)` if it switched,
+/// or `None` if the active account is already the best choice. Used by the
+/// menu bar's "Now" item.
+pub(crate) fn optimize_now() -> Result<Option<String>> {
+    let state = State::load()?;
+    let active = state.active.clone();
+    let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
+    let best = auto_pick(&rows)?;
+    if active.as_deref() == Some(best.as_str()) {
+        return Ok(None);
+    }
+    switch_to(&best)?;
+    Ok(Some(best))
+}
+
 /// Pick the account with room to spare whose weekly window resets soonest.
 /// Operates entirely on cached rows — callers must not fetch first.
 fn auto_pick(rows: &[Row]) -> Result<String> {

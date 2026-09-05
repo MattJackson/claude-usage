@@ -7,32 +7,26 @@
 //! never fetches on its own, so menu interactions can't trigger HTTP 429s.
 
 use anyhow::Result;
+use std::cell::RefCell;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tao::event::{Event, StartCause};
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use block2::RcBlock;
+use objc2::MainThreadMarker;
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+use objc2_foundation::NSTimer;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::{TrayIcon, TrayIconBuilder};
+use tray_icon::TrayIconBuilder;
 
 use crate::store::State;
 use crate::{
-    age_str, capture_current, next_interval, notify, remove_account, row_from_account, switch_to,
-    watch_cycle, with_state_lock, Row, SwapGuard, TARGET_CEILING_PCT, TRIGGER_PCT,
-    WATCH_INTERVAL_SECS,
+    age_str, capture_current, next_interval, notify, optimize_now, remove_account,
+    row_from_account, switch_to, watch_cycle, with_state_lock, Row, SwapGuard, TARGET_CEILING_PCT,
+    TRIGGER_PCT, WATCH_INTERVAL_SECS,
 };
 
 /// Name shown for our Login Item in System Events.
 const LOGIN_ITEM_NAME: &str = "Claude Usage";
-
-/// Events delivered to the main thread's run loop.
-enum UserEvent {
-    /// The poller refreshed the snapshot; rebuild the menu/title if it changed.
-    Refresh,
-    /// A menu item with this id was clicked.
-    Menu(String),
-}
 
 /// One account as shown in the menu.
 struct AcctView {
@@ -58,128 +52,76 @@ struct Snapshot {
 }
 
 pub fn run() -> Result<()> {
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
-    let proxy = event_loop.create_proxy();
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| anyhow::anyhow!("the menu bar must run on the main thread"))?;
+    let app = NSApplication::sharedApplication(mtm);
+    // Background (menu-bar-only) app: no Dock icon, even as the bare binary.
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    // Forward menu clicks into the run loop.
-    {
-        let proxy = proxy.clone();
-        let rx = MenuEvent::receiver();
-        std::thread::spawn(move || {
-            while let Ok(ev) = rx.recv() {
-                let _ = proxy.send_event(UserEvent::Menu(ev.id.0));
-            }
-        });
-    }
-
-    let snapshot: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(Snapshot::default()));
+    // Poll + auto-swap on a background thread. It writes cached usage to
+    // state.json; the main-thread timer reads it back to render.
     let (poll_tx, poll_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || poll_loop(poll_rx));
 
-    // Poll + auto-swap on a background thread.
-    {
-        let snapshot = snapshot.clone();
-        let proxy = proxy.clone();
-        std::thread::spawn(move || poll_loop(snapshot, proxy, poll_rx));
-    }
+    // Build the tray on the main thread and keep it alive for the app's lifetime.
+    let initial = build_snapshot();
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(build_menu(&initial)))
+        .with_title(title_for(&initial))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
+    let _ = tray.set_tooltip(Some(tooltip_for(&initial)));
 
-    // React quickly to external State changes (e.g. a CLI `claude-usage switch`)
-    // by watching the state file's mtime and doing a local-only refresh.
-    {
-        let snapshot = snapshot.clone();
-        let proxy = proxy.clone();
-        std::thread::spawn(move || watch_state_file(snapshot, proxy));
-    }
-
-    // The tray must be created on the main thread once the app is initialised.
-    // We only re-install the menu when its content actually changes: re-installing
-    // an open NSMenu on macOS dismisses it, so no-op ticks must not touch it.
-    let mut tray: Option<TrayIcon> = None;
-    let mut last_sig = String::new();
-    let mut last_title = String::new();
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-        match event {
-            Event::NewEvents(StartCause::Init) => {
-                // Run as a background (menu-bar-only) app: no Dock icon, even when
-                // launched as the bare binary rather than the .app bundle.
-                set_accessory_activation_policy();
-
-                let snap = lock_snapshot(&snapshot);
-                last_sig = menu_signature(&snap);
-                last_title = title_for(&snap);
-                let built = TrayIconBuilder::new()
-                    .with_menu(Box::new(build_menu(&snap)))
-                    .with_title(last_title.clone())
-                    .build();
-                match built {
-                    Ok(t) => {
-                        let _ = t.set_tooltip(Some(tooltip_for(&snap)));
-                        tray = Some(t);
-                    }
-                    Err(e) => eprintln!("failed to create tray icon: {e}"),
-                }
-            }
-            Event::UserEvent(UserEvent::Refresh) => {
-                if let Some(t) = &tray {
-                    let snap = lock_snapshot(&snapshot);
-                    let sig = menu_signature(&snap);
-                    if sig != last_sig {
-                        t.set_menu(Some(Box::new(build_menu(&snap))));
-                        let _ = t.set_tooltip(Some(tooltip_for(&snap)));
-                        last_sig = sig;
-                    }
-                    let title = title_for(&snap);
-                    if title != last_title {
-                        t.set_title(Some(title.clone()));
-                        last_title = title;
-                    }
-                }
-            }
-            Event::UserEvent(UserEvent::Menu(id)) => handle_click(&id, &poll_tx, control_flow),
-            _ => {}
+    // All UI updates happen in this timer, scheduled in the DEFAULT run-loop mode.
+    // A status menu opens its own nested tracking loop (NSEventTrackingRunLoopMode);
+    // a default-mode timer never fires there, so an open menu is never dismissed.
+    // (This is exactly the tao bug we sidestepped by dropping tao: it added its
+    // run-loop observer to kCFRunLoopCommonModes, which *does* fire during
+    // tracking and collapsed the menu.) Each tick rebuilds the display from cached
+    // state — so "updated Xm ago" ticks and a CLI switch shows up within ~1s — and
+    // only re-installs the menu/title when the rendered content actually changes.
+    let menu_rx = MenuEvent::receiver().clone();
+    let last_sig = RefCell::new(menu_signature(&initial));
+    let last_title = RefCell::new(title_for(&initial));
+    let tick = RcBlock::new(move |_t: core::ptr::NonNull<NSTimer>| {
+        // A menu closes before its click is delivered, so handling it here won't
+        // fight menu tracking.
+        while let Ok(ev) = menu_rx.try_recv() {
+            handle_click(&ev.id.0, &poll_tx);
+        }
+        let snap = build_snapshot();
+        let sig = menu_signature(&snap);
+        if *last_sig.borrow() != sig {
+            tray.set_menu(Some(Box::new(build_menu(&snap))));
+            let _ = tray.set_tooltip(Some(tooltip_for(&snap)));
+            *last_sig.borrow_mut() = sig;
+        }
+        let title = title_for(&snap);
+        if *last_title.borrow() != title {
+            tray.set_title(Some(title.clone()));
+            *last_title.borrow_mut() = title;
         }
     });
-}
+    // The run loop retains the timer; scheduled timers fire in the default mode.
+    let _timer =
+        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.75, true, &tick) };
 
-/// Lock the shared snapshot, recovering from a poisoned mutex rather than
-/// panicking (kept consistent across all three threads).
-fn lock_snapshot(snapshot: &Arc<Mutex<Snapshot>>) -> std::sync::MutexGuard<'_, Snapshot> {
-    snapshot.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Make this a background app (menu-bar only, no Dock icon). tao 0.37 exposes no
-/// activation-policy hook, so set it via AppKit once the NSApplication exists.
-fn set_accessory_activation_policy() {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-    if let Some(mtm) = MainThreadMarker::new() {
-        let app = NSApplication::sharedApplication(mtm);
-        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-    }
+    app.run();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Poller thread
 // ---------------------------------------------------------------------------
 
-fn poll_loop(
-    snapshot: Arc<Mutex<Snapshot>>,
-    proxy: EventLoopProxy<UserEvent>,
-    poll_rx: mpsc::Receiver<()>,
-) {
+fn poll_loop(poll_rx: mpsc::Receiver<()>) {
     let mut guard = SwapGuard::default();
     let base = WATCH_INTERVAL_SECS;
     let mut current = base;
     loop {
-        // Compute the snapshot BEFORE taking the lock (State::load + osascript are
-        // blocking; holding the lock across them would stall the main thread).
+        // Fetch usage + auto-swap; this writes cached usage to state.json, which
+        // the main-thread timer reads back to render. "Refresh now" pokes poll_rx.
         let rate_limited = run_cycle(&mut guard);
-        let snap = build_snapshot();
-        {
-            let mut s = lock_snapshot(&snapshot);
-            *s = snap;
-        }
-        let _ = proxy.send_event(UserEvent::Refresh);
         current = next_interval(current, base, rate_limited);
         match poll_rx.recv_timeout(Duration::from_secs(current)) {
             Ok(_) | Err(RecvTimeoutError::Timeout) => continue,
@@ -236,30 +178,6 @@ fn build_snapshot() -> Snapshot {
         autoswap,
         threshold,
         start_at_login: login_item_enabled(),
-    }
-}
-
-/// Watch the state file's mtime; on change, do a local-only refresh so a CLI
-/// switch (or a menu remove) shows within a second or two.
-fn watch_state_file(snapshot: Arc<Mutex<Snapshot>>, proxy: EventLoopProxy<UserEvent>) {
-    let path = match crate::store::config_dir() {
-        Ok(d) => d.join("state.json"),
-        Err(_) => return,
-    };
-    let mtime = || std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    let mut last = mtime();
-    loop {
-        std::thread::sleep(Duration::from_secs(1));
-        let cur = mtime();
-        if cur != last {
-            last = cur;
-            let snap = build_snapshot();
-            {
-                let mut s = lock_snapshot(&snapshot);
-                *s = snap;
-            }
-            let _ = proxy.send_event(UserEvent::Refresh);
-        }
     }
 }
 
@@ -361,6 +279,16 @@ fn build_menu(snap: &Snapshot) -> Menu {
             None,
         ));
     }
+    // Immediately switch to the account auto-pick considers best right now
+    // (soonest-resetting with room), so you burn quota before it resets. Stays
+    // put if you're already on the best one.
+    let _ = swap.append(&PredefinedMenuItem::separator());
+    let _ = swap.append(&MenuItem::with_id(
+        "autoswap:now",
+        "Switch to best account now",
+        true,
+        None,
+    ));
     let _ = menu.append(&swap);
     let _ = menu.append(&PredefinedMenuItem::separator());
 
@@ -432,7 +360,7 @@ fn menu_signature(snap: &Snapshot) -> String {
 }
 
 fn header_line(a: &AcctView) -> String {
-    format!("{}  ·  S {} / W {}", a.email, pct(a.session), pct(a.weekly))
+    format!("{}  ·  {} / {}", a.email, pct(a.session), pct(a.weekly))
 }
 
 fn add(menu: &Menu, item: MenuItem) {
@@ -477,16 +405,21 @@ fn pct(p: Option<f64>) -> String {
 // Click handling
 // ---------------------------------------------------------------------------
 
-fn handle_click(id: &str, poll_tx: &mpsc::Sender<()>, control_flow: &mut ControlFlow) {
-    // Most actions only mutate state.json; the state watcher refreshes the UI
-    // within ~1s without any network call. Only "Refresh now" forces a poll.
+fn handle_click(id: &str, poll_tx: &mpsc::Sender<()>) {
+    // Most actions only mutate state.json; the main-thread timer re-renders from
+    // it within ~1s without any network call. Only "Refresh now" forces a poll.
     match id {
-        "quit" => *control_flow = ControlFlow::Exit,
+        "quit" => std::process::exit(0),
         "noop" => {}
         "refresh" => {
             let _ = poll_tx.send(());
         }
         "autoswap:off" => set_autoswap(false),
+        "autoswap:now" => match optimize_now() {
+            Ok(Some(email)) => notify(&format!("Switched to {email}")),
+            Ok(None) => notify("Already on the best account"),
+            Err(e) => notify(&format!("Optimize failed: {e}")),
+        },
         "startlogin" => toggle_login_item(),
         "capture" => match capture_current() {
             Ok((email, existed)) => notify(&format!(

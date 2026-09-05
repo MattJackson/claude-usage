@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "Check usage / limits across multiple Claude Max accounts, and switch between them."
 
@@ -19,13 +19,16 @@ base64 = "0.22"
 rand = "0.8"
 fs2 = "0.4"
 tray-icon = "0.24.2"
-tao = "0.37.0"
 
-# macOS: set the app's activation policy to Accessory (menu-bar only, no Dock
-# icon) at runtime. (Keychain uses the `security` CLI — see the note in main.rs.)
+# macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
+# its run-loop observer to kCFRunLoopCommonModes, which fires during a status
+# menu's NSEventTrackingRunLoopMode and dismisses the open menu. A native loop
+# plus an NSTimer scheduled in the default mode only avoids that entirely.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSTimer", "NSRunLoop", "NSDate", "NSString"] }
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
+block2 = "0.6"
 
 [dev-dependencies]
 assert_cmd = "2"
