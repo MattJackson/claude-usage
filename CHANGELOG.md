@@ -59,8 +59,8 @@ fixes; every top finding was independently confirmed before fixing.
 - Shared log-rotation helper (`logging::rotate_if_large`) used by both the debug
   log and history.jsonl. Extracted pure helpers (`identity_matches`,
   `launchd_managed_from_env`, `write_bytes_atomic_mode`) and added 10 unit tests
-  covering the keychain-adoption gate, swap hysteresis, backoff, rollback mode
-  preservation, and UTF-16 styling offsets (incl. astral characters).
+  covering the keychain-adoption gate, swap hysteresis, backoff, atomic-write
+  mode application, and UTF-16 styling offsets (incl. astral characters).
 
 ## [0.1.10] - 2026-09-05
 

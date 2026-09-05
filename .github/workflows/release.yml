@@ -1,9 +1,12 @@
 name: Release
 
 on:
+  # Tag-triggered only: every step derives the version from the pushed tag
+  # (GITHUB_REF), and the version guard compares it to Cargo.toml. A
+  # workflow_dispatch run has a branch ref, so it could never pass that guard —
+  # releases are cut by pushing a v*.*.* tag.
   push:
     tags: ['v*.*.*']
-  workflow_dispatch:
 
 permissions:
   contents: write
