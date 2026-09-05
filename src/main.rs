@@ -153,7 +153,14 @@ pub(crate) fn capture_current() -> Result<(String, bool)> {
 
     let existed = with_state_lock(|| {
         let mut state = State::load()?;
-        let existed = state.find(&email).is_some();
+        let existed = if let Some(cur) = state.find(&email) {
+            // Re-capturing only refreshes identity/tokens — keep the usage snapshot
+            // the scheduler already fetched, so `list`/menu don't blank to "no data".
+            acct.cached_usage = cur.cached_usage.clone();
+            true
+        } else {
+            false
+        };
         state.upsert(acct);
         state.active = Some(email.clone());
         state.save()?;
@@ -219,8 +226,11 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
         Some(kind) => {
             println!("\nLaunching claude…\n");
             let mut cmd = std::process::Command::new("claude");
-            if let Launch::Continue = kind {
-                cmd.arg("--continue");
+            match kind {
+                Launch::Continue => {
+                    cmd.arg("--continue");
+                }
+                Launch::Fresh => {}
             }
             match cmd.status() {
                 Ok(s) if s.success() => Ok(()),
@@ -246,7 +256,23 @@ fn select_email(state: &State, selector: Option<&str>) -> Result<String> {
 /// backfill) OUTSIDE the state lock, then commits keychain + ~/.claude.json +
 /// state under the lock with a fresh reload. Returns the display label.
 pub(crate) fn switch_to(email: &str) -> Result<String> {
-    // Phase 1 (no lock): refresh the token and resolve the identity over the net.
+    let (acct, identity, backfilled) = prepare_switch(email)?;
+    let label = acct.email.clone().unwrap_or_else(|| email.to_string());
+    Ok(switch_to_guarded(email, &acct, &identity, backfilled, None)?.unwrap_or(label))
+}
+
+/// Like `switch_to`, but only if `expect_active` is still the active account
+/// when the lock is taken (a compare-and-set). Used by the auto-swap daemon so a
+/// concurrent manual switch isn't overridden by a stale decision. Returns the
+/// label on a real switch, or `None` if it was skipped.
+fn switch_to_if_still_active(email: &str, expect_active: &str) -> Result<Option<String>> {
+    let (acct, identity, backfilled) = prepare_switch(email)?;
+    switch_to_guarded(email, &acct, &identity, backfilled, Some(expect_active))
+}
+
+/// Phase 1 of a switch (no lock): refresh the token and resolve the identity
+/// over the network, returning what the locked commit phase needs.
+fn prepare_switch(email: &str) -> Result<(Account, serde_json::Value, bool)> {
     let state = State::load()?;
     let mut acct = state
         .find(email)
@@ -254,18 +280,53 @@ pub(crate) fn switch_to(email: &str) -> Result<String> {
         .with_context(|| format!("no account matches '{email}'"))?;
     oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS)?;
     let (identity, backfilled) = resolve_identity(&acct)?;
-    let label = acct.email.clone().unwrap_or_else(|| email.to_string());
+    Ok((acct, identity, backfilled))
+}
 
-    // Phase 2 (locked): reload, apply the mutation, save. Keeps a concurrent
-    // daemon poll or another switch from clobbering this write.
-    with_state_lock(|| {
+/// The locked phase of a switch, optionally guarded by `expect_active`: if given
+/// and the reloaded active account no longer matches it, the switch is skipped
+/// (returns `Ok(None)`). The auto-swap daemon uses this so a manual switch that
+/// lands between its decision and this commit isn't silently overridden by a now
+/// stale choice. `acct`/`identity`/`backfilled` come from the caller's unlocked
+/// phase-1 network work. Returns the display label on a real switch.
+fn switch_to_guarded(
+    email: &str,
+    acct: &Account,
+    identity: &serde_json::Value,
+    backfilled: bool,
+    expect_active: Option<&str>,
+) -> Result<Option<String>> {
+    let label = acct.email.clone().unwrap_or_else(|| email.to_string());
+    let switched = with_state_lock(|| {
         let mut st = State::load()?;
+        if let Some(exp) = expect_active {
+            if st.active.as_deref() != Some(exp) {
+                logging::log(&format!(
+                    "swap to {label} skipped: active changed to {:?} since the decision",
+                    st.active
+                ));
+                return Ok(false);
+            }
+        }
         // Preserve any token rotation the currently-active session picked up.
         sync_active_from_keychain(&mut st);
+        // A concurrent poll may have rotated this account's token after our
+        // phase-1 snapshot; use whichever tokens are fresher so we never write a
+        // stale (possibly already-superseded) refresh token to the keychain.
+        let mut acct = acct.clone();
+        if let Some(cur) = st.find(email) {
+            if cur.expires_at > acct.expires_at {
+                acct.set_tokens(
+                    cur.access_token.clone(),
+                    cur.refresh_token.clone(),
+                    cur.expires_at,
+                );
+            }
+        }
         // ~/.claude.json first, keychain last (the commit point), rollback on fail.
-        apply_account(&acct, &identity)?;
+        apply_account(&acct, identity)?;
         if let Some(a) = st.find_mut(email) {
-            a.set_tokens(
+            a.set_tokens_if_newer(
                 acct.access_token.clone(),
                 acct.refresh_token.clone(),
                 acct.expires_at,
@@ -275,11 +336,19 @@ pub(crate) fn switch_to(email: &str) -> Result<String> {
             }
         }
         st.active = Some(email.to_string());
-        st.save()?;
-        Ok(())
+        // The login is already committed to the keychain + ~/.claude.json at this
+        // point; if only the state.json bookkeeping write fails, say so clearly.
+        if let Err(e) = st.save() {
+            return Err(e).context("the login was switched but recording it in state.json failed");
+        }
+        Ok(true)
     })?;
-    logging::log(&format!("switch -> {label}"));
-    Ok(label)
+    if switched {
+        logging::log(&format!("switch -> {label}"));
+        Ok(Some(label))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Resolve the `oauthAccount` identity to write for this account.
@@ -309,12 +378,42 @@ fn apply_account(acct: &Account, identity: &serde_json::Value) -> Result<()> {
     let prior = read_claude_json_raw();
     write_claude_identity(identity, acct.user_id.as_deref())?;
     if let Err(e) = keychain_write(&acct.keychain_blob) {
-        if let Some(bytes) = prior {
-            let _ = restore_claude_json_raw(&bytes);
+        if let Some((bytes, mode)) = &prior {
+            // If the rollback ALSO fails we're half-applied (~/.claude.json points
+            // at the new account, keychain still holds the old) — surface that
+            // explicitly rather than silently swallowing the rollback error.
+            if let Err(re) = restore_claude_json_raw(bytes, *mode) {
+                return Err(e).context(format!(
+                    "writing the account into the keychain, and rolling back \
+                     ~/.claude.json failed too ({re:#}); it may now point at the new \
+                     account while the keychain holds the old — run `claude-usage \
+                     switch` again to reconcile"
+                ));
+            }
         }
         return Err(e).context("writing the account into the keychain");
     }
     Ok(())
+}
+
+/// Whether the keychain / `~/.claude.json` identity is our tracked account:
+/// match on `accountUuid` when both sides have one, otherwise case-insensitive
+/// email. An account with no known identity yet adopts (self-heal); a known
+/// email with nothing to compare against does NOT (stay safe). Pure, for tests.
+fn identity_matches(
+    acct_uuid: Option<&str>,
+    acct_email: Option<&str>,
+    json_uuid: Option<&str>,
+    json_email: Option<&str>,
+) -> bool {
+    match (acct_uuid, json_uuid) {
+        (Some(a), Some(b)) => a == b,
+        _ => match (acct_email, json_email) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            (None, _) => true,
+            _ => false,
+        },
+    }
 }
 
 /// If the account currently in the keychain is genuinely our active account,
@@ -347,16 +446,12 @@ fn sync_active_from_keychain(state: &mut State) {
         return;
     };
     // Determine whether the keychain/.claude.json identity matches this account.
-    let matches = match (&acct.identity_uuid(), &json_uuid) {
-        (Some(a), Some(b)) => a == b,
-        _ => match (&acct.email, &json_email) {
-            (Some(a), Some(b)) => a.to_ascii_lowercase() == *b,
-            // Account has no known identity yet: adopt and self-heal below.
-            (None, _) => true,
-            // We have an email but .claude.json has none to compare: be safe, skip.
-            _ => false,
-        },
-    };
+    let matches = identity_matches(
+        acct.identity_uuid().as_deref(),
+        acct.email.as_deref(),
+        json_uuid.as_deref(),
+        json_email.as_deref(),
+    );
     if !matches {
         logging::log(
             "sync: keychain identity does not match the active account; not adopting tokens",
@@ -711,18 +806,57 @@ fn read_claude_identity() -> (Option<serde_json::Value>, Option<String>) {
     (oauth, uid)
 }
 
-/// Raw bytes of ~/.claude.json, for rollback.
-fn read_claude_json_raw() -> Option<Vec<u8>> {
+/// Raw bytes of ~/.claude.json plus its permission mode, for rollback.
+fn read_claude_json_raw() -> Option<(Vec<u8>, u32)> {
     let path = claude_json_path().ok()?;
-    std::fs::read(&path).ok()
+    let bytes = std::fs::read(&path).ok()?;
+    let mode = claude_json_mode(&path);
+    Some((bytes, mode))
 }
 
-/// Restore ~/.claude.json to prior raw bytes (atomic tmp+rename).
-fn restore_claude_json_raw(bytes: &[u8]) -> Result<()> {
+/// The file's permission bits (0o600 fallback so a rollback never loosens perms).
+#[cfg(unix)]
+fn claude_json_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode())
+        .unwrap_or(0o600)
+}
+
+#[cfg(not(unix))]
+fn claude_json_mode(_path: &std::path::Path) -> u32 {
+    0o600
+}
+
+/// Restore ~/.claude.json to prior raw bytes (atomic tmp+rename), re-applying the
+/// original mode so the rollback preserves the file's permissions (matching the
+/// documented "rewrites preserve the original file mode" invariant). Cleans up
+/// the temp file on any failure.
+fn restore_claude_json_raw(bytes: &[u8], mode: u32) -> Result<()> {
     let path = claude_json_path()?;
+    write_bytes_atomic_mode(&path, bytes, mode)
+}
+
+/// Atomically write `bytes` to `path` (tmp + rename) with permission `mode`,
+/// cleaning up the temp file on any failure. Split out from
+/// `restore_claude_json_raw` so the mode-preservation can be unit-tested.
+fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<()> {
     let tmp = path.with_extension("json.claude-usage.tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, &path)?;
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).context("writing rollback temp file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).context("renaming rollback file into place");
+    }
     Ok(())
 }
 
@@ -912,6 +1046,14 @@ pub(crate) struct SwapGuard {
     stuck_notified: bool,
 }
 
+/// Drop no-return entries past their window so `left_at` can't grow without
+/// bound over a daemon running for weeks (e.g. accounts later `rm`'d).
+fn prune_swap_guard(guard: &mut SwapGuard) {
+    guard
+        .left_at
+        .retain(|_, t| t.elapsed().as_secs() < NO_RETURN_SECS);
+}
+
 /// Result of one poll: the swap it made (if any) and the rate-limited flag.
 pub(crate) struct CycleOutcome {
     pub swapped: Option<(String, String)>,
@@ -982,12 +1124,20 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                     .find(|r| r.email == target)
                     .map(|r| (r.session.pct.unwrap_or(0.0), r.weekly.pct.unwrap_or(0.0)))
                     .unwrap_or((0.0, 0.0));
-                let label = switch_to(&target)?;
+                // Compare-and-set on the active account: if a manual switch landed
+                // since choose_swap_target read the snapshot, skip this swap.
+                let Some(label) = switch_to_if_still_active(&target, &active_email)? else {
+                    return Ok(CycleOutcome {
+                        swapped: None,
+                        rate_limited: refresh.rate_limited,
+                    });
+                };
                 guard
                     .left_at
                     .insert(active_email.clone(), std::time::Instant::now());
                 guard.last_swap = Some(std::time::Instant::now());
                 guard.stuck_notified = false;
+                prune_swap_guard(guard);
                 log_event(&serde_json::json!({
                     "ts": Utc::now().timestamp(),
                     "event": "swap",
@@ -1060,11 +1210,7 @@ fn log_event(v: &serde_json::Value) {
         let _ = std::fs::create_dir_all(dir);
     }
     // Rotate if it has grown too large (keep one previous generation).
-    if let Ok(m) = std::fs::metadata(&path) {
-        if m.len() > HISTORY_MAX_BYTES {
-            let _ = std::fs::rename(&path, path.with_extension("jsonl.1"));
-        }
-    }
+    logging::rotate_if_large(&path, HISTORY_MAX_BYTES);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1130,12 +1276,18 @@ fn cmd_report(_args: &[String]) -> Result<()> {
     let mut by_hour = [0f64; 24];
     let mut prev: Option<&Sample> = None;
     for s in &active {
-        if let (Some(p), Some(cur)) = (prev.and_then(|p| p.session), s.session) {
-            let delta = cur - p;
-            if delta > 0.0 {
-                if let Some(dt) = Local.timestamp_opt(s.ts, 0).single() {
-                    by_weekday[dt.weekday().num_days_from_monday() as usize] += delta;
-                    by_hour[dt.hour() as usize] += delta;
+        // Only diff consecutive samples of the SAME account — a delta that spans
+        // an account switch would subtract two unrelated accounts' session %.
+        if let Some(p) = prev {
+            if p.account == s.account {
+                if let (Some(pv), Some(cur)) = (p.session, s.session) {
+                    let delta = cur - pv;
+                    if delta > 0.0 {
+                        if let Some(dt) = Local.timestamp_opt(s.ts, 0).single() {
+                            by_weekday[dt.weekday().num_days_from_monday() as usize] += delta;
+                            by_hour[dt.hour() as usize] += delta;
+                        }
+                    }
                 }
             }
         }

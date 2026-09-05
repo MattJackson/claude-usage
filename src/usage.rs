@@ -64,10 +64,12 @@ pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
             .map_err(|e| FetchError::Other(format!("parsing usage response: {e}"))),
         Err(ureq::Error::Status(429, _)) => Err(FetchError::RateLimited),
         Err(ureq::Error::Status(401, _)) => Err(FetchError::Auth),
-        Err(ureq::Error::Status(code, r)) => {
-            let text = r.into_string().unwrap_or_default();
+        Err(ureq::Error::Status(code, _r)) => {
+            // Don't fold the raw response body into the error — it can echo
+            // account/request detail and ends up in the debug log (same hygiene
+            // rule as oauth::post_token). The status code is enough.
             Err(FetchError::Other(format!(
-                "usage endpoint returned HTTP {code}: {text}"
+                "usage endpoint returned HTTP {code}"
             )))
         }
         Err(e) => Err(FetchError::Transient(e.to_string())),

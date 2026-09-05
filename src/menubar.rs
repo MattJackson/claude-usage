@@ -282,38 +282,79 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
         return;
     }
     crate::logging::log("binary changed on disk (brew upgrade); relaunching");
-    if relaunch_via_launchd() {
-        // kickstart -k will SIGKILL and restart this job; wait to be replaced.
-        // (If it somehow doesn't, we still exit so we're not left on the old
-        // binary — launchd's kickstart reliably restarts an existing job.)
-        std::thread::sleep(Duration::from_secs(3));
-        std::process::exit(0);
+    match relaunch_via_launchd() {
+        LaunchdRestart::Issued => {
+            // kickstart -k will SIGKILL and restart this job; wait to be replaced.
+            std::thread::sleep(Duration::from_secs(3));
+            std::process::exit(0);
+        }
+        LaunchdRestart::Failed => {
+            // Under launchd but the kickstart didn't take. Staying on the current
+            // (old) binary — alive — is far better than exiting into a dead,
+            // never-restarted state (KeepAlive=false won't bring us back).
+            crate::logging::log("launchctl kickstart failed; staying on current version");
+        }
+        LaunchdRestart::NotManaged => {
+            // Bare run (no launchd job): an orphaned child re-parents to
+            // launchd/init and outlives our exit — but only exit if the spawn
+            // actually succeeded, else we'd vanish with no replacement.
+            match std::process::Command::new(&stable).arg("menubar").spawn() {
+                Ok(_) => std::process::exit(0),
+                Err(e) => crate::logging::log(&format!(
+                    "relaunch spawn failed: {e}; staying on current version"
+                )),
+            }
+        }
     }
-    // Bare run (no launchd job): the orphaned child re-parents to launchd/init
-    // and outlives our exit.
-    let _ = std::process::Command::new(&stable).arg("menubar").spawn();
-    std::process::exit(0);
 }
 
-/// If we're running as the launchd agent, ask launchd to kill+restart the job.
-/// Returns true if the kickstart request was issued (so the caller should wait
-/// to be replaced rather than self-spawn). Detected via `XPC_SERVICE_NAME`,
-/// which launchd sets to the job label for a LaunchAgent — precise enough that a
-/// manual `claude-usage menubar` run (which self-spawns fine) isn't misrouted.
-fn relaunch_via_launchd() -> bool {
-    let under_launchd = std::env::var("XPC_SERVICE_NAME")
-        .map(|v| v == crate::LAUNCHD_LABEL)
-        .unwrap_or(false);
-    if !under_launchd {
-        return false;
+/// Outcome of attempting a launchd-driven restart.
+enum LaunchdRestart {
+    /// kickstart succeeded — the caller should wait to be replaced.
+    Issued,
+    /// We're launchd-managed but kickstart failed — caller must NOT exit.
+    Failed,
+    /// Not launchd-managed — caller should self-spawn a replacement.
+    NotManaged,
+}
+
+/// If we're running as the launchd agent, ask launchd to kill+restart the job
+/// (`launchctl kickstart -k`). We wait on the command's exit status — reporting
+/// success only when the kickstart actually took, so a failed request can't lead
+/// the caller to exit into a dead, unrestarted state.
+fn relaunch_via_launchd() -> LaunchdRestart {
+    if !is_launchd_managed() {
+        return LaunchdRestart::NotManaged;
     }
     let uid = unsafe { libc::getuid() };
     let target = format!("gui/{uid}/{}", crate::LAUNCHD_LABEL);
     crate::logging::log(&format!("relaunching via launchctl kickstart -k {target}"));
-    std::process::Command::new("launchctl")
+    match std::process::Command::new("launchctl")
         .args(["kickstart", "-k", &target])
-        .spawn()
-        .is_ok()
+        .status()
+    {
+        Ok(s) if s.success() => LaunchdRestart::Issued,
+        Ok(s) => {
+            crate::logging::log(&format!("launchctl kickstart exited with {s}"));
+            LaunchdRestart::Failed
+        }
+        Err(e) => {
+            crate::logging::log(&format!("launchctl kickstart could not run: {e}"));
+            LaunchdRestart::Failed
+        }
+    }
+}
+
+/// Whether we're the launchd-managed agent. `XPC_SERVICE_NAME` is set by launchd
+/// to the job label for a LaunchAgent, so a manual `claude-usage menubar` run
+/// (which self-spawns fine) isn't misrouted to the kickstart path.
+fn is_launchd_managed() -> bool {
+    launchd_managed_from_env(std::env::var("XPC_SERVICE_NAME").ok().as_deref())
+}
+
+/// Pure predicate behind `is_launchd_managed`, split out for testing.
+fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
+    xpc_service_name == Some(crate::LAUNCHD_LABEL)
 }
 
 /// Run one poll+auto-swap cycle; returns whether it was rate limited.
@@ -348,9 +389,11 @@ fn acctview_from_row(r: &Row, active: &Option<String>) -> AcctView {
 }
 
 /// Build the UI snapshot from local State only (no network), reading each
-/// account's cached usage. Used after a poll and to react to external changes.
+/// account's cached usage. Runs every 0.75s UI tick, so it avoids re-reading
+/// state.json unless its mtime changed and probes the Login Item at most once a
+/// minute (both were per-tick subprocess/disk costs before).
 fn build_snapshot() -> Snapshot {
-    let st = State::load().unwrap_or_default();
+    let st = cached_state();
     let autoswap = !st.autoswap_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     let active = st.active.clone();
@@ -363,8 +406,71 @@ fn build_snapshot() -> Snapshot {
         accounts,
         autoswap,
         threshold,
-        start_at_login: login_item_enabled(),
+        start_at_login: cached_login_item_enabled(),
     }
+}
+
+/// Return the parsed state, re-reading state.json only when its mtime changed.
+/// The 0.75s UI tick would otherwise read+parse the file every tick forever.
+/// Only the main thread calls this, but a Mutex keeps it trivially sound.
+fn cached_state() -> State {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::SystemTime;
+    struct C {
+        mtime: Option<SystemTime>,
+        state: State,
+        loaded: bool,
+    }
+    static CELL: OnceLock<Mutex<C>> = OnceLock::new();
+    let cell = CELL.get_or_init(|| {
+        Mutex::new(C {
+            mtime: None,
+            state: State::default(),
+            loaded: false,
+        })
+    });
+    let path = crate::store::config_dir()
+        .map(|d| d.join("state.json"))
+        .unwrap_or_default();
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.loaded || g.mtime != mtime {
+        g.state = State::load().unwrap_or_default();
+        g.mtime = mtime;
+        g.loaded = true;
+    }
+    g.state.clone()
+}
+
+/// How often to re-probe the Login Item state (an osascript subprocess).
+const LOGIN_PROBE_TTL: Duration = Duration::from_secs(60);
+
+/// Login-item enabled state, probed at most once per `LOGIN_PROBE_TTL` (the
+/// probe forks an `osascript`; doing it every 0.75s tick was the top perf cost).
+/// `set_login_item_cache` refreshes it immediately when we toggle it ourselves.
+fn cached_login_item_enabled() -> bool {
+    let mut g = login_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = g
+        .map(|(_, t)| t.elapsed() < LOGIN_PROBE_TTL)
+        .unwrap_or(false);
+    if !fresh {
+        let v = login_item_enabled();
+        *g = Some((v, std::time::Instant::now()));
+    }
+    g.map(|(v, _)| v).unwrap_or(false)
+}
+
+/// Record a known Login Item state (after we toggle it) so the menu reflects it
+/// at once instead of waiting for the next probe.
+fn set_login_item_cache(enabled: bool) {
+    *login_cache().lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((enabled, std::time::Instant::now()));
+}
+
+fn login_cache() -> &'static std::sync::Mutex<Option<(bool, std::time::Instant)>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<(bool, std::time::Instant)>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 // ---------------------------------------------------------------------------
@@ -662,7 +768,7 @@ fn menu_signature(snap: &Snapshot) -> String {
     let mut s = String::new();
     for a in &snap.accounts {
         s.push_str(&format!(
-            "{}|{}|{}|{}|{}|{}|rs={}|rw={}|u={};",
+            "{}|{}|{}|{}|{}|{}|rs={}|rw={}|ro={}|u={};",
             a.email,
             a.active,
             a.has_data,
@@ -671,6 +777,7 @@ fn menu_signature(snap: &Snapshot) -> String {
             a.opus.map(|v| v.round() as i64).unwrap_or(-1),
             a.session_reset,
             a.weekly_reset,
+            a.opus_reset,
             a.updated,
         ));
     }
@@ -840,22 +947,40 @@ fn login_item_enabled() -> bool {
 }
 
 fn toggle_login_item() {
-    let script = if login_item_enabled() {
-        format!("tell application \"System Events\" to delete login item \"{LOGIN_ITEM_NAME}\"")
+    // Probe fresh here (a click is rare) so we don't act on a stale cached state.
+    let currently_on = login_item_enabled();
+    let (script, desired) = if currently_on {
+        (
+            format!("tell application \"System Events\" to delete login item {LOGIN_ITEM_NAME:?}"),
+            false,
+        )
     } else {
         let path = app_path();
         if path.is_empty() {
+            notify("Could not determine the app path for launch-at-login");
             return;
         }
-        format!(
-            "tell application \"System Events\" to make login item at end with properties \
-             {{name:\"{LOGIN_ITEM_NAME}\", path:\"{path}\", hidden:true}}"
+        // {name:?}/{path:?} use Rust's Debug quoting so a name or path containing
+        // a quote/backslash can't break out of the AppleScript string literal.
+        (
+            format!(
+                "tell application \"System Events\" to make login item at end with properties \
+                 {{name:{LOGIN_ITEM_NAME:?}, path:{path:?}, hidden:true}}"
+            ),
+            true,
         )
     };
-    let _ = std::process::Command::new("osascript")
+    match std::process::Command::new("osascript")
         .arg("-e")
         .arg(script)
-        .status();
+        .status()
+    {
+        Ok(s) if s.success() => set_login_item_cache(desired),
+        _ => notify(
+            "Could not change launch-at-login (grant Automation access to System Events in \
+             System Settings › Privacy & Security)",
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -964,5 +1089,31 @@ mod tests {
         // top header + account header, but no stat rows (all under 80%).
         assert_eq!(styles.len(), 2);
         assert!(styles.iter().all(|s| s.colors.is_empty()));
+    }
+
+    #[test]
+    fn u16len_counts_surrogate_pairs() {
+        assert_eq!(u16len("abc"), 3);
+        assert_eq!(u16len("café"), 4); // é is BMP → 1 code unit
+        assert_eq!(u16len("a😀b"), 4); // 😀 is astral → 2 code units
+    }
+
+    #[test]
+    fn header_row_offsets_hold_for_astral_email() {
+        // An astral (surrogate-pair) char makes char-count diverge from UTF-16
+        // units — the colored span must still land on the percentage by offset.
+        let a = acct("😀@x.com", Some(99.0), None, false);
+        let r = header_row(&a);
+        let (off, len, _) = r.colors[0];
+        let utf16: Vec<u16> = r.plain.encode_utf16().collect();
+        let picked = String::from_utf16(&utf16[off..off + len]).unwrap();
+        assert_eq!(picked, "99%");
+    }
+
+    #[test]
+    fn launchd_managed_detects_matching_service_name() {
+        assert!(launchd_managed_from_env(Some(crate::LAUNCHD_LABEL)));
+        assert!(!launchd_managed_from_env(Some("com.other.service")));
+        assert!(!launchd_managed_from_env(None));
     }
 }

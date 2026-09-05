@@ -105,6 +105,25 @@ impl Account {
             .map(String::from)
     }
 
+    /// Update tokens only if `expires_at` is at least as new as what we already
+    /// hold. Prevents a stale phase-1 snapshot (captured before a lock) from
+    /// clobbering a fresher token a concurrent refresh rotated in the meantime —
+    /// a single-use refresh token, once superseded, would otherwise be lost.
+    /// Returns whether the update was applied.
+    pub fn set_tokens_if_newer(
+        &mut self,
+        access: String,
+        refresh: String,
+        expires_at: i64,
+    ) -> bool {
+        if expires_at >= self.expires_at {
+            self.set_tokens(access, refresh, expires_at);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Update the tokens after a refresh, keeping the blob in sync.
     pub fn set_tokens(&mut self, access: String, refresh: String, expires_at: i64) {
         self.access_token = access.clone();
@@ -121,7 +140,7 @@ impl Account {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
     pub accounts: Vec<Account>,

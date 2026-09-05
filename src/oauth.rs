@@ -10,7 +10,10 @@ use crate::store::Account;
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
-    refresh_token: String,
+    /// OPTIONAL in a refresh-grant response (RFC 6749 §6): when the server does
+    /// not rotate the refresh token it may omit this, and the old one stays valid.
+    #[serde(default)]
+    refresh_token: Option<String>,
     /// Lifetime of the access token, in seconds.
     expires_in: i64,
 }
@@ -29,13 +32,20 @@ pub fn refresh(acct: &mut Account) -> Result<bool> {
     });
     let tok = post_token(&body).context("refreshing access token")?;
     let expires_at = now_millis().saturating_add(tok.expires_in.saturating_mul(1000));
-    acct.set_tokens(tok.access_token, tok.refresh_token, expires_at);
+    // Keep the existing refresh token if the server didn't rotate one.
+    let refresh_token = tok
+        .refresh_token
+        .unwrap_or_else(|| acct.refresh_token.clone());
+    acct.set_tokens(tok.access_token, refresh_token, expires_at);
     Ok(true)
 }
 
 /// Refresh only if the token expires within `skew_secs`.
 pub fn ensure_fresh(acct: &mut Account, skew_secs: i64) -> Result<bool> {
-    if acct.expires_at - now_millis() <= skew_secs * 1000 {
+    // Saturating so a corrupt `expires_at` (e.g. near i64::MIN loaded from a
+    // malformed state.json) can't overflow — it just reads as "expired" and
+    // triggers a refresh instead of panicking (debug) or wrapping (release).
+    if acct.expires_at.saturating_sub(now_millis()) <= skew_secs.saturating_mul(1000) {
         refresh(acct)
     } else {
         Ok(false)

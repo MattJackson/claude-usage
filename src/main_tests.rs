@@ -283,3 +283,102 @@ fn choose_swap_target_skips_ceiling_and_maxed_targets() {
     let guard = SwapGuard::default();
     assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
 }
+
+#[test]
+fn choose_swap_target_excludes_recently_left_account() {
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full("free@e.com", 20.0, 20.0, reset),
+    ];
+    // We just left free@e.com — the no-return window must exclude it, so with no
+    // other candidate there's nothing to swap to.
+    let mut left_at = std::collections::HashMap::new();
+    left_at.insert("free@e.com".to_string(), std::time::Instant::now());
+    let guard = SwapGuard {
+        left_at,
+        ..SwapGuard::default()
+    };
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+}
+
+// --- next_interval (backoff) ---
+
+#[test]
+fn next_interval_resets_to_base_when_not_limited() {
+    // A clean cycle always returns to the base cadence, even from a backed-off value.
+    assert_eq!(next_interval(600, 60, false), 60);
+    assert_eq!(next_interval(60, 60, false), 60);
+}
+
+#[test]
+fn next_interval_doubles_on_rate_limit_capped() {
+    // Doubles on a rate limit…
+    assert_eq!(next_interval(60, 60, true), 120);
+    // …never below base even if `current` was stale-small…
+    assert_eq!(next_interval(1, 60, true), 120);
+    // …and is capped at the max.
+    assert_eq!(
+        next_interval(WATCH_MAX_INTERVAL_SECS, 60, true),
+        WATCH_MAX_INTERVAL_SECS
+    );
+}
+
+// --- identity_matches (keychain adoption gate) ---
+
+#[test]
+fn identity_matches_by_uuid_when_both_present() {
+    assert!(identity_matches(
+        Some("u1"),
+        Some("a@e.com"),
+        Some("u1"),
+        Some("b@e.com")
+    ));
+    // UUID mismatch wins over an email match — a different account is logged in.
+    assert!(!identity_matches(
+        Some("u1"),
+        Some("a@e.com"),
+        Some("u2"),
+        Some("a@e.com")
+    ));
+}
+
+#[test]
+fn identity_matches_falls_back_to_email_case_insensitive() {
+    assert!(identity_matches(
+        None,
+        Some("A@E.com"),
+        None,
+        Some("a@e.com")
+    ));
+    assert!(!identity_matches(
+        None,
+        Some("a@e.com"),
+        None,
+        Some("other@e.com")
+    ));
+}
+
+#[test]
+fn identity_matches_adopts_when_account_has_no_identity() {
+    // No known identity yet → adopt (self-heal).
+    assert!(identity_matches(None, None, None, Some("a@e.com")));
+    // But a known email with nothing to compare against → stay safe, skip.
+    assert!(!identity_matches(None, Some("a@e.com"), None, None));
+}
+
+// --- write_bytes_atomic_mode (rollback mode preservation) ---
+
+#[cfg(unix)]
+#[test]
+fn write_bytes_atomic_mode_preserves_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("claude.json");
+    write_bytes_atomic_mode(&path, b"{\"x\":1}", 0o600).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"{\"x\":1}");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "rollback must restore the original 0600 mode");
+    // No temp file left behind.
+    assert!(!path.with_extension("json.claude-usage.tmp").exists());
+}

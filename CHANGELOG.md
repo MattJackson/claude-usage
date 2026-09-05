@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-05
+
+Post-audit hardening milestone. A full multi-lens code audit (10 review lenses
+plus opus escalation and adversarial verification rounds) drove the following
+fixes; every top finding was independently confirmed before fixing.
+
+### Fixed
+- **Concurrent token clobbering.** A `switch` and the background poll each
+  snapshot an account's tokens *before* taking the state lock, then wrote them
+  back unconditionally — so a refresh-token rotation landing in that window was
+  overwritten with a stale, already-superseded single-use token, breaking the
+  next refresh. Token writes are now recency-guarded (`set_tokens_if_newer`), and
+  `switch` uses whichever tokens are freshest at commit time.
+- **Auto-swap overriding a manual switch.** The daemon chose a swap target from a
+  snapshot then switched with no compare-and-set; a manual switch in the gap was
+  silently reverted. The swap now only commits if the expected account is still
+  active.
+- **`expires_at` overflow.** `ensure_fresh` used non-saturating arithmetic; a
+  corrupt `expires_at` (e.g. near `i64::MIN` from a malformed state.json) could
+  panic the daemon (debug) or wrap and never refresh (release). Now saturating.
+- **OAuth refresh without a rotated token.** The refresh response *required*
+  `refresh_token`, but it's optional (RFC 6749 §6); a valid response omitting it
+  aborted the refresh. The existing refresh token is now kept in that case.
+- **Half-applied switch hardening.** The `~/.claude.json` rollback no longer
+  swallows its own error (a double-fault is surfaced) and now preserves the
+  file's permission mode; its temp file is cleaned up on failure.
+- **Hot-swap relaunch never exits into a dead state.** If `launchctl kickstart`
+  (launchd) or the bare-run self-spawn fails, the app now stays alive on the
+  current binary and logs it, instead of exiting with no replacement.
+- **Re-capture no longer wipes cached usage.** `capture` on an existing account
+  now preserves its usage snapshot (it only refreshes identity/tokens).
+- **`report` no longer mixes accounts.** Weekday/hour consumption deltas are only
+  computed between consecutive samples of the *same* account.
+- **Log hygiene.** The usage-fetch error no longer folds the raw HTTP response
+  body into the error/debug log (matching the token endpoint's existing rule).
+- **`toggle_login_item`** now surfaces an osascript failure instead of silently
+  no-opping, and the Login Item AppleScript escapes the interpolated path.
+
+### Changed
+- **Menu-bar CPU/IO.** The 0.75s UI tick no longer re-reads+parses `state.json`
+  every tick (now gated on file mtime) nor forks an `osascript` to probe the
+  Login Item every tick (now probed at most once a minute, refreshed instantly
+  when toggled).
+- Menu redraw signature now includes the Opus reset countdown, so a changing Opus
+  reset no longer leaves a stale value on screen.
+- `left_at` no-return state is pruned so it can't grow unbounded over a long-lived
+  daemon.
+
+### Internal
+- Shared log-rotation helper (`logging::rotate_if_large`) used by both the debug
+  log and history.jsonl. Extracted pure helpers (`identity_matches`,
+  `launchd_managed_from_env`, `write_bytes_atomic_mode`) and added 10 unit tests
+  covering the keychain-adoption gate, swap hysteresis, backoff, rollback mode
+  preservation, and UTF-16 styling offsets (incl. astral characters).
+
 ## [0.1.10] - 2026-09-05
 
 ### Fixed
@@ -208,7 +263,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MattJackson/claude-usage/compare/v0.1.10...v0.2.0
 [0.1.10]: https://github.com/MattJackson/claude-usage/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/MattJackson/claude-usage/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/MattJackson/claude-usage/compare/v0.1.7...v0.1.8
