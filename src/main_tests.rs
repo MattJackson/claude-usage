@@ -438,15 +438,13 @@ fn merged_cached_usage_prefers_existing_snapshot() {
         opus_reset: None,
         fetched_at: 123,
     }));
-    let fresh = acct_with_cache(None); // freshly captured from keychain: no cache
-    let merged = merged_cached_usage(Some(&existing), &fresh);
+    let merged = merged_cached_usage(Some(&existing));
     assert_eq!(merged.unwrap().session_pct, Some(42.0));
 }
 
 #[test]
 fn merged_cached_usage_none_for_new_account() {
-    let fresh = acct_with_cache(None);
-    assert!(merged_cached_usage(None, &fresh).is_none());
+    assert!(merged_cached_usage(None).is_none());
 }
 
 // --- rotate_if_large (shared log rotation) ---

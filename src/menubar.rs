@@ -258,6 +258,9 @@ fn poll_loop() {
         // hits the network, so ordinary use can never rate-limit.
         let rate_limited = run_cycle(&mut guard);
         current = next_interval(current, base, rate_limited);
+        if rate_limited {
+            crate::logging::log(&format!("rate limited; backing off to {current}s"));
+        }
         std::thread::sleep(Duration::from_secs(current));
     }
 }

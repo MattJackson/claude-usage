@@ -157,7 +157,7 @@ pub(crate) fn capture_current() -> Result<(String, bool)> {
         let existed = existing.is_some();
         // Re-capturing only refreshes identity/tokens — keep the usage snapshot
         // the scheduler already fetched, so `list`/menu don't blank to "no data".
-        acct.cached_usage = merged_cached_usage(existing, &acct);
+        acct.cached_usage = merged_cached_usage(existing);
         state.upsert(acct);
         state.active = Some(email.clone());
         state.save()?;
@@ -166,13 +166,11 @@ pub(crate) fn capture_current() -> Result<(String, bool)> {
     Ok((email, existed))
 }
 
-/// The cached usage to keep when (re)capturing an account: prefer the snapshot
-/// we already had for this email (capture only refreshes identity/tokens), else
-/// whatever the fresh record carries. Pure, for tests.
-fn merged_cached_usage(existing: Option<&Account>, fresh: &Account) -> Option<CachedUsage> {
-    existing
-        .and_then(|a| a.cached_usage.clone())
-        .or_else(|| fresh.cached_usage.clone())
+/// The cached usage to keep when (re)capturing an account: the snapshot we
+/// already had for this email, if any (capture only refreshes identity/tokens; a
+/// freshly captured account has no snapshot of its own). Pure, for tests.
+fn merged_cached_usage(existing: Option<&Account>) -> Option<CachedUsage> {
+    existing.and_then(|a| a.cached_usage.clone())
 }
 
 /// Remove an account by email (used by the CLI `rm` and the menu bar).
@@ -510,7 +508,13 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
                     acct.expires_at,
                 );
             }
-            st.save()
+            // The token was already rotated server-side (single-use); if we can't
+            // persist it, say so — the stored refresh token is now stale.
+            st.save().context(
+                "the token was refreshed but recording the rotation in state.json \
+                 failed; if refreshes start failing, run `claude-usage capture` for \
+                 this account",
+            )
         })?;
     }
     println!("{token}");
@@ -852,14 +856,16 @@ fn restore_claude_json_raw(bytes: &[u8], mode: u32) -> Result<()> {
     write_bytes_atomic_mode(&path, bytes, mode)
 }
 
-/// Atomically write `bytes` to `path` (tmp + rename) with permission `mode`,
-/// cleaning up the temp file on any failure. Split out from
-/// `restore_claude_json_raw` so the mode-preservation can be unit-tested.
+/// Atomically write `bytes` to `path` (tmp + rename) ending at permission
+/// `mode`, cleaning up the temp file on any failure. The temp is created
+/// owner-only from the start (via `store::write_private`, no umask window) since
+/// these files carry OAuth tokens; `mode` is then applied before the rename.
+/// Shared by the `~/.claude.json` identity write and rollback, and unit-tested.
 fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<()> {
     let tmp = path.with_extension("json.claude-usage.tmp");
-    if let Err(e) = std::fs::write(&tmp, bytes) {
+    if let Err(e) = store::write_private(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e).context("writing rollback temp file");
+        return Err(e).context("writing temp file");
     }
     #[cfg(unix)]
     {
@@ -870,7 +876,7 @@ fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> R
     let _ = mode;
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e).context("renaming rollback file into place");
+        return Err(e).context("renaming file into place");
     }
     Ok(())
 }
@@ -899,24 +905,10 @@ fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str
     }
     obj.remove("cachedUsageUtilization");
     let json = serde_json::to_vec_pretty(&v)?;
-    let tmp = path.with_extension("json.claude-usage.tmp");
-    if let Err(e) = std::fs::write(&tmp, &json) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).context("writing ~/.claude.json.tmp");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path)
-            .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or(0o600);
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
-    }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).context("replacing ~/.claude.json");
-    }
-    Ok(())
+    // Preserve the file's existing mode; the shared writer creates the temp
+    // owner-only first, so tokens are never briefly world-readable.
+    let mode = claude_json_mode(&path);
+    write_bytes_atomic_mode(&path, &json, mode).context("replacing ~/.claude.json")
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,6 +1029,9 @@ fn cmd_watch(args: &[String]) -> Result<()> {
                     eprintln!("[{}] swapped {from} -> {to}", Utc::now().to_rfc3339());
                 }
                 current = next_interval(current, base, outcome.rate_limited);
+                if outcome.rate_limited {
+                    logging::log(&format!("rate limited; backing off to {current}s"));
+                }
             }
             Err(e) => eprintln!("watch cycle error: {e:#}"),
         }
@@ -1048,9 +1043,7 @@ fn cmd_watch(args: &[String]) -> Result<()> {
 /// a rate limit, reset to the base cadence on a clean cycle.
 fn next_interval(current: u64, base: u64, rate_limited: bool) -> u64 {
     if rate_limited {
-        let next = (current.max(base) * 2).min(WATCH_MAX_INTERVAL_SECS);
-        logging::log(&format!("rate limited; backing off to {next}s"));
-        next
+        (current.max(base) * 2).min(WATCH_MAX_INTERVAL_SECS)
     } else {
         base
     }
