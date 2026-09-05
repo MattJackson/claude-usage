@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-09-05
+
+### Added
+- **Hot-swap on `brew upgrade`.** A running menu-bar app detects when the binary
+  is replaced and relaunches itself into the new version — no manual restart. The
+  launchd login item now targets the stable `<brew-prefix>/bin/claude-usage`
+  symlink instead of the versioned Cellar path an upgrade deletes.
+
+### Removed
+- The menu's "Refresh now" item. It was the only user-triggered off-schedule
+  usage fetch and could contribute to rate limiting; usage now refreshes solely on
+  the scheduler tick.
+
 ## [0.1.7] - 2026-09-05
 
 ### Fixed
@@ -161,7 +174,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/MattJackson/claude-usage/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/MattJackson/claude-usage/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/MattJackson/claude-usage/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/MattJackson/claude-usage/compare/v0.1.4...v0.1.5

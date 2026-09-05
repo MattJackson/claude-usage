@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Check usage / limits across multiple Claude Max accounts, and switch between them."
 

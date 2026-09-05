@@ -8,7 +8,6 @@
 
 use anyhow::Result;
 use std::cell::RefCell;
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use block2::RcBlock;
@@ -60,8 +59,11 @@ pub fn run() -> Result<()> {
 
     // Poll + auto-swap on a background thread. It writes cached usage to
     // state.json; the main-thread timer reads it back to render.
-    let (poll_tx, poll_rx) = mpsc::channel::<()>();
-    std::thread::spawn(move || poll_loop(poll_rx));
+    std::thread::spawn(poll_loop);
+
+    // Remember the binary we launched from so the timer can notice a `brew
+    // upgrade` replacing it and relaunch into the new version.
+    let start_exe = std::fs::canonicalize(crate::stable_exe_path()).ok();
 
     // Build the tray on the main thread and keep it alive for the app's lifetime.
     let initial = build_snapshot();
@@ -84,10 +86,14 @@ pub fn run() -> Result<()> {
     let last_sig = RefCell::new(menu_signature(&initial));
     let last_title = RefCell::new(title_for(&initial));
     let tick = RcBlock::new(move |_t: core::ptr::NonNull<NSTimer>| {
+        // If `brew upgrade` replaced our binary, relaunch into the new version.
+        if let Some(start) = &start_exe {
+            maybe_relaunch_after_upgrade(start);
+        }
         // A menu closes before its click is delivered, so handling it here won't
         // fight menu tracking.
         while let Ok(ev) = menu_rx.try_recv() {
-            handle_click(&ev.id.0, &poll_tx);
+            handle_click(&ev.id.0);
         }
         let snap = build_snapshot();
         let sig = menu_signature(&snap);
@@ -114,18 +120,30 @@ pub fn run() -> Result<()> {
 // Poller thread
 // ---------------------------------------------------------------------------
 
-fn poll_loop(poll_rx: mpsc::Receiver<()>) {
+fn poll_loop() {
     let mut guard = SwapGuard::default();
     let base = WATCH_INTERVAL_SECS;
     let mut current = base;
     loop {
         // Fetch usage + auto-swap; this writes cached usage to state.json, which
-        // the main-thread timer reads back to render. "Refresh now" pokes poll_rx.
+        // the main-thread timer reads back to render. This is the ONLY thing that
+        // hits the network, so ordinary use can never rate-limit.
         let rate_limited = run_cycle(&mut guard);
         current = next_interval(current, base, rate_limited);
-        match poll_rx.recv_timeout(Duration::from_secs(current)) {
-            Ok(_) | Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+        std::thread::sleep(Duration::from_secs(current));
+    }
+}
+
+/// Relaunch into the on-disk binary if it changed since we started (i.e. a
+/// `brew upgrade` repointed the stable symlink), so the menu bar hot-swaps to
+/// the new version without waiting for the next login.
+fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
+    let stable = crate::stable_exe_path();
+    if let Ok(now) = std::fs::canonicalize(&stable) {
+        if now != start {
+            crate::logging::log("binary changed on disk (brew upgrade); relaunching");
+            let _ = std::process::Command::new(&stable).arg("menubar").spawn();
+            std::process::exit(0);
         }
     }
 }
@@ -296,10 +314,6 @@ fn build_menu(snap: &Snapshot) -> Menu {
         &menu,
         MenuItem::with_id("capture", "Capture current login…", true, None),
     );
-    add(
-        &menu,
-        MenuItem::with_id("refresh", "Refresh now", true, None),
-    );
     add_check(
         &menu,
         CheckMenuItem::with_id(
@@ -405,15 +419,12 @@ fn pct(p: Option<f64>) -> String {
 // Click handling
 // ---------------------------------------------------------------------------
 
-fn handle_click(id: &str, poll_tx: &mpsc::Sender<()>) {
-    // Most actions only mutate state.json; the main-thread timer re-renders from
-    // it within ~1s without any network call. Only "Refresh now" forces a poll.
+fn handle_click(id: &str) {
+    // Actions only mutate state.json; the main-thread timer re-renders from it
+    // within ~1s without any network call.
     match id {
         "quit" => std::process::exit(0),
         "noop" => {}
-        "refresh" => {
-            let _ = poll_tx.send(());
-        }
         "autoswap:off" => set_autoswap(false),
         "autoswap:now" => match optimize_now() {
             Ok(Some(email)) => notify(&format!("Switched to {email}")),

@@ -21,8 +21,9 @@ brew install MattJackson/tap/claude-usage
 claude-usage install     # menu-bar app + auto-swap, now and at every login
 ```
 
-Upgrades come through Homebrew: `brew upgrade claude-usage`. Building from source is
-covered [below](#from-source).
+Upgrades come through Homebrew: `brew upgrade claude-usage` — a running menu-bar app
+notices the new binary and relaunches itself into it, so you don't have to restart
+anything. Building from source is covered [below](#from-source).
 
 **At a glance**
 

@@ -1222,8 +1222,25 @@ fn plist_path() -> Result<std::path::PathBuf> {
         .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
+/// Path to invoke for the login item and for a post-upgrade relaunch, chosen to
+/// survive `brew upgrade`. `current_exe()` resolves symlinks to the versioned
+/// Homebrew Cellar path, which an upgrade deletes; map that back to the stable
+/// `<prefix>/bin/claude-usage` symlink brew keeps repointing. For a from-source
+/// install the resolved path is already stable.
+pub(crate) fn stable_exe_path() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let s = exe.to_string_lossy();
+    if let Some(idx) = s.find("/Cellar/claude-usage/") {
+        let stable = std::path::PathBuf::from(format!("{}/bin/claude-usage", &s[..idx]));
+        if stable.exists() {
+            return stable;
+        }
+    }
+    exe
+}
+
 fn cmd_install() -> Result<()> {
-    let exe = std::env::current_exe().context("locating this binary")?;
+    let exe = stable_exe_path();
     // No StandardOut/ErrorPath: the app has its own rotated ~/.config log; letting
     // launchd capture stdout/stderr would accumulate an uncapped file forever.
     let plist = format!(
