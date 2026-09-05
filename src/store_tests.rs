@@ -118,3 +118,25 @@ fn upsert_appends_new_account() {
     assert_eq!(s.accounts.len(), 2);
     assert!(s.find("work").is_some());
 }
+
+#[test]
+fn rename_changes_name_and_active_case_insensitively() {
+    let mut s = State::default();
+    s.accounts.push(acct("Personal"));
+    s.active = Some("Personal".to_string());
+    s.rename("personal", "Home").unwrap();
+    assert_eq!(s.accounts[0].name, "Home");
+    assert_eq!(s.active.as_deref(), Some("Home"));
+}
+
+#[test]
+fn rename_rejects_missing_empty_and_collision() {
+    let mut s = State::default();
+    s.accounts.push(acct("Personal"));
+    s.accounts.push(acct("Work"));
+    assert!(s.rename("nope", "X").is_err()); // missing source
+    assert!(s.rename("Personal", "  ").is_err()); // empty target
+    assert!(s.rename("Personal", "work").is_err()); // collides (case-insensitive)
+                                                    // A pure case change of the same account is allowed.
+    assert!(s.rename("personal", "PERSONAL").is_ok());
+}

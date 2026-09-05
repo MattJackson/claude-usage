@@ -10,6 +10,27 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// The last usage snapshot fetched for an account. Written only by the
+/// scheduler's poll; read (never fetched) by `list`, `switch`, and the menu bar
+/// so ad-hoc commands never hit the usage API (and never trigger HTTP 429).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedUsage {
+    #[serde(default)]
+    pub session_pct: Option<f64>,
+    #[serde(default)]
+    pub weekly_pct: Option<f64>,
+    #[serde(default)]
+    pub session_reset: Option<String>,
+    #[serde(default)]
+    pub weekly_reset: Option<String>,
+    #[serde(default)]
+    pub opus_pct: Option<f64>,
+    #[serde(default)]
+    pub opus_reset: Option<String>,
+    /// Unix epoch seconds when this snapshot was fetched.
+    pub fetched_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     /// Friendly name chosen by the user (unique).
@@ -31,6 +52,9 @@ pub struct Account {
     /// The `userID` from `~/.claude.json` at capture time.
     #[serde(default)]
     pub user_id: Option<String>,
+    /// Last usage snapshot; populated only by the scheduler poll.
+    #[serde(default)]
+    pub cached_usage: Option<CachedUsage>,
 }
 
 impl Account {
@@ -61,6 +85,7 @@ impl Account {
             keychain_blob: blob.trim().to_string(),
             oauth_account: None,
             user_id: None,
+            cached_usage: None,
         })
     }
 
@@ -155,6 +180,39 @@ impl State {
         let before = self.accounts.len();
         self.accounts.retain(|a| !a.name.eq_ignore_ascii_case(name));
         self.accounts.len() != before
+    }
+
+    /// Rename an account (case-insensitive lookup of `old`). Updates `active` if
+    /// it pointed at the renamed account. Errors if `old` is missing, `new` is
+    /// empty, or `new` already names a different account.
+    pub fn rename(&mut self, old: &str, new: &str) -> Result<()> {
+        let new = new.trim();
+        if new.is_empty() {
+            return Err(anyhow!("the new name cannot be empty"));
+        }
+        if self.find(old).is_none() {
+            return Err(anyhow!("no account named '{old}'"));
+        }
+        // Allow a pure case change of the same account, but not colliding with a
+        // different one.
+        if self
+            .accounts
+            .iter()
+            .any(|a| a.name.eq_ignore_ascii_case(new) && !a.name.eq_ignore_ascii_case(old))
+        {
+            return Err(anyhow!("an account named '{new}' already exists"));
+        }
+        let was_active = self
+            .active
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(old));
+        if let Some(a) = self.find_mut(old) {
+            a.name = new.to_string();
+        }
+        if was_active {
+            self.active = Some(new.to_string());
+        }
+        Ok(())
     }
 }
 

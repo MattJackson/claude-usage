@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-05
+
+### Added
+- `rename` command (CLI `claude-usage rename <old> <new>`, and Rename/Remove in
+  the menu bar) for managing captured accounts.
+- `--version` / `-V`.
+- Per-account **cached usage** in state, refreshed only by the scheduler.
+- A debug log at `~/.config/claude-usage/claude-usage.log` (no secrets).
+- Unit tests (store/usage/main/oauth) and black-box CLI integration tests.
+
+### Changed
+- **Usage is fetched only on the scheduler tick, never on switch or ad-hoc
+  commands.** `list` and the menu bar read the cache (shown as "updated Xm ago"),
+  so ordinary use can no longer trigger HTTP 429s.
+- Menu bar runs **Dock-less** (accessory activation policy) — truly background.
+- The open menu is no longer dismissed by background refreshes — it rebuilds only
+  when the displayed data actually changes.
+- Profile-backfilled account identity is now **persisted**, so accounts captured
+  before the identity fix self-heal on first switch and later switches make no
+  network calls.
+- CI hardening: build-provenance attestation, SHA-pinned actions, concurrency,
+  `--locked` release builds.
+
+### Fixed
+- Transient usage-fetch errors (e.g. 429) keep the last-known percentage instead
+  of showing `!`, with exponential poll backoff.
+- `~/.claude.json` rewrites preserve the original file mode and no longer re-sort
+  keys (`preserve_order`).
+- Case-insensitive account matching also applies when clearing the active account
+  on `rm`.
+
 ## [0.1.2] - 2026-09-05
 
 ### Fixed
@@ -57,7 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/MattJackson/claude-usage/compare/v0.1.2...v0.1.4
 [0.1.2]: https://github.com/MattJackson/claude-usage/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/MattJackson/claude-usage/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/MattJackson/claude-usage/releases/tag/v0.1.0

@@ -96,6 +96,7 @@ fn row(session: Option<f64>, weekly: Option<f64>) -> Row {
         weekly: cell(weekly),
         opus: None,
         error: None,
+        fetched_at: Some(0),
     }
 }
 
@@ -128,4 +129,54 @@ fn row_max_pct_takes_tightest() {
 #[test]
 fn row_headroom_is_complement_of_max() {
     assert_eq!(row(Some(30.0), Some(70.0)).headroom(), 30.0);
+}
+
+#[test]
+fn row_has_data_tracks_fetched_at() {
+    assert!(row(Some(10.0), Some(20.0)).has_data());
+    let mut r = row(Some(10.0), Some(20.0));
+    r.fetched_at = None;
+    assert!(!r.has_data());
+}
+
+// --- age_str ---
+
+#[test]
+fn age_str_never_without_timestamp() {
+    assert_eq!(age_str(None), "never");
+}
+
+#[test]
+fn age_str_minutes_and_hours() {
+    let now = Utc::now().timestamp();
+    assert_eq!(age_str(Some(now - 120)), "2m ago");
+    assert_eq!(age_str(Some(now - 7200)), "2h ago");
+}
+
+// --- cached_from_usage / row_from_account ---
+
+#[test]
+fn cached_from_usage_extracts_windows() {
+    let u: usage::Usage = serde_json::from_str(
+        r#"{"five_hour":{"utilization":9.0,"resets_at":"2026-09-05T08:00:00Z"},
+            "seven_day":{"utilization":61.0,"resets_at":"2026-09-09T00:00:00Z"},
+            "seven_day_opus":null}"#,
+    )
+    .unwrap();
+    let c = cached_from_usage(&u);
+    assert_eq!(c.session_pct, Some(9.0));
+    assert_eq!(c.weekly_pct, Some(61.0));
+    assert_eq!(c.session_reset.as_deref(), Some("2026-09-05T08:00:00Z"));
+    assert!(c.opus_pct.is_none());
+    assert!(c.fetched_at > 0);
+}
+
+#[test]
+fn row_from_account_without_cache_has_no_data() {
+    let a = Account::from_keychain_blob(
+        "x".to_string(),
+        r#"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":0}}"#,
+    )
+    .unwrap();
+    assert!(!row_from_account(&a).has_data());
 }

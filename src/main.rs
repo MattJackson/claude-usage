@@ -3,6 +3,7 @@
 //! `/login` persists), which every running `claude` adopts on its next request.
 
 mod config;
+mod logging;
 #[cfg(target_os = "macos")]
 mod menubar;
 mod oauth;
@@ -13,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use std::io::Write;
 
-use store::{Account, State};
+use store::{Account, CachedUsage, State};
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// Refresh a token if it expires within this many seconds.
@@ -22,6 +23,8 @@ const REFRESH_SKEW_SECS: i64 = 300;
 // --- watch (auto-swap daemon) defaults ---
 /// How often the watcher polls, in seconds.
 const WATCH_INTERVAL_SECS: u64 = 150;
+/// Upper bound for the poll interval when backing off after a 429.
+const WATCH_MAX_INTERVAL_SECS: u64 = 1200;
 /// Swap away from the active account when it reaches this utilization.
 const TRIGGER_PCT: f64 = 95.0;
 /// Only swap to an account at or below this utilization (hysteresis band).
@@ -43,7 +46,8 @@ fn main() {
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        None | Some("list") | Some("ls") => cmd_list(),
+        None => cmd_list(&[]),
+        Some("list") | Some("ls") => cmd_list(&args[1..]),
         Some("capture") | Some("add") => cmd_capture(args.get(1)),
         Some("switch") | Some("use") => cmd_switch(args.get(1).map(String::as_str), None),
         Some("start") => cmd_switch(args.get(1).map(String::as_str), Some(Launch::Fresh)),
@@ -58,6 +62,7 @@ fn run() -> Result<()> {
         Some("install") => cmd_install(),
         Some("uninstall") => cmd_uninstall(),
         Some("rm") | Some("remove") => cmd_rm(args.get(1)),
+        Some("rename") | Some("mv") => cmd_rename(args.get(1), args.get(2)),
         Some("-h") | Some("--help") | Some("help") => {
             print_help();
             Ok(())
@@ -78,7 +83,8 @@ fn print_help() {
     println!(
         "claude-usage — usage & instant account switching for Claude\n\n\
          USAGE:\n  \
-         claude-usage                   Show usage for every account (default)\n  \
+         claude-usage                   Show cached usage for every account (default)\n  \
+         claude-usage list --refresh    Fetch usage now, then show it\n  \
          claude-usage capture <name>    Save the account you're currently logged into\n  \
          claude-usage switch [name]     Make <name> the active login (no launch)\n  \
          claude-usage start [name]      Switch, then launch a fresh `claude`\n  \
@@ -89,6 +95,7 @@ fn print_help() {
          claude-usage install           Run the menu-bar app at every login (via launchd)\n  \
          claude-usage uninstall         Stop running the menu-bar app at login\n  \
          claude-usage report            Usage patterns by weekday / hour / account\n  \
+         claude-usage rename <old> <new>  Rename an account\n  \
          claude-usage rm <name>         Forget an account\n\n\
          With no [name], switch/start/continue auto-pick the account that has room\n  \
          and whose weekly limit resets soonest (use it before the quota resets).\n\n\
@@ -141,16 +148,18 @@ fn cmd_capture(name: Option<&String>) -> Result<()> {
 // list (default) — dashboard
 // ---------------------------------------------------------------------------
 
-fn cmd_list() -> Result<()> {
+fn cmd_list(args: &[String]) -> Result<()> {
+    let refresh = args.iter().any(|a| a == "--refresh" || a == "-r");
     let mut state = State::load()?;
     if state.accounts.is_empty() {
         println!("No accounts yet. Log into one with `claude`, then: claude-usage capture <name>");
         return Ok(());
     }
-    let (rows, dirty) = collect_usage(&mut state)?;
-    if dirty {
-        state.save()?;
+    // By default read the cache (no network); --refresh does exactly one fetch.
+    if refresh {
+        refresh_usage_cache(&mut state);
     }
+    let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
     render_table(&rows, state.active.as_deref());
     Ok(())
 }
@@ -172,10 +181,8 @@ fn cmd_switch(name: Option<&str>, launch: Option<Launch>) -> Result<()> {
     let name = match name {
         Some(n) => n.to_string(),
         None => {
-            let (rows, dirty) = collect_usage(&mut state)?;
-            if dirty {
-                state.save()?;
-            }
+            // Auto-pick reads the cached usage only — never hits the network.
+            let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
             auto_pick(&rows)?
         }
     };
@@ -188,9 +195,18 @@ fn cmd_switch(name: Option<&str>, launch: Option<Launch>) -> Result<()> {
     let acct = acct.clone();
     let label = format!("{}{}", acct.name, email_suffix(&acct));
 
-    apply_account(&acct).context("switching the active account")?;
+    // Write keychain + ~/.claude.json identity. If the identity had to be
+    // backfilled from the profile API, persist it so future switches are
+    // fully network-free.
+    let backfilled = apply_account(&acct).context("switching the active account")?;
+    if let Some(v) = backfilled {
+        if let Some(a) = state.find_mut(&name) {
+            a.oauth_account = Some(v);
+        }
+    }
     state.active = Some(acct.name.clone());
     state.save()?;
+    logging::log(&format!("switch -> {}", acct.name));
 
     println!("Active login is now '{label}'.");
     println!("New `claude` sessions will use it. Already-running sessions keep their");
@@ -276,6 +292,20 @@ fn cmd_rm(name: Option<&String>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// rename
+// ---------------------------------------------------------------------------
+
+fn cmd_rename(old: Option<&String>, new: Option<&String>) -> Result<()> {
+    let old = old.context("usage: claude-usage rename <old> <new>")?;
+    let new = new.context("usage: claude-usage rename <old> <new>")?;
+    let mut state = State::load()?;
+    state.rename(old, new)?;
+    state.save()?;
+    println!("Renamed '{old}' to '{}'.", new.trim());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Usage collection + auto-pick
 // ---------------------------------------------------------------------------
 
@@ -286,6 +316,8 @@ struct Row {
     weekly: Cell,
     opus: Option<Cell>,
     error: Option<String>,
+    /// Unix epoch seconds when the cached usage was fetched (None = no data yet).
+    fetched_at: Option<i64>,
 }
 
 struct Cell {
@@ -302,47 +334,68 @@ impl Cell {
     }
 }
 
-fn collect_usage(state: &mut State) -> Result<(Vec<Row>, bool)> {
-    // Keep the active account's stored tokens honest before we call the API.
-    sync_active_from_keychain(state);
-
-    let mut dirty = false;
-    let mut rows = Vec::new();
-    let names: Vec<String> = state.accounts.iter().map(|a| a.name.clone()).collect();
-    for name in &names {
-        let acct = state.find_mut(name).unwrap();
-        match oauth::ensure_fresh(acct, REFRESH_SKEW_SECS) {
-            Ok(changed) => dirty |= changed,
-            Err(e) => {
-                rows.push(Row::error(
-                    &acct.name,
-                    acct.email.as_deref(),
-                    format!("auth: {e}"),
-                ));
-                continue;
-            }
-        }
-        let token = acct.access_token.clone();
-        let (name, email) = (acct.name.clone(), acct.email.clone());
-        match usage::fetch(&token) {
-            Ok(u) => rows.push(Row::from_usage(&name, email.as_deref(), &u)),
-            Err(e) => rows.push(Row::error(&name, email.as_deref(), e.to_string())),
-        }
+/// Build a display row from an account's cached usage (never fetches).
+fn row_from_account(a: &Account) -> Row {
+    let c = a.cached_usage.as_ref();
+    Row {
+        name: a.name.clone(),
+        email: a.email.clone().unwrap_or_default(),
+        session: cell_from_parts(
+            c.and_then(|c| c.session_pct),
+            c.and_then(|c| c.session_reset.as_deref()),
+        ),
+        weekly: cell_from_parts(
+            c.and_then(|c| c.weekly_pct),
+            c.and_then(|c| c.weekly_reset.as_deref()),
+        ),
+        opus: c.and_then(|c| {
+            c.opus_pct
+                .map(|p| cell_from_parts(Some(p), c.opus_reset.as_deref()))
+        }),
+        error: None,
+        fetched_at: c.map(|c| c.fetched_at),
     }
-    Ok((rows, dirty))
+}
+
+/// Convert a fetched `Usage` into the cacheable snapshot.
+fn cached_from_usage(u: &usage::Usage) -> CachedUsage {
+    let parts = |w: &Option<usage::Window>| {
+        w.as_ref()
+            .map(|w| (w.utilization, w.resets_at.clone()))
+            .unwrap_or((None, None))
+    };
+    let (session_pct, session_reset) = parts(&u.five_hour);
+    let (weekly_pct, weekly_reset) = parts(&u.seven_day);
+    let (opus_pct, opus_reset) = parts(&u.seven_day_opus);
+    CachedUsage {
+        session_pct,
+        weekly_pct,
+        session_reset,
+        weekly_reset,
+        opus_pct,
+        opus_reset,
+        fetched_at: Utc::now().timestamp(),
+    }
 }
 
 /// Pick the account with room to spare whose weekly window resets soonest.
+/// Operates entirely on cached rows — callers must not fetch first.
 fn auto_pick(rows: &[Row]) -> Result<String> {
+    if !rows.iter().any(|r| r.has_data()) {
+        bail!(
+            "no usage data yet — let the menu-bar app or `claude-usage watch` \
+             populate it, or pass an explicit account name"
+        );
+    }
     let mut candidates: Vec<&Row> = rows
         .iter()
-        .filter(|r| r.error.is_none() && r.available())
+        .filter(|r| r.has_data() && r.available())
         .collect();
     if candidates.is_empty() {
         // Nothing has room; report the soonest reset so the user knows the wait.
         let soonest = rows
             .iter()
-            .filter(|r| r.error.is_none())
+            .filter(|r| r.has_data())
             .filter_map(|r| r.weekly.resets_at.map(|dt| (r, dt)))
             .min_by_key(|(_, dt)| *dt);
         match soonest {
@@ -375,36 +428,9 @@ fn auto_pick(rows: &[Row]) -> Result<String> {
 }
 
 impl Row {
-    fn error(name: &str, email: Option<&str>, msg: String) -> Row {
-        Row {
-            name: name.to_string(),
-            email: email.unwrap_or("").to_string(),
-            session: Cell {
-                pct: None,
-                resets_at: None,
-            },
-            weekly: Cell {
-                pct: None,
-                resets_at: None,
-            },
-            opus: None,
-            error: Some(msg),
-        }
-    }
-
-    fn from_usage(name: &str, email: Option<&str>, u: &usage::Usage) -> Row {
-        Row {
-            name: name.to_string(),
-            email: email.unwrap_or("").to_string(),
-            session: cell_from(&u.five_hour),
-            weekly: cell_from(&u.seven_day),
-            opus: u
-                .seven_day_opus
-                .as_ref()
-                .filter(|w| w.utilization.is_some())
-                .map(|w| cell_from(&Some(w.clone()))),
-            error: None,
-        }
+    /// True once we have a cached usage sample to reason about.
+    fn has_data(&self) -> bool {
+        self.error.is_none() && self.fetched_at.is_some()
     }
 
     /// Not blocked and both session and weekly have headroom.
@@ -427,20 +453,12 @@ impl Row {
     }
 }
 
-fn cell_from(w: &Option<usage::Window>) -> Cell {
-    match w {
-        Some(w) => Cell {
-            pct: w.utilization,
-            resets_at: w
-                .resets_at
-                .as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc)),
-        },
-        None => Cell {
-            pct: None,
-            resets_at: None,
-        },
+fn cell_from_parts(pct: Option<f64>, reset: Option<&str>) -> Cell {
+    Cell {
+        pct,
+        resets_at: reset
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc)),
     }
 }
 
@@ -553,27 +571,36 @@ fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str
 /// Apply an account as the active login: write its keychain token AND its
 /// `~/.claude.json` identity (backfilling the identity from the profile API if
 /// it wasn't captured). Both halves are required for the switch to take effect.
-fn apply_account(acct: &Account) -> Result<()> {
+///
+/// Returns `Some(identity)` when the identity had to be backfilled from the
+/// profile API, so the caller can persist it and avoid future network calls.
+fn apply_account(acct: &Account) -> Result<Option<serde_json::Value>> {
     keychain_write(&acct.keychain_blob)?;
-    let identity = match &acct.oauth_account {
-        Some(v) => Some(v.clone()),
-        None => usage::fetch_profile(&acct.access_token)
-            .as_ref()
-            .and_then(usage::oauth_account_from_profile),
-    };
-    match identity {
-        Some(v) => write_claude_identity(&v, acct.user_id.as_deref())?,
-        None => eprintln!(
-            "warning: could not set the account identity in ~/.claude.json \
-             (re-run `claude-usage capture {}` after logging in)",
-            acct.name
-        ),
+    match &acct.oauth_account {
+        Some(v) => {
+            write_claude_identity(v, acct.user_id.as_deref())?;
+            Ok(None)
+        }
+        None => {
+            let built = usage::fetch_profile(&acct.access_token)
+                .as_ref()
+                .and_then(usage::oauth_account_from_profile);
+            match &built {
+                Some(v) => write_claude_identity(v, acct.user_id.as_deref())?,
+                None => eprintln!(
+                    "warning: could not set the account identity in ~/.claude.json \
+                     (re-run `claude-usage capture {}` after logging in)",
+                    acct.name
+                ),
+            }
+            Ok(built)
+        }
     }
-    Ok(())
 }
 
 /// Write an account into the keychain + .claude.json and mark it active.
-/// Returns its label.
+/// Returns its label. Persists a backfilled identity so later switches never
+/// touch the network.
 fn perform_switch(state: &mut State, name: &str) -> Result<String> {
     let acct = state
         .find_mut(name)
@@ -581,10 +608,66 @@ fn perform_switch(state: &mut State, name: &str) -> Result<String> {
     oauth::ensure_fresh(acct, REFRESH_SKEW_SECS)?;
     let acct = acct.clone();
     let label = acct.email.clone().unwrap_or_else(|| acct.name.clone());
-    apply_account(&acct)?;
+    let backfilled = apply_account(&acct)?;
+    if let Some(v) = backfilled {
+        if let Some(a) = state.find_mut(name) {
+            a.oauth_account = Some(v);
+        }
+    }
     state.active = Some(acct.name.clone());
     state.save()?;
+    logging::log(&format!("switch(auto) -> {}", acct.name));
     Ok(label)
+}
+
+/// Outcome of a usage refresh.
+struct RefreshOutcome {
+    /// True if any account got HTTP 429 (caller should back off).
+    rate_limited: bool,
+}
+
+/// The ONE place that calls the usage API. Refreshes each account's token (only
+/// if near expiry), fetches usage, and writes it to `cached_usage`. On a 429 or
+/// transient error it KEEPS the existing cache instead of clearing it. Saves the
+/// state and returns whether a rate limit was hit.
+fn refresh_usage_cache(state: &mut State) -> RefreshOutcome {
+    // Keep the active account's stored tokens honest before we call the API.
+    sync_active_from_keychain(state);
+
+    logging::log("poll: refreshing usage cache");
+    let mut rate_limited = false;
+    let names: Vec<String> = state.accounts.iter().map(|a| a.name.clone()).collect();
+    for name in &names {
+        let Some(acct) = state.find_mut(name) else {
+            continue;
+        };
+        if let Err(e) = oauth::ensure_fresh(acct, REFRESH_SKEW_SECS) {
+            logging::log(&format!(
+                "token refresh failed for {name}: {e} (keeping cache)"
+            ));
+            continue;
+        }
+        let token = acct.access_token.clone();
+        match usage::fetch(&token) {
+            Ok(u) => {
+                let cu = cached_from_usage(&u);
+                if let Some(a) = state.find_mut(name) {
+                    a.cached_usage = Some(cu);
+                }
+                logging::log(&format!("usage ok for {name}"));
+            }
+            Err(usage::FetchError::RateLimited) => {
+                rate_limited = true;
+                logging::log(&format!("usage 429 for {name}; keeping cache"));
+            }
+            Err(e) => {
+                logging::log(&format!("usage error for {name}: {e}; keeping cache"));
+            }
+        }
+    }
+    let _ = state.save();
+    logging::log("poll: done");
+    RefreshOutcome { rate_limited }
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +692,8 @@ fn cmd_watch(args: &[String]) -> Result<()> {
         "claude-usage watch: every {interval}s, swap at {trigger:.0}%, target <= {ceiling:.0}%"
     );
 
+    let base = interval;
+    let mut current = base;
     let mut guard = SwapGuard::default();
     loop {
         match watch_cycle(trigger, ceiling, &mut guard) {
@@ -616,10 +701,23 @@ fn cmd_watch(args: &[String]) -> Result<()> {
                 if let Some((from, to)) = outcome.swapped {
                     eprintln!("[{}] swapped {from} -> {to}", Utc::now().to_rfc3339());
                 }
+                current = next_interval(current, base, outcome.rate_limited);
             }
             Err(e) => eprintln!("watch cycle error: {e:#}"),
         }
-        std::thread::sleep(std::time::Duration::from_secs(interval));
+        std::thread::sleep(std::time::Duration::from_secs(current));
+    }
+}
+
+/// Compute the next poll interval: exponential backoff (doubling, capped) after
+/// a rate limit, reset to the base cadence on a clean cycle.
+fn next_interval(current: u64, base: u64, rate_limited: bool) -> u64 {
+    if rate_limited {
+        let next = (current.max(base) * 2).min(WATCH_MAX_INTERVAL_SECS);
+        logging::log(&format!("rate limited; backing off to {next}s"));
+        next
+    } else {
+        base
     }
 }
 
@@ -631,17 +729,18 @@ struct SwapGuard {
     stuck_notified: bool,
 }
 
-/// Result of one poll: the freshly-fetched rows, the active account, and the
-/// swap it made (if any). Callers render/log this however they like.
+/// Result of one poll: the current rows, the active account, the swap it made
+/// (if any), and whether it was rate limited. Callers render/log this.
 struct CycleOutcome {
     rows: Vec<Row>,
     active: Option<String>,
     swapped: Option<(String, String)>,
+    rate_limited: bool,
 }
 
-/// Poll usage for every account, record history, and auto-swap away from the
-/// active account if it has reached `trigger` and a healthy target exists.
-/// Shared by the CLI `watch` loop and the menu-bar poller so they can't diverge.
+/// Poll usage for every account (the only network path), record history, and
+/// auto-swap away from the active account if it has reached `trigger` and a
+/// healthy target exists. Shared by `claude-usage watch` and the menu-bar poller.
 fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<CycleOutcome> {
     let mut state = State::load()?;
     if state.accounts.is_empty() {
@@ -649,12 +748,11 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
             rows: Vec::new(),
             active: None,
             swapped: None,
+            rate_limited: false,
         });
     }
-    let (rows, dirty) = collect_usage(&mut state)?;
-    if dirty {
-        state.save()?;
-    }
+    let refresh = refresh_usage_cache(&mut state);
+    let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
     append_history(&rows, state.active.as_deref());
 
     let active = state.active.clone();
@@ -665,10 +763,10 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
             break 'decide;
         };
         // Extract the active account's scalars so the borrow of `rows` ends here.
-        let Some((act_err, act_max, act_s, act_w)) =
+        let Some((act_nodata, act_max, act_s, act_w)) =
             rows.iter().find(|r| r.name == active_name).map(|r| {
                 (
-                    r.error.is_some(),
+                    !r.has_data(),
                     r.max_pct(),
                     r.session.pct.unwrap_or(0.0),
                     r.weekly.pct.unwrap_or(0.0),
@@ -678,7 +776,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
             break 'decide;
         };
 
-        if act_err || act_max < trigger {
+        if act_nodata || act_max < trigger {
             guard.stuck_notified = false;
             break 'decide;
         }
@@ -696,10 +794,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
             let mut candidates: Vec<&Row> = rows
                 .iter()
                 .filter(|r| {
-                    r.error.is_none()
-                        && r.name != active_name
-                        && r.available()
-                        && r.max_pct() <= ceiling
+                    r.has_data() && r.name != active_name && r.available() && r.max_pct() <= ceiling
                 })
                 .filter(|r| {
                     guard
@@ -735,7 +830,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                 if !guard.stuck_notified {
                     let soonest = rows
                         .iter()
-                        .filter(|r| r.error.is_none())
+                        .filter(|r| r.has_data())
                         .filter_map(|r| r.weekly.resets_at.map(humanize_until))
                         .min()
                         .unwrap_or_else(|| "unknown".to_string());
@@ -773,6 +868,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
         rows,
         active,
         swapped,
+        rate_limited: refresh.rate_limited,
     })
 }
 
@@ -817,7 +913,7 @@ fn log_event(v: &serde_json::Value) {
 fn append_history(rows: &[Row], active: Option<&str>) {
     let ts = Utc::now().timestamp();
     for r in rows {
-        if r.error.is_some() {
+        if !r.has_data() {
             continue;
         }
         log_event(&serde_json::json!({
@@ -1039,6 +1135,7 @@ fn render_table(rows: &[Row], active: Option<&str>) {
     if has_opus {
         header.push_str(&format!("  {:<22} {:<11}", "WEEKLY OPUS", "RESETS IN"));
     }
+    header.push_str(&format!("  {:<10}", "UPDATED"));
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
 
@@ -1048,12 +1145,11 @@ fn render_table(rows: &[Row], active: Option<&str>) {
         } else {
             " "
         };
-        if let Some(err) = &r.error {
+        if !r.has_data() {
             println!(
-                "{marker}  {:<12} {:<26} ⚠ {}",
+                "{marker}  {:<12} {:<26} no data yet (run the menu-bar app or `claude-usage watch`)",
                 r.name,
                 truncate(&r.email, 26),
-                err
             );
             continue;
         }
@@ -1075,11 +1171,35 @@ fn render_table(rows: &[Row], active: Option<&str>) {
                 None => line.push_str(&format!("  {:<22} {:<11}", "-", "")),
             }
         }
+        line.push_str(&format!("  {:<10}", age_str(r.fetched_at)));
         println!("{line}");
     }
     println!();
     if active.is_none() {
-        println!("(no active account tracked yet — `capture` the one you're on)\n");
+        println!("(no active account tracked yet — `capture` the one you're on)");
+    }
+    println!(
+        "Usage updates on a schedule (menu-bar app / `claude-usage watch`). \
+         Run `claude-usage list --refresh` to fetch now.\n"
+    );
+}
+
+/// Human-friendly "time since" for a cached-usage timestamp.
+fn age_str(fetched_at: Option<i64>) -> String {
+    let Some(ts) = fetched_at else {
+        return "never".to_string();
+    };
+    let secs = Utc::now().timestamp() - ts;
+    if secs < 0 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
     }
 }
 

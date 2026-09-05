@@ -1,9 +1,35 @@
 //! Fetch and model the /api/oauth/usage response.
 
-use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use crate::config;
+
+/// Why a usage fetch failed. Lets callers keep the last-known cache on transient
+/// failures (and back off on rate limits) instead of surfacing a hard error.
+#[derive(Debug)]
+pub enum FetchError {
+    /// HTTP 429 — we're being rate limited; back off and reuse the cache.
+    RateLimited,
+    /// HTTP 401 — token expired or revoked.
+    Auth,
+    /// Network / transport failure (no HTTP status).
+    Transient(String),
+    /// Any other non-success status or a parse failure.
+    Other(String),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::RateLimited => write!(f, "rate limited (HTTP 429)"),
+            FetchError::Auth => write!(f, "unauthorized (token expired or revoked)"),
+            FetchError::Transient(e) => write!(f, "transient error: {e}"),
+            FetchError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Window {
@@ -25,7 +51,7 @@ pub struct Usage {
     pub seven_day_opus: Option<Window>,
 }
 
-pub fn fetch(access_token: &str) -> Result<Usage> {
+pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
     let resp = ureq::get(config::USAGE_URL)
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
@@ -33,13 +59,18 @@ pub fn fetch(access_token: &str) -> Result<Usage> {
         .set("Content-Type", "application/json")
         .call();
     match resp {
-        Ok(r) => r.into_json::<Usage>().context("parsing usage response"),
-        Err(ureq::Error::Status(401, _)) => Err(anyhow!("unauthorized (token expired or revoked)")),
+        Ok(r) => r
+            .into_json::<Usage>()
+            .map_err(|e| FetchError::Other(format!("parsing usage response: {e}"))),
+        Err(ureq::Error::Status(429, _)) => Err(FetchError::RateLimited),
+        Err(ureq::Error::Status(401, _)) => Err(FetchError::Auth),
         Err(ureq::Error::Status(code, r)) => {
             let text = r.into_string().unwrap_or_default();
-            Err(anyhow!("usage endpoint returned HTTP {code}: {text}"))
+            Err(FetchError::Other(format!(
+                "usage endpoint returned HTTP {code}: {text}"
+            )))
         }
-        Err(e) => Err(anyhow!("usage request failed: {e}")),
+        Err(e) => Err(FetchError::Transient(e.to_string())),
     }
 }
 
