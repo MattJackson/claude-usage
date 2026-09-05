@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "Check usage / limits across multiple Claude Max accounts, and switch between them."
 
@@ -49,6 +49,7 @@ objc2-app-kit = { version = "0.3", features = [
     "objc2-core-foundation", # REQUIRED: CGFloat-typed methods are cfg-gated on it
 ] }
 block2 = "0.6"
+libc = "0.2" # getuid() for the launchctl kickstart restart target
 
 [dev-dependencies]
 assert_cmd = "2"

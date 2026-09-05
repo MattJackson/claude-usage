@@ -35,7 +35,7 @@ const SWAP_COOLDOWN_SECS: u64 = 300;
 /// Don't return to an account we just left for this long.
 const NO_RETURN_SECS: u64 = 1200;
 /// Bundle id / label for the launchd agent (runs the menu-bar app at login).
-const LAUNCHD_LABEL: &str = "com.claude-usage.menubar";
+pub(crate) const LAUNCHD_LABEL: &str = "com.claude-usage.menubar";
 
 fn main() {
     if let Err(e) = run() {

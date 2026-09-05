@@ -265,15 +265,55 @@ fn poll_loop() {
 /// Relaunch into the on-disk binary if it changed since we started (i.e. a
 /// `brew upgrade` repointed the stable symlink), so the menu bar hot-swaps to
 /// the new version without waiting for the next login.
+///
+/// When we're the launchd-managed agent we must NOT just spawn a child and
+/// exit: the child is in the job's process group, and launchd SIGKILLs that
+/// whole group when the main process exits (AbandonProcessGroup defaults to
+/// false), so the replacement dies with us and — with KeepAlive=false — is never
+/// restarted. Instead we ask launchd to restart the job (`launchctl kickstart
+/// -k`), which relaunches it in a fresh job context. A bare/from-source run has
+/// no such job, so there the orphaned self-spawn survives our exit as usual.
 fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
     let stable = crate::stable_exe_path();
-    if let Ok(now) = std::fs::canonicalize(&stable) {
-        if now != start {
-            crate::logging::log("binary changed on disk (brew upgrade); relaunching");
-            let _ = std::process::Command::new(&stable).arg("menubar").spawn();
-            std::process::exit(0);
-        }
+    let Ok(now) = std::fs::canonicalize(&stable) else {
+        return;
+    };
+    if now == start {
+        return;
     }
+    crate::logging::log("binary changed on disk (brew upgrade); relaunching");
+    if relaunch_via_launchd() {
+        // kickstart -k will SIGKILL and restart this job; wait to be replaced.
+        // (If it somehow doesn't, we still exit so we're not left on the old
+        // binary — launchd's kickstart reliably restarts an existing job.)
+        std::thread::sleep(Duration::from_secs(3));
+        std::process::exit(0);
+    }
+    // Bare run (no launchd job): the orphaned child re-parents to launchd/init
+    // and outlives our exit.
+    let _ = std::process::Command::new(&stable).arg("menubar").spawn();
+    std::process::exit(0);
+}
+
+/// If we're running as the launchd agent, ask launchd to kill+restart the job.
+/// Returns true if the kickstart request was issued (so the caller should wait
+/// to be replaced rather than self-spawn). Detected via `XPC_SERVICE_NAME`,
+/// which launchd sets to the job label for a LaunchAgent — precise enough that a
+/// manual `claude-usage menubar` run (which self-spawns fine) isn't misrouted.
+fn relaunch_via_launchd() -> bool {
+    let under_launchd = std::env::var("XPC_SERVICE_NAME")
+        .map(|v| v == crate::LAUNCHD_LABEL)
+        .unwrap_or(false);
+    if !under_launchd {
+        return false;
+    }
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}/{}", crate::LAUNCHD_LABEL);
+    crate::logging::log(&format!("relaunching via launchctl kickstart -k {target}"));
+    std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &target])
+        .spawn()
+        .is_ok()
 }
 
 /// Run one poll+auto-swap cycle; returns whether it was rate limited.

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-09-05
+
+### Fixed
+- **Hot-swap on `brew upgrade` now actually restarts the menu bar.** The running
+  app is a launchd agent, and the old relaunch spawned a child then exited — but
+  the child was in the job's process group, which launchd SIGKILLs when the main
+  process exits (`AbandonProcessGroup` defaults false), so the replacement died
+  with us and (with `KeepAlive=false`) was never restarted. The launchd instance
+  now asks launchd to restart the job (`launchctl kickstart -k gui/<uid>/<label>`)
+  instead of self-spawning; bare/from-source runs keep the orphan-survives
+  self-spawn. (Upgrading *from* 0.1.9 still needs one manual restart since the old
+  binary does the relaunch; 0.1.10 onward hot-swaps correctly.)
+
 ## [0.1.9] - 2026-09-05
 
 ### Changed
@@ -195,7 +208,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/MattJackson/claude-usage/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/MattJackson/claude-usage/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/MattJackson/claude-usage/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/MattJackson/claude-usage/compare/v0.1.6...v0.1.7
