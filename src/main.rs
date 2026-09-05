@@ -541,7 +541,9 @@ fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o777).unwrap_or(0o600);
+        let mode = std::fs::metadata(&path)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o600);
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
     }
     std::fs::rename(&tmp, &path).context("replacing ~/.claude.json")?;

@@ -80,7 +80,9 @@ fn help_subcommand_matches_flag() {
         .arg("help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("usage & instant account switching"));
+        .stdout(predicate::str::contains(
+            "usage & instant account switching",
+        ));
 }
 
 #[test]
