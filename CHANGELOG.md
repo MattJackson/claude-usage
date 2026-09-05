@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-05
+
+### Changed
+- **Menu polish, battery-menu style.** Account rows now render their trailing
+  `S% / W%` **right-aligned** at a fixed tab stop, the **active account is bold**
+  (the checkmark on the row is gone), and any percentage in a danger band is
+  **colored** — amber at ≥80%, red at ≥95% — so a nearly-spent account is obvious
+  at a glance. The same coloring applies to the top info line and the per-account
+  session/weekly/opus stat rows.
+
+### Internal
+- These effects need `NSMenuItem.attributedTitle`, which muda's plain-string API
+  can't set. Rather than depend on an unreleased muda fork, we build the muda menu
+  as before (so clicks/structure/events are unchanged) then walk the native
+  `NSMenu` via muda's public `ns_menu()` and set attributed titles ourselves with
+  objc2 (right `NSTextTab` paragraph style, bold `NSFont`, `systemOrange`/`systemRed`
+  over the percentage ranges). Upstream muda PR
+  [#399](https://github.com/tauri-apps/muda/pull/399) adds a typed
+  `set_attributed_title`; if it merges and ships we migrate the ~80-line objc2
+  helper to a couple of calls.
+
 ## [0.1.8] - 2026-09-05
 
 ### Added
@@ -174,7 +195,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/MattJackson/claude-usage/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/MattJackson/claude-usage/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/MattJackson/claude-usage/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/MattJackson/claude-usage/compare/v0.1.5...v0.1.6

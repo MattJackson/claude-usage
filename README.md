@@ -109,7 +109,10 @@ Notes:
 `claude-usage menubar` is the primary interface: a status-bar item showing your
 active account's **session %** at a glance. Click it for a dropdown:
 
-- **One submenu per account**, labelled `email  S% / W%` (✓ on the active one):
+- **One submenu per account**, labelled `email` on the left with `S% / W%`
+  right-aligned battery-menu style. The **active account is bold**; any percentage
+  in a danger band is colored (amber ≥80%, red ≥95%) so a nearly-spent account
+  jumps out. Each opens:
   - **Switch to this account**
   - a stats block — `Session X% · resets in …`, `Weekly X% · resets in …`, Opus if
     present, and `updated Xm ago`

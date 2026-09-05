@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 description = "Check usage / limits across multiple Claude Max accounts, and switch between them."
 
@@ -26,8 +26,28 @@ tray-icon = "0.24.2"
 # plus an NSTimer scheduled in the default mode only avoids that entirely.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSTimer", "NSRunLoop", "NSDate", "NSString"] }
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSTimer",
+    "NSRunLoop",
+    "NSDate",
+    "NSString",
+    "NSAttributedString", # NSMutableAttributedString + addAttribute_value_range
+    "NSArray",            # tab-stops array
+    "NSDictionary",       # empty NSTextTab options dict
+    "NSGeometry",         # NSRange (re-exported at crate root)
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSMenu",             # walk the native menu + submenus
+    "NSMenuItem",         # setAttributedTitle
+    "NSFont",             # bold system font (active row)
+    "NSColor",            # systemOrange/systemRed (usage bands)
+    "NSParagraphStyle",   # NSTextTab right-align tab stop
+    "NSText",             # NSTextAlignment
+    "NSAttributedString", # attribute-name constants live here
+    "objc2-core-foundation", # REQUIRED: CGFloat-typed methods are cfg-gated on it
+] }
 block2 = "0.6"
 
 [dev-dependencies]
