@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-05
+
+### Changed
+- Release automation: each `v*.*.*` tag now auto-bumps the Homebrew tap formula,
+  so `brew upgrade` picks up new versions.
+- Releases fail fast if the git tag doesn't match the `Cargo.toml` version.
+
 ## [0.1.0] - 2026-09-05
 
 ### Added
@@ -23,10 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with room, using a hysteresis band (trigger 95% / target ≤85%), swap cooldown,
   and no-bounce-back to avoid thrashing. Native notifications on swap and when no
   account has room.
-- `install` / `uninstall` — run the watcher always-on via a launchd agent.
+- macOS **menu-bar app** (`menubar`) — live usage % in the menu bar, click-to-switch
+  accounts, auto-swap toggle (90/95/98), capture-login, start-at-login, and quit.
+- `install` / `uninstall` — run the menu-bar app (which includes the auto-swap
+  daemon) at every login via a launchd agent.
+- **Self-update** (`update`, plus a once-daily background check) — downloads the
+  latest release, verifies its SHA-256 checksum, replaces the binary, and relaunches.
 - `report` — usage patterns by weekday, hour of day, and per-account weekly peak.
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/MattJackson/claude-usage/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/MattJackson/claude-usage/releases/tag/v0.1.0

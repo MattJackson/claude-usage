@@ -26,6 +26,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$tag" != "$cargo_ver" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $cargo_ver"
+            exit 1
+          fi
+
       - name: Build (aarch64 + x86_64)
         run: |
           cargo build --release --target aarch64-apple-darwin
@@ -66,3 +75,34 @@ jobs:
             dist/*.tar.gz
             dist/*.sha256
             dist/SHA256SUMS
+
+      - name: Bump Homebrew tap formula
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+        run: |
+          version="${GITHUB_REF#refs/tags/}"      # e.g. v0.1.1
+          ver="${version#v}"                       # e.g. 0.1.1
+          sum="$(shasum -a 256 "dist/${BIN}-${version}-universal-apple-darwin.tar.gz" | awk '{print $1}')"
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$TAP_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes"
+
+          git clone git@github.com:MattJackson/homebrew-tap.git tap
+          f="tap/Formula/${BIN}.rb"
+          url="https://github.com/MattJackson/claude-usage/releases/download/${version}/${BIN}-${version}-universal-apple-darwin.tar.gz"
+          sed -i '' -E "s|^  url .*|  url \"${url}\"|" "$f"
+          sed -i '' -E "s|^  sha256 .*|  sha256 \"${sum}\"|" "$f"
+          sed -i '' -E "s|^  version .*|  version \"${ver}\"|" "$f"
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "formula already up to date"
+          else
+            git commit -am "${BIN} ${ver}"
+            git push origin HEAD:main
+          fi
