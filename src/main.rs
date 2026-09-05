@@ -153,20 +153,26 @@ pub(crate) fn capture_current() -> Result<(String, bool)> {
 
     let existed = with_state_lock(|| {
         let mut state = State::load()?;
-        let existed = if let Some(cur) = state.find(&email) {
-            // Re-capturing only refreshes identity/tokens — keep the usage snapshot
-            // the scheduler already fetched, so `list`/menu don't blank to "no data".
-            acct.cached_usage = cur.cached_usage.clone();
-            true
-        } else {
-            false
-        };
+        let existing = state.find(&email);
+        let existed = existing.is_some();
+        // Re-capturing only refreshes identity/tokens — keep the usage snapshot
+        // the scheduler already fetched, so `list`/menu don't blank to "no data".
+        acct.cached_usage = merged_cached_usage(existing, &acct);
         state.upsert(acct);
         state.active = Some(email.clone());
         state.save()?;
         Ok(existed)
     })?;
     Ok((email, existed))
+}
+
+/// The cached usage to keep when (re)capturing an account: prefer the snapshot
+/// we already had for this email (capture only refreshes identity/tokens), else
+/// whatever the fresh record carries. Pure, for tests.
+fn merged_cached_usage(existing: Option<&Account>, fresh: &Account) -> Option<CachedUsage> {
+    existing
+        .and_then(|a| a.cached_usage.clone())
+        .or_else(|| fresh.cached_usage.clone())
 }
 
 /// Remove an account by email (used by the CLI `rm` and the menu bar).
@@ -484,20 +490,29 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
             _ => bail!("multiple accounts; specify one by email or prefix"),
         },
     };
-    // A token refresh is a network call, but on the token endpoint (not the
-    // rate-limited usage endpoint) and only when actually near expiry.
-    let token = with_state_lock(|| {
-        let mut st = State::load()?;
-        let acct = st
-            .find_mut(&email)
-            .with_context(|| format!("no account matches '{email}'"))?;
-        let refreshed = oauth::ensure_fresh(acct, REFRESH_SKEW_SECS)?;
-        let token = acct.access_token.clone();
-        if refreshed {
-            st.save()?;
-        }
-        Ok(token)
-    })?;
+    // Phase 1 (no lock): refresh if near expiry. Network I/O stays OUTSIDE the
+    // cross-process lock so a slow/hung token endpoint can't stall the daemon
+    // poll or a concurrent switch (which all take the same lock).
+    let mut acct = State::load()?
+        .find(&email)
+        .cloned()
+        .with_context(|| format!("no account matches '{email}'"))?;
+    let refreshed = oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS)?;
+    let token = acct.access_token.clone();
+    // Phase 2 (locked): persist a rotation without clobbering a fresher one.
+    if refreshed {
+        with_state_lock(|| {
+            let mut st = State::load()?;
+            if let Some(a) = st.find_mut(&email) {
+                a.set_tokens_if_newer(
+                    acct.access_token.clone(),
+                    acct.refresh_token.clone(),
+                    acct.expires_at,
+                );
+            }
+            st.save()
+        })?;
+    }
     println!("{token}");
     Ok(())
 }
@@ -967,7 +982,10 @@ fn refresh_usage_cache() -> RefreshOutcome {
         let mut st = State::load()?;
         for (email, acct, cu) in &updates {
             if let Some(a) = st.find_mut(email) {
-                a.set_tokens(
+                // Recency-guarded (matching switch_to): a concurrent switch that
+                // adopted a keychain rotation while we were fetching must not be
+                // clobbered by our older phase-1 snapshot.
+                a.set_tokens_if_newer(
                     acct.access_token.clone(),
                     acct.refresh_token.clone(),
                     acct.expires_at,
@@ -1160,11 +1178,15 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                     .map(|r| r.has_data() && r.max_pct() >= trigger)
                     .unwrap_or(false);
                 if act_over && !guard.stuck_notified {
+                    // Pick the soonest reset by TIMESTAMP, then humanize — taking
+                    // min() of humanized strings sorts lexicographically ("3d 12h"
+                    // < "3d 9h"), which is not chronological.
                     let soonest = rows
                         .iter()
                         .filter(|r| r.has_data())
-                        .filter_map(|r| r.weekly.resets_at.map(humanize_until))
+                        .filter_map(|r| r.weekly.resets_at)
                         .min()
+                        .map(humanize_until)
                         .unwrap_or_else(|| "unknown".to_string());
                     notify(&format!(
                         "All accounts high — staying on {active_email}, soonest reset in {soonest}"
@@ -1251,6 +1273,29 @@ struct Sample {
     event: Option<String>,
 }
 
+/// Positive session-% deltas between consecutive SAME-account active samples —
+/// the quantity `cmd_report` buckets by weekday/hour. A delta across an account
+/// switch would subtract two unrelated accounts' percentages, so those are
+/// skipped; only increases count. Returns `(timestamp, delta)`. Pure, for tests.
+fn consumption_deltas(active: &[&Sample]) -> Vec<(i64, f64)> {
+    let mut out = Vec::new();
+    let mut prev: Option<&Sample> = None;
+    for s in active {
+        if let Some(p) = prev {
+            if p.account == s.account {
+                if let (Some(pv), Some(cur)) = (p.session, s.session) {
+                    let delta = cur - pv;
+                    if delta > 0.0 {
+                        out.push((s.ts, delta));
+                    }
+                }
+            }
+        }
+        prev = Some(s);
+    }
+    out
+}
+
 fn cmd_report(_args: &[String]) -> Result<()> {
     use chrono::{Datelike, Local, TimeZone, Timelike};
 
@@ -1274,24 +1319,11 @@ fn cmd_report(_args: &[String]) -> Result<()> {
 
     let mut by_weekday = [0f64; 7];
     let mut by_hour = [0f64; 24];
-    let mut prev: Option<&Sample> = None;
-    for s in &active {
-        // Only diff consecutive samples of the SAME account — a delta that spans
-        // an account switch would subtract two unrelated accounts' session %.
-        if let Some(p) = prev {
-            if p.account == s.account {
-                if let (Some(pv), Some(cur)) = (p.session, s.session) {
-                    let delta = cur - pv;
-                    if delta > 0.0 {
-                        if let Some(dt) = Local.timestamp_opt(s.ts, 0).single() {
-                            by_weekday[dt.weekday().num_days_from_monday() as usize] += delta;
-                            by_hour[dt.hour() as usize] += delta;
-                        }
-                    }
-                }
-            }
+    for (ts, delta) in consumption_deltas(&active) {
+        if let Some(dt) = Local.timestamp_opt(ts, 0).single() {
+            by_weekday[dt.weekday().num_days_from_monday() as usize] += delta;
+            by_hour[dt.hour() as usize] += delta;
         }
-        prev = Some(s);
     }
 
     let mut peak: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();

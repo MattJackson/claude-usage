@@ -1116,4 +1116,23 @@ mod tests {
         assert!(!launchd_managed_from_env(Some("com.other.service")));
         assert!(!launchd_managed_from_env(None));
     }
+
+    #[test]
+    fn menu_signature_changes_when_opus_reset_changes() {
+        // The redraw-gating signature must include the Opus reset countdown, or a
+        // changing Opus reset leaves a stale value on screen (no rebuild fires).
+        let mut a = acct("you@work.com", Some(50.0), Some(60.0), true);
+        a.opus = Some(30.0);
+        a.opus_reset = "3h".into();
+        let base = Snapshot {
+            accounts: vec![a],
+            autoswap: true,
+            threshold: 95.0,
+            start_at_login: false,
+        };
+        let sig1 = menu_signature(&base);
+        let mut changed = base;
+        changed.accounts[0].opus_reset = "2h".into();
+        assert_ne!(sig1, menu_signature(&changed));
+    }
 }

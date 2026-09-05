@@ -382,3 +382,99 @@ fn write_bytes_atomic_mode_preserves_mode() {
     // No temp file left behind.
     assert!(!path.with_extension("json.claude-usage.tmp").exists());
 }
+
+// --- consumption_deltas (report same-account guard) ---
+
+fn sample(account: &str, session: f64, ts: i64) -> Sample {
+    Sample {
+        ts,
+        account: Some(account.to_string()),
+        active: Some(true),
+        session: Some(session),
+        weekly: None,
+        event: None,
+    }
+}
+
+#[test]
+fn consumption_deltas_only_counts_same_account_increases() {
+    let a1 = sample("a@e.com", 10.0, 100);
+    let a2 = sample("a@e.com", 40.0, 200); // +30, same account -> counted
+    let b1 = sample("b@e.com", 5.0, 300); // a->b switch -> NOT counted
+    let b2 = sample("b@e.com", 20.0, 400); // +15, same account -> counted
+    let a3 = sample("a@e.com", 45.0, 500); // b->a switch -> NOT counted
+    let list: Vec<&Sample> = vec![&a1, &a2, &b1, &b2, &a3];
+    assert_eq!(consumption_deltas(&list), vec![(200, 30.0), (400, 15.0)]);
+}
+
+#[test]
+fn consumption_deltas_ignores_negative_deltas() {
+    // A reset (session drops) is not consumption.
+    let a1 = sample("a@e.com", 90.0, 100);
+    let a2 = sample("a@e.com", 5.0, 200); // reset, negative -> skipped
+    let list: Vec<&Sample> = vec![&a1, &a2];
+    assert!(consumption_deltas(&list).is_empty());
+}
+
+// --- merged_cached_usage (re-capture preserves usage) ---
+
+fn acct_with_cache(cache: Option<CachedUsage>) -> Account {
+    let mut a = Account::from_keychain_blob(
+        r#"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":0}}"#,
+    )
+    .unwrap();
+    a.cached_usage = cache;
+    a
+}
+
+#[test]
+fn merged_cached_usage_prefers_existing_snapshot() {
+    let existing = acct_with_cache(Some(CachedUsage {
+        session_pct: Some(42.0),
+        weekly_pct: Some(61.0),
+        session_reset: None,
+        weekly_reset: None,
+        opus_pct: None,
+        opus_reset: None,
+        fetched_at: 123,
+    }));
+    let fresh = acct_with_cache(None); // freshly captured from keychain: no cache
+    let merged = merged_cached_usage(Some(&existing), &fresh);
+    assert_eq!(merged.unwrap().session_pct, Some(42.0));
+}
+
+#[test]
+fn merged_cached_usage_none_for_new_account() {
+    let fresh = acct_with_cache(None);
+    assert!(merged_cached_usage(None, &fresh).is_none());
+}
+
+// --- rotate_if_large (shared log rotation) ---
+
+#[test]
+fn rotate_if_large_rotates_over_threshold_with_correct_name() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, rotated) in [
+        ("claude-usage.log", "claude-usage.log.1"),
+        ("history.jsonl", "history.jsonl.1"),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"0123456789").unwrap();
+        logging::rotate_if_large(&path, 5); // 10 bytes > 5 -> rotate
+        assert!(!path.exists(), "{name} should have been moved aside");
+        assert!(
+            dir.path().join(rotated).exists(),
+            "expected rotated file {rotated}"
+        );
+    }
+}
+
+#[test]
+fn rotate_if_large_leaves_small_file_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("claude-usage.log");
+    std::fs::write(&path, b"tiny").unwrap();
+    logging::rotate_if_large(&path, 1_000_000);
+    assert!(path.exists());
+    assert!(!dir.path().join("claude-usage.log.1").exists());
+}

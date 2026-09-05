@@ -42,14 +42,19 @@ pub fn refresh(acct: &mut Account) -> Result<bool> {
 
 /// Refresh only if the token expires within `skew_secs`.
 pub fn ensure_fresh(acct: &mut Account, skew_secs: i64) -> Result<bool> {
-    // Saturating so a corrupt `expires_at` (e.g. near i64::MIN loaded from a
-    // malformed state.json) can't overflow — it just reads as "expired" and
-    // triggers a refresh instead of panicking (debug) or wrapping (release).
-    if acct.expires_at.saturating_sub(now_millis()) <= skew_secs.saturating_mul(1000) {
+    if needs_refresh(acct.expires_at, now_millis(), skew_secs) {
         refresh(acct)
     } else {
         Ok(false)
     }
+}
+
+/// Whether a token expiring at `expires_at` (unix millis) is within `skew_secs`
+/// of `now_millis`. Saturating so a corrupt `expires_at` (e.g. near i64::MIN from
+/// a malformed state.json) reads as "expired" instead of overflowing — a plain
+/// subtraction would panic in debug and wrap to "fresh" in release. Pure, tested.
+fn needs_refresh(expires_at: i64, now_millis: i64, skew_secs: i64) -> bool {
+    expires_at.saturating_sub(now_millis) <= skew_secs.saturating_mul(1000)
 }
 
 fn post_token(body: &serde_json::Value) -> Result<TokenResponse> {

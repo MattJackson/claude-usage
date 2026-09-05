@@ -30,6 +30,24 @@ fn from_keychain_blob_parses_valid() {
 }
 
 #[test]
+fn set_tokens_if_newer_only_applies_when_at_least_as_new() {
+    let mut a = Account::from_keychain_blob(&blob("old", "oldr", 100)).unwrap();
+    // Older expiry: rejected, tokens unchanged.
+    assert!(!a.set_tokens_if_newer("stale".into(), "staler".into(), 50));
+    assert_eq!(a.access_token, "old");
+    assert_eq!(a.expires_at, 100);
+    // Equal expiry: applied (>=).
+    assert!(a.set_tokens_if_newer("eq".into(), "eqr".into(), 100));
+    assert_eq!(a.access_token, "eq");
+    // Newer expiry: applied, and the blob is kept in sync.
+    assert!(a.set_tokens_if_newer("new".into(), "newr".into(), 200));
+    assert_eq!(a.access_token, "new");
+    assert_eq!(a.refresh_token, "newr");
+    assert_eq!(a.expires_at, 200);
+    assert!(a.keychain_blob.contains("new"));
+}
+
+#[test]
 fn from_keychain_blob_missing_expires_defaults_zero() {
     let b = serde_json::json!({
         "claudeAiOauth": { "accessToken": "t", "refreshToken": "r" }

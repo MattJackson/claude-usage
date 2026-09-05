@@ -193,8 +193,10 @@ runs inside the menu-bar app (so `claude-usage install` keeps it on), or headles
 ## Security
 
 - Tokens live locally in `~/.config/claude-usage/state.json` (owner-only, `0600`)
-  and the macOS Keychain, read/written via the Security framework (never passed on a
-  command line).
+  and the macOS Keychain, accessed via the `security` CLI. Under the single-user
+  threat model this tool assumes, that CLI briefly places the token blob in its own
+  process arguments; a code-signed build will move this back to the Security
+  framework API. Tokens are never written to logs.
 - The tool uses the **same public OAuth client id** as the official Claude Code CLI,
   and sends tokens only to Anthropic's own endpoints — nowhere else.
 - If `ANTHROPIC_API_KEY` is set in your environment, Claude Code uses that and
