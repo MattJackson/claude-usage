@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-05
+
+### Changed
+- **Accounts are now identified by email, not a made-up name.** `capture` takes no
+  name and keys on the account's email; `switch`/`start`/`continue`/`token`/`rm`
+  accept a full email or a unique prefix (ambiguous prefixes error and list the
+  matches). Old name-keyed `state.json` files migrate automatically on load
+  (email backfilled from the stored identity; the active name mapped to its email).
+- Removed the `rename` command/menu item (emails are fixed by the account).
+- Menu bar: each account is now a **submenu** (switch · session/weekly/opus stats
+  with reset countdowns · "updated Xm ago" · Remove); auto-swap is a single
+  **"Auto-swap at high usage" submenu** (Off / 90 / 95 / 98); "Quit claude-usage"
+  is now just "Quit".
+- Keychain access goes through Security.framework (`security-framework`) instead of
+  the `security` CLI, so tokens are never passed on a process command line (argv).
+
+### Fixed
+- **Switching is now atomic.** The identity is resolved first (a switch to an
+  identity-less account while offline now errors instead of half-applying);
+  `~/.claude.json` is written before the keychain, and the keychain write is the
+  commit point — on failure `~/.claude.json` is rolled back. No more "switch
+  reported success but the account didn't change."
+- **`sync_active_from_keychain` verifies identity** (accountUuid, fallback email)
+  before adopting keychain tokens, so a `/login` into a different account no longer
+  silently overwrites the tracked account's tokens.
+- **Cross-process state lock.** All state read-modify-writes take an advisory file
+  lock, and the scheduler does its network I/O outside the lock then reloads and
+  merges under it — a concurrent daemon poll and CLI/menu switch can no longer
+  clobber each other.
+- Auto-pick / auto-swap tie-break now prefers **more** headroom (lower usage) among
+  equally-soon-resetting accounts (was inverted).
+- `~/.claude.json`: the previous account's `userID` is removed when the new account
+  has none (no stale identity pairing).
+- `history.jsonl` is now size-capped/rotated like the debug log; the launchd agent
+  no longer captures an uncapped stdout/stderr log.
+- Menu-bar: the snapshot is computed before taking the UI lock (no stalls across
+  blocking `osascript`/disk reads); a poisoned lock is recovered consistently.
+- Saturating arithmetic on token-expiry and cache-age math; temp files cleaned up
+  on rename failure and created owner-only; OAuth error bodies are no longer logged.
+
 ## [0.1.4] - 2026-09-05
 
 ### Added
@@ -88,7 +128,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/MattJackson/claude-usage/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/MattJackson/claude-usage/compare/v0.1.2...v0.1.4
 [0.1.2]: https://github.com/MattJackson/claude-usage/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/MattJackson/claude-usage/compare/v0.1.0...v0.1.1

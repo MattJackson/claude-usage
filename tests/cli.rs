@@ -1,8 +1,8 @@
 //! Black-box CLI integration tests. Each test runs the compiled `claude-usage`
 //! binary as a subprocess with an isolated `HOME` (a fresh tempdir), so it never
-//! touches the real `~/.config/claude-usage/state.json`, `~/.claude.json`, the
-//! macOS Keychain, or the network. Only argument-validation and offline paths
-//! (`--help`, empty-state `list`, `rm`) are exercised.
+//! touches the real `~/.config/claude-usage/state.json`, `~/.claude.json`, or the
+//! network. (Keychain access isn't HOME-scoped, so `capture` is not exercised
+//! here.) Accounts are keyed by email.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -30,27 +30,35 @@ fn seed_state(home: &TempDir, json: &str) {
     fs::write(&p, json).unwrap();
 }
 
-/// Two fake accounts, `active` null so `rm` behaves cleanly. Field names match
-/// the `State`/`Account` serde shape (snake_case). `keychain_blob` is only parsed
-/// on capture, never on load, so a dummy value is fine here.
+/// Two fake accounts in the email-keyed shape. `keychain_blob` is only parsed on
+/// capture, never on load, so a dummy value is fine here.
 const TWO_ACCOUNTS: &str = r#"{
   "accounts": [
-    {"name":"Personal","email":"matthew@pq.io","access_token":"a","refresh_token":"b","expires_at":0,"keychain_blob":"{}","oauth_account":null,"user_id":null},
-    {"name":"dev1","email":"dev@getbusbar.com","access_token":"c","refresh_token":"d","expires_at":0,"keychain_blob":"{}","oauth_account":null,"user_id":null}
+    {"email":"matthew@pq.io","access_token":"a","refresh_token":"b","expires_at":0,"keychain_blob":"{}","oauth_account":null,"user_id":null,"cached_usage":null},
+    {"email":"dev@getbusbar.com","access_token":"c","refresh_token":"d","expires_at":0,"keychain_blob":"{}","oauth_account":null,"user_id":null,"cached_usage":null}
   ],
   "active": null,
   "autoswap_disabled": false,
   "trigger_pct": null
 }"#;
 
-fn account_names_lower(home: &TempDir) -> Vec<String> {
+/// The legacy name-keyed shape, to prove migration on load.
+const OLD_SHAPE: &str = r#"{
+  "accounts": [
+    {"name":"dev1","email":"dev@getbusbar.com","access_token":"c","refresh_token":"d","expires_at":0,"keychain_blob":"{}"},
+    {"name":"Personal","email":"matthew@pq.io","access_token":"a","refresh_token":"b","expires_at":0,"keychain_blob":"{}"}
+  ],
+  "active": "Personal"
+}"#;
+
+fn account_emails_lower(home: &TempDir) -> Vec<String> {
     let s = fs::read_to_string(state_path(home)).unwrap();
     let v: serde_json::Value = serde_json::from_str(&s).unwrap();
     v["accounts"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|a| a["name"].as_str().unwrap().to_lowercase())
+        .map(|a| a["email"].as_str().unwrap().to_lowercase())
         .collect()
 }
 
@@ -70,7 +78,7 @@ fn help_lists_subcommands() {
         .stdout(predicate::str::contains("report"))
         .stdout(predicate::str::contains("install"))
         .stdout(predicate::str::contains("uninstall"))
-        .stdout(predicate::str::contains("rm <name>"));
+        .stdout(predicate::str::contains("rm <email>"));
 }
 
 #[test]
@@ -83,6 +91,16 @@ fn help_subcommand_matches_flag() {
         .stdout(predicate::str::contains(
             "usage & instant account switching",
         ));
+}
+
+#[test]
+fn version_flag() {
+    let home = TempDir::new().unwrap();
+    bin(&home)
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claude-usage "));
 }
 
 #[test]
@@ -108,50 +126,37 @@ fn bare_list_with_no_accounts() {
 #[test]
 fn rm_missing_account_errors() {
     let home = TempDir::new().unwrap();
+    seed_state(&home, TWO_ACCOUNTS);
     bin(&home)
-        .args(["rm", "nope"])
+        .args(["rm", "nobody@example.com"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("no account named"));
+        .stderr(predicate::str::contains("no account matches"));
 }
 
 #[test]
 fn switch_with_no_accounts_errors() {
     let home = TempDir::new().unwrap();
     bin(&home)
-        .args(["switch", "nope"])
+        .args(["switch", "nope@example.com"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("no accounts yet"));
 }
 
 #[test]
-fn capture_requires_a_name() {
-    let home = TempDir::new().unwrap();
-    bin(&home)
-        .arg("capture")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "usage: claude-usage capture <name>",
-        ));
-}
-
-#[test]
-fn rm_removes_seeded_account() {
+fn rm_removes_seeded_account_by_prefix() {
     let home = TempDir::new().unwrap();
     seed_state(&home, TWO_ACCOUNTS);
+    // Unique prefix "dev" resolves to dev@getbusbar.com.
     bin(&home)
-        .args(["rm", "dev1"])
+        .args(["rm", "dev"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Removed 'dev1'"));
-    let names = account_names_lower(&home);
-    assert!(!names.contains(&"dev1".to_string()), "dev1 should be gone");
-    assert!(
-        names.contains(&"personal".to_string()),
-        "Personal should remain"
-    );
+        .stdout(predicate::str::contains("Removed dev@getbusbar.com"));
+    let emails = account_emails_lower(&home);
+    assert!(!emails.contains(&"dev@getbusbar.com".to_string()));
+    assert!(emails.contains(&"matthew@pq.io".to_string()));
 }
 
 #[test]
@@ -159,14 +164,40 @@ fn rm_is_case_insensitive() {
     let home = TempDir::new().unwrap();
     seed_state(&home, TWO_ACCOUNTS);
     bin(&home)
-        .args(["rm", "PERSONAL"])
+        .args(["rm", "MATTHEW@PQ.IO"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Removed 'PERSONAL'"));
-    let names = account_names_lower(&home);
-    assert!(
-        !names.contains(&"personal".to_string()),
-        "Personal should be removed despite different casing"
+        .stdout(predicate::str::contains("Removed matthew@pq.io"));
+    let emails = account_emails_lower(&home);
+    assert!(!emails.contains(&"matthew@pq.io".to_string()));
+    assert!(emails.contains(&"dev@getbusbar.com".to_string()));
+}
+
+#[test]
+fn rm_ambiguous_prefix_errors() {
+    let home = TempDir::new().unwrap();
+    seed_state(
+        &home,
+        r#"{"accounts":[
+            {"email":"dev1@e.com","access_token":"a","refresh_token":"b","expires_at":0,"keychain_blob":"{}"},
+            {"email":"dev2@e.com","access_token":"c","refresh_token":"d","expires_at":0,"keychain_blob":"{}"}
+        ],"active":null}"#,
     );
-    assert!(names.contains(&"dev1".to_string()), "dev1 should remain");
+    bin(&home)
+        .args(["rm", "dev"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ambiguous"));
+}
+
+#[test]
+fn migrates_old_name_keyed_state_on_load() {
+    let home = TempDir::new().unwrap();
+    seed_state(&home, OLD_SHAPE);
+    // `list` reads (and migrates) the old shape; accounts show by email.
+    bin(&home)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dev@getbusbar.com"))
+        .stdout(predicate::str::contains("matthew@pq.io"));
 }

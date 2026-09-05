@@ -9,7 +9,7 @@ fn acct_expiring_at(expires_at: i64) -> Account {
         }
     })
     .to_string();
-    Account::from_keychain_blob("x".to_string(), &blob).unwrap()
+    Account::from_keychain_blob(&blob).unwrap()
 }
 
 #[test]

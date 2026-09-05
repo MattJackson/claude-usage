@@ -1,10 +1,11 @@
 //! Persistent, owner-only token store for all captured accounts.
 //!
-//! Each account keeps the *exact* keychain blob captured from a real
-//! `claude` login (`{"claudeAiOauth":{...}}`), so writing it back on a
-//! switch always produces a login Claude Code accepts. The access/refresh
-//! tokens are also mirrored as plain fields for API calls, and patched back
-//! into the blob whenever we refresh.
+//! Accounts are keyed by their Claude account **email** — the stable identity
+//! Claude Code itself uses. Each account keeps the *exact* keychain blob
+//! captured from a real `claude` login (`{"claudeAiOauth":{...}}`), so writing
+//! it back on a switch always produces a login Claude Code accepts. The
+//! access/refresh tokens are also mirrored as plain fields for API calls, and
+//! patched back into the blob whenever we refresh.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -33,9 +34,9 @@ pub struct CachedUsage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
-    /// Friendly name chosen by the user (unique).
-    pub name: String,
-    /// Label discovered from the profile endpoint (email), if known.
+    /// The account's email — the identity key. Always set for a captured
+    /// account; `None` only transiently while building one from a keychain blob
+    /// before its email is resolved.
     #[serde(default)]
     pub email: Option<String>,
     pub access_token: String,
@@ -58,8 +59,9 @@ pub struct Account {
 }
 
 impl Account {
-    /// Build an Account from a raw keychain blob string.
-    pub fn from_keychain_blob(name: String, blob: &str) -> Result<Account> {
+    /// Build an Account from a raw keychain blob string. The email is resolved
+    /// separately by the caller (it is not present in the keychain blob).
+    pub fn from_keychain_blob(blob: &str) -> Result<Account> {
         let v: serde_json::Value =
             serde_json::from_str(blob).context("keychain value is not valid JSON")?;
         let o = v.get("claudeAiOauth").ok_or_else(|| {
@@ -77,7 +79,6 @@ impl Account {
             .to_string();
         let expires_at = o.get("expiresAt").and_then(|x| x.as_i64()).unwrap_or(0);
         Ok(Account {
-            name,
             email: None,
             access_token,
             refresh_token,
@@ -87,6 +88,21 @@ impl Account {
             user_id: None,
             cached_usage: None,
         })
+    }
+
+    /// The identity key for this account (its email, or "" if unresolved).
+    pub fn key(&self) -> &str {
+        self.email.as_deref().unwrap_or("")
+    }
+
+    /// The account's stable identity from its captured `oauthAccount`, preferring
+    /// the accountUuid and falling back to the email.
+    pub fn identity_uuid(&self) -> Option<String> {
+        self.oauth_account
+            .as_ref()
+            .and_then(|o| o.get("accountUuid"))
+            .and_then(|x| x.as_str())
+            .map(String::from)
     }
 
     /// Update the tokens after a refresh, keeping the blob in sync.
@@ -109,7 +125,7 @@ impl Account {
 pub struct State {
     #[serde(default)]
     pub accounts: Vec<Account>,
-    /// Name of the account currently written to the keychain, if known.
+    /// Email of the account currently written to the keychain, if known.
     #[serde(default)]
     pub active: Option<String>,
     /// Menu-bar: auto-swap is on unless this is set (defaults to enabled).
@@ -132,12 +148,93 @@ fn state_path() -> Result<PathBuf> {
 impl State {
     pub fn load() -> Result<State> {
         let path = state_path()?;
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                serde_json::from_slice(&bytes).context("state.json is corrupt; edit or remove it")
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
+            Err(e) => return Err(e).context("reading state.json"),
+        };
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).context("state.json is corrupt; edit or remove it")?;
+        Ok(State::from_value(&v))
+    }
+
+    /// Build a State from parsed JSON, migrating the old name-keyed shape
+    /// (`Account.name`, `active` = a name) to the email-keyed shape.
+    pub fn from_value(v: &serde_json::Value) -> State {
+        let mut accounts = Vec::new();
+        // Map an old `name` -> resolved email so a legacy `active` (a name) can be
+        // migrated to the new email key.
+        let mut name_to_email: Vec<(String, String)> = Vec::new();
+
+        if let Some(arr) = v.get("accounts").and_then(|a| a.as_array()) {
+            for obj in arr {
+                let access_token = obj.get("access_token").and_then(|x| x.as_str());
+                let refresh_token = obj.get("refresh_token").and_then(|x| x.as_str());
+                let (Some(access_token), Some(refresh_token)) = (access_token, refresh_token)
+                else {
+                    continue; // not a usable account entry
+                };
+                let legacy_name = obj.get("name").and_then(|x| x.as_str());
+                let email = obj
+                    .get("email")
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+                    .or_else(|| {
+                        obj.get("oauth_account")
+                            .and_then(|o| o.get("emailAddress"))
+                            .and_then(|x| x.as_str())
+                            .map(String::from)
+                    })
+                    // Last resort so nothing is lost: fall back to the old name.
+                    .or_else(|| legacy_name.map(String::from));
+                if let (Some(name), Some(em)) = (legacy_name, email.as_deref()) {
+                    name_to_email.push((name.to_string(), em.to_string()));
+                }
+                accounts.push(Account {
+                    email,
+                    access_token: access_token.to_string(),
+                    refresh_token: refresh_token.to_string(),
+                    expires_at: obj.get("expires_at").and_then(|x| x.as_i64()).unwrap_or(0),
+                    keychain_blob: obj
+                        .get("keychain_blob")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    oauth_account: obj.get("oauth_account").cloned().filter(|x| !x.is_null()),
+                    user_id: obj
+                        .get("user_id")
+                        .and_then(|x| x.as_str())
+                        .map(String::from),
+                    cached_usage: obj
+                        .get("cached_usage")
+                        .and_then(|x| serde_json::from_value(x.clone()).ok()),
+                });
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
-            Err(e) => Err(e).context("reading state.json"),
+        }
+
+        let active = v.get("active").and_then(|x| x.as_str()).map(|a| {
+            // If it already matches an account email, keep it; else migrate a
+            // legacy active-name to that account's email.
+            if accounts.iter().any(|acc| acc.key().eq_ignore_ascii_case(a)) {
+                a.to_string()
+            } else if let Some((_, em)) = name_to_email
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(a))
+            {
+                em.clone()
+            } else {
+                a.to_string()
+            }
+        });
+
+        State {
+            accounts,
+            active,
+            autoswap_disabled: v
+                .get("autoswap_disabled")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            trigger_pct: v.get("trigger_pct").and_then(|x| x.as_f64()),
         }
     }
 
@@ -147,85 +244,93 @@ impl State {
         let path = state_path()?;
         let json = serde_json::to_vec_pretty(self)?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json).context("writing state.json.tmp")?;
-        set_owner_only(&tmp)?;
-        std::fs::rename(&tmp, &path).context("renaming state.json")?;
-        set_owner_only(&path)?;
+        // Create the temp file owner-only from the start (no umask window), then
+        // rename it into place; clean up the temp file on any failure.
+        if let Err(e) = write_private(&tmp, &json) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).context("writing state.json.tmp");
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).context("renaming state.json");
+        }
         Ok(())
     }
 
-    pub fn find(&self, name: &str) -> Option<&Account> {
+    /// Look up an account by exact email (case-insensitive).
+    pub fn find(&self, email: &str) -> Option<&Account> {
         self.accounts
             .iter()
-            .find(|a| a.name.eq_ignore_ascii_case(name))
+            .find(|a| a.key().eq_ignore_ascii_case(email))
     }
 
-    pub fn find_mut(&mut self, name: &str) -> Option<&mut Account> {
+    pub fn find_mut(&mut self, email: &str) -> Option<&mut Account> {
         self.accounts
             .iter_mut()
-            .find(|a| a.name.eq_ignore_ascii_case(name))
+            .find(|a| a.key().eq_ignore_ascii_case(email))
+    }
+
+    /// Resolve a user-supplied selector (a full email or a unique prefix) to an
+    /// account's email key. Ambiguous prefixes and misses are errors.
+    pub fn resolve(&self, selector: &str) -> Result<String> {
+        let sel = selector.trim();
+        if sel.is_empty() {
+            return Err(anyhow!("no account specified"));
+        }
+        // Exact (case-insensitive) email match wins outright.
+        if let Some(a) = self.find(sel) {
+            return Ok(a.key().to_string());
+        }
+        let matches: Vec<&str> = self
+            .accounts
+            .iter()
+            .map(|a| a.key())
+            .filter(|k| k.to_lowercase().starts_with(&sel.to_lowercase()))
+            .collect();
+        match matches.as_slice() {
+            [one] => Ok((*one).to_string()),
+            [] => Err(anyhow!("no account matches '{sel}'")),
+            many => Err(anyhow!(
+                "'{sel}' is ambiguous — matches: {}",
+                many.join(", ")
+            )),
+        }
     }
 
     pub fn upsert(&mut self, acct: Account) {
-        if let Some(existing) = self.find_mut(&acct.name) {
-            let name = existing.name.clone();
+        let key = acct.key().to_string();
+        if let Some(existing) = self.find_mut(&key) {
             *existing = acct;
-            existing.name = name;
         } else {
             self.accounts.push(acct);
         }
     }
 
-    pub fn remove(&mut self, name: &str) -> bool {
+    pub fn remove(&mut self, email: &str) -> bool {
         let before = self.accounts.len();
-        self.accounts.retain(|a| !a.name.eq_ignore_ascii_case(name));
+        self.accounts
+            .retain(|a| !a.key().eq_ignore_ascii_case(email));
         self.accounts.len() != before
-    }
-
-    /// Rename an account (case-insensitive lookup of `old`). Updates `active` if
-    /// it pointed at the renamed account. Errors if `old` is missing, `new` is
-    /// empty, or `new` already names a different account.
-    pub fn rename(&mut self, old: &str, new: &str) -> Result<()> {
-        let new = new.trim();
-        if new.is_empty() {
-            return Err(anyhow!("the new name cannot be empty"));
-        }
-        if self.find(old).is_none() {
-            return Err(anyhow!("no account named '{old}'"));
-        }
-        // Allow a pure case change of the same account, but not colliding with a
-        // different one.
-        if self
-            .accounts
-            .iter()
-            .any(|a| a.name.eq_ignore_ascii_case(new) && !a.name.eq_ignore_ascii_case(old))
-        {
-            return Err(anyhow!("an account named '{new}' already exists"));
-        }
-        let was_active = self
-            .active
-            .as_deref()
-            .is_some_and(|a| a.eq_ignore_ascii_case(old));
-        if let Some(a) = self.find_mut(old) {
-            a.name = new.to_string();
-        }
-        if was_active {
-            self.active = Some(new.to_string());
-        }
-        Ok(())
     }
 }
 
+/// Write `bytes` to `path`, creating the file owner-only (0600) from the start.
 #[cfg(unix)]
-fn set_owner_only(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .context("chmod 600 on state file")
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)
 }
 
 #[cfg(not(unix))]
-fn set_owner_only(_path: &std::path::Path) -> Result<()> {
-    Ok(())
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
 }
 
 #[cfg(test)]

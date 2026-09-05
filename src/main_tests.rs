@@ -90,13 +90,30 @@ fn cell(pct: Option<f64>) -> Cell {
 
 fn row(session: Option<f64>, weekly: Option<f64>) -> Row {
     Row {
-        name: "x".to_string(),
-        email: String::new(),
+        email: "x@e.com".to_string(),
         session: cell(session),
         weekly: cell(weekly),
         opus: None,
         error: None,
         fetched_at: Some(0),
+    }
+}
+
+/// A row with an email and a weekly reset time, for pick/order tests.
+fn row_full(email: &str, session: f64, weekly: f64, weekly_reset: DateTime<Utc>) -> Row {
+    Row {
+        email: email.to_string(),
+        session: Cell {
+            pct: Some(session),
+            resets_at: None,
+        },
+        weekly: Cell {
+            pct: Some(weekly),
+            resets_at: Some(weekly_reset),
+        },
+        opus: None,
+        error: None,
+        fetched_at: Some(Utc::now().timestamp()),
     }
 }
 
@@ -174,9 +191,95 @@ fn cached_from_usage_extracts_windows() {
 #[test]
 fn row_from_account_without_cache_has_no_data() {
     let a = Account::from_keychain_blob(
-        "x".to_string(),
         r#"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":0}}"#,
     )
     .unwrap();
     assert!(!row_from_account(&a).has_data());
+}
+
+// --- candidate_order / auto_pick tie-break (D1) ---
+
+#[test]
+fn candidate_order_prefers_more_headroom_on_equal_reset() {
+    let reset = Utc::now() + Duration::hours(24);
+    // a: 80% used (20% headroom); b: 10% used (90% headroom). Same reset.
+    let a = row_full("a@e.com", 80.0, 80.0, reset);
+    let b = row_full("b@e.com", 10.0, 10.0, reset);
+    // b (more headroom) must sort BEFORE a.
+    assert_eq!(candidate_order(&a, &b), std::cmp::Ordering::Greater);
+    assert_eq!(candidate_order(&b, &a), std::cmp::Ordering::Less);
+}
+
+#[test]
+fn auto_pick_tie_break_picks_higher_headroom() {
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("high@e.com", 80.0, 80.0, reset),
+        row_full("low@e.com", 10.0, 10.0, reset),
+    ];
+    // Equal soonest reset → the account with MORE headroom (lower usage) wins.
+    assert_eq!(auto_pick(&rows).unwrap(), "low@e.com");
+}
+
+#[test]
+fn auto_pick_prefers_soonest_reset() {
+    let soon = Utc::now() + Duration::hours(2);
+    let later = Utc::now() + Duration::hours(48);
+    // The soonest-resetting account wins even with slightly less headroom.
+    let rows = vec![
+        row_full("later@e.com", 5.0, 5.0, later),
+        row_full("soon@e.com", 40.0, 40.0, soon),
+    ];
+    assert_eq!(auto_pick(&rows).unwrap(), "soon@e.com");
+}
+
+// --- choose_swap_target (auto-swap guard) ---
+
+#[test]
+fn choose_swap_target_moves_off_over_trigger_account() {
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full("free@e.com", 20.0, 20.0, reset),
+    ];
+    let guard = SwapGuard::default();
+    let target = choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard);
+    assert_eq!(target.as_deref(), Some("free@e.com"));
+}
+
+#[test]
+fn choose_swap_target_none_when_active_below_trigger() {
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 40.0, 40.0, reset),
+        row_full("free@e.com", 20.0, 20.0, reset),
+    ];
+    let guard = SwapGuard::default();
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+}
+
+#[test]
+fn choose_swap_target_respects_cooldown() {
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full("free@e.com", 20.0, 20.0, reset),
+    ];
+    let guard = SwapGuard {
+        last_swap: Some(std::time::Instant::now()),
+        ..SwapGuard::default()
+    };
+    // Just swapped → cooldown blocks another swap.
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+}
+
+#[test]
+fn choose_swap_target_skips_ceiling_and_maxed_targets() {
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full("alsohigh@e.com", 90.0, 90.0, reset), // over the 85% ceiling
+    ];
+    let guard = SwapGuard::default();
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
 }

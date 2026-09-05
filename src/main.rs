@@ -1,6 +1,8 @@
-//! claude-usage — usage/limits across multiple Claude accounts, and instant
-//! account switching by writing the shared keychain login (the same thing
-//! `/login` persists), which every running `claude` adopts on its next request.
+//! claude-usage — usage/limits across multiple Claude accounts, keyed by the
+//! account email, and account switching by writing the shared keychain login
+//! plus the `~/.claude.json` identity Claude Code reads. New `claude` sessions
+//! use the switched account; already-running sessions keep theirs until
+//! restarted.
 
 mod config;
 mod logging;
@@ -12,7 +14,6 @@ mod usage;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
-use std::io::Write;
 
 use store::{Account, CachedUsage, State};
 
@@ -48,21 +49,20 @@ fn run() -> Result<()> {
     match args.first().map(String::as_str) {
         None => cmd_list(&[]),
         Some("list") | Some("ls") => cmd_list(&args[1..]),
-        Some("capture") | Some("add") => cmd_capture(args.get(1)),
+        Some("capture") | Some("add") => cmd_capture(),
         Some("switch") | Some("use") => cmd_switch(args.get(1).map(String::as_str), None),
         Some("start") => cmd_switch(args.get(1).map(String::as_str), Some(Launch::Fresh)),
         Some("continue") | Some("cont") | Some("c") => {
             cmd_switch(args.get(1).map(String::as_str), Some(Launch::Continue))
         }
-        Some("token") => cmd_token(args.get(1)),
+        Some("token") => cmd_token(args.get(1).map(String::as_str)),
         Some("watch") => cmd_watch(&args[1..]),
         #[cfg(target_os = "macos")]
         Some("menubar") => menubar::run(),
         Some("report") => cmd_report(&args[1..]),
         Some("install") => cmd_install(),
         Some("uninstall") => cmd_uninstall(),
-        Some("rm") | Some("remove") => cmd_rm(args.get(1)),
-        Some("rename") | Some("mv") => cmd_rename(args.get(1), args.get(2)),
+        Some("rm") | Some("remove") => cmd_rm(args.get(1).map(String::as_str)),
         Some("-h") | Some("--help") | Some("help") => {
             print_help();
             Ok(())
@@ -82,25 +82,26 @@ fn run() -> Result<()> {
 fn print_help() {
     println!(
         "claude-usage — usage & instant account switching for Claude\n\n\
+         Accounts are identified by their email; commands accept a full email or a\n\
+         unique prefix (e.g. `dev` for dev@example.com).\n\n\
          USAGE:\n  \
          claude-usage                   Show cached usage for every account (default)\n  \
          claude-usage list --refresh    Fetch usage now, then show it\n  \
-         claude-usage capture <name>    Save the account you're currently logged into\n  \
-         claude-usage switch [name]     Make <name> the active login (no launch)\n  \
-         claude-usage start [name]      Switch, then launch a fresh `claude`\n  \
-         claude-usage continue [name]   Switch, then launch `claude --continue`\n  \
-         claude-usage token <name>      Print a fresh access token\n  \
+         claude-usage capture           Save the account you're currently logged into\n  \
+         claude-usage switch [email]    Make <email> the active login (no launch)\n  \
+         claude-usage start [email]     Switch, then launch a fresh `claude`\n  \
+         claude-usage continue [email]  Switch, then launch `claude --continue`\n  \
+         claude-usage token [email]     Print a fresh access token\n  \
          claude-usage watch             Auto-swap at 95%, keep working (foreground)\n  \
          claude-usage menubar           Run the macOS menu-bar app (usage + auto-swap)\n  \
          claude-usage install           Run the menu-bar app at every login (via launchd)\n  \
          claude-usage uninstall         Stop running the menu-bar app at login\n  \
          claude-usage report            Usage patterns by weekday / hour / account\n  \
-         claude-usage rename <old> <new>  Rename an account\n  \
-         claude-usage rm <name>         Forget an account\n\n\
-         With no [name], switch/start/continue auto-pick the account that has room\n  \
+         claude-usage rm <email>        Forget an account\n\n\
+         With no [email], switch/start/continue auto-pick the account that has room\n  \
          and whose weekly limit resets soonest (use it before the quota resets).\n\n\
          Onboarding: log into an account with `claude` as usual, then\n  \
-         `claude-usage capture <name>`. Repeat once per account.\n"
+         `claude-usage capture`. Repeat once per account.\n"
     );
 }
 
@@ -111,37 +112,70 @@ enum Launch {
 }
 
 // ---------------------------------------------------------------------------
-// capture — snapshot the current keychain login under a name
+// capture — snapshot the current keychain login, keyed by its email
 // ---------------------------------------------------------------------------
 
-fn cmd_capture(name: Option<&String>) -> Result<()> {
-    let name = name
-        .context("usage: claude-usage capture <name>")?
-        .trim()
-        .to_string();
-    if name.is_empty() {
-        bail!("account name cannot be empty");
+fn cmd_capture() -> Result<()> {
+    let (email, existed) = capture_current()?;
+    if existed {
+        println!("Refreshed {email} — it's the active login.");
+    } else {
+        println!("Captured {email} — it's the active login.");
     }
+    Ok(())
+}
+
+/// Capture the account currently in the keychain, keyed by its email. Returns
+/// (email, existed_already). Shared by the CLI and the menu bar.
+pub(crate) fn capture_current() -> Result<(String, bool)> {
     let blob = keychain_read()
         .context("no claude.ai login found in the keychain — run `claude` and /login first")?;
-    let mut acct = Account::from_keychain_blob(name.clone(), &blob)?;
-    acct.email = usage::fetch_email(&acct.access_token);
+    let mut acct = Account::from_keychain_blob(&blob)?;
     // Snapshot the account identity Claude stores in ~/.claude.json, so a later
     // switch can restore it (the keychain token alone doesn't set the account).
     let (oauth_account, user_id) = read_claude_identity();
+    // Resolve the email (the identity key): prefer the profile API, fall back to
+    // the identity object we just read from ~/.claude.json.
+    let email = usage::fetch_email(&acct.access_token)
+        .or_else(|| {
+            oauth_account
+                .as_ref()
+                .and_then(|o| o.get("emailAddress"))
+                .and_then(|x| x.as_str())
+                .map(String::from)
+        })
+        .context(
+            "could not determine this account's email (offline?) — connect and try `capture` again",
+        )?;
+    acct.email = Some(email.clone());
     acct.oauth_account = oauth_account;
     acct.user_id = user_id;
 
-    let mut state = State::load()?;
-    state.upsert(acct);
-    state.active = Some(name.clone());
-    state.save()?;
+    let existed = with_state_lock(|| {
+        let mut state = State::load()?;
+        let existed = state.find(&email).is_some();
+        state.upsert(acct);
+        state.active = Some(email.clone());
+        state.save()?;
+        Ok(existed)
+    })?;
+    Ok((email, existed))
+}
 
-    match state.find(&name).and_then(|a| a.email.clone()) {
-        Some(email) => println!("Captured '{name}' ({email}) — it's the active login."),
-        None => println!("Captured '{name}' — it's the active login."),
-    }
-    Ok(())
+/// Remove an account by email (used by the CLI `rm` and the menu bar).
+pub(crate) fn remove_account(email: &str) -> Result<()> {
+    with_state_lock(|| {
+        let mut state = State::load()?;
+        state.remove(email);
+        if state
+            .active
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(email))
+        {
+            state.active = None;
+        }
+        state.save()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -150,14 +184,14 @@ fn cmd_capture(name: Option<&String>) -> Result<()> {
 
 fn cmd_list(args: &[String]) -> Result<()> {
     let refresh = args.iter().any(|a| a == "--refresh" || a == "-r");
-    let mut state = State::load()?;
-    if state.accounts.is_empty() {
-        println!("No accounts yet. Log into one with `claude`, then: claude-usage capture <name>");
-        return Ok(());
-    }
     // By default read the cache (no network); --refresh does exactly one fetch.
     if refresh {
-        refresh_usage_cache(&mut state);
+        refresh_usage_cache();
+    }
+    let state = State::load()?;
+    if state.accounts.is_empty() {
+        println!("No accounts yet. Log into one with `claude`, then: claude-usage capture");
+        return Ok(());
     }
     let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
     render_table(&rows, state.active.as_deref());
@@ -168,47 +202,15 @@ fn cmd_list(args: &[String]) -> Result<()> {
 // switch / start / continue
 // ---------------------------------------------------------------------------
 
-fn cmd_switch(name: Option<&str>, launch: Option<Launch>) -> Result<()> {
-    let mut state = State::load()?;
+fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
+    let state = State::load()?;
     if state.accounts.is_empty() {
-        bail!("no accounts yet; capture one with: claude-usage capture <name>");
+        bail!("no accounts yet; capture one with: claude-usage capture");
     }
+    let email = select_email(&state, selector)?;
+    let label = switch_to(&email)?;
 
-    // Before changing the keychain, save any token rotation the currently
-    // active account picked up while it was live, so we never lose its login.
-    sync_active_from_keychain(&mut state);
-
-    let name = match name {
-        Some(n) => n.to_string(),
-        None => {
-            // Auto-pick reads the cached usage only — never hits the network.
-            let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
-            auto_pick(&rows)?
-        }
-    };
-
-    let acct = state
-        .find_mut(&name)
-        .with_context(|| format!("no account named '{name}'"))?;
-    // Make sure we hand Claude a token that isn't about to expire.
-    oauth::ensure_fresh(acct, REFRESH_SKEW_SECS)?;
-    let acct = acct.clone();
-    let label = format!("{}{}", acct.name, email_suffix(&acct));
-
-    // Write keychain + ~/.claude.json identity. If the identity had to be
-    // backfilled from the profile API, persist it so future switches are
-    // fully network-free.
-    let backfilled = apply_account(&acct).context("switching the active account")?;
-    if let Some(v) = backfilled {
-        if let Some(a) = state.find_mut(&name) {
-            a.oauth_account = Some(v);
-        }
-    }
-    state.active = Some(acct.name.clone());
-    state.save()?;
-    logging::log(&format!("switch -> {}", acct.name));
-
-    println!("Active login is now '{label}'.");
+    println!("Active login is now {label}.");
     println!("New `claude` sessions will use it. Already-running sessions keep their");
     println!("current account until they're restarted.");
 
@@ -229,21 +231,146 @@ fn cmd_switch(name: Option<&str>, launch: Option<Launch>) -> Result<()> {
     }
 }
 
-/// If the account currently in the keychain is one we track, refresh our
-/// stored blob from it (captures token rotation done by live sessions).
+/// Resolve `selector` to an account email, or auto-pick when none is given.
+fn select_email(state: &State, selector: Option<&str>) -> Result<String> {
+    match selector {
+        Some(sel) => state.resolve(sel),
+        None => {
+            let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
+            auto_pick(&rows)
+        }
+    }
+}
+
+/// Make `email` the active login. Does all network work (token refresh, identity
+/// backfill) OUTSIDE the state lock, then commits keychain + ~/.claude.json +
+/// state under the lock with a fresh reload. Returns the display label.
+pub(crate) fn switch_to(email: &str) -> Result<String> {
+    // Phase 1 (no lock): refresh the token and resolve the identity over the net.
+    let state = State::load()?;
+    let mut acct = state
+        .find(email)
+        .cloned()
+        .with_context(|| format!("no account matches '{email}'"))?;
+    oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS)?;
+    let (identity, backfilled) = resolve_identity(&acct)?;
+    let label = acct.email.clone().unwrap_or_else(|| email.to_string());
+
+    // Phase 2 (locked): reload, apply the mutation, save. Keeps a concurrent
+    // daemon poll or another switch from clobbering this write.
+    with_state_lock(|| {
+        let mut st = State::load()?;
+        // Preserve any token rotation the currently-active session picked up.
+        sync_active_from_keychain(&mut st);
+        // ~/.claude.json first, keychain last (the commit point), rollback on fail.
+        apply_account(&acct, &identity)?;
+        if let Some(a) = st.find_mut(email) {
+            a.set_tokens(
+                acct.access_token.clone(),
+                acct.refresh_token.clone(),
+                acct.expires_at,
+            );
+            if backfilled {
+                a.oauth_account = Some(identity.clone());
+            }
+        }
+        st.active = Some(email.to_string());
+        st.save()?;
+        Ok(())
+    })?;
+    logging::log(&format!("switch -> {label}"));
+    Ok(label)
+}
+
+/// Resolve the `oauthAccount` identity to write for this account.
+/// Returns (identity, backfilled_from_network). Errors if it can't be resolved
+/// (e.g. offline and never captured) — the caller then does NOT switch, rather
+/// than half-applying one.
+fn resolve_identity(acct: &Account) -> Result<(serde_json::Value, bool)> {
+    if let Some(v) = &acct.oauth_account {
+        return Ok((v.clone(), false));
+    }
+    let built = usage::fetch_profile(&acct.access_token)
+        .as_ref()
+        .and_then(usage::oauth_account_from_profile);
+    built.map(|v| (v, true)).ok_or_else(|| {
+        anyhow!(
+            "could not resolve this account's identity (offline?) — \
+             run `claude-usage capture` for it while logged in"
+        )
+    })
+}
+
+/// Apply an account as the active login: write ~/.claude.json identity FIRST
+/// (atomic tmp+rename), then the keychain token LAST (the flaky commit point).
+/// If the keychain write fails, roll ~/.claude.json back to its prior contents
+/// so both halves stay consistent, and return Err (never a half-applied switch).
+fn apply_account(acct: &Account, identity: &serde_json::Value) -> Result<()> {
+    let prior = read_claude_json_raw();
+    write_claude_identity(identity, acct.user_id.as_deref())?;
+    if let Err(e) = keychain_write(&acct.keychain_blob) {
+        if let Some(bytes) = prior {
+            let _ = restore_claude_json_raw(&bytes);
+        }
+        return Err(e).context("writing the account into the keychain");
+    }
+    Ok(())
+}
+
+/// If the account currently in the keychain is genuinely our active account,
+/// adopt any token rotation a live `claude` session performed. Verified by
+/// identity: `/login` into a *different* account rewrites ~/.claude.json's
+/// oauthAccount, so a mismatch means the keychain is not our active account and
+/// we must NOT overwrite its stored tokens. In-place rotation keeps the same
+/// account uuid/email, so legitimate rotation is still captured.
 fn sync_active_from_keychain(state: &mut State) {
     let Some(active) = state.active.clone() else {
         return;
     };
     let Some(blob) = keychain_read() else { return };
-    if let Ok(fresh) = Account::from_keychain_blob(active.clone(), &blob) {
-        if let Some(acct) = state.find_mut(&active) {
-            // Only adopt if it's really the same account (refresh token lineage
-            // changes on rotation, but the keychain is the source of truth here).
-            acct.access_token = fresh.access_token;
-            acct.refresh_token = fresh.refresh_token;
-            acct.expires_at = fresh.expires_at;
-            acct.keychain_blob = fresh.keychain_blob;
+    let Ok(fresh) = Account::from_keychain_blob(&blob) else {
+        return;
+    };
+    let (json_oauth, _) = read_claude_identity();
+    let json_uuid = json_oauth
+        .as_ref()
+        .and_then(|o| o.get("accountUuid"))
+        .and_then(|x| x.as_str())
+        .map(String::from);
+    let json_email = json_oauth
+        .as_ref()
+        .and_then(|o| o.get("emailAddress"))
+        .and_then(|x| x.as_str())
+        .map(str::to_ascii_lowercase);
+
+    let Some(acct) = state.find_mut(&active) else {
+        return;
+    };
+    // Determine whether the keychain/.claude.json identity matches this account.
+    let matches = match (&acct.identity_uuid(), &json_uuid) {
+        (Some(a), Some(b)) => a == b,
+        _ => match (&acct.email, &json_email) {
+            (Some(a), Some(b)) => a.to_ascii_lowercase() == *b,
+            // Account has no known identity yet: adopt and self-heal below.
+            (None, _) => true,
+            // We have an email but .claude.json has none to compare: be safe, skip.
+            _ => false,
+        },
+    };
+    if !matches {
+        logging::log(
+            "sync: keychain identity does not match the active account; not adopting tokens",
+        );
+        return;
+    }
+    acct.access_token = fresh.access_token;
+    acct.refresh_token = fresh.refresh_token;
+    acct.expires_at = fresh.expires_at;
+    acct.keychain_blob = fresh.keychain_blob;
+    // Self-heal: if we had no identity but .claude.json has one, record it.
+    if acct.oauth_account.is_none() {
+        if let Some(o) = json_oauth {
+            acct.oauth_account = Some(o);
         }
     }
 }
@@ -252,19 +379,31 @@ fn sync_active_from_keychain(state: &mut State) {
 // token
 // ---------------------------------------------------------------------------
 
-fn cmd_token(name: Option<&String>) -> Result<()> {
-    let name = resolve_name(name)?;
-    let mut state = State::load()?;
-    let acct = state
-        .find_mut(&name)
-        .with_context(|| format!("no account named '{name}'"))?;
-    if oauth::ensure_fresh(acct, REFRESH_SKEW_SECS)? {
+fn cmd_token(selector: Option<&str>) -> Result<()> {
+    let state = State::load()?;
+    let email = match selector {
+        Some(sel) => state.resolve(sel)?,
+        None => match state.accounts.as_slice() {
+            [only] => only.key().to_string(),
+            [] => bail!("no accounts; capture one with: claude-usage capture"),
+            _ => bail!("multiple accounts; specify one by email or prefix"),
+        },
+    };
+    // A token refresh is a network call, but on the token endpoint (not the
+    // rate-limited usage endpoint) and only when actually near expiry.
+    let token = with_state_lock(|| {
+        let mut st = State::load()?;
+        let acct = st
+            .find_mut(&email)
+            .with_context(|| format!("no account matches '{email}'"))?;
+        let refreshed = oauth::ensure_fresh(acct, REFRESH_SKEW_SECS)?;
         let token = acct.access_token.clone();
-        state.save()?;
-        println!("{token}");
-    } else {
-        println!("{}", acct.access_token);
-    }
+        if refreshed {
+            st.save()?;
+        }
+        Ok(token)
+    })?;
+    println!("{token}");
     Ok(())
 }
 
@@ -272,45 +411,20 @@ fn cmd_token(name: Option<&String>) -> Result<()> {
 // rm
 // ---------------------------------------------------------------------------
 
-fn cmd_rm(name: Option<&String>) -> Result<()> {
-    let name = name.context("usage: claude-usage rm <name>")?;
-    let mut state = State::load()?;
-    if state.remove(name) {
-        if state
-            .active
-            .as_deref()
-            .is_some_and(|a| a.eq_ignore_ascii_case(name))
-        {
-            state.active = None;
-        }
-        state.save()?;
-        println!("Removed '{name}'.");
-    } else {
-        bail!("no account named '{name}'");
-    }
+fn cmd_rm(selector: Option<&str>) -> Result<()> {
+    let selector = selector.context("usage: claude-usage rm <email>")?;
+    let state = State::load()?;
+    let email = state.resolve(selector)?;
+    remove_account(&email)?;
+    println!("Removed {email}.");
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// rename
-// ---------------------------------------------------------------------------
-
-fn cmd_rename(old: Option<&String>, new: Option<&String>) -> Result<()> {
-    let old = old.context("usage: claude-usage rename <old> <new>")?;
-    let new = new.context("usage: claude-usage rename <old> <new>")?;
-    let mut state = State::load()?;
-    state.rename(old, new)?;
-    state.save()?;
-    println!("Renamed '{old}' to '{}'.", new.trim());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Usage collection + auto-pick
+// Usage rows + auto-pick
 // ---------------------------------------------------------------------------
 
 struct Row {
-    name: String,
     email: String,
     session: Cell,
     weekly: Cell,
@@ -338,8 +452,7 @@ impl Cell {
 fn row_from_account(a: &Account) -> Row {
     let c = a.cached_usage.as_ref();
     Row {
-        name: a.name.clone(),
-        email: a.email.clone().unwrap_or_default(),
+        email: a.key().to_string(),
         session: cell_from_parts(
             c.and_then(|c| c.session_pct),
             c.and_then(|c| c.session_reset.as_deref()),
@@ -378,13 +491,25 @@ fn cached_from_usage(u: &usage::Usage) -> CachedUsage {
     }
 }
 
+/// Compare two candidate rows for auto-pick / auto-swap: soonest weekly reset
+/// first, then MORE headroom (lower usage) first.
+fn candidate_order(a: &Row, b: &Row) -> std::cmp::Ordering {
+    let ka = a.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let kb = b.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
+    ka.cmp(&kb).then(
+        b.headroom()
+            .partial_cmp(&a.headroom())
+            .unwrap_or(std::cmp::Ordering::Equal),
+    )
+}
+
 /// Pick the account with room to spare whose weekly window resets soonest.
 /// Operates entirely on cached rows — callers must not fetch first.
 fn auto_pick(rows: &[Row]) -> Result<String> {
     if !rows.iter().any(|r| r.has_data()) {
         bail!(
             "no usage data yet — let the menu-bar app or `claude-usage watch` \
-             populate it, or pass an explicit account name"
+             populate it, or pass an explicit account email"
         );
     }
     let mut candidates: Vec<&Row> = rows
@@ -392,7 +517,6 @@ fn auto_pick(rows: &[Row]) -> Result<String> {
         .filter(|r| r.has_data() && r.available())
         .collect();
     if candidates.is_empty() {
-        // Nothing has room; report the soonest reset so the user knows the wait.
         let soonest = rows
             .iter()
             .filter(|r| r.has_data())
@@ -400,31 +524,22 @@ fn auto_pick(rows: &[Row]) -> Result<String> {
             .min_by_key(|(_, dt)| *dt);
         match soonest {
             Some((r, dt)) => bail!(
-                "all accounts are maxed out; '{}' resets soonest, in {}",
-                r.name,
+                "all accounts are maxed out; {} resets soonest, in {}",
+                r.email,
                 humanize_until(dt)
             ),
             None => bail!("no account currently has room"),
         }
     }
-    // Soonest weekly reset first; tie-break on lower usage.
-    candidates.sort_by(|a, b| {
-        let ka = a.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
-        let kb = b.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
-        ka.cmp(&kb).then(
-            a.headroom()
-                .partial_cmp(&b.headroom())
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
-    });
+    candidates.sort_by(|a, b| candidate_order(a, b));
     let pick = candidates[0];
     println!(
-        "Auto-picked '{}' — weekly resets in {}, {:.0}% headroom.",
-        pick.name,
+        "Auto-picked {} — weekly resets in {}, {:.0}% headroom.",
+        pick.email,
         pick.weekly.resets_in(),
         pick.headroom()
     );
-    Ok(pick.name.clone())
+    Ok(pick.email.clone())
 }
 
 impl Row {
@@ -463,29 +578,44 @@ fn cell_from_parts(pct: Option<f64>, reset: Option<&str>) -> Cell {
 }
 
 // ---------------------------------------------------------------------------
-// Keychain helpers (macOS)
+// Cross-process state lock
+// ---------------------------------------------------------------------------
+
+/// Run `f` holding an exclusive advisory lock on ~/.config/claude-usage/lock,
+/// serializing state read-modify-write across processes (the daemon poll and
+/// concurrent CLI/menu commands). The lock is fd-scoped, so the kernel releases
+/// it if the holder dies. Do NOT do network I/O inside `f`.
+fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use fs2::FileExt;
+    let dir = store::config_dir()?;
+    std::fs::create_dir_all(&dir).context("creating ~/.config/claude-usage")?;
+    let lock_path = dir.join("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .context("opening state lock")?;
+    file.lock_exclusive().context("acquiring state lock")?;
+    let r = f();
+    let _ = file.unlock();
+    r
+}
+
+// ---------------------------------------------------------------------------
+// Keychain helpers (macOS, via Security.framework — no token in argv)
 // ---------------------------------------------------------------------------
 
 fn keychain_account() -> String {
     std::env::var("USER").unwrap_or_else(|_| "claude".to_string())
 }
 
+#[cfg(target_os = "macos")]
 fn keychain_read() -> Option<String> {
-    let out = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            &keychain_account(),
-            "-w",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let bytes =
+        security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, &keychain_account())
+            .ok()?;
+    let s = String::from_utf8_lossy(&bytes).trim().to_string();
     if s.is_empty() {
         None
     } else {
@@ -493,24 +623,24 @@ fn keychain_read() -> Option<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn keychain_write(blob: &str) -> Result<()> {
-    let status = std::process::Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U", // update if it already exists
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            &keychain_account(),
-            "-w",
-            blob,
-        ])
-        .status()
-        .context("running `security`")?;
-    if !status.success() {
-        return Err(anyhow!("`security add-generic-password` failed"));
-    }
-    Ok(())
+    security_framework::passwords::set_generic_password(
+        KEYCHAIN_SERVICE,
+        &keychain_account(),
+        blob.as_bytes(),
+    )
+    .map_err(|e| anyhow!("writing to the keychain: {e}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_read() -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_write(_blob: &str) -> Result<()> {
+    Err(anyhow!("keychain is only supported on macOS"))
 }
 
 fn claude_json_path() -> Result<std::path::PathBuf> {
@@ -518,8 +648,7 @@ fn claude_json_path() -> Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(home).join(".claude.json"))
 }
 
-/// Read the current `oauthAccount` + `userID` from `~/.claude.json` (used at
-/// capture time to snapshot the account's identity).
+/// Read the current `oauthAccount` + `userID` from `~/.claude.json`.
 fn read_claude_identity() -> (Option<serde_json::Value>, Option<String>) {
     let Ok(path) = claude_json_path() else {
         return (None, None);
@@ -535,9 +664,25 @@ fn read_claude_identity() -> (Option<serde_json::Value>, Option<String>) {
     (oauth, uid)
 }
 
+/// Raw bytes of ~/.claude.json, for rollback.
+fn read_claude_json_raw() -> Option<Vec<u8>> {
+    let path = claude_json_path().ok()?;
+    std::fs::read(&path).ok()
+}
+
+/// Restore ~/.claude.json to prior raw bytes (atomic tmp+rename).
+fn restore_claude_json_raw(bytes: &[u8]) -> Result<()> {
+    let path = claude_json_path()?;
+    let tmp = path.with_extension("json.claude-usage.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 /// Patch `~/.claude.json` so its active identity is this account: set
-/// `oauthAccount` and `userID`, and drop the now-stale `cachedUsageUtilization`.
-/// This is the half of a switch that actually changes which account Claude uses.
+/// `oauthAccount`, set or (when unknown) REMOVE `userID`, and drop the stale
+/// `cachedUsageUtilization`. Atomic, preserves the file mode, cleans the tmp on
+/// failure.
 fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str>) -> Result<()> {
     let path = claude_json_path()?;
     let bytes = std::fs::read(&path).context("reading ~/.claude.json")?;
@@ -547,15 +692,22 @@ fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str
         .as_object_mut()
         .ok_or_else(|| anyhow!("~/.claude.json is not a JSON object"))?;
     obj.insert("oauthAccount".into(), oauth_account.clone());
-    if let Some(uid) = user_id {
-        obj.insert("userID".into(), serde_json::Value::String(uid.to_string()));
+    match user_id {
+        Some(uid) => {
+            obj.insert("userID".into(), serde_json::Value::String(uid.to_string()));
+        }
+        // Don't leave the previous account's userID paired with a new identity.
+        None => {
+            obj.remove("userID");
+        }
     }
     obj.remove("cachedUsageUtilization");
-    // Write atomically to avoid corrupting the file if we're interrupted, and
-    // preserve the original file's permissions so we never widen them.
     let json = serde_json::to_vec_pretty(&v)?;
     let tmp = path.with_extension("json.claude-usage.tmp");
-    std::fs::write(&tmp, &json).context("writing ~/.claude.json.tmp")?;
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).context("writing ~/.claude.json.tmp");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -564,61 +716,16 @@ fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str
             .unwrap_or(0o600);
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
     }
-    std::fs::rename(&tmp, &path).context("replacing ~/.claude.json")?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).context("replacing ~/.claude.json");
+    }
     Ok(())
 }
 
-/// Apply an account as the active login: write its keychain token AND its
-/// `~/.claude.json` identity (backfilling the identity from the profile API if
-/// it wasn't captured). Both halves are required for the switch to take effect.
-///
-/// Returns `Some(identity)` when the identity had to be backfilled from the
-/// profile API, so the caller can persist it and avoid future network calls.
-fn apply_account(acct: &Account) -> Result<Option<serde_json::Value>> {
-    keychain_write(&acct.keychain_blob)?;
-    match &acct.oauth_account {
-        Some(v) => {
-            write_claude_identity(v, acct.user_id.as_deref())?;
-            Ok(None)
-        }
-        None => {
-            let built = usage::fetch_profile(&acct.access_token)
-                .as_ref()
-                .and_then(usage::oauth_account_from_profile);
-            match &built {
-                Some(v) => write_claude_identity(v, acct.user_id.as_deref())?,
-                None => eprintln!(
-                    "warning: could not set the account identity in ~/.claude.json \
-                     (re-run `claude-usage capture {}` after logging in)",
-                    acct.name
-                ),
-            }
-            Ok(built)
-        }
-    }
-}
-
-/// Write an account into the keychain + .claude.json and mark it active.
-/// Returns its label. Persists a backfilled identity so later switches never
-/// touch the network.
-fn perform_switch(state: &mut State, name: &str) -> Result<String> {
-    let acct = state
-        .find_mut(name)
-        .with_context(|| format!("no account named '{name}'"))?;
-    oauth::ensure_fresh(acct, REFRESH_SKEW_SECS)?;
-    let acct = acct.clone();
-    let label = acct.email.clone().unwrap_or_else(|| acct.name.clone());
-    let backfilled = apply_account(&acct)?;
-    if let Some(v) = backfilled {
-        if let Some(a) = state.find_mut(name) {
-            a.oauth_account = Some(v);
-        }
-    }
-    state.active = Some(acct.name.clone());
-    state.save()?;
-    logging::log(&format!("switch(auto) -> {}", acct.name));
-    Ok(label)
-}
+// ---------------------------------------------------------------------------
+// Usage refresh (the ONE network path)
+// ---------------------------------------------------------------------------
 
 /// Outcome of a usage refresh.
 struct RefreshOutcome {
@@ -626,46 +733,75 @@ struct RefreshOutcome {
     rate_limited: bool,
 }
 
-/// The ONE place that calls the usage API. Refreshes each account's token (only
-/// if near expiry), fetches usage, and writes it to `cached_usage`. On a 429 or
-/// transient error it KEEPS the existing cache instead of clearing it. Saves the
-/// state and returns whether a rate limit was hit.
-fn refresh_usage_cache(state: &mut State) -> RefreshOutcome {
-    // Keep the active account's stored tokens honest before we call the API.
-    sync_active_from_keychain(state);
-
+/// The ONE place that calls the usage API. Does all network work (token refresh
+/// if near expiry, usage fetch) OUTSIDE the state lock, then takes the lock,
+/// reloads state, merges the fresh tokens + `cached_usage` by email, and saves —
+/// so a concurrent switch is never clobbered. On 429/transient error it KEEPS
+/// the existing cache.
+fn refresh_usage_cache() -> RefreshOutcome {
+    let mut state = match State::load() {
+        Ok(s) => s,
+        Err(e) => {
+            logging::log(&format!("poll: state load failed: {e}"));
+            return RefreshOutcome {
+                rate_limited: false,
+            };
+        }
+    };
+    sync_active_from_keychain(&mut state);
     logging::log("poll: refreshing usage cache");
+
     let mut rate_limited = false;
-    let names: Vec<String> = state.accounts.iter().map(|a| a.name.clone()).collect();
-    for name in &names {
-        let Some(acct) = state.find_mut(name) else {
+    // (email, refreshed account after ensure_fresh, new cached usage or None)
+    let mut updates: Vec<(String, Account, Option<CachedUsage>)> = Vec::new();
+    let emails: Vec<String> = state.accounts.iter().map(|a| a.key().to_string()).collect();
+    for email in &emails {
+        let Some(acct) = state.find(email).cloned() else {
             continue;
         };
-        if let Err(e) = oauth::ensure_fresh(acct, REFRESH_SKEW_SECS) {
+        let mut acct = acct;
+        if let Err(e) = oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
             logging::log(&format!(
-                "token refresh failed for {name}: {e} (keeping cache)"
+                "token refresh failed for {email}: {e} (keeping cache)"
             ));
             continue;
         }
-        let token = acct.access_token.clone();
-        match usage::fetch(&token) {
-            Ok(u) => {
-                let cu = cached_from_usage(&u);
-                if let Some(a) = state.find_mut(name) {
-                    a.cached_usage = Some(cu);
-                }
-                logging::log(&format!("usage ok for {name}"));
-            }
+        let cu = match usage::fetch(&acct.access_token) {
+            Ok(u) => Some(cached_from_usage(&u)),
             Err(usage::FetchError::RateLimited) => {
                 rate_limited = true;
-                logging::log(&format!("usage 429 for {name}; keeping cache"));
+                logging::log(&format!("usage 429 for {email}; keeping cache"));
+                None
             }
             Err(e) => {
-                logging::log(&format!("usage error for {name}: {e}; keeping cache"));
+                logging::log(&format!("usage error for {email}: {e}; keeping cache"));
+                None
+            }
+        };
+        updates.push((email.clone(), acct, cu));
+    }
+
+    // Merge under the lock with a fresh reload so we don't clobber a switch.
+    let merged = with_state_lock(|| {
+        let mut st = State::load()?;
+        for (email, acct, cu) in &updates {
+            if let Some(a) = st.find_mut(email) {
+                a.set_tokens(
+                    acct.access_token.clone(),
+                    acct.refresh_token.clone(),
+                    acct.expires_at,
+                );
+                if let Some(cu) = cu {
+                    a.cached_usage = Some(cu.clone());
+                }
             }
         }
+        st.save()?;
+        Ok(())
+    });
+    if let Err(e) = merged {
+        logging::log(&format!("poll: saving refreshed cache failed: {e:#}"));
     }
-    let _ = state.save();
     logging::log("poll: done");
     RefreshOutcome { rate_limited }
 }
@@ -723,111 +859,110 @@ fn next_interval(current: u64, base: u64, rate_limited: bool) -> u64 {
 
 /// Anti-thrash state carried across watch cycles.
 #[derive(Default)]
-struct SwapGuard {
+pub(crate) struct SwapGuard {
     last_swap: Option<std::time::Instant>,
     left_at: std::collections::HashMap<String, std::time::Instant>,
     stuck_notified: bool,
 }
 
-/// Result of one poll: the current rows, the active account, the swap it made
-/// (if any), and whether it was rate limited. Callers render/log this.
-struct CycleOutcome {
-    rows: Vec<Row>,
-    active: Option<String>,
-    swapped: Option<(String, String)>,
-    rate_limited: bool,
+/// Result of one poll: the swap it made (if any) and the rate-limited flag.
+pub(crate) struct CycleOutcome {
+    pub swapped: Option<(String, String)>,
+    pub rate_limited: bool,
+}
+
+/// A pure auto-swap decision over cached rows. Returns the email to swap to, or
+/// None (with `guard` consulted for cooldown / no-return). Extracted for tests.
+fn choose_swap_target(
+    rows: &[Row],
+    active: &str,
+    trigger: f64,
+    ceiling: f64,
+    guard: &SwapGuard,
+) -> Option<String> {
+    let act = rows.iter().find(|r| r.email == active)?;
+    if !act.has_data() || act.max_pct() < trigger {
+        return None;
+    }
+    if guard
+        .last_swap
+        .map(|t| t.elapsed().as_secs() < SWAP_COOLDOWN_SECS)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let mut candidates: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.has_data() && r.email != active && r.available() && r.max_pct() <= ceiling)
+        .filter(|r| {
+            guard
+                .left_at
+                .get(&r.email)
+                .map(|t| t.elapsed().as_secs() >= NO_RETURN_SECS)
+                .unwrap_or(true)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by(|a, b| candidate_order(a, b));
+    Some(candidates[0].email.clone())
 }
 
 /// Poll usage for every account (the only network path), record history, and
 /// auto-swap away from the active account if it has reached `trigger` and a
 /// healthy target exists. Shared by `claude-usage watch` and the menu-bar poller.
 fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<CycleOutcome> {
-    let mut state = State::load()?;
+    let refresh = refresh_usage_cache();
+    let state = State::load()?;
     if state.accounts.is_empty() {
         return Ok(CycleOutcome {
-            rows: Vec::new(),
-            active: None,
             swapped: None,
-            rate_limited: false,
+            rate_limited: refresh.rate_limited,
         });
     }
-    let refresh = refresh_usage_cache(&mut state);
     let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
     append_history(&rows, state.active.as_deref());
 
     let active = state.active.clone();
     let mut swapped = None;
 
-    'decide: {
-        let Some(active_name) = active.clone() else {
-            break 'decide;
-        };
-        // Extract the active account's scalars so the borrow of `rows` ends here.
-        let Some((act_nodata, act_max, act_s, act_w)) =
-            rows.iter().find(|r| r.name == active_name).map(|r| {
-                (
-                    !r.has_data(),
-                    r.max_pct(),
-                    r.session.pct.unwrap_or(0.0),
-                    r.weekly.pct.unwrap_or(0.0),
-                )
-            })
-        else {
-            break 'decide;
-        };
-
-        if act_nodata || act_max < trigger {
-            guard.stuck_notified = false;
-            break 'decide;
-        }
-        // Respect the global swap cooldown.
-        if guard
-            .last_swap
-            .map(|t| t.elapsed().as_secs() < SWAP_COOLDOWN_SECS)
-            .unwrap_or(false)
-        {
-            break 'decide;
-        }
-
-        // Eligible targets: healthy headroom, not the active one, not just-left.
-        let pick: Option<(String, f64, f64)> = {
-            let mut candidates: Vec<&Row> = rows
-                .iter()
-                .filter(|r| {
-                    r.has_data() && r.name != active_name && r.available() && r.max_pct() <= ceiling
-                })
-                .filter(|r| {
-                    guard
-                        .left_at
-                        .get(&r.name)
-                        .map(|t| t.elapsed().as_secs() >= NO_RETURN_SECS)
-                        .unwrap_or(true)
-                })
-                .collect();
-            if candidates.is_empty() {
-                None
-            } else {
-                candidates.sort_by(|a, b| {
-                    let ka = a.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
-                    let kb = b.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
-                    ka.cmp(&kb).then(
-                        a.headroom()
-                            .partial_cmp(&b.headroom())
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                    )
-                });
-                let p = candidates[0];
-                Some((
-                    p.name.clone(),
-                    p.session.pct.unwrap_or(0.0),
-                    p.weekly.pct.unwrap_or(0.0),
-                ))
+    if let Some(active_email) = active.clone() {
+        match choose_swap_target(&rows, &active_email, trigger, ceiling, guard) {
+            Some(target) => {
+                let (pick_s, pick_w) = rows
+                    .iter()
+                    .find(|r| r.email == target)
+                    .map(|r| (r.session.pct.unwrap_or(0.0), r.weekly.pct.unwrap_or(0.0)))
+                    .unwrap_or((0.0, 0.0));
+                let label = switch_to(&target)?;
+                guard
+                    .left_at
+                    .insert(active_email.clone(), std::time::Instant::now());
+                guard.last_swap = Some(std::time::Instant::now());
+                guard.stuck_notified = false;
+                log_event(&serde_json::json!({
+                    "ts": Utc::now().timestamp(),
+                    "event": "swap",
+                    "from": active_email,
+                    "to": target,
+                    "session": pick_s,
+                    "weekly": pick_w,
+                }));
+                notify(&format!(
+                    "Switched to {label} — {pick_s:.0}% / {pick_w:.0}%"
+                ));
+                swapped = Some((active_email, target));
             }
-        };
-
-        match pick {
             None => {
-                if !guard.stuck_notified {
+                // If the active account is over trigger but nothing is eligible,
+                // notify once that we're stuck.
+                let act_over = rows
+                    .iter()
+                    .find(|r| r.email == active_email)
+                    .map(|r| r.has_data() && r.max_pct() >= trigger)
+                    .unwrap_or(false);
+                if act_over && !guard.stuck_notified {
                     let soonest = rows
                         .iter()
                         .filter(|r| r.has_data())
@@ -835,48 +970,20 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                         .min()
                         .unwrap_or_else(|| "unknown".to_string());
                     notify(&format!(
-                        "All accounts high — staying on {} ({act_s:.0}%/{act_w:.0}%), soonest reset in {soonest}",
-                        active_label(&state, &active_name),
+                        "All accounts high — staying on {active_email}, soonest reset in {soonest}"
                     ));
                     guard.stuck_notified = true;
+                } else if !act_over {
+                    guard.stuck_notified = false;
                 }
-            }
-            Some((pick_name, pick_s, pick_w)) => {
-                let label = perform_switch(&mut state, &pick_name)?;
-                guard
-                    .left_at
-                    .insert(active_name.clone(), std::time::Instant::now());
-                guard.last_swap = Some(std::time::Instant::now());
-                guard.stuck_notified = false;
-                log_event(&serde_json::json!({
-                    "ts": Utc::now().timestamp(),
-                    "event": "swap",
-                    "from": active_name,
-                    "to": pick_name,
-                    "session": pick_s,
-                    "weekly": pick_w,
-                }));
-                notify(&format!(
-                    "Switched to {label} — {pick_s:.0}% / {pick_w:.0}%"
-                ));
-                swapped = Some((active_name.clone(), pick_name));
             }
         }
     }
 
     Ok(CycleOutcome {
-        rows,
-        active,
         swapped,
         rate_limited: refresh.rate_limited,
     })
-}
-
-fn active_label(state: &State, name: &str) -> String {
-    state
-        .find(name)
-        .and_then(|a| a.email.clone())
-        .unwrap_or_else(|| name.to_string())
 }
 
 /// Fire a native macOS notification (best effort).
@@ -892,14 +999,24 @@ fn notify(msg: &str) {
 // History logging + reporting
 // ---------------------------------------------------------------------------
 
+/// Rotate a log file once it grows past this size (~1 MB).
+const HISTORY_MAX_BYTES: u64 = 1_000_000;
+
 fn history_path() -> Result<std::path::PathBuf> {
     Ok(store::config_dir()?.join("history.jsonl"))
 }
 
 fn log_event(v: &serde_json::Value) {
+    use std::io::Write;
     let Ok(path) = history_path() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
+    }
+    // Rotate if it has grown too large (keep one previous generation).
+    if let Ok(m) = std::fs::metadata(&path) {
+        if m.len() > HISTORY_MAX_BYTES {
+            let _ = std::fs::rename(&path, path.with_extension("jsonl.1"));
+        }
     }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -918,8 +1035,8 @@ fn append_history(rows: &[Row], active: Option<&str>) {
         }
         log_event(&serde_json::json!({
             "ts": ts,
-            "account": r.name,
-            "active": active == Some(r.name.as_str()),
+            "account": r.email,
+            "active": active == Some(r.email.as_str()),
             "session": r.session.pct,
             "weekly": r.weekly.pct,
         }));
@@ -956,7 +1073,6 @@ fn cmd_report(_args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // Consumption = positive change in the active account's session% over time.
     let mut active: Vec<&Sample> = samples
         .iter()
         .filter(|s| s.event.is_none() && s.active == Some(true))
@@ -970,8 +1086,7 @@ fn cmd_report(_args: &[String]) -> Result<()> {
         if let (Some(p), Some(cur)) = (prev.and_then(|p| p.session), s.session) {
             let delta = cur - p;
             if delta > 0.0 {
-                let dt = Local.timestamp_opt(s.ts, 0).single();
-                if let Some(dt) = dt {
+                if let Some(dt) = Local.timestamp_opt(s.ts, 0).single() {
                     by_weekday[dt.weekday().num_days_from_monday() as usize] += delta;
                     by_hour[dt.hour() as usize] += delta;
                 }
@@ -980,7 +1095,6 @@ fn cmd_report(_args: &[String]) -> Result<()> {
         prev = Some(s);
     }
 
-    // Per-account peak weekly utilization.
     let mut peak: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
     for s in &samples {
         if let (Some(a), Some(w)) = (&s.account, s.weekly) {
@@ -994,8 +1108,12 @@ fn cmd_report(_args: &[String]) -> Result<()> {
         .iter()
         .filter(|s| s.event.as_deref() == Some("swap"))
         .count();
-    let span_start = Local.timestamp_opt(samples.first().unwrap().ts, 0).single();
-    let span_end = Local.timestamp_opt(samples.last().unwrap().ts, 0).single();
+    let span_start = samples
+        .first()
+        .and_then(|s| Local.timestamp_opt(s.ts, 0).single());
+    let span_end = samples
+        .last()
+        .and_then(|s| Local.timestamp_opt(s.ts, 0).single());
 
     println!("\nUsage report");
     if let (Some(a), Some(b)) = (span_start, span_end) {
@@ -1018,8 +1136,8 @@ fn cmd_report(_args: &[String]) -> Result<()> {
     print_bars(&hours, &by_hour);
 
     println!("\nPeak weekly utilization per account:");
-    for (name, p) in &peak {
-        println!("  {:<14} {}", name, bar(Some(*p)));
+    for (email, p) in &peak {
+        println!("  {:<28} {}", email, bar(Some(*p)));
     }
     let maxpeak = peak.values().cloned().fold(0.0_f64, f64::max);
     println!();
@@ -1059,10 +1177,8 @@ fn plist_path() -> Result<std::path::PathBuf> {
 
 fn cmd_install() -> Result<()> {
     let exe = std::env::current_exe().context("locating this binary")?;
-    let dir = store::config_dir()?;
-    std::fs::create_dir_all(&dir)?;
-    let out_log = dir.join("watch.out.log");
-    let err_log = dir.join("watch.err.log");
+    // No StandardOut/ErrorPath: the app has its own rotated ~/.config log; letting
+    // launchd capture stdout/stderr would accumulate an uncapped file forever.
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1076,15 +1192,11 @@ fn cmd_install() -> Result<()> {
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>{out}</string>
-  <key>StandardErrorPath</key><string>{err}</string>
 </dict>
 </plist>
 "#,
         label = LAUNCHD_LABEL,
         exe = exe.display(),
-        out = out_log.display(),
-        err = err_log.display(),
     );
     let path = plist_path()?;
     if let Some(p) = path.parent() {
@@ -1092,7 +1204,6 @@ fn cmd_install() -> Result<()> {
     }
     std::fs::write(&path, plist).context("writing LaunchAgent plist")?;
 
-    // Reload if already present, then start.
     let _ = std::process::Command::new("launchctl")
         .args(["unload", &path.to_string_lossy()])
         .status();
@@ -1104,7 +1215,10 @@ fn cmd_install() -> Result<()> {
         bail!("launchctl load failed for {}", path.display());
     }
     println!("Installed and started the claude-usage menu bar app — it now runs at every login.");
-    println!("Logs: {}", err_log.display());
+    println!(
+        "Logs: {}",
+        store::config_dir()?.join("claude-usage.log").display()
+    );
     Ok(())
 }
 
@@ -1128,8 +1242,8 @@ fn render_table(rows: &[Row], active: Option<&str>) {
     let has_opus = rows.iter().any(|r| r.opus.is_some());
     println!();
     let mut header = format!(
-        "{:<2} {:<12} {:<26} {:<22} {:<11}",
-        "", "ACCOUNT", "EMAIL", "SESSION (5h)", "RESETS IN"
+        "{:<2} {:<28} {:<22} {:<11}",
+        "", "ACCOUNT", "SESSION (5h)", "RESETS IN"
     );
     header.push_str(&format!("  {:<22} {:<11}", "WEEKLY (7d)", "RESETS IN"));
     if has_opus {
@@ -1140,23 +1254,21 @@ fn render_table(rows: &[Row], active: Option<&str>) {
     println!("{}", "-".repeat(header.len()));
 
     for r in rows {
-        let marker = if active == Some(r.name.as_str()) {
+        let marker = if active == Some(r.email.as_str()) {
             "▶"
         } else {
             " "
         };
         if !r.has_data() {
             println!(
-                "{marker}  {:<12} {:<26} no data yet (run the menu-bar app or `claude-usage watch`)",
-                r.name,
-                truncate(&r.email, 26),
+                "{marker}  {:<28} no data yet (run the menu-bar app or `claude-usage watch`)",
+                truncate(&r.email, 28),
             );
             continue;
         }
         let mut line = format!(
-            "{marker}  {:<12} {:<26} {:<22} {:<11}",
-            r.name,
-            truncate(&r.email, 26),
+            "{marker}  {:<28} {:<22} {:<11}",
+            truncate(&r.email, 28),
             bar(r.session.pct),
             r.session.resets_in(),
         );
@@ -1189,7 +1301,7 @@ fn age_str(fetched_at: Option<i64>) -> String {
     let Some(ts) = fetched_at else {
         return "never".to_string();
     };
-    let secs = Utc::now().timestamp() - ts;
+    let secs = Utc::now().timestamp().saturating_sub(ts);
     if secs < 0 {
         "just now".to_string()
     } else if secs < 60 {
@@ -1241,40 +1353,6 @@ fn truncate(s: &str, max: usize) -> String {
         t.push('…');
         t
     }
-}
-
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
-
-fn email_suffix(acct: &Account) -> String {
-    match &acct.email {
-        Some(e) => format!(" ({e})"),
-        None => String::new(),
-    }
-}
-
-fn resolve_name(name: Option<&String>) -> Result<String> {
-    if let Some(n) = name {
-        return Ok(n.clone());
-    }
-    let state = State::load()?;
-    match state.accounts.as_slice() {
-        [only] => Ok(only.name.clone()),
-        [] => bail!("no accounts; capture one with: claude-usage capture <name>"),
-        _ => bail!("multiple accounts; specify one by name"),
-    }
-}
-
-#[allow(dead_code)]
-fn prompt(msg: &str) -> Result<String> {
-    print!("{msg}");
-    std::io::stdout().flush().ok();
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_line(&mut buf)
-        .context("reading input")?;
-    Ok(buf.trim_end_matches(['\n', '\r']).to_string())
 }
 
 #[cfg(test)]

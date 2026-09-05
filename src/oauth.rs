@@ -28,11 +28,8 @@ pub fn refresh(acct: &mut Account) -> Result<bool> {
         "client_id": config::CLIENT_ID,
     });
     let tok = post_token(&body).context("refreshing access token")?;
-    acct.set_tokens(
-        tok.access_token,
-        tok.refresh_token,
-        now_millis() + tok.expires_in * 1000,
-    );
+    let expires_at = now_millis().saturating_add(tok.expires_in.saturating_mul(1000));
+    acct.set_tokens(tok.access_token, tok.refresh_token, expires_at);
     Ok(true)
 }
 
@@ -54,9 +51,10 @@ fn post_token(body: &serde_json::Value) -> Result<TokenResponse> {
         Ok(r) => r
             .into_json::<TokenResponse>()
             .context("parsing token response"),
-        Err(ureq::Error::Status(code, r)) => {
-            let text = r.into_string().unwrap_or_default();
-            Err(anyhow!("token endpoint returned HTTP {code}: {text}"))
+        Err(ureq::Error::Status(code, _r)) => {
+            // Don't include the raw response body — it can echo submitted request
+            // data and ends up in the debug log. The status code is enough.
+            Err(anyhow!("token endpoint returned HTTP {code}"))
         }
         Err(e) => Err(anyhow!("token request failed: {e}")),
     }

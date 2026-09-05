@@ -11,17 +11,20 @@ fn blob(access: &str, refresh: &str, expires: i64) -> String {
     .to_string()
 }
 
-fn acct(name: &str) -> Account {
-    Account::from_keychain_blob(name.to_string(), &blob("acc", "ref", 123)).unwrap()
+/// An account keyed by `email`.
+fn acct(email: &str) -> Account {
+    let mut a = Account::from_keychain_blob(&blob("acc", "ref", 123)).unwrap();
+    a.email = Some(email.to_string());
+    a
 }
 
 #[test]
 fn from_keychain_blob_parses_valid() {
-    let a = Account::from_keychain_blob("work".to_string(), &blob("tok", "rt", 999)).unwrap();
-    assert_eq!(a.name, "work");
+    let a = Account::from_keychain_blob(&blob("tok", "rt", 999)).unwrap();
     assert_eq!(a.access_token, "tok");
     assert_eq!(a.refresh_token, "rt");
     assert_eq!(a.expires_at, 999);
+    assert!(a.email.is_none());
     assert!(a.oauth_account.is_none());
     assert!(a.user_id.is_none());
 }
@@ -32,30 +35,30 @@ fn from_keychain_blob_missing_expires_defaults_zero() {
         "claudeAiOauth": { "accessToken": "t", "refreshToken": "r" }
     })
     .to_string();
-    let a = Account::from_keychain_blob("x".to_string(), &b).unwrap();
+    let a = Account::from_keychain_blob(&b).unwrap();
     assert_eq!(a.expires_at, 0);
 }
 
 #[test]
 fn from_keychain_blob_rejects_non_json() {
-    assert!(Account::from_keychain_blob("x".to_string(), "not json").is_err());
+    assert!(Account::from_keychain_blob("not json").is_err());
 }
 
 #[test]
 fn from_keychain_blob_rejects_missing_oauth_object() {
     let b = serde_json::json!({ "somethingElse": {} }).to_string();
-    assert!(Account::from_keychain_blob("x".to_string(), &b).is_err());
+    assert!(Account::from_keychain_blob(&b).is_err());
 }
 
 #[test]
 fn from_keychain_blob_rejects_missing_access_token() {
     let b = serde_json::json!({ "claudeAiOauth": { "refreshToken": "r" } }).to_string();
-    assert!(Account::from_keychain_blob("x".to_string(), &b).is_err());
+    assert!(Account::from_keychain_blob(&b).is_err());
 }
 
 #[test]
 fn set_tokens_updates_fields_and_patches_blob() {
-    let mut a = Account::from_keychain_blob("x".to_string(), &blob("old", "oldr", 1)).unwrap();
+    let mut a = Account::from_keychain_blob(&blob("old", "oldr", 1)).unwrap();
     a.set_tokens("new".to_string(), "newr".to_string(), 42);
     assert_eq!(a.access_token, "new");
     assert_eq!(a.refresh_token, "newr");
@@ -70,73 +73,110 @@ fn set_tokens_updates_fields_and_patches_blob() {
 }
 
 #[test]
-fn find_is_case_insensitive() {
-    let mut s = State::default();
-    s.accounts.push(acct("Personal"));
-    assert!(s.find("personal").is_some());
-    assert!(s.find("PERSONAL").is_some());
-    assert!(s.find("Personal").is_some());
-    assert!(s.find("other").is_none());
+fn identity_uuid_reads_oauth_account() {
+    let mut a = acct("x@e.com");
+    assert!(a.identity_uuid().is_none());
+    a.oauth_account = Some(serde_json::json!({ "accountUuid": "u-123" }));
+    assert_eq!(a.identity_uuid().as_deref(), Some("u-123"));
 }
 
 #[test]
-fn find_mut_is_case_insensitive() {
+fn find_is_case_insensitive_by_email() {
     let mut s = State::default();
-    s.accounts.push(acct("Work"));
-    assert!(s.find_mut("work").is_some());
-    assert!(s.find_mut("nope").is_none());
+    s.accounts.push(acct("Person@Example.com"));
+    assert!(s.find("person@example.com").is_some());
+    assert!(s.find("PERSON@EXAMPLE.COM").is_some());
+    assert!(s.find("other@example.com").is_none());
 }
 
 #[test]
-fn remove_is_case_insensitive() {
+fn find_mut_is_case_insensitive_by_email() {
     let mut s = State::default();
-    s.accounts.push(acct("Dev1"));
-    assert!(s.remove("dev1"));
+    s.accounts.push(acct("work@e.com"));
+    assert!(s.find_mut("WORK@e.com").is_some());
+    assert!(s.find_mut("nope@e.com").is_none());
+}
+
+#[test]
+fn remove_is_case_insensitive_by_email() {
+    let mut s = State::default();
+    s.accounts.push(acct("dev@e.com"));
+    assert!(s.remove("DEV@e.com"));
     assert!(s.accounts.is_empty());
-    assert!(!s.remove("dev1"));
+    assert!(!s.remove("dev@e.com"));
 }
 
 #[test]
-fn upsert_replaces_existing_and_keeps_stored_casing() {
+fn upsert_replaces_existing_by_email() {
     let mut s = State::default();
-    s.accounts.push(acct("Personal"));
-    let mut replacement = acct("personal");
+    s.accounts.push(acct("me@e.com"));
+    let mut replacement = acct("ME@e.com");
     replacement.access_token = "rotated".to_string();
     s.upsert(replacement);
-
     assert_eq!(s.accounts.len(), 1);
-    let a = &s.accounts[0];
-    assert_eq!(a.name, "Personal"); // stored casing preserved
-    assert_eq!(a.access_token, "rotated"); // contents replaced
+    assert_eq!(s.accounts[0].access_token, "rotated");
 }
 
 #[test]
 fn upsert_appends_new_account() {
     let mut s = State::default();
-    s.accounts.push(acct("Personal"));
-    s.upsert(acct("Work"));
+    s.accounts.push(acct("a@e.com"));
+    s.upsert(acct("b@e.com"));
     assert_eq!(s.accounts.len(), 2);
-    assert!(s.find("work").is_some());
+    assert!(s.find("b@e.com").is_some());
 }
 
 #[test]
-fn rename_changes_name_and_active_case_insensitively() {
+fn resolve_exact_and_unique_prefix() {
     let mut s = State::default();
-    s.accounts.push(acct("Personal"));
-    s.active = Some("Personal".to_string());
-    s.rename("personal", "Home").unwrap();
-    assert_eq!(s.accounts[0].name, "Home");
-    assert_eq!(s.active.as_deref(), Some("Home"));
+    s.accounts.push(acct("dev@getbusbar.com"));
+    s.accounts.push(acct("matthew@pq.io"));
+    // Exact (case-insensitive).
+    assert_eq!(s.resolve("DEV@getbusbar.com").unwrap(), "dev@getbusbar.com");
+    // Unique prefix.
+    assert_eq!(s.resolve("dev").unwrap(), "dev@getbusbar.com");
+    assert_eq!(s.resolve("matt").unwrap(), "matthew@pq.io");
 }
 
 #[test]
-fn rename_rejects_missing_empty_and_collision() {
+fn resolve_ambiguous_and_missing_error() {
     let mut s = State::default();
-    s.accounts.push(acct("Personal"));
-    s.accounts.push(acct("Work"));
-    assert!(s.rename("nope", "X").is_err()); // missing source
-    assert!(s.rename("Personal", "  ").is_err()); // empty target
-    assert!(s.rename("Personal", "work").is_err()); // collides (case-insensitive)
-                                                    // A pure case change of the same account is allowed.
-    assert!(s.rename("personal", "PERSONAL").is_ok());
+    s.accounts.push(acct("dev1@e.com"));
+    s.accounts.push(acct("dev2@e.com"));
+    assert!(s.resolve("dev").is_err()); // ambiguous
+    assert!(s.resolve("nobody").is_err()); // no match
+    assert!(s.resolve("").is_err()); // empty
+}
+
+#[test]
+fn migrates_old_name_keyed_state() {
+    // Old shape: accounts have `name`, and `active` is a name.
+    let old = serde_json::json!({
+        "accounts": [
+            {
+                "name": "dev1",
+                "email": "dev@getbusbar.com",
+                "access_token": "a1",
+                "refresh_token": "r1",
+                "expires_at": 1,
+                "keychain_blob": "{}"
+            },
+            {
+                "name": "Personal",
+                "oauth_account": { "emailAddress": "matthew@pq.io", "accountUuid": "u1" },
+                "access_token": "a2",
+                "refresh_token": "r2",
+                "expires_at": 2,
+                "keychain_blob": "{}"
+            }
+        ],
+        "active": "Personal"
+    });
+    let s = State::from_value(&old);
+    assert_eq!(s.accounts.len(), 2);
+    assert_eq!(s.find("dev@getbusbar.com").unwrap().access_token, "a1");
+    // email backfilled from oauth_account.emailAddress
+    assert!(s.find("matthew@pq.io").is_some());
+    // active migrated from the legacy name to that account's email
+    assert_eq!(s.active.as_deref(), Some("matthew@pq.io"));
 }

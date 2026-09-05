@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Check usage / limits across multiple Claude Max accounts, and switch between them."
 
@@ -17,12 +17,14 @@ ureq = { version = "2", features = ["json", "tls"] }
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+fs2 = "0.4"
 tray-icon = "0.24.2"
 tao = "0.37.0"
 
-# macOS: set the app's activation policy to Accessory (menu-bar only, no Dock
-# icon) at runtime. These crates are already in the tree via tray-icon/tao.
+# macOS: keychain access via Security.framework (no token in argv), and set the
+# app's activation policy to Accessory (menu-bar only, no Dock icon) at runtime.
 [target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
 

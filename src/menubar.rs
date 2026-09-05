@@ -1,7 +1,7 @@
 //! macOS menu-bar app: shows the active account's usage in the status bar and
-//! lets you switch / rename / remove accounts and toggle the auto-swap daemon
-//! from a dropdown. The same `watch_cycle` that powers `claude-usage watch`
-//! runs on a background thread here, so the daemon behaviour is identical.
+//! lets you switch / capture / remove accounts and set the auto-swap threshold
+//! from a dropdown. The same `watch_cycle` that powers `claude-usage watch` runs
+//! on a background thread here, so the daemon behaviour is identical.
 //!
 //! Usage numbers come from the cache (written by the scheduler poll); the UI
 //! never fetches on its own, so menu interactions can't trigger HTTP 429s.
@@ -16,10 +16,11 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-use crate::store::{Account, State};
+use crate::store::State;
 use crate::{
-    keychain_read, next_interval, notify, perform_switch, row_from_account, watch_cycle, Row,
-    SwapGuard, TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
+    age_str, capture_current, next_interval, notify, remove_account, row_from_account, switch_to,
+    watch_cycle, with_state_lock, Row, SwapGuard, TARGET_CEILING_PCT, TRIGGER_PCT,
+    WATCH_INTERVAL_SECS,
 };
 
 /// Name shown for our Login Item in System Events.
@@ -35,11 +36,14 @@ enum UserEvent {
 
 /// One account as shown in the menu.
 struct AcctView {
-    name: String,
-    label: String,
+    email: String,
     session: Option<f64>,
     weekly: Option<f64>,
-    resets_in: String,
+    opus: Option<f64>,
+    session_reset: String,
+    weekly_reset: String,
+    opus_reset: String,
+    updated: String,
     active: bool,
     has_data: bool,
 }
@@ -100,7 +104,7 @@ pub fn run() -> Result<()> {
                 // launched as the bare binary rather than the .app bundle.
                 set_accessory_activation_policy();
 
-                let snap = snapshot.lock().unwrap();
+                let snap = lock_snapshot(&snapshot);
                 last_sig = menu_signature(&snap);
                 last_title = title_for(&snap);
                 let built = TrayIconBuilder::new()
@@ -117,7 +121,7 @@ pub fn run() -> Result<()> {
             }
             Event::UserEvent(UserEvent::Refresh) => {
                 if let Some(t) = &tray {
-                    let snap = snapshot.lock().unwrap();
+                    let snap = lock_snapshot(&snapshot);
                     let sig = menu_signature(&snap);
                     if sig != last_sig {
                         t.set_menu(Some(Box::new(build_menu(&snap))));
@@ -135,6 +139,12 @@ pub fn run() -> Result<()> {
             _ => {}
         }
     });
+}
+
+/// Lock the shared snapshot, recovering from a poisoned mutex rather than
+/// panicking (kept consistent across all three threads).
+fn lock_snapshot(snapshot: &Arc<Mutex<Snapshot>>) -> std::sync::MutexGuard<'_, Snapshot> {
+    snapshot.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Make this a background app (menu-bar only, no Dock icon). tao 0.37 exposes no
@@ -161,13 +171,16 @@ fn poll_loop(
     let base = WATCH_INTERVAL_SECS;
     let mut current = base;
     loop {
-        let (snap, rate_limited) = do_poll(&mut guard);
-        if let Ok(mut s) = snapshot.lock() {
+        // Compute the snapshot BEFORE taking the lock (State::load + osascript are
+        // blocking; holding the lock across them would stall the main thread).
+        let rate_limited = run_cycle(&mut guard);
+        let snap = build_snapshot();
+        {
+            let mut s = lock_snapshot(&snapshot);
             *s = snap;
         }
         let _ = proxy.send_event(UserEvent::Refresh);
         current = next_interval(current, base, rate_limited);
-        // Wake early if the UI requested an immediate refresh.
         match poll_rx.recv_timeout(Duration::from_secs(current)) {
             Ok(_) | Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
@@ -175,54 +188,40 @@ fn poll_loop(
     }
 }
 
-fn do_poll(guard: &mut SwapGuard) -> (Snapshot, bool) {
+/// Run one poll+auto-swap cycle; returns whether it was rate limited.
+fn run_cycle(guard: &mut SwapGuard) -> bool {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
-    let start_at_login = login_item_enabled();
-
-    let (rows, active, rate_limited) = match watch_cycle(trigger, TARGET_CEILING_PCT, guard) {
-        Ok(o) => (o.rows, o.active, o.rate_limited),
+    match watch_cycle(trigger, TARGET_CEILING_PCT, guard) {
+        Ok(o) => o.rate_limited,
         Err(e) => {
             crate::logging::log(&format!("menubar poll failed: {e}"));
-            (Vec::new(), None, false)
+            false
         }
-    };
-
-    let accounts = rows.iter().map(|r| acctview_from_row(r, &active)).collect();
-    (
-        Snapshot {
-            accounts,
-            autoswap,
-            threshold,
-            start_at_login,
-        },
-        rate_limited,
-    )
+    }
 }
 
 fn acctview_from_row(r: &Row, active: &Option<String>) -> AcctView {
     AcctView {
-        name: r.name.clone(),
-        label: if r.email.is_empty() {
-            r.name.clone()
-        } else {
-            r.email.clone()
-        },
+        email: r.email.clone(),
         session: r.session.pct,
         weekly: r.weekly.pct,
-        resets_in: r.weekly.resets_in(),
-        active: active.as_deref() == Some(r.name.as_str()),
+        opus: r.opus.as_ref().and_then(|c| c.pct),
+        session_reset: r.session.resets_in(),
+        weekly_reset: r.weekly.resets_in(),
+        opus_reset: r.opus.as_ref().map(|c| c.resets_in()).unwrap_or_default(),
+        updated: age_str(r.fetched_at),
+        active: active.as_deref() == Some(r.email.as_str()),
         has_data: r.has_data(),
     }
 }
 
-/// Rebuild the snapshot from local State only (no network), reading each
-/// account's cached usage. Used to react instantly to external state changes
-/// such as a CLI `claude-usage switch`.
-fn light_snapshot() -> Snapshot {
+/// Build the UI snapshot from local State only (no network), reading each
+/// account's cached usage. Used after a poll and to react to external changes.
+fn build_snapshot() -> Snapshot {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
@@ -232,7 +231,6 @@ fn light_snapshot() -> Snapshot {
         .iter()
         .map(|a| acctview_from_row(&row_from_account(a), &active))
         .collect();
-
     Snapshot {
         accounts,
         autoswap,
@@ -242,7 +240,7 @@ fn light_snapshot() -> Snapshot {
 }
 
 /// Watch the state file's mtime; on change, do a local-only refresh so a CLI
-/// switch (or a menu rename/remove) shows within a second or two.
+/// switch (or a menu remove) shows within a second or two.
 fn watch_state_file(snapshot: Arc<Mutex<Snapshot>>, proxy: EventLoopProxy<UserEvent>) {
     let path = match crate::store::config_dir() {
         Ok(d) => d.join("state.json"),
@@ -255,8 +253,10 @@ fn watch_state_file(snapshot: Arc<Mutex<Snapshot>>, proxy: EventLoopProxy<UserEv
         let cur = mtime();
         if cur != last {
             last = cur;
-            if let Ok(mut s) = snapshot.lock() {
-                *s = light_snapshot();
+            let snap = build_snapshot();
+            {
+                let mut s = lock_snapshot(&snapshot);
+                *s = snap;
             }
             let _ = proxy.send_event(UserEvent::Refresh);
         }
@@ -273,8 +273,8 @@ fn build_menu(snap: &Snapshot) -> Menu {
     match snap.accounts.iter().find(|a| a.active) {
         Some(a) => {
             add(&menu, MenuItem::with_id("hdr", header_line(a), false, None));
-            if !a.resets_in.is_empty() {
-                let line = format!("weekly resets in {}", a.resets_in);
+            if !a.weekly_reset.is_empty() {
+                let line = format!("weekly resets in {}", a.weekly_reset);
                 add(&menu, MenuItem::with_id("hdr2", line, false, None));
             }
         }
@@ -291,73 +291,83 @@ fn build_menu(snap: &Snapshot) -> Menu {
             MenuItem::with_id("none", "Capture a login below to begin", false, None),
         );
     }
+    // One submenu per account: switch / stats / remove.
     for a in &snap.accounts {
-        let usage = if a.has_data {
-            format!("S {} / W {}", pct(a.session), pct(a.weekly))
-        } else {
-            "no data yet".to_string()
-        };
-        let text = format!("{}   {}", a.label, usage);
-        add_check(
-            &menu,
-            CheckMenuItem::with_id(format!("acct:{}", a.name), text, true, a.active, None),
+        let head = format!(
+            "{}{}   {} / {}",
+            if a.active { "✓ " } else { "" },
+            a.email,
+            pct(a.session),
+            pct(a.weekly)
         );
+        let sub = Submenu::with_id(format!("sub:{}", a.email), head, true);
+        if a.active {
+            let _ = sub.append(&MenuItem::with_id("noop", "✓ Active", false, None));
+        } else {
+            let _ = sub.append(&MenuItem::with_id(
+                format!("acct:{}", a.email),
+                "Switch to this account",
+                true,
+                None,
+            ));
+        }
+        let _ = sub.append(&PredefinedMenuItem::separator());
+        if a.has_data {
+            let _ = sub.append(&stat_item("Session", a.session, &a.session_reset));
+            let _ = sub.append(&stat_item("Weekly", a.weekly, &a.weekly_reset));
+            if a.opus.is_some() {
+                let _ = sub.append(&stat_item("Opus", a.opus, &a.opus_reset));
+            }
+            let _ = sub.append(&MenuItem::with_id(
+                "noop",
+                format!("updated {}", a.updated),
+                false,
+                None,
+            ));
+        } else {
+            let _ = sub.append(&MenuItem::with_id("noop", "no data yet", false, None));
+        }
+        let _ = sub.append(&PredefinedMenuItem::separator());
+        let _ = sub.append(&MenuItem::with_id(
+            format!("remove:{}", a.email),
+            "Remove…",
+            true,
+            None,
+        ));
+        let _ = menu.append(&sub);
     }
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    add_check(
-        &menu,
-        CheckMenuItem::with_id(
-            "autoswap",
-            "Auto-swap at high usage",
-            true,
-            snap.autoswap,
-            None,
-        ),
-    );
-    let sub = Submenu::with_id(
-        "thresh",
-        format!("Swap threshold: {:.0}%", snap.threshold),
+    // Auto-swap: one submenu, Off / 90 / 95 / 98.
+    let cur = if snap.autoswap {
+        snap.threshold.round() as i32
+    } else {
+        0
+    };
+    let swap = Submenu::with_id("autoswap", "Auto-swap at high usage", true);
+    let _ = swap.append(&CheckMenuItem::with_id(
+        "autoswap:off",
+        "Off",
         true,
-    );
+        cur == 0,
+        None,
+    ));
     for t in [90i32, 95, 98] {
-        let checked = snap.threshold.round() as i32 == t;
-        let _ = sub.append(&CheckMenuItem::with_id(
-            format!("thresh:{t}"),
+        let _ = swap.append(&CheckMenuItem::with_id(
+            format!("autoswap:{t}"),
             format!("{t}%"),
             true,
-            checked,
+            cur == t,
             None,
         ));
     }
-    let _ = menu.append(&sub);
+    let _ = menu.append(&swap);
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     add(
         &menu,
         MenuItem::with_id("capture", "Capture current login…", true, None),
     );
-    // Per-account rename / remove submenus.
-    if !snap.accounts.is_empty() {
-        let ren = Submenu::with_id("rename", "Rename account", true);
-        let rem = Submenu::with_id("remove", "Remove account", true);
-        for a in &snap.accounts {
-            let _ = ren.append(&MenuItem::with_id(
-                format!("rename:{}", a.name),
-                format!("{}…", a.name),
-                true,
-                None,
-            ));
-            let _ = rem.append(&MenuItem::with_id(
-                format!("remove:{}", a.name),
-                format!("{}…", a.name),
-                true,
-                None,
-            ));
-        }
-        let _ = menu.append(&ren);
-        let _ = menu.append(&rem);
-    }
     add(
         &menu,
         MenuItem::with_id("refresh", "Refresh now", true, None),
@@ -382,12 +392,18 @@ fn build_menu(snap: &Snapshot) -> Menu {
             None,
         ),
     );
-    add(
-        &menu,
-        MenuItem::with_id("quit", "Quit claude-usage", true, None),
-    );
+    add(&menu, MenuItem::with_id("quit", "Quit", true, None));
 
     menu
+}
+
+fn stat_item(label: &str, pct_val: Option<f64>, reset: &str) -> MenuItem {
+    let text = if reset.is_empty() {
+        format!("{label}  {}", pct(pct_val))
+    } else {
+        format!("{label}  {}  · resets in {reset}", pct(pct_val))
+    };
+    MenuItem::with_id("noop", text, false, None)
 }
 
 /// A stable fingerprint of everything the menu renders. When it's unchanged we
@@ -396,13 +412,16 @@ fn menu_signature(snap: &Snapshot) -> String {
     let mut s = String::new();
     for a in &snap.accounts {
         s.push_str(&format!(
-            "{}|{}|{}|{}|{}|{};",
-            a.name,
-            a.label,
+            "{}|{}|{}|{}|{}|{}|rs={}|rw={}|u={};",
+            a.email,
             a.active,
             a.has_data,
             a.session.map(|v| v.round() as i64).unwrap_or(-1),
             a.weekly.map(|v| v.round() as i64).unwrap_or(-1),
+            a.opus.map(|v| v.round() as i64).unwrap_or(-1),
+            a.session_reset,
+            a.weekly_reset,
+            a.updated,
         ));
     }
     s.push_str(&format!(
@@ -413,7 +432,7 @@ fn menu_signature(snap: &Snapshot) -> String {
 }
 
 fn header_line(a: &AcctView) -> String {
-    format!("{}  ·  S {} / W {}", a.label, pct(a.session), pct(a.weekly))
+    format!("{}  ·  S {} / W {}", a.email, pct(a.session), pct(a.weekly))
 }
 
 fn add(menu: &Menu, item: MenuItem) {
@@ -441,7 +460,7 @@ fn tooltip_for(snap: &Snapshot) -> String {
     match snap.accounts.iter().find(|a| a.active) {
         Some(a) => format!(
             "{} — session {}, weekly {}",
-            a.label,
+            a.email,
             pct(a.session),
             pct(a.weekly)
         ),
@@ -463,35 +482,34 @@ fn handle_click(id: &str, poll_tx: &mpsc::Sender<()>, control_flow: &mut Control
     // within ~1s without any network call. Only "Refresh now" forces a poll.
     match id {
         "quit" => *control_flow = ControlFlow::Exit,
+        "noop" => {}
         "refresh" => {
             let _ = poll_tx.send(());
         }
-        "autoswap" => toggle_autoswap(),
+        "autoswap:off" => set_autoswap(false),
         "startlogin" => toggle_login_item(),
-        "capture" => {
-            if let Some(name) = ask_name("Name this account (e.g. work, personal):") {
-                if let Err(e) = do_capture(&name) {
-                    notify(&format!("Capture failed: {e}"));
-                }
-            }
-        }
+        "capture" => match capture_current() {
+            Ok((email, existed)) => notify(&format!(
+                "{} {email}",
+                if existed { "Refreshed" } else { "Captured" }
+            )),
+            Err(e) => notify(&format!("Capture failed: {e}")),
+        },
         _ => {
-            if let Some(t) = id.strip_prefix("thresh:") {
+            if let Some(t) = id.strip_prefix("autoswap:") {
                 if let Ok(v) = t.parse::<f64>() {
-                    set_threshold(v);
+                    set_autoswap_threshold(v);
                 }
-            } else if let Some(name) = id.strip_prefix("acct:") {
-                switch_to(name);
-            } else if let Some(name) = id.strip_prefix("rename:") {
-                if let Some(new) = ask_name(&format!("Rename '{name}' to:")) {
-                    if let Err(e) = do_rename(name, &new) {
-                        notify(&format!("Rename failed: {e}"));
-                    }
+            } else if let Some(email) = id.strip_prefix("acct:") {
+                match switch_to(email) {
+                    Ok(label) => notify(&format!("Switched to {label}")),
+                    Err(e) => notify(&format!("Switch failed: {e}")),
                 }
-            } else if let Some(name) = id.strip_prefix("remove:") {
-                if confirm(&format!("Remove account '{name}'? This cannot be undone.")) {
-                    if let Err(e) = do_remove(name) {
-                        notify(&format!("Remove failed: {e}"));
+            } else if let Some(email) = id.strip_prefix("remove:") {
+                if confirm(&format!("Remove account {email}? This cannot be undone.")) {
+                    match remove_account(email) {
+                        Ok(_) => notify(&format!("Removed {email}")),
+                        Err(e) => notify(&format!("Remove failed: {e}")),
                     }
                 }
             }
@@ -499,68 +517,34 @@ fn handle_click(id: &str, poll_tx: &mpsc::Sender<()>, control_flow: &mut Control
     }
 }
 
-fn toggle_autoswap() {
-    if let Ok(mut st) = State::load() {
-        st.autoswap_disabled = !st.autoswap_disabled;
-        let _ = st.save();
+/// Enable or disable auto-swap. Surfaces a save failure so the menu checkmark
+/// and on-disk state can't silently disagree.
+fn set_autoswap(enabled: bool) {
+    let r = with_state_lock(|| {
+        let mut st = State::load()?;
+        st.autoswap_disabled = !enabled;
+        st.save()
+    });
+    if let Err(e) = r {
+        notify(&format!("Could not save auto-swap setting: {e}"));
     }
 }
 
-fn set_threshold(v: f64) {
-    if let Ok(mut st) = State::load() {
+/// Set the swap threshold AND enable auto-swap.
+fn set_autoswap_threshold(v: f64) {
+    let r = with_state_lock(|| {
+        let mut st = State::load()?;
         st.trigger_pct = Some(v);
-        let _ = st.save();
+        st.autoswap_disabled = false;
+        st.save()
+    });
+    if let Err(e) = r {
+        notify(&format!("Could not save threshold: {e}"));
     }
-}
-
-fn switch_to(name: &str) {
-    if let Ok(mut st) = State::load() {
-        match perform_switch(&mut st, name) {
-            Ok(label) => notify(&format!("Switched to {label}")),
-            Err(e) => notify(&format!("Switch failed: {e}")),
-        }
-    }
-}
-
-fn do_capture(name: &str) -> Result<()> {
-    let blob = keychain_read()
-        .ok_or_else(|| anyhow::anyhow!("no claude.ai login found in the keychain"))?;
-    let mut acct = Account::from_keychain_blob(name.to_string(), &blob)?;
-    acct.email = crate::usage::fetch_email(&acct.access_token);
-    let label = acct.email.clone().unwrap_or_else(|| name.to_string());
-    let mut st = State::load()?;
-    st.upsert(acct);
-    st.active = Some(name.to_string());
-    st.save()?;
-    notify(&format!("Captured {label}"));
-    Ok(())
-}
-
-fn do_rename(old: &str, new: &str) -> Result<()> {
-    let mut st = State::load()?;
-    st.rename(old, new)?;
-    st.save()?;
-    notify(&format!("Renamed to {}", new.trim()));
-    Ok(())
-}
-
-fn do_remove(name: &str) -> Result<()> {
-    let mut st = State::load()?;
-    if st.remove(name) {
-        if st
-            .active
-            .as_deref()
-            .is_some_and(|a| a.eq_ignore_ascii_case(name))
-        {
-            st.active = None;
-        }
-        st.save()?;
-        notify(&format!("Removed {name}"));
-    }
-    Ok(())
 }
 
 /// Ask for a line of text with a native dialog. None if cancelled/empty.
+#[allow(dead_code)]
 fn ask_name(prompt: &str) -> Option<String> {
     let script =
         format!("display dialog {prompt:?} default answer \"\" with title \"claude-usage\"");
