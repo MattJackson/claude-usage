@@ -1,0 +1,13 @@
+# Rust build output
+/target
+
+# Distribution / packaged app bundles
+/dist
+*.app
+
+# Editor / OS cruft
+**/*.rs.bk
+.DS_Store
+scratch/
+
+# Note: Cargo.lock IS committed (this is a binary crate).

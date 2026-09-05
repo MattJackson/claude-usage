@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: claude-usage
+
+jobs:
+  release:
+    name: Build universal macOS binary and publish release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Both Apple architectures so we can lipo a universal binary.
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (aarch64 + x86_64)
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Package binaries
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+
+          # Per-arch tarballs.
+          for arch in aarch64 x86_64; do
+            tar -C "target/${arch}-apple-darwin/release" -czf \
+              "dist/${BIN}-${version}-${arch}-apple-darwin.tar.gz" "${BIN}"
+          done
+
+          # Universal (fat) binary via lipo.
+          lipo -create -output "dist/${BIN}" \
+            "target/aarch64-apple-darwin/release/${BIN}" \
+            "target/x86_64-apple-darwin/release/${BIN}"
+          tar -C dist -czf "dist/${BIN}-${version}-universal-apple-darwin.tar.gz" "${BIN}"
+          rm -f "dist/${BIN}"
+
+          # Checksums: a per-asset .sha256 (consumed by the self-update
+          # feature, which verifies before replacing the binary) plus a
+          # combined SHA256SUMS manifest.
+          cd dist
+          for f in *.tar.gz; do
+            shasum -a 256 "$f" > "${f}.sha256"
+          done
+          shasum -a 256 *.tar.gz > SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/SHA256SUMS
