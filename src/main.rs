@@ -7,7 +7,6 @@ mod config;
 mod menubar;
 mod oauth;
 mod store;
-mod update;
 mod usage;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -56,7 +55,6 @@ fn run() -> Result<()> {
         #[cfg(target_os = "macos")]
         Some("menubar") => menubar::run(),
         Some("report") => cmd_report(&args[1..]),
-        Some("update") => cmd_update(),
         Some("install") => cmd_install(),
         Some("uninstall") => cmd_uninstall(),
         Some("rm") | Some("remove") => cmd_rm(args.get(1)),
@@ -87,7 +85,6 @@ fn print_help() {
          claude-usage install           Run the menu-bar app at every login (via launchd)\n  \
          claude-usage uninstall         Stop running the menu-bar app at login\n  \
          claude-usage report            Usage patterns by weekday / hour / account\n  \
-         claude-usage update            Update to the latest release from GitHub\n  \
          claude-usage rm <name>         Forget an account\n\n\
          With no [name], switch/start/continue auto-pick the account that has room\n  \
          and whose weekly limit resets soonest (use it before the quota resets).\n\n\
@@ -118,6 +115,11 @@ fn cmd_capture(name: Option<&String>) -> Result<()> {
         .context("no claude.ai login found in the keychain — run `claude` and /login first")?;
     let mut acct = Account::from_keychain_blob(name.clone(), &blob)?;
     acct.email = usage::fetch_email(&acct.access_token);
+    // Snapshot the account identity Claude stores in ~/.claude.json, so a later
+    // switch can restore it (the keychain token alone doesn't set the account).
+    let (oauth_account, user_id) = read_claude_identity();
+    acct.oauth_account = oauth_account;
+    acct.user_id = user_id;
 
     let mut state = State::load()?;
     state.upsert(acct);
@@ -179,15 +181,16 @@ fn cmd_switch(name: Option<&str>, launch: Option<Launch>) -> Result<()> {
         .with_context(|| format!("no account named '{name}'"))?;
     // Make sure we hand Claude a token that isn't about to expire.
     oauth::ensure_fresh(acct, REFRESH_SKEW_SECS)?;
-    let blob = acct.keychain_blob.clone();
-    let label = format!("{}{}", acct.name, email_suffix(acct));
+    let acct = acct.clone();
+    let label = format!("{}{}", acct.name, email_suffix(&acct));
 
-    keychain_write(&blob).context("writing the account into the keychain")?;
-    state.active = Some(name.clone());
+    apply_account(&acct).context("switching the active account")?;
+    state.active = Some(acct.name.clone());
     state.save()?;
 
     println!("Active login is now '{label}'.");
-    println!("Running `claude` sessions will use it on their next request.");
+    println!("New `claude` sessions will use it. Already-running sessions keep their");
+    println!("current account until they're restarted.");
 
     match launch {
         None => Ok(()),
@@ -484,16 +487,85 @@ fn keychain_write(blob: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write an account into the keychain and mark it active. Returns its label.
+fn claude_json_path() -> Result<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(std::path::PathBuf::from(home).join(".claude.json"))
+}
+
+/// Read the current `oauthAccount` + `userID` from `~/.claude.json` (used at
+/// capture time to snapshot the account's identity).
+fn read_claude_identity() -> (Option<serde_json::Value>, Option<String>) {
+    let Ok(path) = claude_json_path() else {
+        return (None, None);
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return (None, None);
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return (None, None);
+    };
+    let oauth = v.get("oauthAccount").cloned();
+    let uid = v.get("userID").and_then(|u| u.as_str()).map(String::from);
+    (oauth, uid)
+}
+
+/// Patch `~/.claude.json` so its active identity is this account: set
+/// `oauthAccount` and `userID`, and drop the now-stale `cachedUsageUtilization`.
+/// This is the half of a switch that actually changes which account Claude uses.
+fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str>) -> Result<()> {
+    let path = claude_json_path()?;
+    let bytes = std::fs::read(&path).context("reading ~/.claude.json")?;
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&bytes).context("parsing ~/.claude.json")?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("~/.claude.json is not a JSON object"))?;
+    obj.insert("oauthAccount".into(), oauth_account.clone());
+    if let Some(uid) = user_id {
+        obj.insert("userID".into(), serde_json::Value::String(uid.to_string()));
+    }
+    obj.remove("cachedUsageUtilization");
+    // Write atomically to avoid corrupting the file if we're interrupted.
+    let json = serde_json::to_vec_pretty(&v)?;
+    let tmp = path.with_extension("json.claude-usage.tmp");
+    std::fs::write(&tmp, &json).context("writing ~/.claude.json.tmp")?;
+    std::fs::rename(&tmp, &path).context("replacing ~/.claude.json")?;
+    Ok(())
+}
+
+/// Apply an account as the active login: write its keychain token AND its
+/// `~/.claude.json` identity (backfilling the identity from the profile API if
+/// it wasn't captured). Both halves are required for the switch to take effect.
+fn apply_account(acct: &Account) -> Result<()> {
+    keychain_write(&acct.keychain_blob)?;
+    let identity = match &acct.oauth_account {
+        Some(v) => Some(v.clone()),
+        None => usage::fetch_profile(&acct.access_token)
+            .as_ref()
+            .and_then(usage::oauth_account_from_profile),
+    };
+    match identity {
+        Some(v) => write_claude_identity(&v, acct.user_id.as_deref())?,
+        None => eprintln!(
+            "warning: could not set the account identity in ~/.claude.json \
+             (re-run `claude-usage capture {}` after logging in)",
+            acct.name
+        ),
+    }
+    Ok(())
+}
+
+/// Write an account into the keychain + .claude.json and mark it active.
+/// Returns its label.
 fn perform_switch(state: &mut State, name: &str) -> Result<String> {
     let acct = state
         .find_mut(name)
         .with_context(|| format!("no account named '{name}'"))?;
     oauth::ensure_fresh(acct, REFRESH_SKEW_SECS)?;
-    let blob = acct.keychain_blob.clone();
+    let acct = acct.clone();
     let label = acct.email.clone().unwrap_or_else(|| acct.name.clone());
-    keychain_write(&blob)?;
-    state.active = Some(name.to_string());
+    apply_account(&acct)?;
+    state.active = Some(acct.name.clone());
     state.save()?;
     Ok(label)
 }
@@ -554,9 +626,6 @@ struct CycleOutcome {
 /// active account if it has reached `trigger` and a healthy target exists.
 /// Shared by the CLI `watch` loop and the menu-bar poller so they can't diverge.
 fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<CycleOutcome> {
-    // Once a day, self-update in the background (may re-exec and never return).
-    maybe_daily_update();
-
     let mut state = State::load()?;
     if state.accounts.is_empty() {
         return Ok(CycleOutcome {
@@ -695,56 +764,6 @@ fn active_label(state: &State, name: &str) -> String {
         .find(name)
         .and_then(|a| a.email.clone())
         .unwrap_or_else(|| name.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// self-update
-// ---------------------------------------------------------------------------
-
-/// Check GitHub and update to the latest release now (one-shot CLI command).
-fn cmd_update() -> Result<()> {
-    match update::run_update(false)? {
-        update::Outcome::Updated(v) => {
-            println!("Updated to v{v}. Restart any running claude-usage to pick it up.");
-        }
-        update::Outcome::UpToDate => {
-            println!("Already up to date (v{}).", update::current_version());
-        }
-    }
-    Ok(())
-}
-
-/// At most once per 24h, check for a newer release and — if auto-update is
-/// enabled — install it and re-exec onto the new version. Best-effort: any
-/// failure is swallowed so it never disrupts the daemon.
-fn maybe_daily_update() {
-    let Ok(mut state) = State::load() else {
-        return;
-    };
-    let now = Utc::now().timestamp();
-    if let Some(last) = state.last_update_check {
-        if now - last < 86_400 {
-            return;
-        }
-    }
-    state.last_update_check = Some(now);
-    let _ = state.save();
-
-    if state.autoupdate_disabled {
-        return;
-    }
-    match update::check_latest() {
-        Ok(Some(_)) => match update::run_update(true) {
-            Ok(update::Outcome::Updated(v)) => {
-                notify(&format!("Updated to v{v} — relaunching"));
-                update::relaunch();
-            }
-            Ok(update::Outcome::UpToDate) => {}
-            Err(e) => eprintln!("auto-update failed: {e:#}"),
-        },
-        Ok(None) => {}
-        Err(e) => eprintln!("update check failed: {e:#}"),
-    }
 }
 
 /// Fire a native macOS notification (best effort).

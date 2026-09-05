@@ -64,3 +64,43 @@ pub fn fetch_email(access_token: &str) -> Option<String> {
     let a = p.account?;
     a.email.or(a.email_address)
 }
+
+/// Fetch the raw profile JSON (`account`, `organization`, ...).
+pub fn fetch_profile(access_token: &str) -> Option<serde_json::Value> {
+    ureq::get(config::PROFILE_URL)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .set("anthropic-beta", config::OAUTH_BETA)
+        .set("anthropic-version", "2023-06-01")
+        .call()
+        .ok()?
+        .into_json()
+        .ok()
+}
+
+/// Build an `oauthAccount` object (the shape Claude Code stores in
+/// `~/.claude.json`) from a profile response. Used to backfill the identity for
+/// accounts captured before we started snapshotting it. Claude refreshes the
+/// remaining fields (e.g. `profileFetchedAt`) on its next profile fetch.
+pub fn oauth_account_from_profile(profile: &serde_json::Value) -> Option<serde_json::Value> {
+    let acct = profile.get("account")?;
+    let org = profile.get("organization");
+    let get = |v: Option<&serde_json::Value>, k: &str| {
+        v.and_then(|o| o.get(k))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    Some(serde_json::json!({
+        "accountUuid": get(Some(acct), "uuid"),
+        "emailAddress": get(Some(acct), "email"),
+        "displayName": get(Some(acct), "display_name"),
+        "fullName": get(Some(acct), "full_name"),
+        "accountCreatedAt": get(Some(acct), "created_at"),
+        "organizationUuid": get(org, "uuid"),
+        "organizationName": get(org, "name"),
+        "organizationType": get(org, "organization_type"),
+        "organizationRateLimitTier": get(org, "rate_limit_tier"),
+        "billingType": get(org, "billing_type"),
+        "hasExtraUsageEnabled": get(org, "has_extra_usage_enabled"),
+        "subscriptionCreatedAt": get(org, "subscription_created_at"),
+    }))
+}

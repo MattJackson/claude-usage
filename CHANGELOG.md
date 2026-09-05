@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-05
+
+### Fixed
+- **Switching now actually changes the active account.** A switch also writes the
+  `oauthAccount` identity in `~/.claude.json` (not just the Keychain token), which
+  is what Claude Code uses to select the account. `capture` snapshots this
+  identity; existing accounts are backfilled from the profile API on switch.
+- Account names are matched case-insensitively (`personal` == `Personal`).
+
+### Changed
+- Removed in-app auto-update; upgrades are handled by `brew upgrade`.
+- Menu bar: percent-only title showing the **session** (5h) utilization, a version
+  line, "Launch at login" clarified, and instant refresh when the active account
+  changes from the CLI.
+- Switch messaging clarified: new `claude` sessions use the account; already-running
+  sessions keep theirs until restarted.
+
 ## [0.1.1] - 2026-09-05
 
 ### Changed
@@ -40,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/MattJackson/claude-usage/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/MattJackson/claude-usage/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/MattJackson/claude-usage/releases/tag/v0.1.0

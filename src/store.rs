@@ -23,6 +23,14 @@ pub struct Account {
     pub expires_at: i64,
     /// The verbatim keychain value: `{"claudeAiOauth":{...}}`.
     pub keychain_blob: String,
+    /// The `oauthAccount` object from `~/.claude.json` at capture time. This is
+    /// the identity Claude Code actually uses for the active account, so a switch
+    /// must restore it alongside the keychain token.
+    #[serde(default)]
+    pub oauth_account: Option<serde_json::Value>,
+    /// The `userID` from `~/.claude.json` at capture time.
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 impl Account {
@@ -51,6 +59,8 @@ impl Account {
             refresh_token,
             expires_at,
             keychain_blob: blob.trim().to_string(),
+            oauth_account: None,
+            user_id: None,
         })
     }
 
@@ -83,12 +93,6 @@ pub struct State {
     /// Menu-bar: swap trigger threshold percent (defaults to 95).
     #[serde(default)]
     pub trigger_pct: Option<f64>,
-    /// Auto-update is on unless this is set (defaults to enabled).
-    #[serde(default)]
-    pub autoupdate_disabled: bool,
-    /// Unix epoch seconds of the last background update check.
-    #[serde(default)]
-    pub last_update_check: Option<i64>,
 }
 
 pub fn config_dir() -> Result<PathBuf> {
@@ -126,11 +130,15 @@ impl State {
     }
 
     pub fn find(&self, name: &str) -> Option<&Account> {
-        self.accounts.iter().find(|a| a.name == name)
+        self.accounts
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(name))
     }
 
     pub fn find_mut(&mut self, name: &str) -> Option<&mut Account> {
-        self.accounts.iter_mut().find(|a| a.name == name)
+        self.accounts
+            .iter_mut()
+            .find(|a| a.name.eq_ignore_ascii_case(name))
     }
 
     pub fn upsert(&mut self, acct: Account) {
@@ -145,7 +153,7 @@ impl State {
 
     pub fn remove(&mut self, name: &str) -> bool {
         let before = self.accounts.len();
-        self.accounts.retain(|a| a.name != name);
+        self.accounts.retain(|a| !a.name.eq_ignore_ascii_case(name));
         self.accounts.len() != before
     }
 }

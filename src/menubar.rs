@@ -11,7 +11,7 @@ use std::time::Duration;
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::store::{Account, State};
 use crate::{
@@ -49,7 +49,6 @@ struct Snapshot {
     autoswap: bool,
     threshold: f64,
     start_at_login: bool,
-    autoupdate: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -79,6 +78,14 @@ pub fn run() -> Result<()> {
         std::thread::spawn(move || poll_loop(snapshot, proxy, poll_rx));
     }
 
+    // React quickly to external State changes (e.g. a CLI `claude-usage switch`)
+    // by watching the state file's mtime and doing a local-only refresh.
+    {
+        let snapshot = snapshot.clone();
+        let proxy = proxy.clone();
+        std::thread::spawn(move || watch_state_file(snapshot, proxy));
+    }
+
     // The tray must be created on the main thread once the app is initialised.
     let mut tray: Option<TrayIcon> = None;
     event_loop.run(move |event, _, control_flow| {
@@ -88,7 +95,6 @@ pub fn run() -> Result<()> {
                 let snap = snapshot.lock().unwrap();
                 let built = TrayIconBuilder::new()
                     .with_menu(Box::new(build_menu(&snap)))
-                    .with_icon(build_icon())
                     .with_title(title_for(&snap))
                     .build();
                 match built {
@@ -140,7 +146,6 @@ fn poll_loop(
 fn do_poll(guard: &mut SwapGuard) -> Snapshot {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
-    let autoupdate = !st.autoupdate_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
@@ -177,7 +182,63 @@ fn do_poll(guard: &mut SwapGuard) -> Snapshot {
         autoswap,
         threshold,
         start_at_login,
-        autoupdate,
+    }
+}
+
+/// Rebuild the snapshot from local State only (no network), carrying over
+/// last-known usage numbers from `prev`. Used to react instantly to external
+/// state changes such as a CLI `claude-usage switch`.
+fn light_snapshot(prev: &Snapshot) -> Snapshot {
+    let st = State::load().unwrap_or_default();
+    let autoswap = !st.autoswap_disabled;
+    let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
+    let accounts = st
+        .accounts
+        .iter()
+        .map(|a| {
+            let prior = prev.accounts.iter().find(|p| p.name == a.name);
+            AcctView {
+                name: a.name.clone(),
+                label: a.email.clone().unwrap_or_else(|| a.name.clone()),
+                session: prior.and_then(|p| p.session),
+                weekly: prior.and_then(|p| p.weekly),
+                resets_in: prior.map(|p| p.resets_in.clone()).unwrap_or_default(),
+                active: st.active.as_deref() == Some(a.name.as_str()),
+                max_pct: prior.map(|p| p.max_pct).unwrap_or(0.0),
+                error: prior.and_then(|p| p.error.clone()),
+            }
+        })
+        .collect();
+
+    Snapshot {
+        accounts,
+        autoswap,
+        threshold,
+        // Reflect the actual registered login-item state, not a stale copy.
+        start_at_login: login_item_enabled(),
+    }
+}
+
+/// Watch the state file's mtime; on change, do a local-only refresh so a CLI
+/// switch shows in the menu within a second or two.
+fn watch_state_file(snapshot: Arc<Mutex<Snapshot>>, proxy: EventLoopProxy<UserEvent>) {
+    let path = match crate::store::config_dir() {
+        Ok(d) => d.join("state.json"),
+        Err(_) => return,
+    };
+    let mtime = || std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let mut last = mtime();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let cur = mtime();
+        if cur != last {
+            last = cur;
+            if let Ok(mut s) = snapshot.lock() {
+                let new = light_snapshot(&s);
+                *s = new;
+            }
+            let _ = proxy.send_event(UserEvent::Refresh);
+        }
     }
 }
 
@@ -258,25 +319,26 @@ fn build_menu(snap: &Snapshot) -> Menu {
         &menu,
         MenuItem::with_id("refresh", "Refresh now", true, None),
     );
-    add(
-        &menu,
-        MenuItem::with_id("update", "Check for updates…", true, None),
-    );
-    add_check(
-        &menu,
-        CheckMenuItem::with_id("autoupdate", "Auto-update", true, snap.autoupdate, None),
-    );
     add_check(
         &menu,
         CheckMenuItem::with_id(
             "startlogin",
-            "Start at login",
+            "Launch at login",
             true,
             snap.start_at_login,
             None,
         ),
     );
     let _ = menu.append(&PredefinedMenuItem::separator());
+    add(
+        &menu,
+        MenuItem::with_id(
+            "version",
+            format!("claude-usage v{}", env!("CARGO_PKG_VERSION")),
+            false,
+            None,
+        ),
+    );
     add(
         &menu,
         MenuItem::with_id("quit", "Quit claude-usage", true, None),
@@ -299,7 +361,11 @@ fn add_check(menu: &Menu, item: CheckMenuItem) {
 
 fn title_for(snap: &Snapshot) -> String {
     match snap.accounts.iter().find(|a| a.active) {
-        Some(a) if a.error.is_none() => format!("{:.0}%", a.max_pct),
+        // Session (5h) matters most day to day; fall back to weekly, then max.
+        Some(a) if a.error.is_none() => {
+            let p = a.session.or(a.weekly).unwrap_or(a.max_pct);
+            format!("{p:.0}%")
+        }
         Some(_) => "!".to_string(),
         None => "—".to_string(),
     }
@@ -322,27 +388,6 @@ fn pct(p: Option<f64>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-/// A small filled circle in Claude's terracotta, shown left of the title.
-fn build_icon() -> Icon {
-    let size = 20u32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    let c = size as f32 / 2.0 - 0.5;
-    let r = size as f32 / 2.0 - 1.0;
-    for y in 0..size {
-        for x in 0..size {
-            let (dx, dy) = (x as f32 - c, y as f32 - c);
-            if dx * dx + dy * dy <= r * r {
-                let i = ((y * size + x) * 4) as usize;
-                rgba[i] = 0xD9;
-                rgba[i + 1] = 0x77;
-                rgba[i + 2] = 0x57;
-                rgba[i + 3] = 0xFF;
-            }
-        }
-    }
-    Icon::from_rgba(rgba, size, size).expect("valid tray icon")
-}
-
 // ---------------------------------------------------------------------------
 // Click handling
 // ---------------------------------------------------------------------------
@@ -361,11 +406,6 @@ fn handle_click(id: &str, poll_tx: &mpsc::Sender<()>, control_flow: &mut Control
             toggle_login_item();
             let _ = poll_tx.send(());
         }
-        "autoupdate" => {
-            toggle_autoupdate();
-            let _ = poll_tx.send(());
-        }
-        "update" => check_for_updates(),
         "capture" => {
             if let Some(name) = ask_name() {
                 if let Err(e) = do_capture(&name) {
@@ -392,24 +432,6 @@ fn toggle_autoswap() {
     if let Ok(mut st) = State::load() {
         st.autoswap_disabled = !st.autoswap_disabled;
         let _ = st.save();
-    }
-}
-
-fn toggle_autoupdate() {
-    if let Ok(mut st) = State::load() {
-        st.autoupdate_disabled = !st.autoupdate_disabled;
-        let _ = st.save();
-    }
-}
-
-fn check_for_updates() {
-    match crate::update::run_update(false) {
-        Ok(crate::update::Outcome::Updated(v)) => {
-            notify(&format!("Updated to v{v} — relaunching"));
-            crate::update::relaunch();
-        }
-        Ok(crate::update::Outcome::UpToDate) => notify("claude-usage is up to date"),
-        Err(e) => notify(&format!("Update failed: {e}")),
     }
 }
 
