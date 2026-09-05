@@ -610,12 +610,31 @@ fn keychain_account() -> String {
     std::env::var("USER").unwrap_or_else(|_| "claude".to_string())
 }
 
+// NOTE: we use the `security` CLI rather than the Security.framework
+// (`security-framework`) API on purpose. SecItem access from this unsigned,
+// brew-installed binary makes macOS prompt on every launch (an unsigned binary
+// has no stable identity for "Always Allow" to pin to). The CLI path doesn't
+// prompt. The only downside is the write blob appears in `security`'s argv,
+// which is LOW risk under this tool's single-user threat model. TODO: switch
+// back to security-framework once we ship a code-signed (Developer ID) build,
+// where "Always Allow" persists.
 #[cfg(target_os = "macos")]
 fn keychain_read() -> Option<String> {
-    let bytes =
-        security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, &keychain_account())
-            .ok()?;
-    let s = String::from_utf8_lossy(&bytes).trim().to_string();
+    let out = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            &keychain_account(),
+            "-w",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() {
         None
     } else {
@@ -625,12 +644,23 @@ fn keychain_read() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn keychain_write(blob: &str) -> Result<()> {
-    security_framework::passwords::set_generic_password(
-        KEYCHAIN_SERVICE,
-        &keychain_account(),
-        blob.as_bytes(),
-    )
-    .map_err(|e| anyhow!("writing to the keychain: {e}"))
+    let status = std::process::Command::new("security")
+        .args([
+            "add-generic-password",
+            "-U", // update if it already exists
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            &keychain_account(),
+            "-w",
+            blob,
+        ])
+        .status()
+        .context("running `security`")?;
+    if !status.success() {
+        return Err(anyhow!("`security add-generic-password` failed"));
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]

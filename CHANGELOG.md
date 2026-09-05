@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-05
+
+### Fixed
+- Keychain access reverted to the `security` CLI. v0.1.5's Security.framework
+  (`security-framework`) call made macOS prompt for Keychain access on every launch
+  from the unsigned brew binary; the CLI path doesn't prompt. (The write blob is
+  visible in `security`'s argv — LOW risk under the single-user threat model. This
+  will move back to Security.framework once the app ships code-signed.)
+
+### Removed
+- Dead `ask_name` menu helper (capture/remove no longer prompt for a name) and the
+  now-unused `security-framework` dependency.
+
 ## [0.1.5] - 2026-09-05
 
 ### Changed
@@ -128,7 +141,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/MattJackson/claude-usage/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/MattJackson/claude-usage/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/MattJackson/claude-usage/compare/v0.1.2...v0.1.4
 [0.1.2]: https://github.com/MattJackson/claude-usage/compare/v0.1.1...v0.1.2

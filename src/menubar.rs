@@ -543,28 +543,6 @@ fn set_autoswap_threshold(v: f64) {
     }
 }
 
-/// Ask for a line of text with a native dialog. None if cancelled/empty.
-#[allow(dead_code)]
-fn ask_name(prompt: &str) -> Option<String> {
-    let script =
-        format!("display dialog {prompt:?} default answer \"\" with title \"claude-usage\"");
-    let out = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None; // cancelled
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let name = s.split("text returned:").nth(1)?.trim().to_string();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
-}
-
 /// A native confirm dialog; true only if the user clicks the destructive button.
 fn confirm(question: &str) -> bool {
     let script = format!(
