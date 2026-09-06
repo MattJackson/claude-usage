@@ -44,7 +44,9 @@ anything. Building from source is covered [below](#from-source).
 - [CLI](#cli)
 - [Auto-swap](#auto-swap)
 - [How it works](#how-it-works)
+- [Contributing](#contributing)
 - [Security](#security)
+- [Changelog](#changelog)
 - [License](#license)
 
 ## Why
@@ -190,8 +192,16 @@ runs inside the menu-bar app (so `claude-usage install` keeps it on), or headles
   tokens are re-synced from the Keychain (with an identity check, so a `/login` into
   a different account can't corrupt a stored one).
 
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow
+(branch/PR against `dev`) and ground rules, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+for community expectations. CI runs `cargo fmt --check`, `cargo clippy`, and
+`cargo test` on macOS on every push and pull request.
+
 ## Security
 
+- To report a vulnerability privately, see [SECURITY.md](SECURITY.md).
 - Tokens live locally in `~/.config/claude-usage/state.json` (owner-only, `0600`)
   and the macOS Keychain, accessed via the `security` CLI. Under the single-user
   threat model this tool assumes, that CLI briefly places the token blob in its own
@@ -202,6 +212,10 @@ runs inside the menu-bar app (so `claude-usage install` keeps it on), or headles
 - If `ANTHROPIC_API_KEY` is set in your environment, Claude Code uses that and
   ignores the Keychain login — so account switching won't take effect until it's
   unset. `claude-usage` manages subscription (OAuth) logins, not API keys.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## License
 
