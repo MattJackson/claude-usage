@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-05
+
+### Changed
+- **CI/release actions bumped off Node.js 20.** `actions/checkout` (→ v7.0.1),
+  `actions/attest-build-provenance` (→ v4.2.2), and `softprops/action-gh-release`
+  (→ v3.0.3) now run on Node.js 24, clearing GitHub's Node 20 deprecation warnings.
+  All remain pinned to commit SHAs. No binary changes.
+
 ## [0.3.0] - 2026-09-05
 
 ### Added
