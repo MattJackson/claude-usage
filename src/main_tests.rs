@@ -90,6 +90,7 @@ fn cell(pct: Option<f64>) -> Cell {
 
 fn row(session: Option<f64>, weekly: Option<f64>) -> Row {
     Row {
+        provider_id: CLAUDE_SLUG.to_string(),
         email: "x@e.com".to_string(),
         session: cell(session),
         weekly: cell(weekly),
@@ -101,7 +102,20 @@ fn row(session: Option<f64>, weekly: Option<f64>) -> Row {
 
 /// A row with an email and a weekly reset time, for pick/order tests.
 fn row_full(email: &str, session: f64, weekly: f64, weekly_reset: DateTime<Utc>) -> Row {
+    row_full_with_provider(CLAUDE_SLUG, email, session, weekly, weekly_reset)
+}
+
+/// Like `row_full`, but with an explicit provider slug — for tests that need
+/// to verify the swap-capability gate on non-Claude / unregistered slugs.
+fn row_full_with_provider(
+    provider_id: &str,
+    email: &str,
+    session: f64,
+    weekly: f64,
+    weekly_reset: DateTime<Utc>,
+) -> Row {
     Row {
+        provider_id: provider_id.to_string(),
         email: email.to_string(),
         session: Cell {
             pct: Some(session),
@@ -366,6 +380,57 @@ fn choose_swap_target_respects_cooldown() {
 }
 
 #[test]
+fn choose_swap_target_skips_target_whose_provider_is_unregistered() {
+    // A row tagged with a provider slug that isn't in the registry (a stub /
+    // reporting-only agent that phase 4+ hasn't wired up yet) must NOT be
+    // selected as a swap target, even if its usage looks great.
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full_with_provider("no-such-provider", "free@e.com", 5.0, 5.0, reset),
+    ];
+    let guard = SwapGuard::default();
+    // Only candidate was filtered by the capability gate → no swap.
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+}
+
+#[test]
+fn choose_swap_target_still_picks_claude_target_after_capability_filter() {
+    // Regression guard for the capability filter: adding it must not have
+    // stopped Claude accounts (the only registered v1 provider) from being
+    // chosen. Baseline swap decision unchanged.
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full("free@e.com", 20.0, 20.0, reset),
+    ];
+    let guard = SwapGuard::default();
+    assert_eq!(
+        choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).as_deref(),
+        Some("free@e.com")
+    );
+}
+
+#[test]
+fn provider_supports_swap_reflects_registered_claude() {
+    // Claude is registered, has both usage and switching → swappable.
+    assert!(provider_supports_swap(CLAUDE_SLUG));
+    // Unknown slugs are treated as non-candidates (safest default).
+    assert!(!provider_supports_swap("nope"));
+}
+
+#[test]
+fn row_from_account_tags_provider_id_claude() {
+    // Every v1-migrated row must carry the "claude" slug so the swap gate
+    // recognizes it. Phase 3 (state v2) replaces this with a bucket lookup.
+    let a = Account::from_keychain_blob(
+        r#"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":0}}"#,
+    )
+    .unwrap();
+    assert_eq!(row_from_account(&a).provider_id, CLAUDE_SLUG);
+}
+
+#[test]
 fn choose_swap_target_skips_ceiling_and_maxed_targets() {
     let reset = Utc::now() + Duration::hours(24);
     let rows = vec![
@@ -421,6 +486,52 @@ fn choose_swap_target_skips_target_whose_weekly_hit_trigger() {
     ];
     let guard = SwapGuard::default();
     assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+}
+
+// --- env-override guard (CLAUDE_CODE_OAUTH_TOKEN) ---
+
+#[test]
+fn choose_swap_target_skips_env_overridden_provider_end_to_end() {
+    // Active is over the trigger and there IS a healthy candidate — without
+    // an env-override, we'd swap to it. With `CLAUDE_CODE_OAUTH_TOKEN`
+    // active on the Claude provider, `claude` ignores whatever token we
+    // write, so any swap is a silent no-op and `watch_cycle` must skip it.
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full("free@e.com", 20.0, 20.0, reset),
+    ];
+    let guard = SwapGuard::default();
+
+    // Baseline sanity: with no override, the swap fires.
+    assert_eq!(
+        choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).as_deref(),
+        Some("free@e.com"),
+        "baseline: without env-override the auto-swap picks free@e.com",
+    );
+
+    // With the override active for `claude`, both the active row's provider
+    // and every candidate row's provider are gated off → no swap.
+    with_env_override_hook(&[CLAUDE_SLUG], || {
+        assert!(
+            choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none(),
+            "env-override active: watch_cycle must NOT swap claude accounts",
+        );
+    });
+}
+
+#[test]
+fn env_override_active_reads_shared_slug_map() {
+    // The hook drives both the menu (via menubar::env_override_for) and the
+    // swap filter — one source of truth for the whole app.
+    assert!(!env_override_active(CLAUDE_SLUG));
+    with_env_override_hook(&[CLAUDE_SLUG], || {
+        assert!(env_override_active(CLAUDE_SLUG));
+        // Unknown / non-Claude slugs are unaffected by the Claude env var.
+        assert!(!env_override_active("codex"));
+    });
+    // Restored on exit.
+    assert!(!env_override_active(CLAUDE_SLUG));
 }
 
 // --- next_interval (backoff) ---

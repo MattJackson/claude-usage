@@ -4,7 +4,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
-use crate::config;
+use super::config;
 use crate::store::Account;
 
 #[derive(Debug, Deserialize)]

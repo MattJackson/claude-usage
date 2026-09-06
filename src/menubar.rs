@@ -5,6 +5,11 @@
 //!
 //! Usage numbers come from the cache (written by the scheduler poll); the UI
 //! never fetches on its own, so menu interactions can't trigger HTTP 429s.
+//!
+//! Menu wiring iterates `providers::all()` and emits one `ProviderSection` per
+//! provider — but only if that provider has at least one captured account in
+//! state (see `build_snapshot`). The "Capture current login ▸" submenu always
+//! shows, with one row per REGISTERED provider (installed or not).
 
 use anyhow::Result;
 use std::cell::RefCell;
@@ -17,34 +22,81 @@ use objc2_foundation::NSTimer;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::TrayIconBuilder;
 
+use crate::providers::{self, SeverityBands};
 use crate::store::State;
 use crate::{
-    age_str, capture_current, menu_order, next_interval, notify, optimize_now, remove_account,
-    row_from_account, switch_to, watch_cycle, with_state_lock, Row, SwapGuard, TARGET_CEILING_PCT,
-    TRIGGER_PCT, WATCH_INTERVAL_SECS,
+    age_str, capture_current, env_override_active, menu_order, next_interval, notify,
+    optimize_now, remove_account, row_from_account, switch_to, watch_cycle, with_state_lock,
+    Row, SwapGuard, CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
 };
 
 /// Name shown for our Login Item in System Events.
 const LOGIN_ITEM_NAME: &str = "Claude Usage";
 
-/// One account as shown in the menu.
+/// Exact title of the disabled section row inserted when a provider's env
+/// override is active. A named constant so `build_menu` and the tests
+/// asserting on the visible menu content can't drift out of sync.
+pub(crate) const ENV_OVERRIDE_ROW_TITLE: &str = "env override active — swap disabled";
+
+/// One rate-limit / quota window as displayed under an account's submenu. `id`
+/// is the provider's own window slug ("session"/"weekly"/"opus" for Claude);
+/// `label` is the short human string ("5h"/"7d"/"Opus 7d").
+#[derive(Clone)]
+struct WindowView {
+    id: String,
+    label: String,
+    pct: Option<f64>,
+    /// Human "resets in X" text, or empty when unknown.
+    reset: String,
+}
+
+/// One account as shown in the menu. Windows are ordered by
+/// `provider.window_order()`; `has_data` gates the stat-row block.
 struct AcctView {
-    email: String,
-    session: Option<f64>,
-    weekly: Option<f64>,
-    opus: Option<f64>,
-    session_reset: String,
-    weekly_reset: String,
-    opus_reset: String,
+    provider_id: &'static str,
+    /// Stable key used inside click ids (`switch:claude:<key>` etc). In v1
+    /// this is the account's email; later phases key on the provider's
+    /// `account_identifier`.
+    key: String,
+    /// Human-facing label rendered in the submenu title.
+    display: String,
+    windows: Vec<WindowView>,
     updated: String,
     active: bool,
     has_data: bool,
 }
 
+/// One provider's block in the menu. Rendered only if `accounts` is non-empty
+/// (per the "section renders only when the provider has at least one captured
+/// account" rule).
+pub(crate) struct ProviderSection {
+    provider_id: &'static str,
+    display_name: &'static str,
+    supports_switching: bool,
+    supports_usage: bool,
+    severity_bands: SeverityBands,
+    /// True when the provider's OAuth env-override is set on this process's
+    /// environment. Surfaced as a disabled row inside the section and used by
+    /// `watch_cycle` to skip that provider entirely.
+    env_override_active: bool,
+    accounts: Vec<AcctView>,
+}
+
+/// Every registered provider's identity, for the always-visible "Capture
+/// current login ▸" submenu. `installed` is a best-effort probe used to grey
+/// out rows whose credential store isn't present on this host; the row stays
+/// clickable so errors surface honestly.
+struct RegisteredProvider {
+    provider_id: &'static str,
+    display_name: &'static str,
+    installed: bool,
+}
+
 /// Everything the UI needs to render, produced by the poller thread.
 #[derive(Default)]
 struct Snapshot {
-    accounts: Vec<AcctView>,
+    sections: Vec<ProviderSection>,
+    registered: Vec<RegisteredProvider>,
     autoswap: bool,
     threshold: f64,
     start_at_login: bool,
@@ -53,17 +105,17 @@ struct Snapshot {
 /// How near a limit a percentage is, for at-a-glance coloring.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Severity {
-    /// >= 80%: approaching the wall.
+    /// >= amber band: approaching the wall.
     Amber,
-    /// >= 95%: about to hit it.
+    /// >= red band: about to hit it.
     Red,
 }
 
-/// Map a utilization percentage to a color band (None below 80%).
-fn severity(p: Option<f64>) -> Option<Severity> {
+/// Map a utilization percentage to a color band given the provider's bands.
+fn severity_with(p: Option<f64>, bands: SeverityBands) -> Option<Severity> {
     match p {
-        Some(v) if v >= 95.0 => Some(Severity::Red),
-        Some(v) if v >= 80.0 => Some(Severity::Amber),
+        Some(v) if v >= bands.red => Some(Severity::Red),
+        Some(v) if v >= bands.amber => Some(Severity::Amber),
         _ => None,
     }
 }
@@ -79,6 +131,8 @@ struct RowStyle {
     plain: String,
     /// Bold the whole row (marks the active account instead of a checkmark).
     bold: bool,
+    /// Whether the row is a section header (bold, disabled, no tab-stop).
+    section_header: bool,
     /// Colored spans: (utf16 offset, utf16 length, band).
     colors: Vec<(usize, usize, Severity)>,
     /// If set, right-align everything after the first `\t` at this x (points),
@@ -96,48 +150,73 @@ fn u16len(s: &str) -> usize {
     s.chars().map(|c| c.len_utf16()).sum()
 }
 
-/// The active-account submenu header: `email \t S% / W%`, bold if active, with
-/// each high percentage colored. This is the single source of the plain title —
-/// `build_menu` uses `.plain` for the submenu title so styling always matches.
-fn header_row(a: &AcctView) -> RowStyle {
-    let s = pct(a.session);
-    let w = pct(a.weekly);
-    let plain = format!("{}\t{s} / {w}", a.email);
-    let mut colors = Vec::new();
-    let s_off = u16len(&a.email) + 1; // + '\t'
-    if let Some(sev) = severity(a.session) {
-        colors.push((s_off, u16len(&s), sev));
+/// Human-facing label for one window row inside an account submenu. Preserves
+/// the v1 "Session"/"Weekly"/"Opus" copy for the Claude windows so a menu that
+/// used to read `Session  85%  · resets in 3h` still does after the refactor.
+/// Unknown window ids fall through to the provider's own short `label` so a
+/// future provider still surfaces something readable.
+fn stat_display_label(w: &WindowView) -> &str {
+    match w.id.as_str() {
+        "session" => "Session",
+        "weekly" => "Weekly",
+        "opus" => "Opus",
+        _ => w.label.as_str(),
     }
-    let w_off = s_off + u16len(&s) + u16len(" / ");
-    if let Some(sev) = severity(a.weekly) {
-        colors.push((w_off, u16len(&w), sev));
+}
+
+/// The first two windows of an account, used to build the two-percentage
+/// summary text in the header rows. `(pct_a, pct_b)` — either may be `None`.
+fn summary_pcts(a: &AcctView) -> (Option<f64>, Option<f64>) {
+    let a0 = a.windows.first().and_then(|w| w.pct);
+    let a1 = a.windows.get(1).and_then(|w| w.pct);
+    (a0, a1)
+}
+
+/// The active-account submenu header: `display \t A% / B%`, bold if active,
+/// with each high percentage colored per the provider's severity bands.
+fn header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
+    let (pa, pb) = summary_pcts(a);
+    let sa = pct(pa);
+    let sb = pct(pb);
+    let plain = format!("{}\t{sa} / {sb}", a.display);
+    let mut colors = Vec::new();
+    let s_off = u16len(&a.display) + 1; // + '\t'
+    if let Some(sev) = severity_with(pa, bands) {
+        colors.push((s_off, u16len(&sa), sev));
+    }
+    let w_off = s_off + u16len(&sa) + u16len(" / ");
+    if let Some(sev) = severity_with(pb, bands) {
+        colors.push((w_off, u16len(&sb), sev));
     }
     RowStyle {
         plain,
         bold: a.active,
+        section_header: false,
         colors,
         tab_x: Some(TAB_X),
     }
 }
 
-/// The top info line for the active account: `email  ·  S% / W%`, percentages
-/// colored (no bold, no tab — it's a disabled header, not a row).
-fn top_header_row(a: &AcctView) -> RowStyle {
-    let s = pct(a.session);
-    let w = pct(a.weekly);
+/// The top info line for the active account: `display  ·  A% / B%`,
+/// percentages colored (no bold, no tab — it's a disabled header, not a row).
+fn top_header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
+    let (pa, pb) = summary_pcts(a);
+    let sa = pct(pa);
+    let sb = pct(pb);
     let plain = header_line(a);
     let mut colors = Vec::new();
-    let s_off = u16len(&a.email) + u16len("  ·  ");
-    if let Some(sev) = severity(a.session) {
-        colors.push((s_off, u16len(&s), sev));
+    let s_off = u16len(&a.display) + u16len("  ·  ");
+    if let Some(sev) = severity_with(pa, bands) {
+        colors.push((s_off, u16len(&sa), sev));
     }
-    let w_off = s_off + u16len(&s) + u16len(" / ");
-    if let Some(sev) = severity(a.weekly) {
-        colors.push((w_off, u16len(&w), sev));
+    let w_off = s_off + u16len(&sa) + u16len(" / ");
+    if let Some(sev) = severity_with(pb, bands) {
+        colors.push((w_off, u16len(&sb), sev));
     }
     RowStyle {
         plain,
         bold: false,
+        section_header: false,
         colors,
         tab_x: None,
     }
@@ -147,29 +226,37 @@ fn top_header_row(a: &AcctView) -> RowStyle {
 /// `build_menu` renders. The native walk applies each by matching `.plain`.
 fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
     let mut styles = Vec::new();
-    if let Some(a) = snap.accounts.iter().find(|a| a.active) {
-        styles.push(top_header_row(a));
+    // Top header: pick the active account across all sections. Its own
+    // section's severity bands drive coloring so a provider with different
+    // thresholds gets its own numbers colored right.
+    if let Some((sec, a)) = active_account(snap) {
+        styles.push(top_header_row(a, sec.severity_bands));
     }
-    for a in &snap.accounts {
-        styles.push(header_row(a));
-        if a.has_data {
-            for (label, pct_val, reset) in [
-                ("Session", a.session, &a.session_reset),
-                ("Weekly", a.weekly, &a.weekly_reset),
-                ("Opus", a.opus, &a.opus_reset),
-            ] {
-                if label == "Opus" && a.opus.is_none() {
-                    continue;
-                }
-                if let Some(sev) = severity(pct_val) {
-                    let (plain, span) = stat_row(label, pct_val, reset);
-                    if let Some((off, len)) = span {
-                        styles.push(RowStyle {
-                            plain,
-                            bold: false,
-                            colors: vec![(off, len, sev)],
-                            tab_x: None,
-                        });
+    for sec in &snap.sections {
+        // The section header row itself gets styled (bold, disabled). Plain
+        // title matches the muda MenuItem title so the walker finds it.
+        styles.push(RowStyle {
+            plain: sec.display_name.to_string(),
+            bold: false,
+            section_header: true,
+            colors: Vec::new(),
+            tab_x: None,
+        });
+        for a in &sec.accounts {
+            styles.push(header_row(a, sec.severity_bands));
+            if a.has_data {
+                for w in &a.windows {
+                    if let Some(sev) = severity_with(w.pct, sec.severity_bands) {
+                        let (plain, span) = stat_row(stat_display_label(w), w.pct, &w.reset);
+                        if let Some((off, len)) = span {
+                            styles.push(RowStyle {
+                                plain,
+                                bold: false,
+                                section_header: false,
+                                colors: vec![(off, len, sev)],
+                                tab_x: None,
+                            });
+                        }
                     }
                 }
             }
@@ -178,7 +265,21 @@ fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
     styles
 }
 
+/// Locate the active section + account (if any) in the snapshot.
+fn active_account(snap: &Snapshot) -> Option<(&ProviderSection, &AcctView)> {
+    for sec in &snap.sections {
+        if let Some(a) = sec.accounts.iter().find(|a| a.active) {
+            return Some((sec, a));
+        }
+    }
+    None
+}
+
 pub fn run() -> Result<()> {
+    // Register providers on the main thread before anything else — the poll
+    // thread and menu build both dispatch through `providers::get`.
+    providers::init();
+
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow::anyhow!("the menu bar must run on the main thread"))?;
     let app = NSApplication::sharedApplication(mtm);
@@ -376,15 +477,61 @@ fn run_cycle(guard: &mut SwapGuard) -> bool {
     }
 }
 
-fn acctview_from_row(r: &Row, active: &Option<String>) -> AcctView {
+/// Whether the provider currently under an env-override that would defeat any
+/// switch we make. Delegates to the shared `crate::env_override_active` so
+/// the menu display and the `choose_swap_target` auto-swap filter can never
+/// disagree, and so tests can toggle overrides through one hook.
+fn env_override_for(provider_id: &str) -> bool {
+    env_override_active(provider_id)
+}
+
+/// Build one account's rendered view from a v1 `Row`. v1 state only has
+/// Claude accounts, so the window set is fixed (session / weekly / opus); the
+/// window IDs come from `provider.window_order()` so this is trivially
+/// generalizable when state v2 lands.
+fn acctview_from_row(
+    r: &Row,
+    active: &Option<String>,
+    provider_id: &'static str,
+    window_order: &'static [&'static str],
+) -> AcctView {
+    // Build the fixed pool of windows we know about for this v1 row.
+    let mut pool: Vec<WindowView> = Vec::new();
+    pool.push(WindowView {
+        id: "session".into(),
+        label: "5h".into(),
+        pct: r.session.pct,
+        reset: r.session.resets_in(),
+    });
+    pool.push(WindowView {
+        id: "weekly".into(),
+        label: "7d".into(),
+        pct: r.weekly.pct,
+        reset: r.weekly.resets_in(),
+    });
+    if let Some(c) = &r.opus {
+        pool.push(WindowView {
+            id: "opus".into(),
+            label: "Opus 7d".into(),
+            pct: c.pct,
+            reset: c.resets_in(),
+        });
+    }
+    // Present them in the provider's declared order; unknown IDs (a
+    // provider added in later phases) fall through to their pool order.
+    let mut windows: Vec<WindowView> = Vec::with_capacity(pool.len());
+    for id in window_order {
+        if let Some(pos) = pool.iter().position(|w| w.id == *id) {
+            windows.push(pool.remove(pos));
+        }
+    }
+    windows.extend(pool);
+
     AcctView {
-        email: r.email.clone(),
-        session: r.session.pct,
-        weekly: r.weekly.pct,
-        opus: r.opus.as_ref().and_then(|c| c.pct),
-        session_reset: r.session.resets_in(),
-        weekly_reset: r.weekly.resets_in(),
-        opus_reset: r.opus.as_ref().map(|c| c.resets_in()).unwrap_or_default(),
+        provider_id,
+        key: r.email.clone(),
+        display: r.email.clone(),
+        windows,
         updated: age_str(r.fetched_at),
         active: active.as_deref() == Some(r.email.as_str()),
         has_data: r.has_data(),
@@ -395,22 +542,83 @@ fn acctview_from_row(r: &Row, active: &Option<String>) -> AcctView {
 /// account's cached usage. Runs every 0.75s UI tick, so it avoids re-reading
 /// state.json unless its mtime changed and probes the Login Item at most once a
 /// minute (both were per-tick subprocess/disk costs before).
+///
+/// A provider's section is only emitted if at least one captured account exists
+/// for it in state — that's the "no header, no rows" rule from the design.
+/// The "Capture current login" submenu is separately fed from
+/// `providers::all()` so every REGISTERED provider stays listable there.
 fn build_snapshot() -> Snapshot {
     let st = cached_state();
     let autoswap = !st.autoswap_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     let active = st.active.clone();
-    // Order rows by swap priority so the account to use first shows first; the
-    // CLI keeps insertion order, this is menu-only.
+
+    // v1 state only has Claude accounts. Group by provider slug so once state
+    // v2 lands (each account tagged with its provider), this loop generalises
+    // with a one-line change (filter by account's slug instead of hardcoded
+    // CLAUDE_SLUG).
     let mut rows: Vec<Row> = st.accounts.iter().map(row_from_account).collect();
     rows.sort_by(menu_order);
-    let accounts = rows.iter().map(|r| acctview_from_row(r, &active)).collect();
+
+    let mut sections: Vec<ProviderSection> = Vec::new();
+    for provider in providers::all() {
+        let slug = provider.provider_id();
+        // In v1 every stored row is a Claude account. Once state carries a
+        // per-account slug this becomes `rows.iter().filter(|r| r.provider_id == slug)`.
+        let provider_rows: Vec<&Row> =
+            rows.iter().filter(|r| r.provider_id == slug).collect();
+        if provider_rows.is_empty() {
+            continue; // no captured accounts → no section (no header, no rows).
+        }
+        let accounts: Vec<AcctView> = provider_rows
+            .into_iter()
+            .map(|r| acctview_from_row(r, &active, slug, provider.window_order()))
+            .collect();
+        let caps = provider.capabilities();
+        sections.push(ProviderSection {
+            provider_id: slug,
+            display_name: provider.display_name(),
+            supports_switching: caps.supports_switching,
+            supports_usage: caps.supports_usage,
+            severity_bands: provider.severity_bands(),
+            env_override_active: env_override_for(slug),
+            accounts,
+        });
+    }
+
+    // The capture submenu always lists every registered provider — including
+    // ones with zero captured accounts — so onboarding for a new provider is
+    // discoverable from the menu itself.
+    let registered: Vec<RegisteredProvider> = providers::all()
+        .iter()
+        .map(|p| RegisteredProvider {
+            provider_id: p.provider_id(),
+            display_name: p.display_name(),
+            // v1 only knows how to probe the Claude keychain. Everything else
+            // is assumed installed; wrong guesses just surface a real error
+            // on the capture attempt instead of pre-emptively greying out.
+            installed: probe_installed(p.provider_id()),
+        })
+        .collect();
+
     Snapshot {
-        accounts,
+        sections,
+        registered,
         autoswap,
         threshold,
         start_at_login: cached_login_item_enabled(),
     }
+}
+
+/// Best-effort per-provider "is the credential store present on this host?"
+/// probe used to grey out capture rows. Cheap enough for the 0.75s tick — for
+/// Claude it does an mtime-cached keychain lookup only when state.json changes
+/// (via `cached_state`). Non-Claude providers default to `true` so a stub
+/// provider's row stays enabled and its click reports a real error.
+fn probe_installed(_slug: &str) -> bool {
+    // v1: don't do anything expensive per tick. A future phase can front this
+    // with a TTL cache once real stub providers land.
+    true
 }
 
 /// Return the parsed state, re-reading state.json only when its mtime changed.
@@ -480,14 +688,35 @@ fn login_cache() -> &'static std::sync::Mutex<Option<(bool, std::time::Instant)>
 // Menu building
 // ---------------------------------------------------------------------------
 
+/// Disabled/header-only rows a section prepends before its account submenus.
+/// Currently: the "env override active — swap disabled" row when the section's
+/// provider is env-overridden. Pure, so tests can assert on it without
+/// instantiating any native menu (muda requires the main thread on macOS).
+pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<&'static str> {
+    let mut rows = Vec::new();
+    if sec.env_override_active {
+        rows.push(ENV_OVERRIDE_ROW_TITLE);
+    }
+    rows
+}
+
 fn build_menu(snap: &Snapshot) -> Menu {
     let menu = Menu::new();
 
-    match snap.accounts.iter().find(|a| a.active) {
-        Some(a) => {
+    // Top header — active account across every section, or a placeholder.
+    match active_account(snap) {
+        Some((_sec, a)) => {
             add(&menu, MenuItem::with_id("hdr", header_line(a), false, None));
-            if !a.weekly_reset.is_empty() {
-                let line = format!("weekly resets in {}", a.weekly_reset);
+            // "weekly resets in X" — use the second window's reset text if
+            // populated, mirroring the v1 Claude two-window layout.
+            // Second-line header preserved verbatim from v1 ("weekly resets in
+            // X"). Uses the second window's reset text — for Claude that's the
+            // 7-day window, matching the v1 layout. Providers whose "weekly-
+            // analog" window isn't 7d still get accurate copy, since the
+            // countdown text itself comes from `resets_in()`.
+            let weekly_reset = a.windows.get(1).map(|w| w.reset.as_str()).unwrap_or("");
+            if !weekly_reset.is_empty() {
+                let line = format!("weekly resets in {weekly_reset}");
                 add(&menu, MenuItem::with_id("hdr2", line, false, None));
             }
         }
@@ -498,56 +727,41 @@ fn build_menu(snap: &Snapshot) -> Menu {
     }
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    if snap.accounts.is_empty() {
+    if snap.sections.is_empty() {
         add(
             &menu,
             MenuItem::with_id("none", "Capture a login below to begin", false, None),
         );
     }
-    // One submenu per account: switch / stats / remove.
-    for a in &snap.accounts {
-        // Plain title (native walk re-styles it: bold if active, tab-aligned
-        // trailing S%/W%, high percentages colored).
-        let head = header_row(a).plain;
-        let sub = Submenu::with_id(format!("sub:{}", a.email), head, true);
-        if a.active {
-            let _ = sub.append(&MenuItem::with_id("noop", "✓ Active", false, None));
-        } else {
-            let _ = sub.append(&MenuItem::with_id(
-                format!("acct:{}", a.email),
-                "Switch to this account",
-                true,
-                None,
-            ));
-        }
-        let _ = sub.append(&PredefinedMenuItem::separator());
-        if a.has_data {
-            let _ = sub.append(&stat_item("Session", a.session, &a.session_reset));
-            let _ = sub.append(&stat_item("Weekly", a.weekly, &a.weekly_reset));
-            if a.opus.is_some() {
-                let _ = sub.append(&stat_item("Opus", a.opus, &a.opus_reset));
-            }
-            let _ = sub.append(&MenuItem::with_id(
-                "noop",
-                format!("updated {}", a.updated),
-                false,
-                None,
-            ));
-        } else {
-            let _ = sub.append(&MenuItem::with_id("noop", "no data yet", false, None));
-        }
-        let _ = sub.append(&PredefinedMenuItem::separator());
-        let _ = sub.append(&MenuItem::with_id(
-            format!("remove:{}", a.email),
-            "Remove…",
-            true,
-            None,
-        ));
-        let _ = menu.append(&sub);
-    }
-    let _ = menu.append(&PredefinedMenuItem::separator());
 
-    // Auto-swap: one submenu, Off / 90 / 95 / 98.
+    // Per-provider sections. Only emit a header + submenus if the provider
+    // has at least one captured account — the "no header, no rows" rule.
+    for sec in &snap.sections {
+        // Section header: bold, disabled (styled later by `apply_menu_styles`
+        // via the RowStyle matching on the plain title).
+        add(
+            &menu,
+            MenuItem::with_id("noop", sec.display_name, false, None),
+        );
+        for title in section_headline_rows(sec) {
+            add(
+                &menu,
+                MenuItem::with_id(
+                    format!("envoverride:{}", sec.provider_id),
+                    title,
+                    false,
+                    None,
+                ),
+            );
+        }
+        for a in &sec.accounts {
+            build_account_submenu(&menu, sec, a);
+        }
+        let _ = menu.append(&PredefinedMenuItem::separator());
+    }
+
+    // Auto-swap: one submenu, Off / 90 / 95 / 98. Stays global for v1 (the
+    // click grammar reserves `autoswap:<slug>:<n>` for per-provider later).
     let cur = if snap.autoswap {
         snap.threshold.round() as i32
     } else {
@@ -570,9 +784,6 @@ fn build_menu(snap: &Snapshot) -> Menu {
             None,
         ));
     }
-    // Immediately switch to the account auto-pick considers best right now
-    // (soonest-resetting with room), so you burn quota before it resets. Stays
-    // put if you're already on the best one.
     let _ = swap.append(&PredefinedMenuItem::separator());
     let _ = swap.append(&MenuItem::with_id(
         "autoswap:now",
@@ -583,10 +794,35 @@ fn build_menu(snap: &Snapshot) -> Menu {
     let _ = menu.append(&swap);
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    add(
-        &menu,
-        MenuItem::with_id("capture", "Capture current login…", true, None),
-    );
+    // Capture current login: ALWAYS shows, one row per REGISTERED provider —
+    // even providers with zero captured accounts so onboarding is discoverable.
+    let capture = Submenu::with_id("capture", "Capture current login", true);
+    if snap.registered.is_empty() {
+        let _ = capture.append(&MenuItem::with_id(
+            "noop",
+            "(no providers registered)",
+            false,
+            None,
+        ));
+    } else {
+        for reg in &snap.registered {
+            let title = if reg.installed {
+                reg.display_name.to_string()
+            } else {
+                format!("{} (not installed)", reg.display_name)
+            };
+            // Row stays clickable even when we think it's not installed —
+            // the actual `capture_current_login` call surfaces the real error.
+            let _ = capture.append(&MenuItem::with_id(
+                format!("capture:{}", reg.provider_id),
+                title,
+                true,
+                None,
+            ));
+        }
+    }
+    let _ = menu.append(&capture);
+
     add_check(
         &menu,
         CheckMenuItem::with_id(
@@ -610,6 +846,74 @@ fn build_menu(snap: &Snapshot) -> Menu {
     add(&menu, MenuItem::with_id("quit", "Quit", true, None));
 
     menu
+}
+
+/// Build one account's submenu inside a provider section. Splits Switch /
+/// stats / Launch / Remove; the pieces vary by capability so a reporting-only
+/// provider drops the Switch item and a no-usage provider swaps the stat block
+/// for a `(no usage endpoint — headers only)` disabled row.
+fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
+    let head = header_row(a, sec.severity_bands).plain;
+    let sub = Submenu::with_id(
+        format!("sub:{}:{}", sec.provider_id, a.key),
+        head,
+        true,
+    );
+    if sec.supports_switching {
+        if a.active {
+            let _ = sub.append(&MenuItem::with_id("noop", "✓ Active", false, None));
+        } else {
+            let _ = sub.append(&MenuItem::with_id(
+                format!("switch:{}:{}", sec.provider_id, a.key),
+                "Switch to this account",
+                true,
+                None,
+            ));
+        }
+    }
+    let _ = sub.append(&PredefinedMenuItem::separator());
+    if sec.supports_usage {
+        if a.has_data && !a.windows.is_empty() {
+            for w in &a.windows {
+                let _ = sub.append(&stat_item(stat_display_label(w), w.pct, &w.reset));
+            }
+            let _ = sub.append(&MenuItem::with_id(
+                "noop",
+                format!("updated {}", a.updated),
+                false,
+                None,
+            ));
+        } else {
+            let _ = sub.append(&MenuItem::with_id("noop", "no data yet", false, None));
+        }
+    } else {
+        let _ = sub.append(&MenuItem::with_id(
+            "noop",
+            "(no usage endpoint — headers only)",
+            false,
+            None,
+        ));
+    }
+    let _ = sub.append(&PredefinedMenuItem::separator());
+    // "Launch" only exposed for providers that both switch and know how to
+    // spawn their client. The trait's default `launch_client` returns
+    // `Unsupported`, so a click on this for a stub provider surfaces a
+    // real error rather than doing nothing.
+    if sec.supports_switching {
+        let _ = sub.append(&MenuItem::with_id(
+            format!("launch:{}:{}", sec.provider_id, a.key),
+            "Launch client",
+            true,
+            None,
+        ));
+    }
+    let _ = sub.append(&MenuItem::with_id(
+        format!("remove:{}:{}", sec.provider_id, a.key),
+        "Remove…",
+        true,
+        None,
+    ));
+    let _ = menu.append(&sub);
 }
 
 /// Build the menu for `snap`, install it on the tray, then style the native
@@ -694,8 +998,9 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
             }
         }
 
-        // Bold marks the active account (in place of a checkmark).
-        if style.bold {
+        // Bold marks either the active account (via header_row) or a section
+        // header (via `section_header`). Both use the same appearance.
+        if style.bold || style.section_header {
             // 0.0 => default menu font size.
             let font = NSFont::boldSystemFontOfSize(0.0);
             // SAFETY: value type matches the font attribute key.
@@ -729,14 +1034,21 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
     }
 
     /// Style every item whose plain title matches, descending into submenus.
-    fn walk(menu: &NSMenu, styles: &[RowStyle]) {
+    /// `top_level` is true on the outermost NSMenu only; section-header styles
+    /// are suppressed inside submenus so a section header whose plain title
+    /// happens to match a submenu row (e.g. the "Claude" row inside the
+    /// "Capture current login" submenu) doesn't inherit the bold header style.
+    fn walk(menu: &NSMenu, styles: &[RowStyle], top_level: bool) {
         for item in menu.itemArray().iter() {
             let title = item.title().to_string();
-            if let Some(style) = styles.iter().find(|s| s.plain == title) {
+            if let Some(style) = styles
+                .iter()
+                .find(|s| s.plain == title && (top_level || !s.section_header))
+            {
                 item.setAttributedTitle(Some(&attributed(style)));
             }
             if let Some(sub) = item.submenu() {
-                walk(&sub, styles);
+                walk(&sub, styles, false);
             }
         }
     }
@@ -744,7 +1056,7 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
     // SAFETY: called only on the main thread (the run-loop timer), with a live
     // NSMenu pointer from muda's ns_menu() that the tray keeps retained.
     let menu: &NSMenu = unsafe { &*(ns_menu as *const NSMenu) };
-    walk(menu, styles);
+    walk(menu, styles, true);
 }
 
 /// A submenu stat line and the span of its percentage (for coloring). Returns
@@ -767,22 +1079,45 @@ fn stat_item(label: &str, pct_val: Option<f64>, reset: &str) -> MenuItem {
 
 /// A stable fingerprint of everything the menu renders. When it's unchanged we
 /// skip `set_menu`, so an open menu is never dismissed by a no-op poll.
+///
+/// Provider id is folded into every account fingerprint so a Codex-side change
+/// doesn't collide with a stale Claude signature (or vice versa) once state
+/// carries multiple providers.
 fn menu_signature(snap: &Snapshot) -> String {
     let mut s = String::new();
-    for a in &snap.accounts {
+    for sec in &snap.sections {
         s.push_str(&format!(
-            "{}|{}|{}|{}|{}|{}|rs={}|rw={}|ro={}|u={};",
-            a.email,
-            a.active,
-            a.has_data,
-            a.session.map(|v| v.round() as i64).unwrap_or(-1),
-            a.weekly.map(|v| v.round() as i64).unwrap_or(-1),
-            a.opus.map(|v| v.round() as i64).unwrap_or(-1),
-            a.session_reset,
-            a.weekly_reset,
-            a.opus_reset,
-            a.updated,
+            "SEC[{}={}|sw={}|us={}|env={}|",
+            sec.provider_id,
+            sec.display_name,
+            sec.supports_switching,
+            sec.supports_usage,
+            sec.env_override_active,
         ));
+        for a in &sec.accounts {
+            // `a.provider_id` mirrors `sec.provider_id` in v1; folding both
+            // keeps the signature honest once state v2 tags each account
+            // with its own slug and a mis-bucketed account could exist.
+            s.push_str(&format!(
+                "{}@{}/{}|{}|{}|",
+                a.provider_id, sec.provider_id, a.key, a.active, a.has_data,
+            ));
+            for w in &a.windows {
+                s.push_str(&format!(
+                    "{}={}:r={}|",
+                    w.id,
+                    w.pct.map(|v| v.round() as i64).unwrap_or(-1),
+                    w.reset,
+                ));
+            }
+            s.push_str(&format!("u={};", a.updated));
+        }
+        s.push_str("] ");
+    }
+    // Capture-submenu contents also affect the redraw: adding a new registered
+    // provider (or a change in its installed-probe answer) must show up.
+    for reg in &snap.registered {
+        s.push_str(&format!("REG[{}|{}|{}] ", reg.provider_id, reg.display_name, reg.installed));
     }
     s.push_str(&format!(
         "as={} th={:.0} li={}",
@@ -792,7 +1127,8 @@ fn menu_signature(snap: &Snapshot) -> String {
 }
 
 fn header_line(a: &AcctView) -> String {
-    format!("{}  ·  {} / {}", a.email, pct(a.session), pct(a.weekly))
+    let (pa, pb) = summary_pcts(a);
+    format!("{}  ·  {} / {}", a.display, pct(pa), pct(pb))
 }
 
 fn add(menu: &Menu, item: MenuItem) {
@@ -804,26 +1140,40 @@ fn add_check(menu: &Menu, item: CheckMenuItem) {
 }
 
 fn title_for(snap: &Snapshot) -> String {
-    match snap.accounts.iter().find(|a| a.active) {
-        // Session (5h) matters most day to day; fall back to weekly. Keep the
-        // last-known number even if a fetch just failed (cache-backed), so a
-        // transient error never blanks the title to "!".
-        Some(a) => match a.session.or(a.weekly) {
-            Some(p) => format!("{p:.0}%"),
-            None => "—".to_string(),
-        },
+    match active_account(snap) {
+        // Session (5h) matters most day to day; fall back to weekly. Preserves
+        // the v1 tray-title semantics — a full weekly can't silently replace
+        // the low session number in the menu bar. Multi-window providers still
+        // yield a single honest number by leaning on the provider's window
+        // ordering (first = session-analog, second = weekly-analog).
+        Some((_sec, a)) => {
+            let s = a.windows.first().and_then(|w| w.pct);
+            let w = a.windows.get(1).and_then(|w| w.pct);
+            match s.or(w) {
+                Some(p) => format!("{p:.0}%"),
+                None => "—".to_string(),
+            }
+        }
         None => "—".to_string(),
     }
 }
 
 fn tooltip_for(snap: &Snapshot) -> String {
-    match snap.accounts.iter().find(|a| a.active) {
-        Some(a) => format!(
-            "{} — session {}, weekly {}",
-            a.email,
-            pct(a.session),
-            pct(a.weekly)
-        ),
+    match active_account(snap) {
+        // Preserve the v1 tooltip format verbatim: `email — session X, weekly Y`.
+        // Multi-window providers still project onto the first two windows
+        // (session-analog / weekly-analog) so the tooltip stays a stable
+        // one-liner regardless of how many windows the provider carries.
+        Some((_sec, a)) => {
+            let s = a.windows.first().and_then(|w| w.pct);
+            let w = a.windows.get(1).and_then(|w| w.pct);
+            format!(
+                "{} — session {}, weekly {}",
+                a.display,
+                pct(s),
+                pct(w)
+            )
+        }
         None => "claude-usage: no active account".to_string(),
     }
 }
@@ -837,46 +1187,132 @@ fn pct(p: Option<f64>) -> String {
 // Click handling
 // ---------------------------------------------------------------------------
 
+/// Parsed click id: `action[:slug[:key]]`. `slug`/`key` are `None` for global
+/// actions (`quit`, `autoswap:off`, `autoswap:95`, `autoswap:now`, `noop`,
+/// `startlogin`, `capture` — the plain-capture id used only by the submenu
+/// title itself, never a click).
+struct ClickId<'a> {
+    action: &'a str,
+    slug: Option<&'a str>,
+    key: Option<&'a str>,
+}
+
+fn parse_click_id(id: &str) -> ClickId<'_> {
+    let mut it = id.splitn(3, ':');
+    let action = it.next().unwrap_or("");
+    let slug = it.next();
+    let key = it.next();
+    ClickId { action, slug, key }
+}
+
 fn handle_click(id: &str) {
+    let c = parse_click_id(id);
     // Actions only mutate state.json; the main-thread timer re-renders from it
     // within ~1s without any network call.
-    match id {
-        "quit" => std::process::exit(0),
-        "noop" => {}
-        "autoswap:off" => set_autoswap(false),
-        "autoswap:now" => match optimize_now() {
+    match (c.action, c.slug, c.key) {
+        ("quit", _, _) => std::process::exit(0),
+        ("noop", _, _) => {}
+        ("startlogin", _, _) => toggle_login_item(),
+        ("autoswap", Some("off"), None) => set_autoswap(false),
+        ("autoswap", Some("now"), None) => match optimize_now() {
             Ok(Some(email)) => notify(&format!("Switched to {email}")),
             Ok(None) => notify("Already on the best account"),
             Err(e) => notify(&format!("Optimize failed: {e}")),
         },
-        "startlogin" => toggle_login_item(),
-        "capture" => match capture_current() {
+        ("autoswap", Some(t), None) => {
+            if let Ok(v) = t.parse::<f64>() {
+                set_autoswap_threshold(v);
+            }
+        }
+        ("capture", Some(slug), None) => handle_capture(slug),
+        ("switch", Some(slug), Some(key)) => handle_switch(slug, key),
+        ("remove", Some(slug), Some(key)) => handle_remove(slug, key),
+        ("launch", Some(slug), Some(key)) => handle_launch(slug, key),
+        // Ignore unrecognized ids (e.g. the top-level "capture" submenu title
+        // or a future action added by a later phase we don't yet handle).
+        _ => {}
+    }
+}
+
+/// Capture the current login for `slug`. For Claude, use the full v1 flow
+/// (persists into state.json + preserves cached usage). For every other
+/// provider, dispatch through the trait — the result is only surfaced via
+/// notification since v1 state has no bucket to persist non-Claude accounts.
+fn handle_capture(slug: &str) {
+    if slug == CLAUDE_SLUG {
+        match capture_current() {
             Ok((email, existed)) => notify(&format!(
                 "{} {email}",
                 if existed { "Refreshed" } else { "Captured" }
             )),
             Err(e) => notify(&format!("Capture failed: {e}")),
-        },
-        _ => {
-            if let Some(t) = id.strip_prefix("autoswap:") {
-                if let Ok(v) = t.parse::<f64>() {
-                    set_autoswap_threshold(v);
-                }
-            } else if let Some(email) = id.strip_prefix("acct:") {
-                match switch_to(email) {
-                    Ok(label) => notify(&format!("Switched to {label}")),
-                    Err(e) => notify(&format!("Switch failed: {e}")),
-                }
-            } else if let Some(email) = id.strip_prefix("remove:") {
-                if confirm(&format!("Remove account {email}? This cannot be undone.")) {
-                    match remove_account(email) {
-                        Ok(_) => notify(&format!("Removed {email}")),
-                        Err(e) => notify(&format!("Remove failed: {e}")),
-                    }
-                }
-            }
         }
+        return;
     }
+    let Some(provider) = providers::get(slug) else {
+        notify(&format!("Capture failed: provider '{slug}' is not registered"));
+        return;
+    };
+    match provider.capture_current_login() {
+        Ok(Some(_)) => notify(&format!(
+            "Captured {} account (persistence lands in a later phase)",
+            provider.display_name()
+        )),
+        Ok(None) => notify(&format!("{} — nothing to capture", provider.display_name())),
+        Err(e) => notify(&format!("Capture failed: {e}")),
+    }
+}
+
+fn handle_switch(slug: &str, key: &str) {
+    // v1 state only knows Claude accounts; a switch on any other slug can't
+    // be persisted yet, so gate on Claude and route to the shared free
+    // function that already knows the v1 identity/keychain dance.
+    if slug != CLAUDE_SLUG {
+        notify(&format!("Switching is not yet supported for {slug}"));
+        return;
+    }
+    match switch_to(key) {
+        Ok(label) => notify(&format!("Switched to {label}")),
+        Err(e) => notify(&format!("Switch failed: {e}")),
+    }
+}
+
+fn handle_remove(slug: &str, key: &str) {
+    if slug != CLAUDE_SLUG {
+        notify(&format!("Remove is not yet supported for {slug}"));
+        return;
+    }
+    if !confirm(&format!("Remove account {key}? This cannot be undone.")) {
+        return;
+    }
+    match remove_account(key) {
+        Ok(_) => notify(&format!("Removed {key}")),
+        Err(e) => notify(&format!("Remove failed: {e}")),
+    }
+}
+
+/// Launch the vendor CLI for `slug`. Providers whose `launch_client` returns
+/// `Unsupported` (the trait default) surface that as a notification rather
+/// than silently doing nothing.
+///
+/// The launch is dispatched onto a background thread — the Claude
+/// implementation calls `Command::status()` (synchronous wait on the child)
+/// and every click is drained inside the main-thread NSTimer tick, so calling
+/// it inline would freeze the entire menu-bar UI (no ticks, no redraws, no
+/// clicks) until the launched `claude` exits, which under a menu-bar app with
+/// no controlling TTY is effectively indefinite.
+fn handle_launch(slug: &str, _key: &str) {
+    let Some(provider) = providers::get(slug) else {
+        notify(&format!("Launch failed: provider '{slug}' is not registered"));
+        return;
+    };
+    // `providers::get` returns `&'static dyn Provider`; the trait is `Send +
+    // Sync + 'static`, so the reference is trivially safe to move.
+    std::thread::spawn(move || {
+        if let Err(e) = provider.launch_client(crate::providers::LaunchMode::Continue) {
+            notify(&format!("Launch failed: {e}"));
+        }
+    });
 }
 
 /// Enable or disable auto-swap. Surfaces a save failure so the menu checkmark
@@ -990,30 +1426,82 @@ fn toggle_login_item() {
 mod tests {
     use super::*;
 
+    fn bands() -> SeverityBands {
+        SeverityBands {
+            amber: 80.0,
+            red: 95.0,
+        }
+    }
+
     fn acct(email: &str, session: Option<f64>, weekly: Option<f64>, active: bool) -> AcctView {
         AcctView {
-            email: email.to_string(),
-            session,
-            weekly,
-            opus: None,
-            session_reset: "3h".into(),
-            weekly_reset: "2d".into(),
-            opus_reset: String::new(),
+            provider_id: CLAUDE_SLUG,
+            key: email.to_string(),
+            display: email.to_string(),
+            windows: vec![
+                WindowView {
+                    id: "session".into(),
+                    label: "5h".into(),
+                    pct: session,
+                    reset: "3h".into(),
+                },
+                WindowView {
+                    id: "weekly".into(),
+                    label: "7d".into(),
+                    pct: weekly,
+                    reset: "2d".into(),
+                },
+            ],
             updated: "1m ago".into(),
             active,
             has_data: true,
         }
     }
 
+    fn one_section_snap(a: AcctView) -> Snapshot {
+        Snapshot {
+            sections: vec![ProviderSection {
+                provider_id: CLAUDE_SLUG,
+                display_name: "Claude",
+                supports_switching: true,
+                supports_usage: true,
+                severity_bands: bands(),
+                env_override_active: false,
+                accounts: vec![a],
+            }],
+            registered: vec![RegisteredProvider {
+                provider_id: CLAUDE_SLUG,
+                display_name: "Claude",
+                installed: true,
+            }],
+            autoswap: false,
+            threshold: 95.0,
+            start_at_login: false,
+        }
+    }
+
     #[test]
-    fn severity_bands() {
-        assert!(severity(None).is_none());
-        assert!(severity(Some(0.0)).is_none());
-        assert!(severity(Some(79.9)).is_none());
-        assert_eq!(severity(Some(80.0)), Some(Severity::Amber));
-        assert_eq!(severity(Some(94.9)), Some(Severity::Amber));
-        assert_eq!(severity(Some(95.0)), Some(Severity::Red));
-        assert_eq!(severity(Some(100.0)), Some(Severity::Red));
+    fn severity_bands_defaults() {
+        let b = bands();
+        assert!(severity_with(None, b).is_none());
+        assert!(severity_with(Some(0.0), b).is_none());
+        assert!(severity_with(Some(79.9), b).is_none());
+        assert_eq!(severity_with(Some(80.0), b), Some(Severity::Amber));
+        assert_eq!(severity_with(Some(94.9), b), Some(Severity::Amber));
+        assert_eq!(severity_with(Some(95.0), b), Some(Severity::Red));
+        assert_eq!(severity_with(Some(100.0), b), Some(Severity::Red));
+    }
+
+    #[test]
+    fn severity_bands_are_provider_driven() {
+        // A provider with different thresholds (50/75) colors the same pct
+        // differently — proving the hardcoded 80/95 are gone.
+        let b = SeverityBands {
+            amber: 50.0,
+            red: 75.0,
+        };
+        assert_eq!(severity_with(Some(60.0), b), Some(Severity::Amber));
+        assert_eq!(severity_with(Some(80.0), b), Some(Severity::Red));
     }
 
     // For ASCII rows, UTF-16 offsets equal byte offsets, so we can slice the
@@ -1025,7 +1513,7 @@ mod tests {
     #[test]
     fn header_row_colors_land_on_percentages() {
         let a = acct("you@work.com", Some(82.0), Some(96.0), true);
-        let r = header_row(&a);
+        let r = header_row(&a, bands());
         assert_eq!(r.plain, "you@work.com\t82% / 96%");
         assert!(r.bold, "active account is bold");
         assert_eq!(r.tab_x, Some(TAB_X), "trailing run is right-aligned");
@@ -1041,18 +1529,16 @@ mod tests {
     #[test]
     fn header_row_low_usage_has_no_colors_and_no_bold_when_inactive() {
         let a = acct("dev@side.com", Some(3.0), Some(9.0), false);
-        let r = header_row(&a);
+        let r = header_row(&a, bands());
         assert!(!r.bold);
         assert!(r.colors.is_empty());
     }
 
     #[test]
     fn header_row_offsets_hold_for_unicode_email() {
-        // A non-ASCII email must still color the right code-unit range.
         let a = acct("café@x.com", Some(99.0), None, false);
-        let r = header_row(&a);
+        let r = header_row(&a, bands());
         let (off, len, _) = r.colors[0];
-        // Slice by UTF-16 units the way NSRange would.
         let utf16: Vec<u16> = r.plain.encode_utf16().collect();
         let picked = String::from_utf16(&utf16[off..off + len]).unwrap();
         assert_eq!(picked, "99%");
@@ -1061,11 +1547,10 @@ mod tests {
     #[test]
     fn top_header_row_colors_land_on_percentages() {
         let a = acct("you@work.com", Some(50.0), Some(88.0), true);
-        let r = top_header_row(&a);
+        let r = top_header_row(&a, bands());
         assert_eq!(r.plain, "you@work.com  ·  50% / 88%");
         assert!(!r.bold, "top info line is not bold");
         assert_eq!(r.tab_x, None);
-        // Only weekly (88) is in a band.
         assert_eq!(r.colors.len(), 1);
         let (o, l, s) = r.colors[0];
         assert_eq!(span_text(&r.plain, o, l), "88%");
@@ -1081,17 +1566,18 @@ mod tests {
     }
 
     #[test]
-    fn menu_styles_skips_low_stat_rows_but_keeps_headers() {
-        let snap = Snapshot {
-            accounts: vec![acct("a@x.com", Some(10.0), Some(20.0), true)],
-            autoswap: false,
-            threshold: 95.0,
-            start_at_login: false,
-        };
+    fn menu_styles_emits_section_header_and_skips_low_stat_rows() {
+        let snap = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
         let styles = menu_styles(&snap);
-        // top header + account header, but no stat rows (all under 80%).
-        assert_eq!(styles.len(), 2);
-        assert!(styles.iter().all(|s| s.colors.is_empty()));
+        // Expect: top header + section header + account header. No stat rows
+        // (all under amber band).
+        let plains: Vec<&str> = styles.iter().map(|s| s.plain.as_str()).collect();
+        assert!(plains.contains(&"Claude"), "section header row present");
+        assert!(styles.iter().any(|s| s.section_header && s.plain == "Claude"));
+        assert!(
+            styles.iter().all(|s| s.colors.is_empty()),
+            "all pcts are low → no colored spans"
+        );
     }
 
     #[test]
@@ -1103,10 +1589,8 @@ mod tests {
 
     #[test]
     fn header_row_offsets_hold_for_astral_email() {
-        // An astral (surrogate-pair) char makes char-count diverge from UTF-16
-        // units — the colored span must still land on the percentage by offset.
         let a = acct("😀@x.com", Some(99.0), None, false);
-        let r = header_row(&a);
+        let r = header_row(&a, bands());
         let (off, len, _) = r.colors[0];
         let utf16: Vec<u16> = r.plain.encode_utf16().collect();
         let picked = String::from_utf16(&utf16[off..off + len]).unwrap();
@@ -1121,21 +1605,143 @@ mod tests {
     }
 
     #[test]
-    fn menu_signature_changes_when_opus_reset_changes() {
-        // The redraw-gating signature must include the Opus reset countdown, or a
-        // changing Opus reset leaves a stale value on screen (no rebuild fires).
+    fn menu_signature_changes_when_a_window_reset_changes() {
+        // A window's reset countdown is folded into the signature so a
+        // changing reset triggers a redraw (would otherwise leave stale text).
         let mut a = acct("you@work.com", Some(50.0), Some(60.0), true);
-        a.opus = Some(30.0);
-        a.opus_reset = "3h".into();
-        let base = Snapshot {
-            accounts: vec![a],
-            autoswap: true,
+        a.windows.push(WindowView {
+            id: "opus".into(),
+            label: "Opus 7d".into(),
+            pct: Some(30.0),
+            reset: "3h".into(),
+        });
+        let base = one_section_snap(a);
+        let sig1 = menu_signature(&base);
+        let mut changed = base;
+        changed.sections[0].accounts[0].windows[2].reset = "2h".into();
+        assert_ne!(sig1, menu_signature(&changed));
+    }
+
+    #[test]
+    fn menu_signature_folds_provider_id() {
+        // Same account, same numbers, different provider slug → different
+        // signature. Guards against a cross-provider menu change being
+        // swallowed by a stale Claude-shaped fingerprint.
+        let mut base = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        let sig1 = menu_signature(&base);
+        // Simulate the same-shaped row landing under a different provider.
+        base.sections[0].provider_id = "codex";
+        base.sections[0].accounts[0].provider_id = "codex";
+        assert_ne!(sig1, menu_signature(&base));
+    }
+
+    #[test]
+    fn parse_click_id_splits_action_slug_key() {
+        let c = parse_click_id("switch:claude:matt@example.com");
+        assert_eq!(c.action, "switch");
+        assert_eq!(c.slug, Some("claude"));
+        assert_eq!(c.key, Some("matt@example.com"));
+
+        let c = parse_click_id("capture:codex");
+        assert_eq!(c.action, "capture");
+        assert_eq!(c.slug, Some("codex"));
+        assert!(c.key.is_none());
+
+        let c = parse_click_id("autoswap:off");
+        assert_eq!(c.action, "autoswap");
+        assert_eq!(c.slug, Some("off"));
+
+        let c = parse_click_id("quit");
+        assert_eq!(c.action, "quit");
+        assert!(c.slug.is_none());
+    }
+
+    // --- env-override guard end-to-end -----------------------------------
+
+    #[test]
+    fn env_override_for_reads_shared_hook_and_row_flows_into_menu_signature() {
+        // (a) With no override, the Claude section's `env_override_active`
+        // stays false and the menu signature reflects "env=false".
+        assert!(!env_override_for(CLAUDE_SLUG));
+
+        let mut snap = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        assert!(!snap.sections[0].env_override_active);
+        let sig_off = menu_signature(&snap);
+
+        // (b) Toggle the env override on for the Claude slug via the shared
+        // hook. `env_override_for` — the same function `build_snapshot`
+        // consults to populate each section's flag — must now report true,
+        // and a section rebuilt with that flag must produce a different
+        // `menu_signature` (so the tray redraws and shows the disabled row).
+        crate::with_env_override_hook(&[CLAUDE_SLUG], || {
+            assert!(env_override_for(CLAUDE_SLUG));
+            assert!(!env_override_for("codex"));
+            snap.sections[0].env_override_active = env_override_for(CLAUDE_SLUG);
+        });
+
+        assert!(snap.sections[0].env_override_active);
+        assert_ne!(
+            sig_off,
+            menu_signature(&snap),
+            "env-override flag must fold into the signature so the menu redraws with the disabled row",
+        );
+        // The redraw signal includes the exact override state so a change
+        // from active→inactive is not swallowed either.
+        assert!(menu_signature(&snap).contains("env=true"));
+    }
+
+    #[test]
+    fn section_renders_env_override_row_when_flagged() {
+        // A section without the override contributes no extra header rows.
+        let base = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
+        assert!(section_headline_rows(&base.sections[0]).is_empty());
+
+        // With the override on, the section prepends the disabled row that
+        // `build_menu` adds verbatim (`ENV_OVERRIDE_ROW_TITLE`). muda's Menu
+        // requires the main thread on macOS, so we assert on the pure
+        // helper `build_menu` shares with us instead of building the menu.
+        let mut flagged = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
+        flagged.sections[0].env_override_active = true;
+        let rows = section_headline_rows(&flagged.sections[0]);
+        assert_eq!(rows, vec![ENV_OVERRIDE_ROW_TITLE]);
+    }
+
+    #[test]
+    fn active_account_looks_across_sections() {
+        // Two sections, active row lives in the second — active_account must
+        // still find it (it's the anchor for the top header + title).
+        let mut a = acct("dev@x.com", Some(10.0), Some(20.0), false);
+        a.active = false;
+        let mut b = acct("work@x.com", Some(50.0), Some(60.0), true);
+        b.provider_id = "codex";
+        let snap = Snapshot {
+            sections: vec![
+                ProviderSection {
+                    provider_id: CLAUDE_SLUG,
+                    display_name: "Claude",
+                    supports_switching: true,
+                    supports_usage: true,
+                    severity_bands: bands(),
+                    env_override_active: false,
+                    accounts: vec![a],
+                },
+                ProviderSection {
+                    provider_id: "codex",
+                    display_name: "Codex",
+                    supports_switching: true,
+                    supports_usage: true,
+                    severity_bands: bands(),
+                    env_override_active: false,
+                    accounts: vec![b],
+                },
+            ],
+            registered: Vec::new(),
+            autoswap: false,
             threshold: 95.0,
             start_at_login: false,
         };
-        let sig1 = menu_signature(&base);
-        let mut changed = base;
-        changed.accounts[0].opus_reset = "2h".into();
-        assert_ne!(sig1, menu_signature(&changed));
+        let (sec, acc) = active_account(&snap).expect("active row found");
+        assert_eq!(sec.provider_id, "codex");
+        assert_eq!(acc.key, "work@x.com");
     }
 }

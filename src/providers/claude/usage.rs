@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use crate::config;
+use super::config;
 
 /// Why a usage fetch failed. Lets callers keep the last-known cache on transient
 /// failures (and back off on rate limits) instead of surfacing a hard error.

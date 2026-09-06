@@ -4,18 +4,25 @@
 //! use the switched account; already-running sessions keep theirs until
 //! restarted.
 
-mod config;
 mod logging;
 #[cfg(target_os = "macos")]
 mod menubar;
-mod oauth;
+mod providers;
 mod store;
-mod usage;
+
+use providers::claude::{oauth, usage};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 
+use providers::Provider;
 use store::{Account, CachedUsage, State};
+
+/// Slug of the sole first-class provider in v1 (state.json is still keyed as
+/// a flat list of Claude accounts). Any code that needs to resolve "the
+/// provider for this account" today uses this; phase 3 (state v2) replaces
+/// the constant with a per-account lookup keyed on the containing bucket.
+const CLAUDE_SLUG: &str = "claude";
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// Refresh a token if it expires within this many seconds.
@@ -51,6 +58,14 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // Populate the provider registry once, before any command handler runs.
+    // Cheap (a `Vec::push` per feature-gated provider) and idempotent, so
+    // handlers that never touch the registry (today: all of them) pay
+    // nothing meaningful. Later phases route `menubar::run` through
+    // `providers::get`, at which point this call is load-bearing — do it
+    // here so it always precedes the dispatch below.
+    providers::init();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None => cmd_list(&[]),
@@ -262,34 +277,134 @@ fn select_email(state: &State, selector: Option<&str>) -> Result<String> {
     }
 }
 
+/// Resolve a provider by slug, mapping "not registered" to a clear error.
+fn provider_by_slug(slug: &str) -> Result<&'static dyn Provider> {
+    providers::get(slug)
+        .with_context(|| format!("provider '{slug}' is not registered in this build"))
+}
+
+/// True iff the provider registered under `slug` is eligible as an auto-swap
+/// candidate — i.e. it exposes both a usage signal (so we can compare
+/// candidates) and a way to switch to it. An unknown slug returns `false`:
+/// the safest thing when a Row's `provider_id` doesn't correspond to any
+/// registered provider is to leave it out of the auto-swap decision.
+fn provider_supports_swap(slug: &str) -> bool {
+    match providers::get(slug) {
+        Some(p) => {
+            let c = p.capabilities();
+            c.supports_usage && c.supports_switching
+        }
+        None => false,
+    }
+}
+
+/// Env var whose presence forces the Claude CLI to use a specific OAuth token,
+/// bypassing the keychain login. When set, any swap we perform is silently
+/// ignored by `claude`, so we skip Claude from auto-swap candidacy AND surface
+/// a disabled "env override active — swap disabled" row in the menu section.
+pub(crate) const CLAUDE_ENV_OVERRIDE_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// The env var (if any) whose presence overrides `slug`'s stored login.
+pub(crate) fn env_override_var_for(slug: &str) -> Option<&'static str> {
+    match slug {
+        CLAUDE_SLUG => Some(CLAUDE_ENV_OVERRIDE_VAR),
+        _ => None,
+    }
+}
+
+/// Whether the given provider currently has its env-override active in this
+/// process's environment. `#[cfg(test)]` builds also consult a thread-local
+/// hook (`set_env_override_hook_for_test`) so tests can toggle overrides
+/// deterministically without racing on the real environment.
+pub(crate) fn env_override_active(slug: &str) -> bool {
+    #[cfg(test)]
+    {
+        if let Some(v) = env_override_hook_lookup(slug) {
+            return v;
+        }
+    }
+    env_override_var_for(slug)
+        .map(|var| {
+            std::env::var_os(var)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set of slugs to report as env-overridden. `None` means "consult the
+    /// real environment", `Some(set)` means "report only these slugs".
+    static ENV_OVERRIDE_TEST_HOOK: std::cell::RefCell<Option<std::collections::HashSet<String>>>
+        = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn env_override_hook_lookup(slug: &str) -> Option<bool> {
+    ENV_OVERRIDE_TEST_HOOK.with(|h| h.borrow().as_ref().map(|s| s.contains(slug)))
+}
+
+/// Run `f` with the env-override lookup answering `true` only for `overrides`.
+/// Restores the previous state on exit (including a panicking `f`, via `Drop`).
+#[cfg(test)]
+pub(crate) fn with_env_override_hook<F, R>(overrides: &[&str], f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    struct Guard(Option<std::collections::HashSet<String>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            ENV_OVERRIDE_TEST_HOOK.with(|h| *h.borrow_mut() = prev);
+        }
+    }
+    let prev = ENV_OVERRIDE_TEST_HOOK.with(|h| h.borrow().clone());
+    let set: std::collections::HashSet<String> =
+        overrides.iter().map(|s| s.to_string()).collect();
+    ENV_OVERRIDE_TEST_HOOK.with(|h| *h.borrow_mut() = Some(set));
+    let _g = Guard(prev);
+    f()
+}
+
 /// Make `email` the active login. Does all network work (token refresh, identity
 /// backfill) OUTSIDE the state lock, then commits keychain + ~/.claude.json +
 /// state under the lock with a fresh reload. Returns the display label.
 pub(crate) fn switch_to(email: &str) -> Result<String> {
-    let (acct, identity, backfilled) = prepare_switch(email)?;
+    // v1 state is Claude-only; look up the "claude" provider now so later
+    // phases can key the switch on the account's containing bucket instead.
+    let provider = provider_by_slug(CLAUDE_SLUG)?;
+    let (acct, identity, backfilled) = prepare_switch(provider, email)?;
     let label = acct.email.clone().unwrap_or_else(|| email.to_string());
-    Ok(switch_to_guarded(email, &acct, &identity, backfilled, None)?.unwrap_or(label))
+    Ok(switch_to_guarded(provider, email, &acct, &identity, backfilled, None)?.unwrap_or(label))
 }
 
 /// Like `switch_to`, but only if `expect_active` is still the active account
 /// when the lock is taken (a compare-and-set). Used by the auto-swap daemon so a
 /// concurrent manual switch isn't overridden by a stale decision. Returns the
 /// label on a real switch, or `None` if it was skipped.
-fn switch_to_if_still_active(email: &str, expect_active: &str) -> Result<Option<String>> {
-    let (acct, identity, backfilled) = prepare_switch(email)?;
-    switch_to_guarded(email, &acct, &identity, backfilled, Some(expect_active))
+fn switch_to_if_still_active(
+    provider: &'static dyn Provider,
+    email: &str,
+    expect_active: &str,
+) -> Result<Option<String>> {
+    let (acct, identity, backfilled) = prepare_switch(provider, email)?;
+    switch_to_guarded(provider, email, &acct, &identity, backfilled, Some(expect_active))
 }
 
 /// Phase 1 of a switch (no lock): refresh the token and resolve the identity
 /// over the network, returning what the locked commit phase needs.
-fn prepare_switch(email: &str) -> Result<(Account, serde_json::Value, bool)> {
+fn prepare_switch(
+    provider: &'static dyn Provider,
+    email: &str,
+) -> Result<(Account, serde_json::Value, bool)> {
     let state = State::load()?;
     let mut acct = state
         .find(email)
         .cloned()
         .with_context(|| format!("no account matches '{email}'"))?;
     oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS)?;
-    let (identity, backfilled) = resolve_identity(&acct)?;
+    let (identity, backfilled) = resolve_identity(provider, &acct)?;
     Ok((acct, identity, backfilled))
 }
 
@@ -300,6 +415,7 @@ fn prepare_switch(email: &str) -> Result<(Account, serde_json::Value, bool)> {
 /// stale choice. `acct`/`identity`/`backfilled` come from the caller's unlocked
 /// phase-1 network work. Returns the display label on a real switch.
 fn switch_to_guarded(
+    provider: &'static dyn Provider,
     email: &str,
     acct: &Account,
     identity: &serde_json::Value,
@@ -319,7 +435,7 @@ fn switch_to_guarded(
             }
         }
         // Preserve any token rotation the currently-active session picked up.
-        sync_active_from_keychain(&mut st);
+        sync_active_from_keychain(provider, &mut st);
         // A concurrent poll may have rotated this account's token after our
         // phase-1 snapshot; use whichever tokens are fresher so we never write a
         // stale (possibly already-superseded) refresh token to the keychain.
@@ -334,7 +450,7 @@ fn switch_to_guarded(
             }
         }
         // ~/.claude.json first, keychain last (the commit point), rollback on fail.
-        apply_account(&acct, identity)?;
+        apply_account(provider, &acct, identity)?;
         if let Some(a) = st.find_mut(email) {
             a.set_tokens_if_newer(
                 acct.access_token.clone(),
@@ -361,11 +477,16 @@ fn switch_to_guarded(
     }
 }
 
-/// Resolve the `oauthAccount` identity to write for this account.
-/// Returns (identity, backfilled_from_network). Errors if it can't be resolved
-/// (e.g. offline and never captured) — the caller then does NOT switch, rather
-/// than half-applying one.
-fn resolve_identity(acct: &Account) -> Result<(serde_json::Value, bool)> {
+/// Resolve the identity to write for this account. Returns (identity,
+/// backfilled_from_network). Errors if it can't be resolved (e.g. offline and
+/// never captured) — the caller then does NOT switch, rather than half-applying
+/// one. `provider` is threaded through so later phases can dispatch off it; the
+/// v1 body still uses the Claude-specific profile endpoint (behavior-preserving).
+fn resolve_identity(
+    provider: &'static dyn Provider,
+    acct: &Account,
+) -> Result<(serde_json::Value, bool)> {
+    let _ = provider;
     if let Some(v) = &acct.oauth_account {
         return Ok((v.clone(), false));
     }
@@ -384,7 +505,14 @@ fn resolve_identity(acct: &Account) -> Result<(serde_json::Value, bool)> {
 /// (atomic tmp+rename), then the keychain token LAST (the flaky commit point).
 /// If the keychain write fails, roll ~/.claude.json back to its prior contents
 /// so both halves stay consistent, and return Err (never a half-applied switch).
-fn apply_account(acct: &Account, identity: &serde_json::Value) -> Result<()> {
+/// `provider` is threaded through for the same forward-compat reason as
+/// `resolve_identity`; the v1 body is the Claude-specific keychain path.
+fn apply_account(
+    provider: &'static dyn Provider,
+    acct: &Account,
+    identity: &serde_json::Value,
+) -> Result<()> {
+    let _ = provider;
     let prior = read_claude_json_raw();
     write_claude_identity(identity, acct.user_id.as_deref())?;
     if let Err(e) = keychain_write(&acct.keychain_blob) {
@@ -432,7 +560,8 @@ fn identity_matches(
 /// oauthAccount, so a mismatch means the keychain is not our active account and
 /// we must NOT overwrite its stored tokens. In-place rotation keeps the same
 /// account uuid/email, so legitimate rotation is still captured.
-fn sync_active_from_keychain(state: &mut State) {
+fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State) {
+    let _ = provider;
     let Some(active) = state.active.clone() else {
         return;
     };
@@ -545,6 +674,12 @@ fn cmd_rm(selector: Option<&str>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 struct Row {
+    /// Slug of the provider that owns this row's account (matches a registered
+    /// `Provider::provider_id`). Threaded through swap decisions so we can
+    /// consult `providers::get(...).capabilities()` without re-reading state.
+    /// In v1 every row is `"claude"`; a Row whose slug isn't registered is
+    /// simply skipped as an auto-swap candidate.
+    provider_id: String,
     email: String,
     session: Cell,
     weekly: Cell,
@@ -572,6 +707,10 @@ impl Cell {
 fn row_from_account(a: &Account) -> Row {
     let c = a.cached_usage.as_ref();
     Row {
+        // v1 state stores only Claude accounts; phase 3 (state v2) tags each
+        // account with its containing provider slug and this becomes a real
+        // per-account lookup.
+        provider_id: CLAUDE_SLUG.to_string(),
         email: a.key().to_string(),
         session: cell_from_parts(
             c.and_then(|c| c.session_pct),
@@ -969,7 +1108,20 @@ fn refresh_usage_cache() -> RefreshOutcome {
             };
         }
     };
-    sync_active_from_keychain(&mut state);
+    // v1 state is Claude-only; resolve the provider once at the top of the
+    // cycle. Phase 3 (state v2) makes this a per-account bucket lookup — the
+    // per-account body below already runs inside a loop, so the transition is
+    // additive rather than restructural.
+    let provider = match provider_by_slug(CLAUDE_SLUG) {
+        Ok(p) => p,
+        Err(e) => {
+            logging::log(&format!("poll: provider unavailable: {e:#}"));
+            return RefreshOutcome {
+                rate_limited: false,
+            };
+        }
+    };
+    sync_active_from_keychain(provider, &mut state);
     logging::log("poll: refreshing usage cache");
 
     let mut rate_limited = false;
@@ -1137,6 +1289,12 @@ fn choose_swap_target(
     if !act.has_data() {
         return None;
     }
+    // If the active account's provider has its env-override active, the CLI
+    // ignores whatever token we install into the keychain — swapping is a
+    // no-op. Bail before we churn the state file.
+    if env_override_active(&act.provider_id) {
+        return None;
+    }
     if guard
         .last_swap
         .map(|t| t.elapsed().as_secs() < SWAP_COOLDOWN_SECS)
@@ -1146,6 +1304,15 @@ fn choose_swap_target(
     }
     let mut candidates: Vec<&Row> = rows
         .iter()
+        // A row is only a valid swap candidate if its owning provider has both
+        // a usage signal (so we can compare its cached utilization to the
+        // ceiling) and a way to actually switch to it. This is the sole
+        // capability gate for auto-swap: reporting-only or stub providers
+        // never surface here, even if their rows carry a stale utilization.
+        .filter(|r| provider_supports_swap(&r.provider_id))
+        // Skip candidates whose provider has its env-override active — a
+        // switch to them would be silently ignored by the vendor CLI.
+        .filter(|r| !env_override_active(&r.provider_id))
         .filter(|r| r.has_data() && r.email != active && r.eligible_target(ceiling, trigger))
         .filter(|r| {
             guard
@@ -1190,11 +1357,14 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
     if let Some(active_email) = active.clone() {
         match choose_swap_target(&rows, &active_email, trigger, ceiling, guard) {
             Some(target) => {
-                let (pick_s, pick_w) = rows
+                let target_row = rows
                     .iter()
                     .find(|r| r.email == target)
-                    .map(|r| (r.session.pct.unwrap_or(0.0), r.weekly.pct.unwrap_or(0.0)))
-                    .unwrap_or((0.0, 0.0));
+                    .expect("choose_swap_target returned an email absent from `rows`");
+                let (pick_s, pick_w) = (
+                    target_row.session.pct.unwrap_or(0.0),
+                    target_row.weekly.pct.unwrap_or(0.0),
+                );
                 // Proactive flip-back if the account we're leaving wasn't itself
                 // over the trigger — a better account simply freed up.
                 let proactive = rows
@@ -1202,9 +1372,26 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                     .find(|r| r.email == active_email)
                     .map(|r| r.max_pct() < trigger)
                     .unwrap_or(false);
+                // Resolve the target row's provider. `choose_swap_target`
+                // already filtered on `provider_supports_swap`, so this must
+                // succeed for any row it returned; a mismatch is a bug.
+                let target_provider = match provider_by_slug(&target_row.provider_id) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        logging::log(&format!(
+                            "swap to {target} skipped: provider unavailable: {e:#}"
+                        ));
+                        return Ok(CycleOutcome {
+                            swapped: None,
+                            rate_limited: refresh.rate_limited,
+                        });
+                    }
+                };
                 // Compare-and-set on the active account: if a manual switch landed
                 // since choose_swap_target read the snapshot, skip this swap.
-                let Some(label) = switch_to_if_still_active(&target, &active_email)? else {
+                let Some(label) =
+                    switch_to_if_still_active(target_provider, &target, &active_email)?
+                else {
                     return Ok(CycleOutcome {
                         swapped: None,
                         rate_limited: refresh.rate_limited,
