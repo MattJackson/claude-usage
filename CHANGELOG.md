@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-05
+
 ### Added
 - **Proactive flip-back.** Auto-swap now returns to an account after its 5h session
   resets — as long as it's still the best one to be on (soonest weekly reset) — so
