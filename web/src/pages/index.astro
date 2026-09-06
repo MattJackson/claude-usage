@@ -1,0 +1,447 @@
+---
+// Home. Hero + product-shot, features grid, three-up usage-state trio,
+// install snippet, footer CTA.
+import Base from '../layouts/Base.astro';
+import CodeBlock from '../components/CodeBlock.astro';
+import InstallSnippet from '../components/InstallSnippet.astro';
+
+const title = 'usagio — see and swap your AI coding CLI quotas from the macOS menu bar';
+const description =
+  'usagio is a native macOS menu-bar app and CLI that tracks usage and quotas across Claude Code, OpenAI Codex, and other AI coding CLIs. Multi-account per provider, no /login dance, auto-swap when a weekly limit hits. Free, MIT-licensed, single Rust binary.';
+---
+<Base title={title} description={description} path="/" current="home">
+
+  <!-- ============ HERO ============ -->
+  <section class="hero">
+    <div class="container hero-inner">
+      <div class="hero-copy fade-up">
+        <span class="eyebrow">MIT&nbsp;Licensed · 100%&nbsp;Rust · macOS&nbsp;Menu&nbsp;Bar</span>
+        <h1 class="h-display hero-title">
+          Every AI&nbsp;coding&nbsp;CLI. <br />
+          <span class="hero-title-accent">One menu&nbsp;bar.</span>
+        </h1>
+        <p class="lede hero-lede">
+          usagio tracks usage and quota across Claude Code, Codex, and every AI
+          coding CLI you run — multiple accounts per provider, one keystroke to
+          switch, and an auto-swap daemon that keeps you coding when a weekly
+          limit hits.
+        </p>
+        <div class="btn-row hero-cta">
+          <a class="btn btn-brand" href="/download/">Download for macOS</a>
+          <a class="btn btn-secondary" href="https://github.com/MattJackson/claude-usage" target="_blank" rel="noopener noreferrer">View on GitHub</a>
+        </div>
+        <p class="hero-foot">Free &amp; open source · macOS&nbsp;13+ · Intel &amp; Apple Silicon</p>
+      </div>
+
+      <!-- Product shot: menu dropdown mock over a soft blurred desktop -->
+      <div class="hero-shot fade-up" aria-hidden="false">
+        <div class="hero-shot-wallpaper" aria-hidden="true"></div>
+        <div class="hero-shot-menubar" aria-hidden="true">
+          <img src="/logo.svg" width="14" height="14" alt="" />
+          <span>Claude · S 42% · W 61%</span>
+        </div>
+        <img
+          class="hero-shot-menu"
+          src="/screenshots/menu-healthy.svg"
+          alt="usagio menu-bar dropdown showing two Claude accounts and one Codex account with session and weekly usage percentages"
+          width="640" height="360" loading="eager"
+        />
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ WHAT IT COVERS ============ -->
+  <section class="providers section-soft">
+    <div class="container">
+      <div class="providers-head fade-up">
+        <span class="eyebrow">One dashboard, every CLI</span>
+        <h2 class="h-section">Ships with support for the CLIs you actually run.</h2>
+        <p class="lede">
+          First-party coverage for Claude Code and Codex today. Stubs and
+          scaffolding for the rest are in the tree — provider adapters land as
+          each CLI's usage surface stabilises.
+        </p>
+      </div>
+      <ul class="provider-grid fade-up" role="list">
+        {[
+          { file: 'claude-code',  label: 'Claude Code', vendor: 'Anthropic', ready: true },
+          { file: 'codex',        label: 'Codex',       vendor: 'OpenAI',    ready: true },
+          { file: 'cursor-agent', label: 'Cursor' },
+          { file: 'opencode',     label: 'opencode' },
+          { file: 'gemini-cli',   label: 'Gemini CLI' },
+          { file: 'qwen-code',    label: 'Qwen' },
+          { file: 'copilot-cli',  label: 'Copilot CLI' },
+          { file: 'amazon-q',     label: 'Amazon Q' },
+          { file: 'cline',        label: 'Cline' },
+          { file: 'grok',         label: 'Grok' },
+          { file: 'kimi',         label: 'Kimi' },
+          { file: 'openrouter',   label: 'OpenRouter' },
+          { file: 'deepseek',     label: 'DeepSeek' },
+          { file: 'zai',          label: 'Z.ai' },
+          { file: 'fireworks',    label: 'Fireworks' },
+          { file: 'synthetic',    label: 'Synthetic' },
+        ].map((p) => (
+          <li class={`provider${p.ready ? ' provider-ready' : ''}`}>
+            <img src={`/icons/${p.file}.svg`} width="18" height="18" alt="" loading="lazy" />
+            <span class="provider-name">{p.label}</span>
+            {p.vendor && <span class="provider-vendor">{p.vendor}</span>}
+          </li>
+        ))}
+      </ul>
+      <p class="provider-legend">
+        <span class="dot dot-ready"></span> Shipping today
+        <span style="margin-left: 1.5rem"><span class="dot dot-planned"></span> Planned / stub in tree</span>
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ FEATURES ============ -->
+  <section class="features">
+    <div class="container">
+      <div class="section-head fade-up">
+        <span class="eyebrow">Built the way Mac tools should be</span>
+        <h2 class="h-section">Native. Fast. Out of your way.</h2>
+      </div>
+      <div class="feature-grid">
+        <article class="feature fade-up">
+          <h3>Session &amp; weekly at a glance</h3>
+          <p>Each row shows session-window and weekly-quota use as a percentage, with reset countdowns on hover. No dashboards, no browser.</p>
+        </article>
+        <article class="feature fade-up">
+          <h3>Multiple accounts per provider</h3>
+          <p>Sign in more than once to Claude Max or Codex, switch which one <code>claude</code> or <code>codex</code> uses without touching <code>/login</code>.</p>
+        </article>
+        <article class="feature fade-up">
+          <h3>Auto-swap daemon</h3>
+          <p>When a weekly quota is about to hit, usagio drains accounts in reset order — the next account is already active before you notice the wall.</p>
+        </article>
+        <article class="feature fade-up">
+          <h3>Menu bar first, CLI too</h3>
+          <p>The same single Rust binary powers the menu-bar app and a scriptable CLI. Pipe usage into your shell prompt, or check it in a Raycast script.</p>
+        </article>
+        <article class="feature fade-up">
+          <h3>Keychain-backed, no webview</h3>
+          <p>Tokens live in the macOS Keychain. State lives in <code>~/.config/usagio</code>. No Electron, no bundled Chromium — one binary, launched by <code>launchd</code>.</p>
+        </article>
+        <article class="feature feature-oss fade-up">
+          <h3>Open source, single binary</h3>
+          <p>Pure Rust. Install via Homebrew or build from source. The whole app is licensed <strong>MIT</strong> — run it anywhere, audit it, build on it.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ WHY OPEN SOURCE ============ -->
+  <section class="why-oss">
+    <div class="container container-narrow fade-up why-oss-inner">
+      <span class="eyebrow">Why open source?</span>
+      <p>
+        usagio talks to first-party provider endpoints with tokens issued to
+        <em>your</em> account. That's a lot of trust to give a closed
+        binary. Every line is MIT-licensed and on
+        <a href="https://github.com/MattJackson/claude-usage" target="_blank" rel="noopener noreferrer">GitHub</a>
+        so you can audit exactly what it sends, where it stores state, and how
+        the auto-swap decides when to move you.
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ USAGE-STATE TRIO ============ -->
+  <section class="states section-soft">
+    <div class="container">
+      <div class="section-head fade-up">
+        <span class="eyebrow">One glance, the whole picture</span>
+        <h2 class="h-section">Green when you're fine. Red when you're not.</h2>
+        <p class="lede">
+          The menu reads at a glance in every state — from a fresh Monday
+          morning to the moment auto-swap catches a weekly ceiling.
+        </p>
+      </div>
+      <div class="state-grid">
+        <figure class="state fade-up">
+          <img src="/screenshots/menu-healthy.svg" alt="Healthy state — all accounts below 60% weekly usage" width="640" height="360" loading="lazy" />
+          <figcaption><strong>Healthy.</strong> Everything under 60%. No decisions to make.</figcaption>
+        </figure>
+        <figure class="state fade-up">
+          <img src="/screenshots/menu-mixed.svg" alt="Mixed state — one account at 82% (warning), one at 94% (critical)" width="640" height="360" loading="lazy" />
+          <figcaption><strong>Mixed.</strong> One account amber at 82%, another red at 94% — but you still have runway.</figcaption>
+        </figure>
+        <figure class="state fade-up">
+          <img src="/screenshots/menu-locked.svg" alt="Locked state — top account weekly-locked, next account auto-swapped in" width="640" height="360" loading="lazy" />
+          <figcaption><strong>Locked.</strong> The primary account hit its weekly wall; auto-swap already moved you to the next.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ INSTALL ============ -->
+  <section class="install">
+    <div class="container container-narrow">
+      <div class="section-head fade-up" style="text-align: center;">
+        <span class="eyebrow">Install</span>
+        <h2 class="h-section">Two commands, no configuration.</h2>
+        <p class="lede" style="margin-inline: auto;">
+          <code>brew install</code> puts the binary on your PATH.
+          <code>claude-usage install</code> wires up the menu-bar app and the
+          auto-swap daemon, now and at every login.
+        </p>
+      </div>
+      <div class="fade-up"><InstallSnippet /></div>
+      <p class="install-note fade-up">
+        Prefer a manual install, or building from source? <a href="/download/">See the download page →</a>
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ CTA BAND ============ -->
+  <section class="cta-band">
+    <div class="container cta-band-inner fade-up">
+      <h2 class="h-section" style="color: #fff;">Stop hitting the wall at 3&nbsp;a.m.</h2>
+      <p style="color: rgba(255,255,255,0.78); max-width: 46ch;">
+        Install usagio. See every quota. Never lose a session to a limit you
+        didn't know you were about to hit.
+      </p>
+      <div class="btn-row" style="justify-content: center;">
+        <a class="btn btn-brand" href="/download/">Download for macOS</a>
+        <a class="btn btn-ghost" style="color: #fff;" href="https://github.com/MattJackson/claude-usage" target="_blank" rel="noopener noreferrer">GitHub&nbsp;→</a>
+      </div>
+    </div>
+  </section>
+
+</Base>
+
+<style>
+  /* ---- hero ---------------------------------------------------------- */
+  .hero {
+    padding-top: clamp(3rem, 8vw, 5.5rem);
+    padding-bottom: clamp(3rem, 8vw, 5.5rem);
+    background:
+      radial-gradient(80% 60% at 15% 0%, rgba(91,43,234,0.06), transparent 60%),
+      radial-gradient(60% 50% at 100% 20%, rgba(147,51,234,0.05), transparent 60%),
+      var(--bg);
+    border-bottom: var(--hairline);
+    overflow: hidden;
+  }
+  .hero-inner {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+    gap: clamp(2rem, 5vw, 4rem);
+    align-items: center;
+  }
+  @media (max-width: 900px) {
+    .hero-inner { grid-template-columns: 1fr; }
+  }
+  .hero-title { margin-bottom: 1.1rem; }
+  .hero-title-accent {
+    background: var(--brand-gradient);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+  }
+  .hero-lede { margin-bottom: 1.75rem; }
+  .hero-cta { margin-bottom: 1rem; }
+  .hero-foot { color: var(--muted); font-size: var(--fs-sm); letter-spacing: 0.005em; }
+
+  /* Product shot: off-center menu over a soft blurred wallpaper card. */
+  .hero-shot {
+    position: relative;
+    aspect-ratio: 16 / 11;
+    border-radius: var(--r-xl);
+    overflow: hidden;
+    background: linear-gradient(135deg, #ece7f8 0%, #e2ecff 55%, #f3ecfb 100%);
+    box-shadow: var(--shadow-lift);
+    border: 1px solid var(--line);
+  }
+  .hero-shot-wallpaper {
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(30% 40% at 20% 30%, rgba(91,43,234,0.28), transparent 60%),
+      radial-gradient(35% 45% at 80% 70%, rgba(147,51,234,0.22), transparent 60%),
+      radial-gradient(40% 50% at 60% 20%, rgba(245,208,254,0.35), transparent 60%);
+    filter: blur(6px);
+  }
+  .hero-shot-menubar {
+    position: absolute; top: 0; left: 0; right: 0;
+    height: 24px;
+    background: rgba(255,255,255,0.55);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border-bottom: 1px solid rgba(255,255,255,0.6);
+    display: flex; align-items: center; gap: 0.4rem;
+    padding: 0 0.7rem;
+    font-size: 11px;
+    color: #17171a;
+    font-weight: 500;
+  }
+  .hero-shot-menu {
+    position: absolute;
+    top: 8%; right: -4%;
+    width: 82%;
+    max-width: 620px;
+    height: auto;
+    filter: drop-shadow(0 24px 40px rgba(23,23,26,0.22));
+  }
+
+  /* ---- providers ----------------------------------------------------- */
+  .providers-head {
+    max-width: 62ch;
+    margin: 0 auto 2.5rem;
+    text-align: center;
+  }
+  .providers-head .lede { margin-inline: auto; margin-top: 0.75rem; }
+  .provider-grid {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 0.55rem;
+  }
+  .provider {
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    padding: 0.7rem 0.9rem;
+    color: var(--muted);
+    font-size: 0.92rem;
+    font-weight: 500;
+    display: flex; align-items: center; gap: 0.55rem;
+    box-shadow: var(--shadow-1);
+    position: relative;
+    min-height: 44px;
+    opacity: 0.75;
+  }
+  .provider img { flex: none; width: 18px; height: 18px; opacity: 0.85; }
+  .provider .provider-name { color: inherit; font-weight: 600; }
+  .provider .provider-vendor {
+    margin-left: auto;
+    font-size: 0.66rem;
+    color: var(--muted-2);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .provider-ready { color: var(--ink); opacity: 1; }
+  .provider-ready::after {
+    content: "";
+    position: absolute; top: 8px; right: 8px;
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--ok);
+    box-shadow: 0 0 0 3px var(--ok-tint);
+  }
+  .provider-ready img { opacity: 1; }
+  .provider-legend {
+    margin-top: 1.5rem;
+    text-align: center;
+    color: var(--muted);
+    font-size: var(--fs-sm);
+  }
+  .provider-legend .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 0.4rem; vertical-align: 1px; }
+  .provider-legend .dot-ready { background: var(--ok); }
+  .provider-legend .dot-planned { background: var(--muted-2); }
+
+  /* ---- section head ------------------------------------------------- */
+  .section-head { margin-bottom: 2.75rem; max-width: 60ch; }
+  .section-head .eyebrow { margin-bottom: 0.6rem; }
+  .section-head .h-section { margin-bottom: 0.65rem; }
+
+  /* ---- features ------------------------------------------------------ */
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: clamp(1rem, 2.5vw, 1.4rem);
+  }
+  .feature {
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    padding: 1.4rem 1.5rem;
+    box-shadow: var(--shadow-1);
+    transition: box-shadow 200ms ease, transform 200ms ease, border-color 200ms ease;
+  }
+  .feature:hover {
+    box-shadow: var(--shadow-2);
+    border-color: var(--line-strong);
+    transform: translateY(-2px);
+  }
+  .feature h3 {
+    font-size: var(--fs-h3);
+    margin-bottom: 0.4rem;
+    letter-spacing: -0.01em;
+  }
+  .feature p {
+    color: var(--muted);
+    font-size: 0.96rem;
+    line-height: 1.6;
+  }
+  .feature code {
+    font-family: var(--font-mono);
+    font-size: 0.86em;
+    background: var(--accent-tint);
+    color: var(--accent);
+    padding: 0.05em 0.35em;
+    border-radius: 4px;
+  }
+
+  /* ---- why open source ---------------------------------------------- */
+  .why-oss { padding: clamp(2rem, 5vw, 3rem) 0 clamp(3rem, 7vw, 4rem); }
+  .why-oss-inner {
+    text-align: center;
+    color: var(--muted);
+    font-size: 1.02rem;
+    line-height: 1.7;
+  }
+  .why-oss-inner .eyebrow { display: block; margin-bottom: 0.75rem; }
+  .why-oss-inner p { max-width: 62ch; margin: 0 auto; }
+  .why-oss-inner a { color: var(--accent); font-weight: 600; }
+  .why-oss-inner a:hover { color: var(--accent-hover); }
+
+  /* ---- state trio ---------------------------------------------------- */
+  .states .section-head { text-align: center; margin-inline: auto; }
+  .states .section-head .lede { margin-inline: auto; margin-top: 0.75rem; }
+  .state-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: clamp(1rem, 2.5vw, 1.5rem);
+  }
+  .state {
+    margin: 0;
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    padding: 0.9rem;
+    box-shadow: var(--shadow-1);
+  }
+  .state img {
+    display: block; width: 100%; height: auto;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+  }
+  .state figcaption {
+    margin-top: 0.85rem;
+    color: var(--muted);
+    font-size: var(--fs-sm);
+    line-height: 1.55;
+  }
+  .state figcaption strong { color: var(--ink); font-weight: 650; }
+
+  /* ---- install ------------------------------------------------------- */
+  .install .section-head { margin-inline: auto; }
+  .install-note {
+    margin: 1.5rem auto 0;
+    text-align: center;
+    color: var(--muted);
+    font-size: var(--fs-sm);
+  }
+  .install-note a { color: var(--accent); font-weight: 600; }
+  .install-note a:hover { color: var(--accent-hover); }
+
+  /* ---- CTA band ------------------------------------------------------ */
+  .cta-band {
+    background: #0f1115;
+    color: #fff;
+    padding: clamp(3rem, 8vw, 4.5rem) 0;
+    text-align: center;
+  }
+  .cta-band-inner { display: grid; place-items: center; gap: 1.1rem; }
+</style>

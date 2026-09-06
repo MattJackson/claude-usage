@@ -1,0 +1,9 @@
+---
+// The canonical two-line install: brew install + `install` subcommand.
+import CodeBlock from './CodeBlock.astro';
+---
+<CodeBlock label="install">
+<span class="c"># Homebrew tap → single Rust binary, no runtime, no webview</span>
+<span class="p">$</span> brew install MattJackson/tap/claude-usage
+<span class="p">$</span> claude-usage install   <span class="c"># menu-bar app + auto-swap, now and every login</span>
+</CodeBlock>

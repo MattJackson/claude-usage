@@ -1,0 +1,224 @@
+---
+import Base from '../layouts/Base.astro';
+import CodeBlock from '../components/CodeBlock.astro';
+
+const title = 'Download usagio for macOS';
+const description =
+  'Install usagio on macOS with one Homebrew command. Requires macOS 12 or later. Free & MIT-licensed. Prebuilt binaries and instructions for building from source.';
+
+const github = 'https://github.com/MattJackson/claude-usage';
+const releases = `${github}/releases`;
+---
+<Base title={title} description={description} path="/download/" current="download">
+
+  <!-- ============ HERO ============ -->
+  <section class="dl-hero">
+    <div class="container container-narrow" style="text-align: center;">
+      <img src="/logo.svg" width="72" height="72" alt="" class="dl-hero-logo fade-up" />
+      <span class="eyebrow fade-up">Latest release</span>
+      <h1 class="h-display fade-up" style="font-size: clamp(2.2rem, 5vw, 3.4rem); margin-top: 0.5rem;">Install usagio</h1>
+      <p class="lede fade-up" style="margin: 1rem auto 0;">
+        One Homebrew command puts the binary on your PATH and the menu-bar
+        app in your dock — well, in your menu bar.
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ BREW INSTALL ============ -->
+  <section class="dl-primary">
+    <div class="container container-narrow">
+      <div class="dl-primary-card fade-up">
+        <div class="dl-primary-head">
+          <span class="eyebrow">Recommended</span>
+          <h2 class="h-section">Homebrew</h2>
+          <p class="dl-primary-lede">
+            Installs the binary, wires up the menu-bar agent, and auto-launches
+            it on login. Upgrades come through <code>brew upgrade</code>; a running
+            app relaunches into the new binary without you restarting anything.
+          </p>
+        </div>
+        <CodeBlock label="install">
+<span class="c"># 1 — Tap and install</span>
+<span class="p">$</span> brew install MattJackson/tap/claude-usage
+
+<span class="c"># 2 — Set up the menu-bar app + auto-swap daemon (now and every login)</span>
+<span class="p">$</span> claude-usage install
+</CodeBlock>
+        <div class="btn-row" style="justify-content: center; margin-top: 1.5rem;">
+          <a class="btn btn-brand btn-brand-lg" href="#" onclick="navigator.clipboard&amp;&amp;navigator.clipboard.writeText('brew install MattJackson/tap/claude-usage');this.blur();return false;">
+            Copy install command
+          </a>
+          <a class="btn btn-secondary" href={releases} target="_blank" rel="noopener noreferrer">All releases on GitHub&nbsp;→</a>
+        </div>
+      </div>
+
+      <!-- ============ VERIFY ============ -->
+      <div class="dl-verify fade-up">
+        <h3 class="dl-h3">Verify the install</h3>
+        <p class="dl-p">
+          Confirm the binary is on your PATH, the version matches what you
+          expected, and the menu-bar agent is registered with <code>launchd</code>.
+        </p>
+        <CodeBlock label="verify">
+<span class="p">$</span> claude-usage --version
+<span class="p">$</span> claude-usage status
+<span class="p">$</span> launchctl list | grep claude-usage
+</CodeBlock>
+      </div>
+
+      <!-- ============ SYSTEM REQ ============ -->
+      <div class="dl-req fade-up">
+        <div class="dl-req-inner">
+          <div>
+            <div class="dl-req-label">Requires</div>
+            <div class="dl-req-body">
+              <strong>macOS 13 Ventura</strong> or later &middot; Apple Silicon or Intel.
+              Uses the macOS Keychain and <code>launchd</code>; no other daemons or
+              runtimes. Windows and Linux are not currently supported.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ FROM SOURCE ============ -->
+      <details class="dl-source fade-up">
+        <summary>
+          <span>Build from source</span>
+          <span class="dl-source-hint">Rust 1.88+ · single <code>cargo build</code></span>
+        </summary>
+        <div class="dl-source-body">
+          <p class="dl-p">
+            Requires a recent stable Rust toolchain. The MSRV is <strong>1.88</strong>.
+            The workspace builds one binary that powers both the menu-bar app
+            and the CLI.
+          </p>
+          <CodeBlock label="build">
+<span class="p">$</span> git clone https://github.com/MattJackson/claude-usage.git
+<span class="p">$</span> cd claude-usage
+<span class="p">$</span> cargo build --release
+
+<span class="c"># Binary at target/release/claude-usage — copy anywhere on your PATH</span>
+<span class="p">$</span> cp target/release/claude-usage /usr/local/bin/
+<span class="p">$</span> claude-usage install
+</CodeBlock>
+          <p class="dl-p dl-p-fine">
+            Contributing? The repo README covers the layout, tests, and the
+            provider-adapter interface for adding new AI coding CLIs.
+          </p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+</Base>
+
+<style>
+  .dl-hero {
+    padding: clamp(3rem, 8vw, 5rem) 0 clamp(2rem, 5vw, 3rem);
+    background:
+      radial-gradient(70% 60% at 50% 0%, rgba(91,43,234,0.06), transparent 65%),
+      var(--bg);
+    border-bottom: var(--hairline);
+  }
+  .dl-hero-logo {
+    margin: 0 auto 1.5rem;
+    filter: drop-shadow(0 18px 30px rgba(91,43,234,0.25));
+  }
+
+  .dl-primary { padding-top: clamp(2.5rem, 6vw, 4rem); }
+  .dl-primary-card {
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: var(--r-xl);
+    padding: clamp(1.75rem, 4vw, 2.5rem);
+    box-shadow: var(--shadow-2);
+  }
+  .dl-primary-head { text-align: center; margin-bottom: 1.5rem; }
+  .dl-primary-head .eyebrow { margin-bottom: 0.4rem; }
+  .dl-primary-head .h-section { margin-bottom: 0.5rem; }
+  .dl-primary-lede {
+    color: var(--muted);
+    max-width: 54ch;
+    margin: 0 auto;
+    font-size: 1rem;
+    line-height: 1.6;
+  }
+  .dl-primary-head code,
+  .dl-verify code,
+  .dl-req code,
+  .dl-source code {
+    font-family: var(--font-mono);
+    font-size: 0.86em;
+    background: var(--accent-tint);
+    color: var(--accent);
+    padding: 0.05em 0.35em;
+    border-radius: 4px;
+  }
+
+  .btn-brand-lg { padding: 0.9rem 1.4rem; font-size: 1rem; border-radius: var(--r-md); }
+
+  .dl-verify {
+    margin-top: clamp(2.5rem, 6vw, 3.5rem);
+  }
+  .dl-h3 {
+    font-size: 1.2rem;
+    letter-spacing: -0.01em;
+    margin-bottom: 0.5rem;
+  }
+  .dl-p {
+    color: var(--muted);
+    line-height: 1.65;
+    margin-bottom: 1rem;
+    max-width: 58ch;
+  }
+  .dl-p-fine { font-size: 0.9rem; color: var(--muted-2); }
+
+  .dl-req {
+    margin-top: clamp(2.5rem, 6vw, 3rem);
+  }
+  .dl-req-inner {
+    background: var(--bg-soft);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    padding: 1.25rem 1.4rem;
+  }
+  .dl-req-label {
+    font-size: var(--fs-xs);
+    letter-spacing: var(--tracking-wide);
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 700;
+    margin-bottom: 0.4rem;
+  }
+  .dl-req-body { color: var(--ink-2); font-size: 0.96rem; line-height: 1.55; }
+  .dl-req-body strong { color: var(--ink); font-weight: 650; }
+
+  .dl-source {
+    margin-top: clamp(2rem, 5vw, 2.5rem);
+    margin-bottom: clamp(3rem, 8vw, 5rem);
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    padding: 1rem 1.25rem;
+    box-shadow: var(--shadow-1);
+  }
+  .dl-source summary {
+    cursor: pointer;
+    list-style: none;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 0.75rem;
+    font-weight: 600;
+    color: var(--ink);
+    padding: 0.35rem 0.1rem;
+  }
+  .dl-source summary::-webkit-details-marker { display: none; }
+  .dl-source summary::after {
+    content: "＋";
+    color: var(--muted);
+    font-weight: 400;
+    transition: transform 200ms ease;
+  }
+  .dl-source[open] summary::after { content: "−"; }
+  .dl-source-hint { color: var(--muted); font-weight: 500; font-size: 0.88rem; }
+  .dl-source-body { padding-top: 1rem; }
+</style>

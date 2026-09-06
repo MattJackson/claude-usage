@@ -1,0 +1,100 @@
+---
+// Shell for every page: HTML head with SEO + OG + JSON-LD, header, main slot,
+// footer, and one tiny inline IntersectionObserver that adds `is-in` to any
+// `.fade-up` element as it scrolls into view (respects prefers-reduced-motion,
+// per global.css).
+import '../styles/global.css';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+
+export interface Props {
+  title: string;
+  description: string;
+  path?: string;                       // e.g. "/download/"
+  current?: 'home' | 'download';
+}
+const {
+  title,
+  description,
+  path = '/',
+  current = 'home',
+} = Astro.props;
+
+const site = Astro.site?.toString().replace(/\/$/, '') ?? 'https://usagio.app';
+const canonical = `${site}${path}`;
+const ogImage = `${site}/favicon.svg`;
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={ogImage} />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+
+    <script
+      type="application/ld+json"
+      set:html={JSON.stringify({
+        '@context': 'https://schema.org',
+        '@graph': [
+          {
+            '@type': 'WebSite',
+            '@id': `${site}/#website`,
+            url: `${site}/`,
+            name: 'usagio',
+            description,
+          },
+          {
+            '@type': 'SoftwareApplication',
+            '@id': `${site}/#app`,
+            name: 'usagio',
+            applicationCategory: 'DeveloperApplication',
+            operatingSystem: 'macOS',
+            url: `${site}/`,
+            downloadUrl: `${site}/download/`,
+            license: 'https://opensource.org/licenses/MIT',
+            isAccessibleForFree: true,
+            offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+          },
+        ],
+      })}
+    />
+  </head>
+  <body>
+    <Header current={current} />
+    <main><slot /></main>
+    <Footer />
+
+    <script is:inline>
+      // Progressive fade-up on scroll. No-op when the browser opts out.
+      (function () {
+        var mql = window.matchMedia('(prefers-reduced-motion: reduce)');
+        if (mql.matches || !('IntersectionObserver' in window)) {
+          document.querySelectorAll('.fade-up').forEach(function (el) { el.classList.add('is-in'); });
+          return;
+        }
+        var io = new IntersectionObserver(function (entries) {
+          entries.forEach(function (entry) {
+            if (entry.isIntersecting) {
+              entry.target.classList.add('is-in');
+              io.unobserve(entry.target);
+            }
+          });
+        }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+        document.querySelectorAll('.fade-up').forEach(function (el) { io.observe(el); });
+      })();
+    </script>
+  </body>
+</html>

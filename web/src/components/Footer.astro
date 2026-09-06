@@ -1,0 +1,66 @@
+---
+const github = 'https://github.com/MattJackson/claude-usage';
+const year = new Date().getFullYear();
+---
+<footer class="site-footer">
+  <div class="container site-footer-inner">
+    <div class="site-footer-brand">
+      <img src="/logo.svg" width="22" height="22" alt="" />
+      <span>usagio</span>
+      <span class="site-footer-sep">·</span>
+      <span class="site-footer-tag">MIT licensed · macOS menu-bar + CLI</span>
+    </div>
+    <nav aria-label="Footer">
+      <a href={github} target="_blank" rel="noopener noreferrer">GitHub</a>
+      <a href={`${github}/blob/main/LICENSE`} target="_blank" rel="noopener noreferrer">License (MIT)</a>
+      <a href="/download/">Download</a>
+      <a href="/THIRD_PARTY_NOTICES.txt">Notices</a>
+    </nav>
+  </div>
+  <div class="container site-footer-copy">
+    &copy; {year} · MIT · Track your AI-coding quota across every tool that matters.
+  </div>
+  <div class="container site-footer-legal">
+    <p>
+      Claude and Claude Code are trademarks of Anthropic, PBC.
+      Codex is a trademark of OpenAI, Inc.
+      Cursor is a trademark of Anysphere, Inc.
+      Copilot is a trademark of GitHub, Inc.
+      Gemini is a trademark of Google LLC.
+      Other product names may be trademarks of their respective owners.
+    </p>
+    <p>
+      usagio is an independent open-source project and is not affiliated with,
+      endorsed by, or sponsored by any of these vendors. This tool uses OAuth
+      tokens or API keys issued to your own account. Provider terms of service
+      may restrict this use; use at your own risk.
+    </p>
+  </div>
+</footer>
+
+<style>
+  .site-footer-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    color: var(--muted);
+    font-size: var(--fs-sm);
+  }
+  .site-footer-brand span:nth-of-type(1) { color: var(--ink); font-weight: 650; }
+  .site-footer-sep { color: var(--muted-2); }
+  .site-footer-copy {
+    margin-top: 1rem;
+    color: var(--muted-2);
+    font-size: var(--fs-xs);
+  }
+  .site-footer-legal {
+    margin-top: 1.1rem;
+    padding-top: 1.1rem;
+    border-top: var(--hairline);
+    color: var(--muted-2);
+    font-size: 0.72rem;
+    line-height: 1.55;
+    max-width: 78ch;
+  }
+  .site-footer-legal p + p { margin-top: 0.55rem; }
+</style>

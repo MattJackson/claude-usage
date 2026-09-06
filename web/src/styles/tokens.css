@@ -1,0 +1,87 @@
+/* usagio design tokens.
+   Restrained Apple-OEM palette: warm graphite ink on white, one saturated
+   indigo accent. Neutral scale is warm-tinted (not pure cool gray) to feel
+   less clinical. Shadows are soft, borders are hairline. */
+:root {
+  /* ---- color: neutrals ------------------------------------------------ */
+  --bg:            #ffffff;
+  --bg-soft:       #f7f7f5;   /* warm off-white for section variation */
+  --bg-sunken:     #f2f1ec;   /* subtle wallpaper suggestion behind hero */
+  --ink:           #17171a;   /* warm near-black for headlines/body */
+  --ink-2:         #3a3a41;
+  --muted:         #6b6b74;
+  --muted-2:       #9a9aa3;
+  --line:          #e7e6e1;   /* hairline borders */
+  --line-strong:   #d9d8d2;
+
+  /* ---- color: brand (derived from the official logo) ------------------
+     Use SPARINGLY: logo, primary Download CTA, one hero flourish, one link
+     accent. Everything else stays graphite on white. */
+  --brand-indigo:      #5B2BEA;
+  --brand-violet:      #9333EA;
+  --brand-accent-pale: #F5D0FE;
+  --brand-gloss:       rgba(255, 255, 255, 0.22);
+  --brand-gradient:    linear-gradient(135deg, var(--brand-indigo) 0%, var(--brand-violet) 100%);
+
+  /* Semantic accent tokens: point at the brand family so downstream rules
+     don't need to know the exact hex. */
+  --accent:        var(--brand-indigo);
+  --accent-hover:  #4a1fd5;
+  --accent-tint:   #f4ecff;
+  --accent-ring:   rgba(91, 43, 234, 0.20);
+
+  /* ---- color: status (menu mocks + micro-state) ---------------------- */
+  --ok:            #16a34a;
+  --ok-tint:       #ecfdf5;
+  --warn:          #d97706;
+  --warn-tint:     #fffbeb;
+  --danger:        #dc2626;
+  --danger-tint:   #fef2f2;
+
+  /* ---- typography ----------------------------------------------------- */
+  --font-sans:     -apple-system, BlinkMacSystemFont, "SF Pro Display",
+                   "SF Pro Text", "Inter", system-ui, "Segoe UI", Roboto,
+                   Helvetica, Arial, sans-serif;
+  --font-mono:     ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas,
+                   monospace;
+
+  /* Type scale — display headings, tight tracking; body wide line-height. */
+  --fs-display:    clamp(2.6rem, 6.4vw, 4.75rem);
+  --fs-h1:         clamp(2rem, 4.4vw, 3rem);
+  --fs-h2:         clamp(1.6rem, 3.4vw, 2.35rem);
+  --fs-h3:         1.18rem;
+  --fs-body:       1.02rem;
+  --fs-sm:         0.9rem;
+  --fs-xs:         0.78rem;
+
+  --lh-display:    1.05;
+  --lh-heading:    1.15;
+  --lh-body:       1.62;
+  --tracking-tight: -0.028em;
+  --tracking-mid:   -0.012em;
+  --tracking-wide:  0.06em;
+
+  /* ---- space, radii, shadow ------------------------------------------ */
+  --maxw:          1120px;
+  --maxw-narrow:   820px;
+  --gutter:        clamp(1rem, 4vw, 2rem);
+
+  --r-sm:          6px;
+  --r-md:          10px;
+  --r-lg:          14px;
+  --r-xl:          20px;
+
+  /* Soft, macOS-style stacked shadows — never harsh. */
+  --shadow-1:      0 1px 2px rgba(23, 23, 26, 0.04),
+                   0 1px 1px rgba(23, 23, 26, 0.03);
+  --shadow-2:      0 6px 20px -12px rgba(23, 23, 26, 0.18),
+                   0 2px 6px -3px rgba(23, 23, 26, 0.08);
+  --shadow-lift:   0 30px 80px -40px rgba(23, 23, 26, 0.35),
+                   0 12px 32px -18px rgba(23, 23, 26, 0.18);
+
+  --hairline:      1px solid var(--line);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { scroll-behavior: auto; }
+}
