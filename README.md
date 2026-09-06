@@ -3,6 +3,7 @@
 [![CI](https://github.com/MattJackson/claude-usage/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/claude-usage/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/claude-usage?display_name=tag&sort=semver)](https://github.com/MattJackson/claude-usage/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://www.rust-lang.org)
 
 See your Claude usage across multiple **Claude Max** accounts from your menu bar,
 switch between them without the `/login` browser dance, and (optionally) auto-ride
