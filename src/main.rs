@@ -759,7 +759,10 @@ fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
         .context("opening state lock")?;
     file.lock_exclusive().context("acquiring state lock")?;
     let r = f();
-    let _ = file.unlock();
+    // Fully-qualified to fs2's trait: std 1.89 added an inherent `File::unlock`
+    // that would otherwise shadow it and break the 1.88 MSRV (fs2 has no such
+    // requirement). Keep this qualified so the call can't drift onto std's.
+    let _ = fs2::FileExt::unlock(&file);
     r
 }
 
