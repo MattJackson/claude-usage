@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Proactive flip-back.** Auto-swap now returns to an account after its 5h session
+  resets — as long as it's still the best one to be on (soonest weekly reset) — so
+  the daemon keeps draining each account's weekly quota in order instead of stranding
+  it after a single session. Guarded by the existing swap cooldown / no-return
+  window, plus a headroom margin so two accounts sharing a weekly reset don't
+  ping-pong. Proactive swaps are labelled "Flipped back to …" and logged with
+  `"reason": "proactive"`.
+
+### Changed
+- **Swap-target eligibility is now session-gated.** A swap/return target must have a
+  **session** at or below the ceiling and a **weekly** below the trigger, rather than
+  requiring the max of both under the ceiling. This lets the daemon return to an
+  account whose weekly is high (but not yet maxed) once its session frees up, to
+  finish spending that weekly before it resets.
+
 ## [0.2.0] - 2026-09-05
 
 Post-audit hardening milestone. A full multi-lens code audit (10 review lenses

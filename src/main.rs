@@ -34,6 +34,12 @@ const TARGET_CEILING_PCT: f64 = 85.0;
 const SWAP_COOLDOWN_SECS: u64 = 300;
 /// Don't return to an account we just left for this long.
 const NO_RETURN_SECS: u64 = 1200;
+/// Proactive flip-back: when the active account is healthy (below trigger), only
+/// swap to a better one if that better account's weekly window resets sooner, or
+/// — on an equal reset — it has at least this many more points of headroom. The
+/// weekly-reset primary key is stable; the headroom tiebreak fluctuates as you
+/// work, so this margin keeps two near-equal accounts from ping-ponging.
+const PROACTIVE_HEADROOM_MARGIN: f64 = 10.0;
 /// Bundle id / label for the launchd agent (runs the menu-bar app at login).
 pub(crate) const LAUNCHD_LABEL: &str = "com.claude-usage.menubar";
 
@@ -685,6 +691,16 @@ impl Row {
         ok(&self.session) && ok(&self.weekly)
     }
 
+    /// Eligible as a swap / return target: the **session** has room to spare (so
+    /// landing here won't immediately re-trigger a swap) and the **weekly** is
+    /// still below the trigger. Weekly is deliberately allowed to run right up to
+    /// the trigger — returning to drain each account's weekly before it resets is
+    /// the whole point, so a high weekly must not disqualify a fresh-session one.
+    fn eligible_target(&self, session_ceiling: f64, weekly_trigger: f64) -> bool {
+        self.session.pct.unwrap_or(0.0) <= session_ceiling
+            && self.weekly.pct.unwrap_or(0.0) < weekly_trigger
+    }
+
     /// Remaining percent on the tightest of session/weekly.
     fn headroom(&self) -> f64 {
         100.0 - self.max_pct()
@@ -1071,8 +1087,28 @@ pub(crate) struct CycleOutcome {
     pub rate_limited: bool,
 }
 
+/// True if `cand` is a strictly better place to be than the healthy `act`:
+/// a sooner weekly reset (use-it-or-lose-it), or — on an equal reset — a
+/// meaningful headroom lead. Used only on the proactive (active-not-in-trouble)
+/// path; the reactive path moves regardless of how the active account ranks.
+fn worth_returning_to(cand: &Row, act: &Row) -> bool {
+    let kc = cand.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let ka = act.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
+    match kc.cmp(&ka) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => cand.headroom() - act.headroom() >= PROACTIVE_HEADROOM_MARGIN,
+    }
+}
+
 /// A pure auto-swap decision over cached rows. Returns the email to swap to, or
 /// None (with `guard` consulted for cooldown / no-return). Extracted for tests.
+///
+/// Two paths: **reactive** — the active account has reached `trigger`, so move to
+/// the best healthy candidate; and **proactive** — the active account is still
+/// healthy, but a better account has since freed up (e.g. its 5h session reset),
+/// so flip back to it. The proactive path additionally requires the candidate to
+/// be `worth_returning_to` the active account, so we don't swap sideways.
 fn choose_swap_target(
     rows: &[Row],
     active: &str,
@@ -1081,7 +1117,7 @@ fn choose_swap_target(
     guard: &SwapGuard,
 ) -> Option<String> {
     let act = rows.iter().find(|r| r.email == active)?;
-    if !act.has_data() || act.max_pct() < trigger {
+    if !act.has_data() {
         return None;
     }
     if guard
@@ -1093,7 +1129,7 @@ fn choose_swap_target(
     }
     let mut candidates: Vec<&Row> = rows
         .iter()
-        .filter(|r| r.has_data() && r.email != active && r.available() && r.max_pct() <= ceiling)
+        .filter(|r| r.has_data() && r.email != active && r.eligible_target(ceiling, trigger))
         .filter(|r| {
             guard
                 .left_at
@@ -1106,7 +1142,14 @@ fn choose_swap_target(
         return None;
     }
     candidates.sort_by(|a, b| candidate_order(a, b));
-    Some(candidates[0].email.clone())
+    let best = candidates[0];
+    // Active in trouble → move to the best candidate. Active still healthy →
+    // only move if the best candidate is genuinely a better place to be.
+    if act.max_pct() >= trigger || worth_returning_to(best, act) {
+        Some(best.email.clone())
+    } else {
+        None
+    }
 }
 
 /// Poll usage for every account (the only network path), record history, and
@@ -1135,6 +1178,13 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                     .find(|r| r.email == target)
                     .map(|r| (r.session.pct.unwrap_or(0.0), r.weekly.pct.unwrap_or(0.0)))
                     .unwrap_or((0.0, 0.0));
+                // Proactive flip-back if the account we're leaving wasn't itself
+                // over the trigger — a better account simply freed up.
+                let proactive = rows
+                    .iter()
+                    .find(|r| r.email == active_email)
+                    .map(|r| r.max_pct() < trigger)
+                    .unwrap_or(false);
                 // Compare-and-set on the active account: if a manual switch landed
                 // since choose_swap_target read the snapshot, skip this swap.
                 let Some(label) = switch_to_if_still_active(&target, &active_email)? else {
@@ -1152,14 +1202,18 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                 log_event(&serde_json::json!({
                     "ts": Utc::now().timestamp(),
                     "event": "swap",
+                    "reason": if proactive { "proactive" } else { "trigger" },
                     "from": active_email,
                     "to": target,
                     "session": pick_s,
                     "weekly": pick_w,
                 }));
-                notify(&format!(
-                    "Switched to {label} — {pick_s:.0}% / {pick_w:.0}%"
-                ));
+                let verb = if proactive {
+                    "Flipped back to"
+                } else {
+                    "Switched to"
+                };
+                notify(&format!("{verb} {label} — {pick_s:.0}% / {pick_w:.0}%"));
                 swapped = Some((active_email, target));
             }
             None => {

@@ -248,13 +248,76 @@ fn choose_swap_target_moves_off_over_trigger_account() {
 }
 
 #[test]
-fn choose_swap_target_none_when_active_below_trigger() {
-    let reset = Utc::now() + Duration::hours(24);
+fn choose_swap_target_stays_below_trigger_when_nothing_better() {
+    // Active is healthy AND already resets soonest, so no candidate is a better
+    // place to be — the proactive path must not swap sideways.
+    let soon = Utc::now() + Duration::hours(2);
+    let later = Utc::now() + Duration::hours(48);
     let rows = vec![
-        row_full("active@e.com", 40.0, 40.0, reset),
-        row_full("free@e.com", 20.0, 20.0, reset),
+        row_full("active@e.com", 40.0, 40.0, soon),
+        row_full("free@e.com", 20.0, 20.0, later),
     ];
     let guard = SwapGuard::default();
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+}
+
+#[test]
+fn choose_swap_target_proactively_flips_back_to_sooner_reset() {
+    // Active is healthy (below trigger) but a freed-up account resets its weekly
+    // window sooner — use-it-or-lose-it says flip back to it.
+    let soon = Utc::now() + Duration::hours(2);
+    let later = Utc::now() + Duration::hours(48);
+    let rows = vec![
+        row_full("active@e.com", 40.0, 40.0, later),
+        row_full("fresh@e.com", 10.0, 10.0, soon),
+    ];
+    let guard = SwapGuard::default();
+    let target = choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard);
+    assert_eq!(target.as_deref(), Some("fresh@e.com"));
+}
+
+#[test]
+fn choose_swap_target_no_proactive_swap_within_headroom_margin() {
+    // Equal weekly reset and only a small headroom lead (< PROACTIVE_HEADROOM_MARGIN)
+    // must not trigger a proactive swap, or two near-equal accounts would ping-pong.
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 30.0, 30.0, reset),
+        row_full("free@e.com", 25.0, 25.0, reset), // 5-point lead, under the margin
+    ];
+    let guard = SwapGuard::default();
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+}
+
+#[test]
+fn choose_swap_target_proactive_swap_beyond_headroom_margin() {
+    // Equal weekly reset but a large headroom lead (>= margin) is worth the swap.
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 70.0, 70.0, reset),
+        row_full("free@e.com", 20.0, 20.0, reset), // 50-point lead
+    ];
+    let guard = SwapGuard::default();
+    let target = choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard);
+    assert_eq!(target.as_deref(), Some("free@e.com"));
+}
+
+#[test]
+fn choose_swap_target_proactive_respects_no_return_window() {
+    // Even when a sooner-resetting account would be a better place to be, the
+    // no-return window still excludes an account we just left.
+    let soon = Utc::now() + Duration::hours(2);
+    let later = Utc::now() + Duration::hours(48);
+    let rows = vec![
+        row_full("active@e.com", 40.0, 40.0, later),
+        row_full("fresh@e.com", 10.0, 10.0, soon),
+    ];
+    let mut left_at = std::collections::HashMap::new();
+    left_at.insert("fresh@e.com".to_string(), std::time::Instant::now());
+    let guard = SwapGuard {
+        left_at,
+        ..SwapGuard::default()
+    };
     assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
 }
 
@@ -299,6 +362,35 @@ fn choose_swap_target_excludes_recently_left_account() {
         left_at,
         ..SwapGuard::default()
     };
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+}
+
+#[test]
+fn choose_swap_target_returns_to_high_weekly_fresh_session_account() {
+    // The account we want to finish draining: weekly is high (88%, above the old
+    // 85% max_pct ceiling) but its session just reset, so it's a valid target and
+    // we should flip back to keep spending its weekly before it resets.
+    let soon = Utc::now() + Duration::hours(2);
+    let later = Utc::now() + Duration::hours(48);
+    let rows = vec![
+        row_full("active@e.com", 40.0, 40.0, later),
+        row_full("draining@e.com", 5.0, 88.0, soon),
+    ];
+    let guard = SwapGuard::default();
+    let target = choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard);
+    assert_eq!(target.as_deref(), Some("draining@e.com"));
+}
+
+#[test]
+fn choose_swap_target_skips_target_whose_weekly_hit_trigger() {
+    // Fresh session but weekly already at the trigger → landing there would
+    // immediately want to swap away again, so it's not a valid target.
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 40.0, reset),
+        row_full("spent@e.com", 5.0, 96.0, reset),
+    ];
+    let guard = SwapGuard::default();
     assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
 }
 

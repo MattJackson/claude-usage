@@ -163,14 +163,28 @@ TOKEN=$(claude-usage token dev)  # a fresh access token for scripts
 
 ## Auto-swap
 
-When the active account's session **or** weekly usage crosses your threshold
-(default **95%**, set from the menu), the daemon switches to another account that has
-room — so a long session keeps going instead of hitting a wall. Hysteresis prevents
-thrashing:
+The daemon's goal is to **exhaust each account's weekly quota in order of soonest
+reset** — spend what's about to expire before it evaporates — without ever letting
+your active session hit the wall. It does this two ways:
 
-- trigger at the threshold, but only swap **to** an account with real headroom;
-- a **swap cooldown** so it can't flip rapidly; and
-- **no bounce-back** to an account it just left.
+- **Reactive.** When the active account's session **or** weekly usage crosses your
+  threshold (default **95%**, set from the menu), it switches to another account with
+  room, so a long session keeps going instead of blocking.
+- **Proactive flip-back.** The usual reason you leave an account is that its **5h
+  session** filled — its weekly still has room. When that session resets, the daemon
+  **returns to the account** to keep draining its weekly, as long as it's still the
+  best one to be on (soonest weekly reset). Over a week this rides each account down
+  to nearly-spent, in order, instead of stranding quota you left behind.
+
+Hysteresis keeps it from thrashing:
+
+- only swap **to** an account whose **session** has room to spare (so it won't
+  immediately re-trigger) — its weekly is allowed right up near the trigger, since
+  draining the weekly is the point;
+- a **swap cooldown** so it can't flip rapidly;
+- **no bounce-back** to an account it just left within a short window; and
+- on a proactive flip-back between two accounts that reset at the same time, a
+  headroom margin so near-equal accounts don't ping-pong.
 
 If no account has room it doesn't swap — it notifies you of the soonest reset. It
 runs inside the menu-bar app (so `claude-usage install` keeps it on), or headless via
