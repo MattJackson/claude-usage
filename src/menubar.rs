@@ -19,7 +19,7 @@ use tray_icon::TrayIconBuilder;
 
 use crate::store::State;
 use crate::{
-    age_str, capture_current, next_interval, notify, optimize_now, remove_account,
+    age_str, capture_current, menu_order, next_interval, notify, optimize_now, remove_account,
     row_from_account, switch_to, watch_cycle, with_state_lock, Row, SwapGuard, TARGET_CEILING_PCT,
     TRIGGER_PCT, WATCH_INTERVAL_SECS,
 };
@@ -400,11 +400,11 @@ fn build_snapshot() -> Snapshot {
     let autoswap = !st.autoswap_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     let active = st.active.clone();
-    let accounts = st
-        .accounts
-        .iter()
-        .map(|a| acctview_from_row(&row_from_account(a), &active))
-        .collect();
+    // Order rows by swap priority so the account to use first shows first; the
+    // CLI keeps insertion order, this is menu-only.
+    let mut rows: Vec<Row> = st.accounts.iter().map(row_from_account).collect();
+    rows.sort_by(menu_order);
+    let accounts = rows.iter().map(|r| acctview_from_row(r, &active)).collect();
     Snapshot {
         accounts,
         autoswap,

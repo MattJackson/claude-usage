@@ -233,6 +233,35 @@ fn auto_pick_prefers_soonest_reset() {
     assert_eq!(auto_pick(&rows).unwrap(), "soon@e.com");
 }
 
+// --- menu_order (dropdown priority) ---
+
+#[test]
+fn menu_order_lists_use_first_account_first() {
+    let soon = Utc::now() + Duration::hours(2);
+    let later = Utc::now() + Duration::hours(48);
+    let mut rows = [
+        row_full("later@e.com", 5.0, 5.0, later),
+        row_full("soon@e.com", 40.0, 40.0, soon),
+    ];
+    rows.sort_by(menu_order);
+    // Soonest weekly reset (the account auto-pick would use first) leads.
+    assert_eq!(rows[0].email, "soon@e.com");
+    assert_eq!(rows[1].email, "later@e.com");
+}
+
+#[test]
+fn menu_order_sinks_maxed_accounts_below_usable_ones() {
+    let reset = Utc::now() + Duration::hours(6);
+    // A maxed account resets soonest, but it's unusable — it must sort last.
+    let mut rows = [
+        row_full("maxed@e.com", 100.0, 40.0, reset),
+        row_full("free@e.com", 30.0, 30.0, Utc::now() + Duration::hours(24)),
+    ];
+    rows.sort_by(menu_order);
+    assert_eq!(rows[0].email, "free@e.com");
+    assert_eq!(rows[1].email, "maxed@e.com");
+}
+
 // --- choose_swap_target (auto-swap guard) ---
 
 #[test]

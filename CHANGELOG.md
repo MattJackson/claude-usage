@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window, plus a headroom margin so two accounts sharing a weekly reset don't
   ping-pong. Proactive swaps are labelled "Flipped back to …" and logged with
   `"reason": "proactive"`.
+- **Priority-ordered menu.** The menu-bar dropdown lists accounts by swap priority
+  (the account to use next on top, maxed-out ones last) instead of insertion order.
+  The CLI keeps insertion order.
 
 ### Changed
 - **Swap-target eligibility is now session-gated.** A swap/return target must have a

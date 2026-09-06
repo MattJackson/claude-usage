@@ -623,6 +623,20 @@ fn candidate_order(a: &Row, b: &Row) -> std::cmp::Ordering {
     )
 }
 
+/// Order accounts for the menu the way auto-pick prioritizes them: the account
+/// you'd switch to first on top, then the rest by the same rule, with unusable
+/// ones (maxed out, or no data yet) sinking to the bottom. Display-only — the
+/// CLI keeps insertion order.
+pub(crate) fn menu_order(a: &Row, b: &Row) -> std::cmp::Ordering {
+    // Usable (has data + room) before unusable; then accounts with data before
+    // those without; then the normal auto-pick priority within each group.
+    let usable = |r: &Row| r.has_data() && r.available();
+    usable(b)
+        .cmp(&usable(a))
+        .then_with(|| b.has_data().cmp(&a.has_data()))
+        .then_with(|| candidate_order(a, b))
+}
+
 /// Switch to the account auto-pick considers best right now (the one with room
 /// whose weekly window resets soonest, so its quota is used before it resets).
 /// Uses cached usage only — no network. Returns `Some(email)` if it switched,

@@ -113,9 +113,11 @@ Notes:
 active account's **session %** at a glance. Click it for a dropdown:
 
 - **One submenu per account**, labelled `email` on the left with `S% / W%`
-  right-aligned battery-menu style. The **active account is bold**; any percentage
-  in a danger band is colored (amber ≥80%, red ≥95%) so a nearly-spent account
-  jumps out. Each opens:
+  right-aligned battery-menu style. Accounts are **ordered by swap priority** — the
+  account you'd use next is at the top, maxed-out ones sink to the bottom — so the
+  list reads top-to-bottom as "use this first, then this." The **active account is
+  bold**; any percentage in a danger band is colored (amber ≥80%, red ≥95%) so a
+  nearly-spent account jumps out. Each opens:
   - **Switch to this account** (the active account shows a disabled **✓ Active**
     here instead)
   - a stats block — `Session X% · resets in …`, `Weekly X% · resets in …`, Opus if
