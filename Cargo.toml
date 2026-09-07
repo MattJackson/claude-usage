@@ -29,6 +29,10 @@ default = [
     "synthetic",
     "vertex-ai",
 ]
+# Opt in to real OpenAI tokenization (o200k_base BPE) for Context Ledger. Off by
+# default — the ~2MB tiktoken binary cost isn't worth it for a ±20% signal that
+# the fallback (chars/3.6) already provides.
+tiktoken = ["dep:tiktoken-rs"]
 claude = []
 codex = []
 opencode = []
@@ -61,6 +65,14 @@ tray-icon = "0.24.2"
 # Desktop notifications for the notifications module. Best-effort — a broken
 # dbus / user-notification connection never fails a watch cycle.
 notify-rust = "4"
+
+# Context Ledger deps: home/config discovery, typed errors, TOML config parsing
+# (Codex config.toml), and optional real tokenization behind the `tiktoken`
+# feature. The fallback path (chars-per-token approximation) works without it.
+dirs = "6"
+thiserror = "1"
+toml = "0.8"
+tiktoken-rs = { version = "0.7", optional = true }
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status

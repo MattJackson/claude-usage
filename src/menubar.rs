@@ -1018,6 +1018,20 @@ fn build_menu(snap: &Snapshot) -> Menu {
     }
     let _ = menu.append(&capture);
 
+    // Context Ledger ▸ — one row per supported CLI. Clicking spawns Terminal
+    // running `claude-usage context --provider <slug>` so the output survives
+    // the click without the menu-bar app having to render a native panel.
+    let ctxledger = Submenu::with_id("ctxledger", "Context Ledger", true);
+    for (slug, label) in context_ledger_menu_items() {
+        let _ = ctxledger.append(&MenuItem::with_id(
+            format!("ctxledger:{}", slug),
+            label,
+            true,
+            None,
+        ));
+    }
+    let _ = menu.append(&ctxledger);
+
     add_check(
         &menu,
         CheckMenuItem::with_id(
@@ -1501,6 +1515,7 @@ fn handle_click(id: &str) {
                 set_autoswap_threshold(v);
             }
         }
+        ("ctxledger", slug, None) => handle_context_ledger(slug),
         ("capture", Some(slug), None) => handle_capture(slug),
         ("apikey", Some(slug), None) => handle_apikey_capture(slug),
         ("switch", Some(slug), Some(key)) => handle_switch(slug, key),
@@ -1623,6 +1638,85 @@ fn handle_launch(slug: &str, _key: &str) {
             notify(&format!("Launch failed: {e}"));
         }
     });
+}
+
+/// Rows to render inside the `Context Ledger ▸` submenu. Kept pure so tests
+/// can pin the exact set + labels without spinning up a native menu (muda's
+/// Menu requires the macOS main thread). Adding a new supported CLI here is
+/// enough to surface it in the menu.
+pub(crate) fn context_ledger_menu_items() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("", "All providers…"),
+        ("claude", "Claude Code…"),
+        ("codex", "Codex…"),
+        ("opencode", "opencode…"),
+    ]
+}
+
+/// Build the shell command a `Context Ledger ▸ …` click should spawn in a new
+/// Terminal window. Kept pure so tests can assert quoting + provider flag
+/// without invoking Terminal. Empty slug maps to "audit every provider" — the
+/// same behavior as running `claude-usage context` with no `--provider` flag.
+pub(crate) fn context_ledger_shell_cmd(slug: Option<&str>, bin_path: &str) -> String {
+    let mut cmd = format!("{} context", shell_quote(bin_path));
+    if let Some(s) = slug.filter(|s| !s.is_empty()) {
+        cmd.push_str(" --provider ");
+        cmd.push_str(&shell_quote(s));
+    }
+    // Wrap with `; echo …; read` so the Terminal window doesn't slam shut on
+    // the last line of output before the user can read it.
+    format!(
+        "{cmd}; printf '\\n[press return to close]'; read _"
+    )
+}
+
+/// Minimal POSIX single-quote escape (wrap in `'…'`, escape internal `'`).
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Handle a click on a `Context Ledger ▸` row. Spawns a new Terminal window
+/// running the `context` subcommand — the output is more valuable persisted in
+/// a shell window than piped through the tiny `notify()` toast. Errors surface
+/// as a notification so a broken osascript path is visible, not swallowed.
+fn handle_context_ledger(slug: Option<&str>) {
+    let bin = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "claude-usage".to_string());
+    let cmd = context_ledger_shell_cmd(slug, &bin);
+    #[cfg(target_os = "macos")]
+    {
+        // `do script` opens a new Terminal window (or reuses one) and runs
+        // the command in it — the point is that the user can read the tree.
+        let script = format!(
+            "tell application \"Terminal\" to do script \"{}\"",
+            cmd.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let res = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .status();
+        match res {
+            Ok(s) if s.success() => {}
+            Ok(s) => notify(&format!("Context Ledger: osascript exited {}", s)),
+            Err(e) => notify(&format!("Context Ledger: could not open Terminal: {e}")),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cmd;
+        notify("Context Ledger: only supported on macOS in this build");
+    }
 }
 
 /// Enable or disable auto-swap. Surfaces a save failure so the menu checkmark
@@ -1997,6 +2091,69 @@ mod tests {
         let c = parse_click_id("quit");
         assert_eq!(c.action, "quit");
         assert!(c.slug.is_none());
+    }
+
+    // --- Context Ledger menu-item wiring ---------------------------------
+
+    #[test]
+    fn context_ledger_menu_items_include_all_supported_slugs() {
+        // The menu MUST offer an "All providers" catch-all plus one row per
+        // supported CLI, in the order the ledger's `cli::run` iterates them.
+        // A change to the supported set has to update this list.
+        let items = context_ledger_menu_items();
+        let slugs: Vec<&str> = items.iter().map(|(s, _)| *s).collect();
+        assert_eq!(slugs, vec!["", "claude", "codex", "opencode"]);
+        // Every row must carry a non-empty display label.
+        for (_, label) in &items {
+            assert!(!label.is_empty(), "context ledger row has empty label");
+        }
+    }
+
+    #[test]
+    fn context_ledger_click_ids_parse_with_optional_slug() {
+        // A slug-scoped click carries the provider as the "slug" segment.
+        let c = parse_click_id("ctxledger:claude");
+        assert_eq!(c.action, "ctxledger");
+        assert_eq!(c.slug, Some("claude"));
+        assert!(c.key.is_none());
+
+        // The "All providers" row carries an empty slug segment — parse_click_id
+        // treats trailing empties as Some(""), which handle_click's ctxledger arm
+        // has to accept (an empty slug means "iterate every provider").
+        let c = parse_click_id("ctxledger:");
+        assert_eq!(c.action, "ctxledger");
+        assert!(matches!(c.slug, Some("") | None));
+
+        // Bare "ctxledger" (no colon) is the fallback shape muda emits when a
+        // future refactor drops the sub-slug — must still route to the handler.
+        let c = parse_click_id("ctxledger");
+        assert_eq!(c.action, "ctxledger");
+        assert!(c.slug.is_none());
+    }
+
+    #[test]
+    fn context_ledger_shell_cmd_quotes_and_flags_provider() {
+        // No slug → no --provider flag; the command still ends in the pause
+        // shim so the Terminal window doesn't slam shut on the last line.
+        let cmd = context_ledger_shell_cmd(None, "/usr/local/bin/claude-usage");
+        assert!(cmd.starts_with("'/usr/local/bin/claude-usage' context"));
+        assert!(!cmd.contains("--provider"));
+        assert!(cmd.contains("[press return to close]"));
+
+        // Empty slug ("All providers…" row) behaves identically to None — no
+        // `--provider ''` sneaks through, which the CLI would reject.
+        let cmd_all = context_ledger_shell_cmd(Some(""), "/opt/bin/cu");
+        assert!(!cmd_all.contains("--provider"));
+
+        // A real slug flows through single-quoted so a path with spaces in
+        // `bin` and a slug with any surprising char both survive the shell.
+        let cmd_c = context_ledger_shell_cmd(Some("claude"), "/Applications/Claude Tools/cu");
+        assert!(cmd_c.contains("'/Applications/Claude Tools/cu' context --provider 'claude'"));
+
+        // Slugs containing a single-quote (paranoid future-proofing) round-trip
+        // via POSIX single-quote escaping (close-quote, escaped tick, re-open).
+        let cmd_q = context_ledger_shell_cmd(Some("a'b"), "cu");
+        assert!(cmd_q.contains("--provider 'a'\\''b'"));
     }
 
     // --- env-override guard end-to-end -----------------------------------
