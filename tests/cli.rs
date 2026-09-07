@@ -1,6 +1,6 @@
-//! Black-box CLI integration tests. Each test runs the compiled `claude-usage`
+//! Black-box CLI integration tests. Each test runs the compiled `usagio`
 //! binary as a subprocess with an isolated `HOME` (a fresh tempdir), so it never
-//! touches the real `~/.config/claude-usage/state.json`, `~/.claude.json`, or the
+//! touches the real `~/.config/usagio/state.json`, `~/.claude.json`, or the
 //! network. (Keychain access isn't HOME-scoped, so `capture` is not exercised
 //! here.) Accounts are keyed by email.
 
@@ -10,9 +10,9 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-/// A `claude-usage` command pinned to an isolated HOME.
+/// A `usagio` command pinned to an isolated HOME.
 fn bin(home: &TempDir) -> Command {
-    let mut c = Command::cargo_bin("claude-usage").expect("binary builds");
+    let mut c = Command::cargo_bin("usagio").expect("binary builds");
     c.env("HOME", home.path());
     c
 }
@@ -20,7 +20,7 @@ fn bin(home: &TempDir) -> Command {
 fn state_path(home: &TempDir) -> PathBuf {
     home.path()
         .join(".config")
-        .join("claude-usage")
+        .join("usagio")
         .join("state.json")
 }
 
@@ -69,7 +69,7 @@ fn help_lists_subcommands() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("claude-usage capture"))
+        .stdout(predicate::str::contains("usagio capture"))
         .stdout(predicate::str::contains("switch"))
         .stdout(predicate::str::contains("start"))
         .stdout(predicate::str::contains("continue"))
@@ -100,7 +100,7 @@ fn version_flag() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("claude-usage "));
+        .stdout(predicate::str::contains("usagio "));
 }
 
 #[test]

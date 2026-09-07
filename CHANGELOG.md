@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-06
+
+Big-bang release. Rebrand from **claude-usage** to **usagio**. Refactored into
+a core+agents architecture; adds OpenAI Codex support alongside Claude with 13
+more provider slots stubbed and ready to fill.
+
+### Renamed
+- Project renamed from `claude-usage` to `usagio` — now tracks usage across
+  Claude Code, Codex, and (via feature-gated stubs) every other AI-coding CLI.
+- Binary, crate, config directory (`~/.config/claude-usage/` →
+  `~/.config/usagio/`), launchd label
+  (`com.claude-usage.menubar` → `com.mattjackson.usagio.menubar`), macOS Login
+  Items entry, log filename, and bundle identifier all migrate on first run
+  (atomic rename with cross-device copy+delete fallback; idempotent).
+- macOS Keychain service string stays `"claude-usage"` for backwards
+  compatibility — existing tokens are preserved without a re-login.
+
+### Added
+- **Multi-provider architecture.** New `Provider` trait + registry with 15
+  slots (Claude + Codex live; 13 stubs: opencode, Gemini CLI, Qwen, Copilot
+  CLI, Cursor Agent, Amazon Q, Cline, Grok, Kimi, and API-key providers
+  OpenRouter, DeepSeek, Z.ai, Fireworks, Synthetic, Vertex AI). All gated
+  behind default-on Cargo features.
+- **Menu redesign.** Flat one-line-per-account row (`agent · email · S % ·
+  W % · ✓`), right-arrow submenu for details, per-provider icons on section
+  headers, countdown-when-locked (`locked · 23h 52m`).
+- **Never-re-login credential sync.** fsnotify watchers on every provider's
+  credential paths + absorb + provider-trait extension so vendor-CLI token
+  rotations never strand our stored copy; last-chance fallback re-reads
+  on-disk credentials before flagging any account as `needs_relogin`.
+- **Analytics.** Usage log (`~/.config/usagio/history.YYYY-MM.ndjson`),
+  weighted-linear-fit burn-rate forecast (`empty in ~40 m · 6 m before
+  reset`), model→USD cost tracking, subscription verdict (`Cancel /
+  Downgrade / Keep / Upgrade`).
+- **Context Ledger.** Audit what each CLI auto-injects into its context per
+  turn (`~/.claude/CLAUDE.md`, skills, MCP tool schemas, subagents, plugins);
+  available as `usagio context` and via the menu.
+- **Overwrite protection.** `save_state` refuses silent account drops
+  (dumps rejected states to `/tmp/usagio-state-rejected-<ts>.json` for
+  evidence), rolling backups in `~/.config/usagio/backups/`, `Settings ▸
+  Backup Config` menu, and a test-isolation tripwire that panics if any
+  unit test tries to touch the real `~/.config/usagio/`.
+- **Platform trait.** `MenuBackend` / `SecretStore` / `Autostart` / `Paths`
+  facade behind `Platform`; macOS wired (keychain via `security`, launchctl,
+  `~/.config`), Linux + Windows stubs behind `cfg(target_os)` (real impls
+  target v1.0).
+- **Notifications.** Threshold (70 / 90 %), reset-back, and weekly-pace
+  triggers via `notify-rust`; once-per-crossing dedup persisted in state.
+- CLI additions: `usagio context [--provider SLUG] [--project PATH]`,
+  `usagio report --pace|--pricing|--verdict`.
+- Website at usagio.dev (Astro 5, dark mode, alternating usage-state
+  layout, GitHub icon, 404 page); `THIRD_PARTY_NOTICES.md` with icon +
+  dependency attribution.
+
+### Changed
+- `state.json` v1 → v2 (providers.<slug>.accounts, `secret_ref` pointers,
+  `Vec<UsageWindow>` for deterministic ordering); v1 auto-migrates on first
+  launch.
+- `REFRESH_SKEW_SECS` 300 → 900 (refresh 15 min before expiry instead of 5).
+- Menu: provider section only renders if that provider has ≥ 1 captured
+  account; "Capture current login" submenu filters to providers with
+  `supports_usage=true`; API-key providers grouped under `Paste API key ▸`.
+- Accounts sort by soonest-expiration on add rather than add-order.
+- `CLAUDE_CODE_OAUTH_TOKEN` env override surfaces a disabled row and
+  skips the provider from auto-swap.
+- `LAUNCHD_LABEL` → `AUTOSTART_LABEL` (OS-agnostic naming).
+- Rust MSRV bumped to 1.88.
+
+### Fixed
+- **CRITICAL:** `switch_to_guarded` self-deadlock — `absorb_before_switch`
+  re-acquired the state lock via `Provider::absorb_credential` and blocked
+  forever (per-open-fd `flock` semantics). Made `with_state_lock`
+  thread-local reentrant.
+- **HIGH:** OAuth 400 `invalid_grant` was lumped into generic HTTP errors
+  and swallowed; account carried a dead grant forever. Now typed as
+  `RefreshError::InvalidGrant`; flags `Account.needs_relogin`; `cmd_token`
+  and `refresh_usage_cache` both run `last_chance_fallback` before flagging.
+- `spawn_watchers` skipped credential paths whose parent didn't exist at
+  startup (fresh installs missed every fsnotify event). Now creates the
+  parent (`0700`) before registering.
+- `refresh_inactive_if_stale` snapshotted `active` outside the state lock
+  (a mid-tick switch could refresh the just-became-active account). Now
+  snapshots and re-checks under the lock.
+- `store::config_dir` silently returned an empty/relative `PathBuf` when
+  the platform Paths impl couldn't resolve `$HOME`. Now errors with
+  actionable context.
+- `choose_swap_target` filters out `needs_relogin` accounts so auto-swap
+  can't hand a working login over to a dead account.
+
+### Security
+- **`save_state_safe`** refuses account drops without an explicit
+  `Account::remove()` flag; rejected states dumped to
+  `/tmp/usagio-state-rejected-<ts>.json` for post-mortem.
+- **Rolling backups** — 20 timestamped copies of `state.json` in
+  `~/.config/usagio/backups/`, one-command restore via `Settings ▸ Backup
+  Config ▸ Restore from backup`.
+- **Test isolation guard** — `store::config_dir()` panics if called from a
+  `#[cfg(test)]` context without a `ScopedConfigDir` / `TestConfigDir`
+  fixture active. Prevents the exact "test wipes prod state" incident that
+  surfaced during this cycle.
+- **Anthropic ToS disclaimer** in menu About + website footer + README:
+  usagio uses OAuth tokens issued to your own accounts; provider ToS may
+  restrict this use.
+
+### Notes
+- **Codex** support is functional but marked USAGE ONLY in v0.4.0;
+  switching enabled in v0.5.0 after Codex proof-of-trait validation.
+- **Linux / Windows** Platform trait implementations are skeleton stubs
+  behind `cfg(target_os)` so cross-compile links; real impls target v1.0.
+- **Keychain service string** stays `"claude-usage"` — renaming would
+  strand every existing token. Documented at the constant site.
+
 ## [0.3.1] - 2026-09-05
 
 ### Changed
@@ -292,7 +404,8 @@ fixes; every top finding was independently confirmed before fixing.
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/MattJackson/claude-usage/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/MattJackson/claude-usage/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MattJackson/claude-usage/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MattJackson/claude-usage/compare/v0.1.10...v0.2.0

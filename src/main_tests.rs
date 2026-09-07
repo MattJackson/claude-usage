@@ -620,7 +620,7 @@ fn write_bytes_atomic_mode_applies_requested_mode() {
         "the requested mode must be applied to the final file"
     );
     // No temp file left behind.
-    assert!(!path.with_extension("json.claude-usage.tmp").exists());
+    assert!(!path.with_extension("json.usagio.tmp").exists());
 }
 
 // --- consumption_deltas (report same-account guard) ---
@@ -693,7 +693,7 @@ fn merged_cached_usage_none_for_new_account() {
 fn rotate_if_large_rotates_over_threshold_with_correct_name() {
     let dir = tempfile::tempdir().unwrap();
     for (name, rotated) in [
-        ("claude-usage.log", "claude-usage.log.1"),
+        ("usagio.log", "usagio.log.1"),
         ("history.jsonl", "history.jsonl.1"),
     ] {
         let path = dir.path().join(name);
@@ -710,11 +710,11 @@ fn rotate_if_large_rotates_over_threshold_with_correct_name() {
 #[test]
 fn rotate_if_large_leaves_small_file_alone() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("claude-usage.log");
+    let path = dir.path().join("usagio.log");
     std::fs::write(&path, b"tiny").unwrap();
     logging::rotate_if_large(&path, 1_000_000);
     assert!(path.exists());
-    assert!(!dir.path().join("claude-usage.log.1").exists());
+    assert!(!dir.path().join("usagio.log.1").exists());
 }
 
 // --- needs_relogin filtering in the swap picker ---

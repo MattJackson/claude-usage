@@ -1,7 +1,7 @@
 # Security Policy
 
-`claude-usage` handles **Claude OAuth tokens** — it stores them in the macOS
-Keychain and in `~/.config/claude-usage/state.json` (owner-only, `0600`), and it
+`usagio` handles **Claude OAuth tokens** — it stores them in the macOS
+Keychain and in `~/.config/usagio/state.json` (owner-only, `0600`), and it
 talks only to first-party Anthropic/Claude endpoints. Its hard requirement is that
 credentials stay local, stay owner-readable only, and are sent nowhere but the
 official endpoints.

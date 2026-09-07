@@ -1,6 +1,6 @@
 # Third-party notices
 
-This document lists third-party assets bundled inside the `claude-usage`
+This document lists third-party assets bundled inside the `usagio`
 binary. Source dependency licenses are collected by `cargo`; this file covers
 only assets that ship as bytes inside the binary itself.
 

@@ -1,6 +1,6 @@
 //! macOS menu-bar app: shows the active account's usage in the status bar and
 //! lets you switch / capture / remove accounts and set the auto-swap threshold
-//! from a dropdown. The same `watch_cycle` that powers `claude-usage watch` runs
+//! from a dropdown. The same `watch_cycle` that powers `usagio watch` runs
 //! on a background thread here, so the daemon behaviour is identical.
 //!
 //! Usage numbers come from the cache (written by the scheduler poll); the UI
@@ -33,7 +33,7 @@ use crate::{
 };
 
 /// Name shown for our Login Item in System Events.
-const LOGIN_ITEM_NAME: &str = "Claude Usage";
+const LOGIN_ITEM_NAME: &str = "usagio";
 
 /// Exact title of the disabled section row inserted when a provider's env
 /// override is active. A named constant so `build_menu` and the tests
@@ -564,7 +564,7 @@ fn relaunch_via_launchd() -> LaunchdRestart {
 }
 
 /// Whether we're the launchd-managed agent. `XPC_SERVICE_NAME` is set by launchd
-/// to the job label for a LaunchAgent, so a manual `claude-usage menubar` run
+/// to the job label for a LaunchAgent, so a manual `usagio menubar` run
 /// (which self-spawns fine) isn't misrouted to the kickstart path.
 fn is_launchd_managed() -> bool {
     launchd_managed_from_env(std::env::var("XPC_SERVICE_NAME").ok().as_deref())
@@ -1030,7 +1030,7 @@ fn build_menu(snap: &Snapshot) -> Menu {
     let _ = menu.append(&capture);
 
     // Context Ledger ▸ — one row per supported CLI. Clicking spawns Terminal
-    // running `claude-usage context --provider <slug>` so the output survives
+    // running `usagio context --provider <slug>` so the output survives
     // the click without the menu-bar app having to render a native panel.
     let ctxledger = Submenu::with_id("ctxledger", "Context Ledger", true);
     for (slug, label) in context_ledger_menu_items() {
@@ -1099,7 +1099,7 @@ fn build_menu(snap: &Snapshot) -> Menu {
         &menu,
         MenuItem::with_id(
             "version",
-            format!("claude-usage v{}", env!("CARGO_PKG_VERSION")),
+            format!("usagio v{}", env!("CARGO_PKG_VERSION")),
             false,
             None,
         ),
@@ -1545,7 +1545,7 @@ fn tooltip_for(snap: &Snapshot) -> String {
             let w = a.windows.get(1).and_then(|w| w.pct);
             format!("{} — session {}, weekly {}", a.display, pct(s), pct(w))
         }
-        None => "claude-usage: no active account".to_string(),
+        None => "usagio: no active account".to_string(),
     }
 }
 
@@ -1856,7 +1856,7 @@ pub(crate) fn context_ledger_menu_items() -> Vec<(&'static str, &'static str)> {
 /// Build the shell command a `Context Ledger ▸ …` click should spawn in a new
 /// Terminal window. Kept pure so tests can assert quoting + provider flag
 /// without invoking Terminal. Empty slug maps to "audit every provider" — the
-/// same behavior as running `claude-usage context` with no `--provider` flag.
+/// same behavior as running `usagio context` with no `--provider` flag.
 pub(crate) fn context_ledger_shell_cmd(slug: Option<&str>, bin_path: &str) -> String {
     let mut cmd = format!("{} context", shell_quote(bin_path));
     if let Some(s) = slug.filter(|s| !s.is_empty()) {
@@ -1890,7 +1890,7 @@ fn shell_quote(s: &str) -> String {
 fn handle_context_ledger(slug: Option<&str>) {
     let bin = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "claude-usage".to_string());
+        .unwrap_or_else(|_| "usagio".to_string());
     let cmd = context_ledger_shell_cmd(slug, &bin);
     #[cfg(target_os = "macos")]
     {
@@ -1947,7 +1947,7 @@ fn set_autoswap_threshold(v: f64) {
 fn confirm(question: &str) -> bool {
     let script = format!(
         "display dialog {question:?} buttons {{\"Cancel\", \"Remove\"}} \
-         default button \"Cancel\" with title \"claude-usage\""
+         default button \"Cancel\" with title \"usagio\""
     );
     match std::process::Command::new("osascript")
         .arg("-e")
@@ -2335,8 +2335,8 @@ mod tests {
     fn context_ledger_shell_cmd_quotes_and_flags_provider() {
         // No slug → no --provider flag; the command still ends in the pause
         // shim so the Terminal window doesn't slam shut on the last line.
-        let cmd = context_ledger_shell_cmd(None, "/usr/local/bin/claude-usage");
-        assert!(cmd.starts_with("'/usr/local/bin/claude-usage' context"));
+        let cmd = context_ledger_shell_cmd(None, "/usr/local/bin/usagio");
+        assert!(cmd.starts_with("'/usr/local/bin/usagio' context"));
         assert!(!cmd.contains("--provider"));
         assert!(cmd.contains("[press return to close]"));
 

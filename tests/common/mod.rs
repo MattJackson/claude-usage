@@ -1,7 +1,7 @@
 //! Shared integration-test helpers.
 //!
 //! `TestLogDir` swaps `$HOME` for a fresh tempdir, so `usage_log` (and any
-//! other module that resolves paths under `~/.config/claude-usage`) reads and
+//! other module that resolves paths under `~/.config/usagio`) reads and
 //! writes into an isolated location. On drop the previous `HOME` is restored
 //! and the tempdir is deleted, so tests never leak state between runs.
 //!
@@ -39,7 +39,7 @@ impl TestLogDir {
         std::env::set_var("HOME", &home_path);
         // Pre-create the config dir so any writer that assumes existence
         // finds it without extra ceremony.
-        let cfg = home_path.join(".config").join("claude-usage");
+        let cfg = home_path.join(".config").join("usagio");
         std::fs::create_dir_all(&cfg).expect("create config dir");
         Self {
             _home: home,
@@ -54,9 +54,9 @@ impl TestLogDir {
         &self.home_path
     }
 
-    /// Path to the isolated `~/.config/claude-usage` directory.
+    /// Path to the isolated `~/.config/usagio` directory.
     pub fn config_dir(&self) -> PathBuf {
-        self.home_path.join(".config").join("claude-usage")
+        self.home_path.join(".config").join("usagio")
     }
 
     /// Append one NDJSON row into the `history.YYYY-MM.ndjson` file whose
@@ -92,13 +92,13 @@ impl Drop for TestLogDir {
 //
 // Both this and the in-crate `store::ScopedConfigDir` funnel through the same
 // contract: no test process (parent OR spawned CLI) ever touches the real
-// `~/.config/claude-usage`. The parent-side `$HOME` swap here isolates any
+// `~/.config/usagio`. The parent-side `$HOME` swap here isolates any
 // spawned subprocess (which inherits `HOME` from us); the in-crate
 // `ScopedConfigDir` layers on top of the same thread-local `HOME_OVERRIDE`
 // that the crate's `cfg(test)` tripwire enforces.
 // ---------------------------------------------------------------------------
 
-/// A scoped `$HOME` guard for integration tests that spawn `claude-usage` as a
+/// A scoped `$HOME` guard for integration tests that spawn `usagio` as a
 /// subprocess. The child inherits `$HOME` from the current process, so pinning
 /// `HOME` here plus asserting inside the subprocess-safe `cfg(not(test))` path
 /// (the built binary is compiled without `cfg(test)`) keeps every state.json
@@ -110,14 +110,14 @@ pub struct TestConfigDir {
 }
 
 impl TestConfigDir {
-    /// Fresh tempdir, `$HOME` repointed at it, `~/.config/claude-usage`
+    /// Fresh tempdir, `$HOME` repointed at it, `~/.config/usagio`
     /// pre-created so callers can seed a state.json without extra ceremony.
     pub fn new() -> Self {
         let home = tempfile::tempdir().expect("tempdir for TestConfigDir");
         let home_path = home.path().to_path_buf();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", &home_path);
-        let cfg = home_path.join(".config").join("claude-usage");
+        let cfg = home_path.join(".config").join("usagio");
         std::fs::create_dir_all(&cfg).expect("create config dir");
         Self {
             _home: home,
@@ -131,7 +131,7 @@ impl TestConfigDir {
     }
 
     pub fn config_dir(&self) -> PathBuf {
-        self.home_path.join(".config").join("claude-usage")
+        self.home_path.join(".config").join("usagio")
     }
 
     pub fn state_path(&self) -> PathBuf {

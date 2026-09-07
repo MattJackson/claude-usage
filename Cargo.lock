@@ -421,39 +421,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "claude-usage"
-version = "0.3.1"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "base64",
- "block2",
- "chrono",
- "dirs",
- "fs2",
- "ksni",
- "libc",
- "notify",
- "notify-rust",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "predicates",
- "rand",
- "secret-service",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 1.0.69",
- "tiktoken-rs",
- "toml",
- "tray-icon",
- "ureq",
- "windows 0.60.0",
-]
-
-[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2806,6 +2773,39 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "usagio"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "base64",
+ "block2",
+ "chrono",
+ "dirs",
+ "fs2",
+ "ksni",
+ "libc",
+ "notify",
+ "notify-rust",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "predicates",
+ "rand",
+ "secret-service",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tiktoken-rs",
+ "toml",
+ "tray-icon",
+ "ureq",
+ "windows 0.60.0",
 ]
 
 [[package]]

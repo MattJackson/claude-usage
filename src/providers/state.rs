@@ -246,7 +246,9 @@ impl StateV2 {
         Self::load_and_migrate_bytes(&bytes, sink)
     }
 
-    /// Default on-disk path — same as v1 (`~/.config/claude-usage/state.json`).
+    /// Default on-disk path — v2 (`~/.config/usagio/state.json`); the
+    /// pre-0.4.0 v1 location (`~/.config/claude-usage/state.json`) is
+    /// migrated on first launch by `crate::paths::migrate_config_dir_if_needed`.
     pub fn default_path() -> Result<PathBuf> {
         Ok(crate::store::config_dir()?.join("state.json"))
     }
@@ -410,10 +412,19 @@ impl SecretSink for NullSecretSink {
 /// keychain slots (service `claude-usage`, account `claude:<identifier>`) so
 /// multiple captured accounts survive; the vendor CLI's own single-slot
 /// `Claude Code-credentials` entry is left untouched.
+///
+/// **Do not rename the service string.** The literal `"claude-usage"` is
+/// intentionally frozen at the pre-v0.4.0 slug: the macOS Keychain namespaces
+/// items by `(service, account)`, so renaming to `"usagio"` would strand
+/// every token that users captured before upgrading. The service string is an
+/// internal identifier — it never appears in any UI — so keeping the
+/// historical name has zero UX cost and preserves a silent upgrade path.
+const KEYCHAIN_SERVICE_LEGACY: &str = "claude-usage";
+
 fn claude_secret_ref(identifier: &str) -> SecretRef {
     SecretRef {
         backend: SecretBackend::Keychain,
-        service: "claude-usage".to_string(),
+        service: KEYCHAIN_SERVICE_LEGACY.to_string(),
         account: format!("claude:{identifier}"),
     }
 }

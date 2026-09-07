@@ -274,15 +274,15 @@ mod tests {
         let orig = std::env::var_os("HOME");
         // SAFETY: single-threaded env mutation, restored on exit.
         std::env::set_var("HOME", "/tmp/platform-test-home");
-        let got = MacOsPaths.config_dir("claude-usage");
+        let got = MacOsPaths.config_dir("usagio");
         assert_eq!(
             got,
-            std::path::PathBuf::from("/tmp/platform-test-home/.config/claude-usage")
+            std::path::PathBuf::from("/tmp/platform-test-home/.config/usagio")
         );
-        let cache = MacOsPaths.cache_dir("claude-usage");
+        let cache = MacOsPaths.cache_dir("usagio");
         assert_eq!(
             cache,
-            std::path::PathBuf::from("/tmp/platform-test-home/Library/Caches/claude-usage")
+            std::path::PathBuf::from("/tmp/platform-test-home/Library/Caches/usagio")
         );
         match orig {
             Some(v) => std::env::set_var("HOME", v),
@@ -299,7 +299,7 @@ mod tests {
     #[ignore = "touches the real login keychain; run with --ignored"]
     fn secret_store_roundtrip() {
         let service = format!(
-            "claude-usage-platform-test-{}",
+            "usagio-platform-test-{}",
             std::process::id()
         );
         let account = "roundtrip";
