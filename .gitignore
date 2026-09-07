@@ -5,6 +5,9 @@
 /dist
 *.app
 
+# Generated once per release by packaging/macos/generate-icns.sh — not source.
+packaging/macos/AppIcon.icns
+
 # Editor / OS cruft
 **/*.rs.bk
 .DS_Store

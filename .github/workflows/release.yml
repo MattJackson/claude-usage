@@ -61,8 +61,48 @@ jobs:
           lipo -create -output "dist/${BIN}" \
             "target/aarch64-apple-darwin/release/${BIN}" \
             "target/x86_64-apple-darwin/release/${BIN}"
-          tar -C dist -czf "dist/${BIN}-${version}-universal-apple-darwin.tar.gz" "${BIN}"
-          rm -f "dist/${BIN}"
+
+      - name: Build usagio.app bundle (for Login Items icon)
+        # Wraps the universal binary from the previous step in a minimal
+        # .app bundle so macOS's Login Items UI (System Settings > General >
+        # Login Items) reads AppIcon.icns from Contents/Resources/ instead
+        # of showing the generic "exec" glyph a bare binary gets. See
+        # packaging/macos/usagio.app.template/Contents/Info.plist and
+        # packaging/macos/generate-icns.sh for the rationale.
+        #
+        # Ad-hoc signed only (`codesign --sign -`) — there's no Apple
+        # Developer account yet for a real Developer ID signature, so this
+        # is not notarised. Gatekeeper may still warn on a first *manual*
+        # double-click of usagio.app, but neither `brew install` nor
+        # `usagio install` (which launches via launchd, not Finder/LaunchServices)
+        # go through that Gatekeeper quarantine prompt path.
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          ver="${version#v}"
+
+          packaging/macos/generate-icns.sh
+
+          app_build="dist/${BIN}.app"
+          cp -R packaging/macos/usagio.app.template "$app_build"
+          sed -i '' "s/{{VERSION}}/${ver}/g" "$app_build/Contents/Info.plist"
+          cp "dist/${BIN}" "$app_build/Contents/MacOS/${BIN}"
+          chmod +x "$app_build/Contents/MacOS/${BIN}"
+          rm -f "$app_build/Contents/MacOS/.gitkeep"
+          cp packaging/macos/AppIcon.icns "$app_build/Contents/Resources/AppIcon.icns"
+          rm -f "$app_build/Contents/Resources/.gitkeep"
+
+          codesign --force --deep --sign - "$app_build"
+
+      - name: Package tarball + checksums
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+
+          # Universal tarball ships both the bare binary (backward compat
+          # with existing self-update / manual-install docs) and the .app
+          # bundle (for `usagio install` / Login Items).
+          tar -C dist -czf "dist/${BIN}-${version}-universal-apple-darwin.tar.gz" \
+            "${BIN}" "${BIN}.app"
+          rm -rf "dist/${BIN}" "dist/${BIN}.app"
 
           # Checksums: a per-asset .sha256 (consumed by the self-update
           # feature, which verifies before replacing the binary) plus a
@@ -113,6 +153,17 @@ jobs:
           sed -i '' -E "s|^  url .*|  url \"${url}\"|" "$f"
           sed -i '' -E "s|^  sha256 .*|  sha256 \"${sum}\"|" "$f"
           sed -i '' -E "s|^  version .*|  version \"${ver}\"|" "$f"
+
+          # The universal tarball now ships usagio.app alongside the bare
+          # binary (see the "Build usagio.app bundle" step above) — install
+          # both so `usagio install` can find the bundle and point launchd
+          # at it for a real Login Items icon.
+          perl -0777 -pi -e 's/def install\n(?:.*\n)*?  end\n/def install\n    bin.install "usagio"\n    prefix.install "usagio.app"\n  end\n/' "$f"
+
+          # Add a caveats block (once) pointing users at `usagio install`.
+          if ! grep -q 'def caveats' "$f"; then
+            perl -0777 -pi -e 's/(\nend\n?)\z/\n  def caveats\n    <<~EOS\n      For the app icon in Login Items, run `usagio install` — it now points\n      launchd at usagio.app\/Contents\/MacOS\/usagio.\n    EOS\n  end\n$1/' "$f"
+          fi
 
           cd tap
           git config user.name "github-actions[bot]"

@@ -849,3 +849,115 @@ fn switch_lock_closure_invariant_mutations_after_reload_survive() {
     );
     assert_eq!(disk.active.as_deref(), Some("b@e.com"));
 }
+
+// --- launch_agent_exe_path / sibling_app_bundle_exe ---
+
+fn mock_cellar_bundle_layout(
+    prefix: &str,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let version_dir = dir.join("Cellar/usagio/0.9.9");
+    let bin_dir = version_dir.join("bin");
+    let bundle_macos_dir = version_dir.join("usagio.app/Contents/MacOS");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&bundle_macos_dir).unwrap();
+
+    let bare_exe = bin_dir.join("usagio");
+    std::fs::write(&bare_exe, b"bare").unwrap();
+    let bundle_exe = bundle_macos_dir.join("usagio");
+    std::fs::write(&bundle_exe, b"bundled").unwrap();
+
+    (dir, bare_exe, bundle_exe)
+}
+
+#[test]
+fn sibling_app_bundle_exe_finds_bundle_next_to_bin_dir() {
+    let (dir, bare_exe, bundle_exe) = mock_cellar_bundle_layout("usagio-bundle-test");
+
+    let found = sibling_app_bundle_exe(&bare_exe).expect("bundle exe should be found");
+    assert_eq!(found, bundle_exe);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sibling_app_bundle_exe_none_when_bundle_absent() {
+    let dir = std::env::temp_dir().join(format!(
+        "usagio-nobundle-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let bin_dir = dir.join("Cellar/usagio/0.9.9/bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let bare_exe = bin_dir.join("usagio");
+    std::fs::write(&bare_exe, b"bare").unwrap();
+
+    assert!(sibling_app_bundle_exe(&bare_exe).is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Mocks a Homebrew-style `<Cellar>/usagio/<version>/{bin,usagio.app}` layout
+/// and reproduces the exact plist-building the real `MacOsAutostart::install`
+/// does (minus the `launchctl load` shell-out, which needs a real launchd job
+/// and a valid Mach-O binary — orthogonal to what's under test here), then
+/// asserts the written LaunchAgent plist's `ProgramArguments` points at the
+/// bundle's `Contents/MacOS/usagio`, not the bare binary. This is what makes
+/// Login Items show the app icon instead of the generic "exec" glyph.
+#[test]
+fn usagio_install_prefers_app_bundle_path_when_available() {
+    let (dir, bare_exe, bundle_exe) = mock_cellar_bundle_layout("usagio-install-bundle-test");
+
+    // Resolve exactly the way `cmd_install` -> `launch_agent_exe_path` would,
+    // given this mocked Cellar layout (bypassing `current_exe()`/
+    // `stable_exe_path()`, which can't be pointed at a scratch dir).
+    let resolved = sibling_app_bundle_exe(&bare_exe).expect("bundle should resolve");
+    assert_eq!(resolved, bundle_exe);
+
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let plist_path = home
+        .join("Library/LaunchAgents")
+        .join("com.mattjackson.usagio.test-bundle.plist");
+
+    crate::env_lock::scoped_env_var("HOME", Some(home.to_str().unwrap()), || {
+        let mut prog_args = format!("    <string>{}</string>\n", resolved.display());
+        prog_args.push_str("    <string>menubar</string>\n");
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mattjackson.usagio.test-bundle</string>
+  <key>ProgramArguments</key>
+  <array>
+{prog_args}  </array>
+</dict>
+</plist>
+"#
+        );
+        std::fs::create_dir_all(plist_path.parent().unwrap()).unwrap();
+        std::fs::write(&plist_path, &plist).unwrap();
+
+        let written = std::fs::read_to_string(&plist_path).unwrap();
+        assert!(
+            written.contains("usagio.app/Contents/MacOS/usagio"),
+            "expected ProgramArguments to point into the app bundle, got:\n{written}"
+        );
+        assert!(
+            !written.contains(&bare_exe.display().to_string()),
+            "must not fall back to the bare binary path when a bundle exists"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
