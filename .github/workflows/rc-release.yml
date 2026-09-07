@@ -1,0 +1,239 @@
+name: RC Release
+
+# Release-candidate dry run of release.yml — lets us push a
+# v<version>-rc<N> tag (e.g. v0.5.0-rc1), download the real packaged
+# artifacts from a real GitHub Release, `brew install --formula` (or
+# install the Linux tarball / Windows zip) on an actual machine, and boot
+# the tray to eyeball it BEFORE cutting the real vX.Y.Z tag.
+#
+# Mirrors every build/package/attest/publish step in release.yml for all
+# three OSes, with exactly one omission: the Homebrew tap-bump step. RC
+# releases must never override the stable tap formula that `brew upgrade
+# usagio` resolves against — only a real vX.Y.Z tag (handled by
+# release.yml) does that.
+on:
+  push:
+    tags: ['v*.*.*-rc*']
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: usagio
+
+jobs:
+  build-macos:
+    name: '[RC] Build universal macOS binary and publish release'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          # Both Apple architectures so we can lipo a universal binary.
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Verify tag's base version matches Cargo.toml version
+        # RC tags carry a `-rcN` suffix Cargo.toml's version never has
+        # (semver pre-release identifiers aren't part of this crate's own
+        # version string) — strip it before comparing, e.g.
+        # v0.5.0-rc1 -> 0.5.0.
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"      # e.g. 0.5.0-rc1
+          base_version="${tag%%-rc*}"           # e.g. 0.5.0
+          cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$base_version" != "$cargo_ver" ]; then
+            echo "::error::tag v$tag's base version ($base_version) does not match Cargo.toml version ($cargo_ver)"
+            exit 1
+          fi
+
+      - name: Build (aarch64 + x86_64)
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Package binaries
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+
+          # Per-arch tarballs.
+          for arch in aarch64 x86_64; do
+            tar -C "target/${arch}-apple-darwin/release" -czf \
+              "dist/${BIN}-${version}-${arch}-apple-darwin.tar.gz" "${BIN}"
+          done
+
+          # Universal (fat) binary via lipo.
+          lipo -create -output "dist/${BIN}" \
+            "target/aarch64-apple-darwin/release/${BIN}" \
+            "target/x86_64-apple-darwin/release/${BIN}"
+
+      - name: Build usagio.app bundle (for Login Items icon)
+        # Same bundle step as release.yml — ad-hoc signed only, not
+        # notarised. See the equivalent step there for the full rationale.
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          ver="${version#v}"
+
+          packaging/macos/generate-icns.sh
+
+          app_build="dist/${BIN}.app"
+          cp -R packaging/macos/usagio.app.template "$app_build"
+          sed -i '' "s/{{VERSION}}/${ver}/g" "$app_build/Contents/Info.plist"
+          cp "dist/${BIN}" "$app_build/Contents/MacOS/${BIN}"
+          chmod +x "$app_build/Contents/MacOS/${BIN}"
+          rm -f "$app_build/Contents/MacOS/.gitkeep"
+          cp packaging/macos/AppIcon.icns "$app_build/Contents/Resources/AppIcon.icns"
+          rm -f "$app_build/Contents/Resources/.gitkeep"
+
+          codesign --force --deep --sign - "$app_build"
+
+      - name: Package tarball + checksums
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+
+          tar -C dist -czf "dist/${BIN}-${version}-universal-apple-darwin.tar.gz" \
+            "${BIN}" "${BIN}.app"
+          rm -rf "dist/${BIN}" "dist/${BIN}.app"
+
+          cd dist
+          for f in *.tar.gz; do
+            shasum -a 256 "$f" > "${f}.sha256"
+          done
+          shasum -a 256 *.tar.gz > SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: 'dist/*.tar.gz'
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          generate_release_notes: true
+          prerelease: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/SHA256SUMS
+
+      # NOTE: deliberately NO "Bump Homebrew tap formula" step here — see
+      # the workflow-level comment at the top of this file. `brew install
+      # --formula ./usagio-<tag>-universal-apple-darwin.tar.gz` (downloaded
+      # straight from this run's Release assets) is the intended way to test
+      # an RC locally; it never touches the tap.
+
+  build-linux:
+    name: '[RC] Build Linux binary and publish release asset'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libssl-dev pkg-config libsecret-1-dev
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Verify tag's base version matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          base_version="${tag%%-rc*}"
+          cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$base_version" != "$cargo_ver" ]; then
+            echo "::error::tag v$tag's base version ($base_version) does not match Cargo.toml version ($cargo_ver)"
+            exit 1
+          fi
+
+      - name: Build (x86_64-unknown-linux-gnu)
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Package binary
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+          tar -C "target/x86_64-unknown-linux-gnu/release" -czf \
+            "dist/${BIN}-${version}-x86_64-unknown-linux-gnu.tar.gz" "${BIN}"
+
+          cd dist
+          shasum -a 256 "${BIN}-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            > "${BIN}-${version}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: 'dist/*.tar.gz'
+
+      - name: Publish GitHub Release asset
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          generate_release_notes: true
+          prerelease: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  build-windows:
+    name: '[RC] Build Windows binary and publish release asset'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Verify tag's base version matches Cargo.toml version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          base_version="${tag%%-rc*}"
+          cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$base_version" != "$cargo_ver" ]; then
+            echo "::error::tag v$tag's base version ($base_version) does not match Cargo.toml version ($cargo_ver)"
+            exit 1
+          fi
+
+      - name: Build (x86_64-pc-windows-msvc)
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package binary
+        shell: bash
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+          cp "target/x86_64-pc-windows-msvc/release/${BIN}.exe" "dist/${BIN}.exe"
+          (cd dist && 7z a "${BIN}-${version}-x86_64-pc-windows-msvc.zip" "${BIN}.exe")
+          rm -f "dist/${BIN}.exe"
+          cd dist
+          sha256sum "${BIN}-${version}-x86_64-pc-windows-msvc.zip" \
+            > "${BIN}-${version}-x86_64-pc-windows-msvc.zip.sha256"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: 'dist/*.zip'
+
+      - name: Publish GitHub Release asset
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          generate_release_notes: true
+          prerelease: true
+          files: |
+            dist/*.zip
+            dist/*.sha256

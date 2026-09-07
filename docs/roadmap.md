@@ -49,6 +49,33 @@ Linux + Windows platform impls (drafts staged at /tmp/usagio-drafts/).
 Same as v0.4.0: `/codeaudit` converges to 0 confirmed issues, all lenses
 retired, 357/357 tests green under `--test-threads=1` × 5 runs.
 
+CI closes the "compile-only" gap on every OS-integration surface before the
+v0.5.0 tag: a real GTK/appindicator tray init under `xvfb-run`, a real
+Secret Service D-Bus round-trip via an unlocked `gnome-keyring-daemon`, and
+the real-registry-write autostart test — all previously `#[ignore]`d or
+verified only by `cargo build` linking successfully — now run on every push
+(see `.github/workflows/ci.yml`). The one surface still not exercised
+end-to-end in CI is the Linux `xdg-desktop-portal` file-dialog backend
+(installing a headless portal implementation is fragile and adds real time
+to every PR for a single dialog); that path is instead covered by routing
+`rfd::FileDialog` through a `Platform::file_dialog()` trait method
+(`src/platform/mod.rs`) with a capturing mock, so the click-handler logic
+around it is unit-tested even though the native portal call itself isn't.
+
+### Pre-release step: `vX.Y.Z-rcN` tags
+
+Before cutting the real `vX.Y.Z` tag, push a `vX.Y.Z-rcN` tag (e.g.
+`v0.5.0-rc1`). `.github/workflows/rc-release.yml` builds and publishes the
+same three artifacts `release.yml` does (macOS universal, Linux x86_64
+tarball, Windows x86_64 zip) as a GitHub prerelease, but does **not** touch
+the Homebrew tap formula — that only ever tracks the latest stable
+`vX.Y.Z` release. This is the only realistic way to validate the
+release/tap-bump machinery end to end (build matrix, packaging, codesign,
+attestation) without risking `brew upgrade usagio` resolving to an RC:
+download the macOS tarball from the RC release,
+`brew install --formula ./usagio-v0.5.0-rc1-universal-apple-darwin.tar.gz`,
+boot the tray, and eyeball it.
+
 ## Hotfix candidates (→ release/0.4.x → 0.4.2)
 
 Filed by user during 0.4.1 soak — evaluating each for 0.4.x vs. 0.5.0:
