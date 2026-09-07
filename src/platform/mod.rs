@@ -196,3 +196,58 @@ pub fn current() -> Box<dyn Platform> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     compile_error!("unsupported target OS");
 }
+
+// ---------------------------------------------------------------------------
+// secure_permissions_unix — the only guard on secret-file permissions on
+// macOS + Linux. Pinned so a refactor that quietly stops chmod'ing (e.g.
+// "simplify" to always return Ok) is caught by a red test, not by an
+// incident.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::secure_permissions_unix;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn secure_permissions_unix_chmods_regular_file_to_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+        std::fs::write(&path, b"shh").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        secure_permissions_unix(&path).expect("chmod should succeed on an existing file");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "file mode should be exactly 0600");
+    }
+
+    #[test]
+    fn secure_permissions_unix_chmods_directory_to_0700() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("secretdir");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        secure_permissions_unix(&path).expect("chmod should succeed on an existing dir");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "dir mode should be exactly 0700");
+    }
+
+    #[test]
+    fn secure_permissions_unix_errors_on_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+
+        // Pinning current behavior: stat fails before any chmod is attempted,
+        // so a missing path is a loud error, not a silent no-op success.
+        let err = secure_permissions_unix(&missing)
+            .expect_err("a missing path must not be treated as already-secure");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("secure_permissions"),
+            "error should identify the operation: {msg}"
+        );
+    }
+}
