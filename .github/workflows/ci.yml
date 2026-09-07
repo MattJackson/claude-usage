@@ -17,26 +17,64 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Fast lane — runs on every push/PR (including dev). Keeps dev quick.
+  # Fast lane — runs on every push/PR (including dev), across all three
+  # platforms usagio ships on. Keeps dev quick per-OS while still catching
+  # platform-specific breakage before it reaches qa/main.
   check:
-    name: fmt + clippy + test
-    runs-on: macos-latest
+    name: fmt + clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Linux-only system deps: tray-icon (GTK/appindicator), notify-rust
+      # (dbus via libxdo for some backends), ureq TLS (openssl), and the
+      # secret-service crate (libsecret) for the credential store.
+      - name: Install Linux system deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libssl-dev pkg-config libsecret-1-dev
+
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
           components: rustfmt, clippy
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+
       - name: cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-features -- -D warnings
+
+      - name: cargo build --release
+        run: cargo build --release --all-features
+
       - name: cargo test
         # --test-threads=1 required: several tests mutate process-global $HOME
         # to point at a tempdir via env_lock::scoped_env_var. Parallel runs
         # would race the lock across binaries. See M7 in the round-1 codeaudit.
-        run: cargo test --all-features -- --test-threads=1
+        run: cargo test --tests --all-features -- --test-threads=1
+
+      # Cheap, Ubuntu-only lint: every `#[cfg(target_os = ...)]` (or the
+      # `cfg!(...)` macro form) outside src/platform/* is a scattered
+      # platform check that should instead be routed through the `Platform`
+      # trait (see src/platform/mod.rs). Runs once, not per-OS, since it's a
+      # text scan of the checked-out source and doesn't depend on the runner.
+      - name: strict-cfg lint (no scattered target_os checks)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          BAD=$(grep -rn 'cfg(target_os' src/ | grep -v '^src/platform/' || true)
+          if [ -n "$BAD" ]; then
+            echo "FAIL: cfg(target_os) found outside src/platform/. Route through the Platform trait."
+            echo "$BAD"
+            exit 1
+          fi
 
   # Full lane — release build, only on the qa and main branches.
   build:
