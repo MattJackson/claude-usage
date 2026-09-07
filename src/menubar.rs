@@ -1231,37 +1231,27 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
 /// call `set_text`, which we never do on these items).
 fn install_menu(tray: &tray_icon::TrayIcon, snap: &Snapshot) {
     let menu = build_menu(snap);
-    #[cfg(target_os = "macos")]
     let ns_menu = {
         use tray_icon::menu::ContextMenu;
         menu.ns_menu()
     };
     tray.set_menu(Some(Box::new(menu)));
-    #[cfg(target_os = "macos")]
     apply_menu_styles(ns_menu, &menu_styles(snap));
-    #[cfg(not(target_os = "macos"))]
-    let _ = snap;
 }
 
-#[cfg(target_os = "macos")]
 use objc2::rc::Retained;
-#[cfg(target_os = "macos")]
 use objc2::runtime::AnyObject;
-#[cfg(target_os = "macos")]
 use objc2::AllocAnyThread;
-#[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSColor, NSControlStateValueOn, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
     NSImage, NSMenu, NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSTextAlignment,
     NSTextTab, NSTextTabOptionKey,
 };
-#[cfg(target_os = "macos")]
 use objc2_foundation::{
     NSArray, NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange,
     NSString,
 };
 
-#[cfg(target_os = "macos")]
 fn color_for(sev: Severity) -> Retained<NSColor> {
     match sev {
         Severity::Amber => NSColor::systemOrangeColor(),
@@ -1273,7 +1263,6 @@ fn color_for(sev: Severity) -> Retained<NSColor> {
 /// (not nested in `apply_menu_styles`) so `#[cfg(test)]` can exercise it
 /// directly — e.g. asserting `disabled_but_white` produces a `labelColor`
 /// foreground-color attribute over the full row.
-#[cfg(target_os = "macos")]
 fn attributed(style: &RowStyle) -> Retained<NSAttributedString> {
     let ns_text = NSString::from_str(&style.plain);
     // NSRange is UTF-16 code units — use NSString::length, not byte length.
@@ -1373,7 +1362,6 @@ fn attributed(style: &RowStyle) -> Retained<NSAttributedString> {
 /// Walk the native `NSMenu` (and its submenus) and set `attributedTitle` on any
 /// item whose plain title matches a `RowStyle` — the mechanism muda's plain
 /// string API can't reach (right-aligned tab stops and arbitrary colors).
-#[cfg(target_os = "macos")]
 fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
     if ns_menu.is_null() {
         return;
@@ -2899,7 +2887,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     fn disabled_but_white_row_gets_a_full_range_labelcolor_attribute() {
         // The "white but not clickable" style: `disabled_but_white` must
         // produce an `NSForegroundColorAttributeName` run spanning the ENTIRE
@@ -2928,7 +2915,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     fn plain_row_with_no_disabled_but_white_has_no_forced_foreground_color() {
         // A normal (non-info) row must NOT get the full-range labelColor
         // treatment — only `disabled_but_white` rows opt into it.
