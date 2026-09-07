@@ -308,6 +308,15 @@ impl MenuBackend for WindowsMenu {
     }
 
     fn run_event_loop(&self) -> Result<()> {
+        // If `request_quit()` was called before this call started (e.g. the
+        // caller tore down and quit during startup, possibly even before
+        // `create_status_item`), `quit` is already `true` here. Honor it
+        // immediately, before touching `cmd_rx`/`tray_state` at all — do NOT
+        // reset it to `false`, which would silently drop the earlier
+        // request and pump a loop the caller already asked to stop.
+        if self.quit.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let rx = self
             .cmd_rx
             .lock()
@@ -320,7 +329,6 @@ impl MenuBackend for WindowsMenu {
             .context("run_event_loop called before create_status_item")?;
 
         let menu_rx = MenuEvent::receiver();
-        self.quit.store(false, Ordering::SeqCst);
         loop {
             if self.quit.load(Ordering::SeqCst) {
                 break;
@@ -791,5 +799,20 @@ mod tests {
 
         // Deleting again must stay Ok (idempotent) rather than erroring.
         secrets.delete(&service, account).unwrap();
+    }
+
+    // --- M7: request_quit() before run_event_loop() must not be a no-op ----
+
+    #[test]
+    fn request_quit_before_run_event_loop_returns_immediately() {
+        let menu = WindowsMenu::default();
+        // No create_status_item call — cmd_rx/tray_state are still None.
+        // A naive implementation that resets `quit` to `false` on entry, or
+        // that checks the flag only after unwrapping cmd_rx/tray_state,
+        // would either drop this request or return the wrong error.
+        menu.request_quit();
+
+        menu.run_event_loop()
+            .expect("an early quit request must make run_event_loop return Ok immediately");
     }
 }
