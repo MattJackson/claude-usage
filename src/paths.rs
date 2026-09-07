@@ -158,16 +158,18 @@ fn copy_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     if file_type.is_symlink() {
         let target = std::fs::read_link(src)?;
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, dst)?;
+        {
+            std::os::unix::fs::symlink(&target, dst)?;
+            return Ok(());
+        }
         #[cfg(not(unix))]
         {
-            let _ = target;
+            let _ = (target, dst);
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "symlink copy not implemented on this platform",
             ));
         }
-        return Ok(());
     }
 
     if file_type.is_dir() {

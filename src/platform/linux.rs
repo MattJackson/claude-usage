@@ -529,10 +529,13 @@ fn decode_png_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
     let bytes = &buf[..info.buffer_size()];
     let rgba = match info.color_type {
         png::ColorType::Rgba => bytes.to_vec(),
-        png::ColorType::Rgb => bytes
-            .chunks_exact(3)
-            .flat_map(|c| [c[0], c[1], c[2], 255])
-            .collect(),
+        png::ColorType::Rgb => {
+            // as_chunks::<3>() is what clippy prefers over chunks_exact(3);
+            // it returns a slice of fixed-size arrays so the compiler can
+            // elide the bounds check inside the closure below.
+            let (chunks, _rem) = bytes.as_chunks::<3>();
+            chunks.iter().flat_map(|c| [c[0], c[1], c[2], 255]).collect()
+        }
         other => {
             bail!("unsupported PNG color type for a tray/menu icon: {other:?} (need RGB or RGBA)")
         }
