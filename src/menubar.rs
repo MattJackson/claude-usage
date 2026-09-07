@@ -1638,8 +1638,9 @@ fn handle_click(id: &str) {
 // Settings ▸ Advanced ▸ Backups ▸ handlers (native Save…/Restore… panels)
 // ---------------------------------------------------------------------------
 
-/// "Save…" click: opens a native SAVE panel (`rfd::FileDialog::save_file`)
-/// defaulting to `~/Downloads/usagio-state-{timestamp}.json`, then writes a
+/// "Save…" click: opens a native SAVE panel (via
+/// `Platform::file_dialog().save_file(...)`) defaulting to
+/// `~/Downloads/usagio-state-{timestamp}.json`, then writes a
 /// REDACTED (token-free) dump of the current state to the chosen path with
 /// mode 0600. This is a portable diagnostics/config snapshot — the same
 /// shape `redact_state_for_dump` already produces for the "REFUSED save"
@@ -1685,8 +1686,9 @@ fn handle_backup_save_with(dialog: &dyn crate::platform::FileDialog) {
     notify(&format!("Saved to {}", path.display()));
 }
 
-/// "Restore…" click: opens a native OPEN panel (`rfd::FileDialog::pick_file`)
-/// defaulting to the automatic rolling-backups directory, validates the
+/// "Restore…" click: opens a native OPEN panel (via
+/// `Platform::file_dialog().pick_file(...)`) defaulting to the automatic
+/// rolling-backups directory, validates the
 /// chosen file is state-shaped, warns before a restore would drop accounts
 /// (a "downgrade"), then atomically replaces `state.json`. The rolling
 /// backups already snapshot the pre-restore state on every ordinary save, but
