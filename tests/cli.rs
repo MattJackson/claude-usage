@@ -3,6 +3,12 @@
 //! touches the real `~/.config/usagio/state.json`, `~/.claude.json`, or the
 //! network. (Keychain access isn't HOME-scoped, so `capture` is not exercised
 //! here.) Accounts are keyed by email.
+//!
+//! Unix-only: the isolation trick relies on `HOME` — on Windows the config
+//! path comes from `dirs::config_dir()` (`%APPDATA%`), which ignores `HOME`.
+//! Wiring cross-platform test isolation via `WindowsPaths` overrides is a
+//! v0.6 follow-up. Uses `cfg(unix)` so the strict-cfg guard leaves it alone.
+#![cfg(unix)]
 
 use assert_cmd::Command;
 use predicates::prelude::*;

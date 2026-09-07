@@ -467,10 +467,9 @@ impl SecretStore for LinuxSecrets {
 /// - `glib::MainLoop` (used for `request_quit`) genuinely is `Send + Sync` —
 ///   GLib documents `g_main_loop_quit` as callable from any thread — so it's
 ///   stored directly as an `Arc<Mutex<Option<glib::MainLoop>>>` field.
-/// Type alias for the click-handler callback slot — factored out so the
-/// `LinuxMenu::click_cb` field type stays under clippy's type-complexity
-/// threshold and so any future ClickCb-typed variable inherits the same
-/// signature (mirror of `WindowsMenu`'s `ClickCb`).
+// ClickCb: factored-out signature for the tray's click-handler callback
+// slot. Keeps `LinuxMenu::click_cb` under clippy's type-complexity
+// threshold; mirror of `WindowsMenu`'s `ClickCb`.
 type ClickCb = Box<dyn Fn(&str) + Send + Sync + 'static>;
 
 pub struct LinuxMenu {
