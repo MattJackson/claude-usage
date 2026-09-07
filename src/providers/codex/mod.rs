@@ -421,9 +421,21 @@ fn auth_json_path() -> Option<PathBuf> {
 /// directory `0700` (created if missing), file `0600`. Rename is atomic on
 /// the same filesystem, so a concurrent reader never observes a partial
 /// write.
+///
+/// H1 (v0.5.0 codeaudit): the tmp file is created with `create_new` +
+/// `mode(0o600)` in a single `open()` call — never `std::fs::write` followed
+/// by a separate `set_permissions`. That two-step sequence has a TOCTOU
+/// window where the file exists at the umask-default mode (typically 0644)
+/// before the chmod lands, during which another local user could read the
+/// OAuth tokens. Mirrors `crate::store::write_private`.
+///
+/// Any failure between creating the tmp file and the final rename removes
+/// the tmp file so a secret-bearing orphan never survives (H4 finding from
+/// the same audit).
 #[cfg(unix)]
 fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let dir = path
         .parent()
@@ -438,9 +450,23 @@ fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
-    std::fs::write(&tmp_path, contents)?;
-    std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp_path, path)?;
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(contents.as_bytes())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(ProviderError::Io(e));
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(ProviderError::Io(e));
+    }
     Ok(())
 }
 
@@ -596,6 +622,53 @@ mod tests {
             let key_b = p.identify_credential(&on_disk_b).unwrap();
             assert_eq!(key_b, AccountKey::new("codex", "b@example.com"));
         });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_auth_json_creates_with_mode_0600_atomically() {
+        // H1: the file must never be observable at the umask-default mode —
+        // it must be created 0600 in the same syscall that creates it, not
+        // written then chmod'd afterwards.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        write_auth_json_atomically(&path, r#"{"tokens":{"access_token":"at"}}"#).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_auth_json_cleans_up_tmp_file_on_rename_failure() {
+        // H1/H4: if the final rename fails (simulated here by pointing the
+        // target at a path whose parent doesn't exist so create_dir_all
+        // succeeds but we then swap the target to a directory, forcing
+        // rename() to fail with EISDIR), the tmp file must not survive.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        // Make the rename destination itself a non-empty directory so
+        // std::fs::rename(file -> dir) fails.
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keepme"), b"x").unwrap();
+
+        let result = write_auth_json_atomically(&target, r#"{"tokens":{"access_token":"at"}}"#);
+        assert!(result.is_err());
+
+        // No leftover `.auth.json.tmp.*` files in the directory.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".auth.json.tmp.")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "orphaned tmp file(s) left behind: {leftovers:?}"
+        );
     }
 
     #[test]
