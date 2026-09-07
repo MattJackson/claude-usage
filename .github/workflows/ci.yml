@@ -86,6 +86,28 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: xvfb-run --auto-servernum cargo test --test integration_tray --all-features -- --ignored --test-threads=1
 
+      # Ubuntu-only: proves the Secret Service D-Bus path in LinuxSecrets
+      # actually works against a real daemon, not just the offline-file
+      # fallback every unit test exercises. `dbus-run-session` spins up a
+      # throwaway session bus and runs the wrapped command inside it;
+      # `gnome-keyring-daemon --unlock` with an empty stdin password creates
+      # an unlocked default keyring so the Secret Service calls succeed with
+      # no interactive prompt. See tests/integration_linux_secrets.rs.
+      - name: Install Secret Service daemon deps
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y gnome-keyring dbus-x11
+
+      - name: Linux Secret Service integration test (real D-Bus daemon)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          dbus-run-session -- bash -c '
+            set -euo pipefail
+            echo -n "" | gnome-keyring-daemon --unlock --components=secrets
+            eval "$(echo -n "" | gnome-keyring-daemon --start --components=secrets)"
+            export GNOME_KEYRING_CONTROL
+            cargo test --test integration_linux_secrets --all-features -- --ignored --test-threads=1
+          '
+
       # Cheap, Ubuntu-only lint: every `#[cfg(target_os = ...)]` (or the
       # `cfg!(...)` macro form) outside src/platform/* is a scattered
       # platform check that should instead be routed through the `Platform`
