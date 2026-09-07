@@ -66,6 +66,16 @@ impl From<std::io::Error> for ProviderError {
 
 pub type PResult<T> = std::result::Result<T, ProviderError>;
 
+/// Coarse window classification used by analytics modules (burn-rate,
+/// cost-tracking) that don't need the full `UsageWindow` metadata but do need
+/// to distinguish "the ~5h session bucket" from "the ~7d weekly bucket."
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Window {
+    Session,
+    Weekly,
+}
+
 /// OAuth-style token grant, decoded to the shape the core needs for refresh
 /// scheduling. Providers translate their own on-disk blob to/from this shape
 /// via `parse_stored_blob` / `patch_stored_blob`.
