@@ -91,6 +91,7 @@ fn cell(pct: Option<f64>) -> Cell {
 fn row(session: Option<f64>, weekly: Option<f64>) -> Row {
     Row {
         provider_id: CLAUDE_SLUG.to_string(),
+        needs_relogin: false,
         email: "x@e.com".to_string(),
         session: cell(session),
         weekly: cell(weekly),
@@ -116,6 +117,7 @@ fn row_full_with_provider(
 ) -> Row {
     Row {
         provider_id: provider_id.to_string(),
+        needs_relogin: false,
         email: email.to_string(),
         session: Cell {
             pct: Some(session),
@@ -713,4 +715,60 @@ fn rotate_if_large_leaves_small_file_alone() {
     logging::rotate_if_large(&path, 1_000_000);
     assert!(path.exists());
     assert!(!dir.path().join("claude-usage.log.1").exists());
+}
+
+// --- needs_relogin filtering in the swap picker ---
+
+/// Construct a row with the needs_relogin flag set. Everything else mirrors
+/// `row_full` so we can build side-by-side "both would otherwise win" tests.
+fn row_full_flagged(
+    email: &str,
+    session: f64,
+    weekly: f64,
+    weekly_reset: DateTime<Utc>,
+) -> Row {
+    let mut r = row_full(email, session, weekly, weekly_reset);
+    r.needs_relogin = true;
+    r
+}
+
+#[test]
+fn choose_swap_target_skips_needs_relogin_candidate() {
+    // The would-be candidate has the flag: even though it's healthier and
+    // would win auto-pick, choose_swap_target must not return it. With only
+    // one candidate and it's flagged, we get back None.
+    let reset = Utc::now() + chrono::Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full_flagged("dead@e.com", 10.0, 10.0, reset),
+    ];
+    let guard = SwapGuard::default();
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+}
+
+#[test]
+fn choose_swap_target_prefers_unflagged_candidate_over_flagged_winner() {
+    // The flagged candidate would win by auto-pick priority (soonest reset,
+    // more headroom), but must be filtered out; the unflagged runner-up
+    // wins instead.
+    let soon = Utc::now() + chrono::Duration::hours(2);
+    let later = Utc::now() + chrono::Duration::hours(48);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, later),
+        row_full_flagged("dead@e.com", 10.0, 10.0, soon),
+        row_full("ok@e.com", 20.0, 20.0, later),
+    ];
+    let guard = SwapGuard::default();
+    let target = choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard);
+    assert_eq!(target.as_deref(), Some("ok@e.com"));
+}
+
+#[test]
+fn row_from_account_propagates_needs_relogin_flag() {
+    let blob = r#"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":0}}"#;
+    let mut a = Account::from_keychain_blob(blob).unwrap();
+    a.email = Some("x@e.com".into());
+    assert!(!row_from_account(&a).needs_relogin);
+    a.needs_relogin = true;
+    assert!(row_from_account(&a).needs_relogin);
 }

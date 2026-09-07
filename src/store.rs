@@ -61,6 +61,16 @@ pub struct Account {
     /// menu-bar restart doesn't re-fire the same "70% crossed" notification.
     #[serde(default)]
     pub notif_state: crate::notifications::NotifState,
+    /// True after the OAuth token endpoint has rejected this account's
+    /// refresh token as invalid_grant. Anthropic single-uses refresh tokens
+    /// and rotates on every refresh, so any stale grant (most commonly one
+    /// the real `claude` CLI rotated behind our back while we weren't
+    /// running) is permanently dead for its family — no retry recovers it.
+    /// When set: menu shows a re-login row, auto-swap skips the account,
+    /// switching to it launches `claude /login` instead of failing silently.
+    /// Cleared on any successful refresh or fresh capture.
+    #[serde(default)]
+    pub needs_relogin: bool,
 }
 
 impl Account {
@@ -93,6 +103,7 @@ impl Account {
             user_id: None,
             cached_usage: None,
             notif_state: crate::notifications::NotifState::default(),
+            needs_relogin: false,
         })
     }
 
@@ -135,6 +146,10 @@ impl Account {
         self.access_token = access.clone();
         self.refresh_token = refresh.clone();
         self.expires_at = expires_at;
+        // Any successful token write means we do have a working grant again,
+        // so clear the re-login flag. Recovers automatically after a manual
+        // `claude /login` (the next capture / sync overwrites the tokens).
+        self.needs_relogin = false;
         if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&self.keychain_blob) {
             if let Some(o) = v.get_mut("claudeAiOauth").and_then(|x| x.as_object_mut()) {
                 o.insert("accessToken".into(), serde_json::Value::String(access));
@@ -237,6 +252,10 @@ impl State {
                         .get("notif_state")
                         .and_then(|x| serde_json::from_value(x.clone()).ok())
                         .unwrap_or_default(),
+                    needs_relogin: obj
+                        .get("needs_relogin")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false),
                 });
             }
         }

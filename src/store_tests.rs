@@ -91,6 +91,59 @@ fn set_tokens_updates_fields_and_patches_blob() {
 }
 
 #[test]
+fn set_tokens_clears_needs_relogin_flag() {
+    // A successful refresh must clear the flag automatically — recovery is
+    // silent after the user runs `claude /login` and we adopt the new blob.
+    let mut a = Account::from_keychain_blob(&blob("old", "oldr", 1)).unwrap();
+    a.needs_relogin = true;
+    a.set_tokens("new".to_string(), "newr".to_string(), 42);
+    assert!(!a.needs_relogin);
+}
+
+#[test]
+fn set_tokens_if_newer_clears_needs_relogin_on_successful_update() {
+    let mut a = Account::from_keychain_blob(&blob("old", "oldr", 100)).unwrap();
+    a.needs_relogin = true;
+    assert!(a.set_tokens_if_newer("new".into(), "newr".into(), 200));
+    assert!(!a.needs_relogin);
+}
+
+#[test]
+fn needs_relogin_defaults_false_on_load() {
+    // Legacy state.json entries with no needs_relogin key must load as false.
+    let v = serde_json::json!({
+        "accounts": [
+            {
+                "email": "x@e.com",
+                "access_token": "a",
+                "refresh_token": "r",
+                "expires_at": 1i64,
+                "keychain_blob": "",
+            }
+        ]
+    });
+    let s = State::from_value(&v);
+    assert_eq!(s.accounts.len(), 1);
+    assert!(!s.accounts[0].needs_relogin);
+}
+
+#[test]
+fn needs_relogin_round_trips_through_save_load() {
+    // Set the flag, serialize with serde_json::to_value, and reload via
+    // from_value — the flag survives the round trip (both #[serde(default)]
+    // on the struct and the explicit key-lookup in from_value).
+    let mut a = acct("x@e.com");
+    a.needs_relogin = true;
+    let state = State {
+        accounts: vec![a],
+        ..State::default()
+    };
+    let v = serde_json::to_value(&state).unwrap();
+    let s = State::from_value(&v);
+    assert!(s.accounts[0].needs_relogin);
+}
+
+#[test]
 fn identity_uuid_reads_oauth_account() {
     let mut a = acct("x@e.com");
     assert!(a.identity_uuid().is_none());

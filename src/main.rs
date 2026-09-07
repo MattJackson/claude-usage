@@ -5,6 +5,7 @@
 //! restarted.
 
 mod countdown;
+mod credentials;
 #[cfg(target_os = "macos")]
 mod icons;
 mod logging;
@@ -30,8 +31,10 @@ use store::{Account, CachedUsage, State};
 const CLAUDE_SLUG: &str = "claude";
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
-/// Refresh a token if it expires within this many seconds.
-const REFRESH_SKEW_SECS: i64 = 300;
+/// Refresh a token if it expires within this many seconds. Sourced from the
+/// credential-sync module so the reactive (switch / cmd_token / poll) path
+/// and the proactive (fsnotify + inactive-refresh) path can never drift.
+const REFRESH_SKEW_SECS: i64 = credentials::REFRESH_SKEW_SECS;
 
 // --- watch (auto-swap daemon) defaults ---
 /// How often the watcher polls, in seconds.
@@ -70,6 +73,21 @@ fn run() -> Result<()> {
     // `providers::get`, at which point this call is load-bearing — do it
     // here so it always precedes the dispatch below.
     providers::init();
+
+    // Spawn fsnotify watchers on every provider's credential paths so
+    // rotations the vendor CLI writes (or another usagio process makes)
+    // are absorbed as they happen, not just on the next 150s watch tick.
+    // Only long-running command paths (watch / menubar) actually benefit;
+    // one-shot commands complete before any event fires, but the setup is
+    // cheap and self-contained.
+    // Leaked deliberately: the watcher owns a thread and must outlive the
+    // process. `Box::leak` on a heap allocation is the standard trick for
+    // "live for program lifetime" without introducing a global mutex.
+    let providers_static: Vec<&'static dyn Provider> =
+        providers::all().iter().map(|b| &**b).collect();
+    if let Some(handle) = credentials::spawn_watchers(providers_static) {
+        Box::leak(Box::new(handle));
+    }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -408,9 +426,38 @@ fn prepare_switch(
         .find(email)
         .cloned()
         .with_context(|| format!("no account matches '{email}'"))?;
-    oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS)?;
+    // Reactive refresh with a clear signal on hard failure. If the refresh
+    // token has been invalidated (single-use / rotated elsewhere / revoked),
+    // bail with a distinctive error so the menu / CLI can prompt a fresh
+    // login instead of silently overwriting the keychain with a stale token
+    // that `claude` will then reject.
+    match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
+        Ok(_) => {}
+        Err(oauth::RefreshError::InvalidGrant) => {
+            flag_needs_relogin(email);
+            bail!(
+                "account {email} needs re-login (refresh token rejected); run \
+                 `claude /login` for it or click the account row in the menu"
+            );
+        }
+        Err(e) => bail!("token refresh for {email} failed: {e}"),
+    }
     let (identity, backfilled) = resolve_identity(provider, &acct)?;
     Ok((acct, identity, backfilled))
+}
+
+/// Best-effort: mark an account `needs_relogin=true` in state.json. If the
+/// state lock is held or the save fails, the next `refresh_usage_cache` tick
+/// re-observes the invalid_grant and sets it again — callers that need
+/// certainty already surface a distinct error to the user.
+fn flag_needs_relogin(email: &str) {
+    let _ = with_state_lock(|| {
+        let mut st = State::load()?;
+        if let Some(a) = st.find_mut(email) {
+            a.needs_relogin = true;
+        }
+        st.save()
+    });
 }
 
 /// The locked phase of a switch, optionally guarded by `expect_active`: if given
@@ -441,6 +488,11 @@ fn switch_to_guarded(
         }
         // Preserve any token rotation the currently-active session picked up.
         sync_active_from_keychain(provider, &mut st);
+        // Provider-agnostic: absorb any lagging on-disk rotations for the
+        // outgoing account BEFORE we overwrite path[0] with the incoming
+        // account's blob. sync_active_from_keychain only handles the Claude
+        // legacy path; this catches every configured credential file.
+        credentials::absorb_before_switch(provider);
         // A concurrent poll may have rotated this account's token after our
         // phase-1 snapshot; use whichever tokens are fresher so we never write a
         // stale (possibly already-superseded) refresh token to the keychain.
@@ -635,7 +687,17 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
         .find(&email)
         .cloned()
         .with_context(|| format!("no account matches '{email}'"))?;
-    let refreshed = oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS)?;
+    let refreshed = match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
+        Ok(b) => b,
+        Err(oauth::RefreshError::InvalidGrant) => {
+            flag_needs_relogin(&email);
+            bail!(
+                "account {email} needs re-login (refresh token rejected); run \
+                 `claude /login` for it or click the account row in the menu"
+            );
+        }
+        Err(e) => bail!("token refresh for {email} failed: {e}"),
+    };
     let token = acct.access_token.clone();
     // Phase 2 (locked): persist a rotation without clobbering a fresher one.
     if refreshed {
@@ -685,6 +747,10 @@ struct Row {
     /// In v1 every row is `"claude"`; a Row whose slug isn't registered is
     /// simply skipped as an auto-swap candidate.
     provider_id: String,
+    /// True when the OAuth token endpoint has permanently rejected this
+    /// account's refresh token. Filtered out of the auto-swap picker and
+    /// surfaced by the menu as a re-login row.
+    needs_relogin: bool,
     email: String,
     session: Cell,
     weekly: Cell,
@@ -716,6 +782,7 @@ fn row_from_account(a: &Account) -> Row {
         // account with its containing provider slug and this becomes a real
         // per-account lookup.
         provider_id: CLAUDE_SLUG.to_string(),
+        needs_relogin: a.needs_relogin,
         email: a.key().to_string(),
         session: cell_from_parts(
             c.and_then(|c| c.session_pct),
@@ -1141,11 +1208,32 @@ fn refresh_usage_cache() -> RefreshOutcome {
             continue;
         };
         let mut acct = acct;
-        if let Err(e) = oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
-            logging::log(&format!(
-                "token refresh failed for {email}: {e} (keeping cache)"
-            ));
+        // Skip accounts already flagged needs_relogin — no useful token to
+        // reason about, and hammering an invalid_grant refresh both wastes
+        // requests and can trip rate limits shared across the tenant.
+        if acct.needs_relogin {
             continue;
+        }
+        match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
+            Ok(_) => {}
+            Err(oauth::RefreshError::InvalidGrant) => {
+                logging::log(&format!(
+                    "token refresh permanently rejected for {email} (invalid_grant); \
+                     flagging for re-login"
+                ));
+                acct.needs_relogin = true;
+                // Fall through to the merge step so the flag is persisted;
+                // skip the usage fetch — a rejected refresh means we don't
+                // have a usable access token to try the usage endpoint with.
+                updates.push((email.clone(), acct, None, None));
+                continue;
+            }
+            Err(e) => {
+                logging::log(&format!(
+                    "token refresh failed for {email}: {e} (keeping cache)"
+                ));
+                continue;
+            }
         }
         let cu = match usage::fetch(&acct.access_token) {
             Ok(u) => Some(cached_from_usage(&u)),
@@ -1224,6 +1312,10 @@ fn refresh_usage_cache() -> RefreshOutcome {
                     acct.refresh_token.clone(),
                     acct.expires_at,
                 );
+                // Propagate the flag from the phase-1 snapshot to the locked
+                // state. `set_tokens_if_newer` only writes on a real refresh,
+                // so we mirror this bit explicitly here.
+                a.needs_relogin = acct.needs_relogin;
                 if let Some(cu) = cu {
                     a.cached_usage = Some(cu.clone());
                 }
@@ -1370,6 +1462,10 @@ fn choose_swap_target(
         // capability gate for auto-swap: reporting-only or stub providers
         // never surface here, even if their rows carry a stale utilization.
         .filter(|r| provider_supports_swap(&r.provider_id))
+        // Skip candidates the token endpoint has permanently rejected —
+        // swapping to a needs-relogin account would just re-write the same
+        // dead credentials into the keychain.
+        .filter(|r| !r.needs_relogin)
         // Skip candidates whose provider has its env-override active — a
         // switch to them would be silently ignored by the vendor CLI.
         .filter(|r| !env_override_active(&r.provider_id))
@@ -1400,6 +1496,16 @@ fn choose_swap_target(
 /// auto-swap away from the active account if it has reached `trigger` and a
 /// healthy target exists. Shared by `claude-usage watch` and the menu-bar poller.
 fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<CycleOutcome> {
+    // Pre-cycle: absorb any on-disk credential rotations the vendor CLI made
+    // behind our back (fsnotify may not fire on remote/network volumes, and
+    // we want the invariant to hold even on the polling path). Then refresh
+    // INACTIVE Claude accounts eagerly so a user who switches to one later
+    // doesn't have to wait for the reactive path to notice.
+    for p in providers::all() {
+        let _ = credentials::absorb_all_lagging(p.as_ref());
+    }
+    credentials::refresh_inactive_if_stale(State::load().ok().and_then(|s| s.active).as_deref());
+
     let refresh = refresh_usage_cache();
     let state = State::load()?;
     if state.accounts.is_empty() {

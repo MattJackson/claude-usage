@@ -33,9 +33,11 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::Value;
 
+use std::time::Duration;
+
 use crate::providers::trait_def::{
-    Capabilities, CaptureMode, CapturedAccount, IdentitySnapshot, PResult, Provider, ProviderError,
-    SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
+    AccountKey, Capabilities, CaptureMode, CapturedAccount, CredentialFreshness, IdentitySnapshot,
+    PResult, Provider, ProviderError, SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
 };
 
 /// Constructor called from `providers::build()` behind the `codex` feature.
@@ -253,6 +255,66 @@ impl Provider for CodexProvider {
     // `write_active_account`, `read_active_identity`, and `launch_client`
     // inherit the trait defaults, which return `ProviderError::Unsupported`.
     // Do not override them until the switching phase lands.
+
+    // --- Credential sync ---------------------------------------------------
+
+    fn credential_paths(&self) -> Vec<PathBuf> {
+        match auth_json_path() {
+            Some(p) => vec![p],
+            None => Vec::new(),
+        }
+    }
+
+    /// Identify a Codex account from its auth.json blob by decoding the
+    /// id_token JWT and reading the `email` claim.
+    fn identify_credential(&self, blob: &str) -> Option<AccountKey> {
+        let parsed: AuthDotJson = serde_json::from_str(blob).ok()?;
+        let claims = parsed.tokens.id_token.as_deref().and_then(jwt_payload_claims)?;
+        let email = claims
+            .get("email")
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .or_else(|| {
+                claims
+                    .get("https://api.openai.com/profile")
+                    .and_then(|p| p.get("email"))
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+            })?;
+        Some(AccountKey::new(self.provider_id(), email))
+    }
+
+    fn credential_freshness(&self, blob: &str) -> CredentialFreshness {
+        let Ok(parsed) = serde_json::from_str::<AuthDotJson>(blob) else {
+            return CredentialFreshness::Invalid;
+        };
+        let Some(claims) = parsed.tokens.id_token.as_deref().and_then(jwt_payload_claims) else {
+            return CredentialFreshness::Invalid;
+        };
+        let Some(exp) = claims.get("exp").and_then(|x| x.as_i64()) else {
+            return CredentialFreshness::Unknown;
+        };
+        let now = Utc::now().timestamp();
+        let remaining = exp.saturating_sub(now);
+        if remaining <= 0 {
+            CredentialFreshness::Expired
+        } else if remaining < crate::credentials::REFRESH_SKEW_SECS {
+            CredentialFreshness::ExpiresIn(Duration::from_secs(remaining as u64))
+        } else {
+            CredentialFreshness::Fresh
+        }
+    }
+
+    /// Codex has no state.json slot yet (v1 stores only Claude accounts), so
+    /// absorb is a no-op — the trait contract of "overwrite the account's
+    /// slot" is a future-proof default we implement now for consistency.
+    fn absorb_credential(&self, account: &AccountKey, _blob: &str) -> PResult<()> {
+        if account.provider != self.provider_id() {
+            return Ok(());
+        }
+        // Nothing to do until Codex accounts are first-class in state v2.
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +466,89 @@ mod tests {
             t.get("refresh_token").and_then(|x| x.as_str()),
             Some("keep-me")
         );
+    }
+
+    fn make_id_token(email: &str, exp: i64) -> String {
+        let hdr = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::json!({ "email": email, "exp": exp })
+                .to_string()
+                .as_bytes(),
+        );
+        format!("{hdr}.{payload}.sig")
+    }
+
+    fn make_blob(email: &str, exp: i64) -> String {
+        let id_token = make_id_token(email, exp);
+        serde_json::json!({
+            "tokens": {
+                "id_token": id_token,
+                "access_token": "at",
+                "refresh_token": "rt"
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn identify_credential_extracts_email_from_id_token() {
+        let blob = make_blob("user@example.com", 4_000_000_000);
+        let k = CodexProvider.identify_credential(&blob).unwrap();
+        assert_eq!(k.provider, "codex");
+        assert_eq!(k.key, "user@example.com");
+    }
+
+    #[test]
+    fn identify_credential_returns_none_without_id_token() {
+        // No id_token in tokens => no way to identify.
+        let blob = serde_json::json!({
+            "tokens": { "access_token": "at", "refresh_token": "rt" }
+        })
+        .to_string();
+        assert!(CodexProvider.identify_credential(&blob).is_none());
+    }
+
+    #[test]
+    fn credential_freshness_reports_fresh_for_far_future_exp() {
+        let blob = make_blob("u@e.com", Utc::now().timestamp() + 3600);
+        assert_eq!(
+            CodexProvider.credential_freshness(&blob),
+            CredentialFreshness::Fresh
+        );
+    }
+
+    #[test]
+    fn credential_freshness_reports_expired_for_past_exp() {
+        let blob = make_blob("u@e.com", 1);
+        assert_eq!(
+            CodexProvider.credential_freshness(&blob),
+            CredentialFreshness::Expired
+        );
+    }
+
+    #[test]
+    fn credential_paths_uses_codex_home_when_set() {
+        // Save + restore any existing value so we don't leak into other tests.
+        // std::env is process-global — this test is #[test] not #[test(serial)],
+        // but the assertion checks the joined path shape regardless of ordering.
+        let prior = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_HOME", "/tmp/codex-fixture");
+        let paths = CodexProvider.credential_paths();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("auth.json"));
+        assert!(paths[0].starts_with("/tmp/codex-fixture"));
+        match prior {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+    }
+
+    #[test]
+    fn absorb_credential_for_wrong_provider_is_noop() {
+        // absorb_credential must ignore keys belonging to a different
+        // provider — never touch Claude's slot from Codex or vice versa.
+        let k = AccountKey::new("claude", "x@e.com");
+        assert!(CodexProvider.absorb_credential(&k, "irrelevant").is_ok());
     }
 
     #[test]
