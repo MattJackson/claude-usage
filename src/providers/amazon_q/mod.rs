@@ -77,6 +77,7 @@ mod tests {
         assert!(!caps.supports_switching);
         assert!(!caps.supports_email_capture);
         assert_eq!(caps.secret_backend, SecretBackend::Sqlite);
+        assert_eq!(caps.capture_mode, CaptureMode::CredsOnDisk);
     }
 
     #[test]

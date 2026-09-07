@@ -217,13 +217,20 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                 };
                 let key = AccountKey::new("claude", &email);
                 if !last_chance_fallback(claude, &key) {
-                    let _ = with_state_lock(|| {
+                    // R2-EH-01 (round-2 codeaudit): mirror flag_needs_relogin's
+                    // logging on save-Err so a state.json write failure here is
+                    // visible instead of being silently discarded.
+                    if let Err(e) = with_state_lock(|| {
                         let mut st = State::load()?;
                         if let Some(a) = st.find_mut(&email) {
                             a.needs_relogin = true;
                         }
                         st.save()
-                    });
+                    }) {
+                        crate::logging::log(&format!(
+                            "credentials: flag_needs_relogin({email}): save failed: {e:#}"
+                        ));
+                    }
                 }
             }
             Err(e) => {
@@ -329,8 +336,16 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
 
     let (tx, rx) = mpsc::channel::<Event>();
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        if let Ok(ev) = res {
-            let _ = tx.send(ev);
+        match res {
+            Ok(ev) => {
+                let _ = tx.send(ev);
+            }
+            // R2-EH-03: log mid-stream notify errors so persistent notify
+            // failures on a credential-parent path leave a signal instead of
+            // manifesting as "no events ever fire".
+            Err(e) => {
+                crate::logging::log(&format!("credentials: notify event error: {e}"));
+            }
         }
     })
     .ok()?;
@@ -365,8 +380,19 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
                         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700));
                 }
             }
-            if watcher.watch(&parent, RecursiveMode::NonRecursive).is_ok() {
-                any_watched = true;
+            // R2-EH-02: log watch failures (EMFILE/ENOSPC/permission/unsupported
+            // FS) so a silent watch drop doesn't degrade us to the 150s poll
+            // cadence with no diagnostic.
+            match watcher.watch(&parent, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    any_watched = true;
+                }
+                Err(e) => {
+                    crate::logging::log(&format!(
+                        "credentials: watch({}) failed: {e}",
+                        parent.display()
+                    ));
+                }
             }
         }
     }

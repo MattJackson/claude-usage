@@ -20,7 +20,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -176,10 +176,14 @@ pub fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
 /// Per-month cached full parse. Keyed by (year, month) so the whole cache
 /// invalidates a month at a time. Only month files that read_range would
 /// have opened anyway are cached — no proactive scan.
+/// Key: (year, month). Value: (mtime at parse time, all snapshots).
+/// R2-PERF-03: value wrapped in Arc so a cache hit is a refcount bump
+/// rather than a full Vec<Snapshot> clone. Callers iterate immutably.
+type MonthCacheEntry = (SystemTime, Arc<Vec<Snapshot>>);
+
 #[derive(Default)]
 struct MonthCache {
-    /// Key: (year, month). Value: (mtime at parse time, all snapshots).
-    months: HashMap<(i32, u32), (SystemTime, Vec<Snapshot>)>,
+    months: HashMap<(i32, u32), MonthCacheEntry>,
 }
 
 static MONTH_CACHE: OnceLock<Mutex<MonthCache>> = OnceLock::new();
@@ -203,9 +207,9 @@ fn read_range_cached(
     loop {
         let path = month_path_ym(dir, y, m);
         let all = load_month_cached(&path, y, m);
-        for snap in all {
-            if snap.ts >= from && snap.ts <= to && account.matches(&snap) {
-                out.push(snap);
+        for snap in all.iter() {
+            if snap.ts >= from && snap.ts <= to && account.matches(snap) {
+                out.push(snap.clone());
             }
         }
         if (y, m) == end {
@@ -228,7 +232,7 @@ fn read_range_cached(
 /// Return all snapshots in month file `path`, using the cached copy when its
 /// mtime matches. Missing file yields an empty vec (cached as UNIX_EPOCH so
 /// a later create-and-write invalidates it).
-fn load_month_cached(path: &Path, year: i32, month: u32) -> Vec<Snapshot> {
+fn load_month_cached(path: &Path, year: i32, month: u32) -> Arc<Vec<Snapshot>> {
     let mtime = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -236,16 +240,18 @@ fn load_month_cached(path: &Path, year: i32, month: u32) -> Vec<Snapshot> {
     if let Ok(mut cache) = month_cache().lock() {
         if let Some((stamp, snaps)) = cache.months.get(&(year, month)) {
             if *stamp == mtime {
-                return snaps.clone();
+                return Arc::clone(snaps);
             }
         }
         // Cache miss / stale — parse and store.
-        let parsed = parse_month(path);
-        cache.months.insert((year, month), (mtime, parsed.clone()));
+        let parsed = Arc::new(parse_month(path));
+        cache
+            .months
+            .insert((year, month), (mtime, Arc::clone(&parsed)));
         return parsed;
     }
     // Fallback if lock is poisoned: skip cache.
-    parse_month(path)
+    Arc::new(parse_month(path))
 }
 
 fn parse_month(path: &Path) -> Vec<Snapshot> {
@@ -288,7 +294,10 @@ pub fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
     let dir = log_dir().ok()?;
     let now = Utc::now();
     // Read enough history to survive a month boundary just after midnight UTC.
-    let snaps = read_range(&dir, account, now - Duration::days(35), now);
+    // R2-PERF-01: use the mtime-gated cache; called per account per poll
+    // from the notifications eval branch, so an uncached scan of ~35 days
+    // of NDJSON per tick is wasteful.
+    let snaps = read_range_cached(&dir, account, now - Duration::days(35), now);
     snaps.into_iter().next_back()
 }
 
@@ -386,6 +395,11 @@ fn rotate_files(dir: &Path, now: DateTime<Utc>) -> Result<()> {
 
 /// Read every snapshot for `account` whose `ts` falls in `[from, to]` from
 /// the month files under `dir` that overlap that range. Sorted ascending.
+///
+/// Kept #[cfg(test)] because production paths now go through the mtime-gated
+/// `read_range_cached`; the tests here still exercise the uncached scan to
+/// isolate cache behavior from the underlying parse loop.
+#[cfg(test)]
 fn read_range(
     dir: &Path,
     account: &AccountKey,

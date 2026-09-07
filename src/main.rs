@@ -53,7 +53,6 @@ pub(crate) const APP_SLUG: &str = "usagio";
 /// Previous slug (pre-v0.4.0). Referenced only by the one-shot migration
 /// in `paths::migrate_config_dir_if_needed` — do not use for any live
 /// path construction.
-#[allow(dead_code)]
 pub(crate) const LEGACY_APP_SLUG: &str = "claude-usage";
 /// Refresh a token if it expires within this many seconds. Sourced from the
 /// credential-sync module so the reactive (switch / cmd_token / poll) path
@@ -634,12 +633,9 @@ fn switch_to_guarded(
                 return Ok(false);
             }
         }
-        // Preserve any token rotation the currently-active session picked up.
-        sync_active_from_keychain(provider, &mut st);
         // Provider-agnostic: absorb any lagging on-disk rotations for the
         // outgoing account BEFORE we overwrite path[0] with the incoming
-        // account's blob. sync_active_from_keychain only handles the Claude
-        // legacy path; this catches every configured credential file.
+        // account's blob. This catches every configured credential file.
         credentials::absorb_before_switch(provider);
         // absorb_before_switch reaches back through the reentrant state lock
         // and rewrites state.json with any freshly-absorbed rotations. Our
@@ -647,7 +643,17 @@ fn switch_to_guarded(
         // it here or our final `st.save()` will clobber the absorbed changes
         // (reintroducing the never-re-login regression). See H1 in the
         // round-1 codeaudit findings.
+        //
+        // NOTE: sync_active_from_keychain MUST run AFTER this reload, not
+        // before it — otherwise the reload discards any keychain-derived
+        // mutations to the in-memory snapshot, causing apply_account (via
+        // the stale `st`) to later re-push pre-rotation tokens on switch-
+        // back. See H_R2_1 in the round-2 codeaudit findings.
         st = State::load()?;
+        // Preserve any token rotation the currently-active session picked up
+        // and wrote into the keychain (Claude legacy path). This mutates `st`
+        // in memory; the final `st.save()` below persists the freshest tokens.
+        sync_active_from_keychain(provider, &mut st);
         // A concurrent poll may have rotated this account's token after our
         // phase-1 snapshot; use whichever tokens are fresher so we never write a
         // stale (possibly already-superseded) refresh token to the keychain.
@@ -1748,10 +1754,18 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
 /// Fire a native macOS notification (best effort).
 fn notify(msg: &str) {
     let script = format!("display notification {msg:?} with title \"usagio\"");
-    let _ = std::process::Command::new("osascript")
+    // R2-EH-04: log osascript spawn/exit failures so H6's user-facing
+    // notification guarantee has diagnostic backing when the channel is
+    // silently unavailable (headless SSH, Automation permission denied).
+    match std::process::Command::new("osascript")
         .arg("-e")
         .arg(script)
-        .status();
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(s) => logging::log(&format!("notify: osascript exited {:?}", s.code())),
+        Err(e) => logging::log(&format!("notify: osascript spawn failed: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------

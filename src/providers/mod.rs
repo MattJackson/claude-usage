@@ -1,8 +1,3 @@
-// Nothing consumes the trait scaffold yet — callers land in later phases.
-// Suppress the churn of dead-code warnings on public API that will be wired
-// up module-by-module.
-#![allow(dead_code)]
-
 //! Provider registry.
 //!
 //! `init()` populates a process-wide `Vec<Box<dyn Provider>>` — one entry per
@@ -10,10 +5,9 @@
 //! `all()` (iteration order = registration order) or `get(slug)` (lookup by
 //! `Provider::provider_id`).
 //!
-//! Per-provider modules do not exist yet; they land in later phases behind
-//! `#[cfg(feature = "<slug>")]` gates that are already declared in
-//! `Cargo.toml`. With zero features enabled this file still compiles: `init`
-//! just registers an empty vector.
+//! Every provider module below is now present. Each `#[cfg(feature = "<slug>")]`
+//! gate maps to a slug listed in `Cargo.toml`'s `[features]` table. With zero
+//! features enabled this file still compiles: `init` registers an empty vector.
 
 pub mod state;
 pub mod trait_def;
@@ -21,12 +15,9 @@ pub use trait_def::*;
 
 use std::sync::OnceLock;
 
-// Per-provider modules will land in later phases. Each declaration below is
-// gated on its Cargo feature; the modules themselves do not yet exist, so
-// these lines are intentionally commented out until the corresponding phase
-// creates the file. The Cargo `[features]` table already lists every slug so
-// the gates line up when the modules land.
-//
+// Per-provider modules. Each declaration is gated on its Cargo feature so
+// downstream builds can compile a subset. The Cargo `[features]` table lists
+// every slug used below.
 #[cfg(feature = "amazon-q")]
 pub mod amazon_q;
 #[cfg(feature = "claude")]
@@ -94,6 +85,7 @@ pub fn get(id: &str) -> Option<&'static dyn Provider> {
 /// to call multiple times per process, but only the first call wins (matches
 /// production semantics).
 #[cfg(test)]
+#[allow(dead_code)] // reserved for cross-file provider fixture tests
 pub fn init_for_test(v: Vec<Box<dyn Provider>>) {
     let _ = REGISTRY.set(v);
 }

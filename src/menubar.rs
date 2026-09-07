@@ -1928,7 +1928,7 @@ fn shell_quote(s: &str) -> String {
 fn handle_context_ledger(slug: Option<&str>) {
     let bin = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "usagio".to_string());
+        .unwrap_or_else(|_| crate::APP_SLUG.to_string());
     let cmd = context_ledger_shell_cmd(slug, &bin);
     #[cfg(target_os = "macos")]
     {

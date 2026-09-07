@@ -1,3 +1,10 @@
+// The provider trait surface below is the crate's provider-facing API: several
+// items are only consumed by feature-gated per-provider impls (or by callers
+// yet to land), so dead-code warnings on the trait/enum surface itself are
+// noise rather than signal. R2-CRAFT-01: narrowed from the previous crate-wide
+// #![allow(dead_code)] on providers/mod.rs to just this file (and state.rs).
+#![allow(dead_code)]
+
 //! Provider trait scaffolding.
 //!
 //! This is the core-agents-refactor v1 trait definition: one `Box<dyn Provider>`

@@ -767,3 +767,85 @@ fn row_from_account_propagates_needs_relogin_flag() {
     a.needs_relogin = true;
     assert!(row_from_account(&a).needs_relogin);
 }
+
+// -----------------------------------------------------------------------------
+// switch_to_guarded lock-closure invariant (H1 round-1 + H_R2_1 round-2)
+//
+// switch_to_guarded's contract is: any in-memory mutation to the state
+// snapshot that happens BEFORE `st = State::load()?;` (the reload that
+// absorbs `absorb_before_switch`'s disk writes) is DISCARDED and must not be
+// relied on. Mutations AFTER the reload survive `st.save()`.
+//
+// This pins that contract at the state-lock/save layer without dragging in
+// the keychain + apply_account plumbing. Red-before-green: swap the order
+// (mutate after reload → mutate before reload) and this test fails.
+// -----------------------------------------------------------------------------
+#[test]
+fn switch_lock_closure_invariant_mutations_after_reload_survive() {
+    use crate::credentials::with_state_lock;
+    use crate::store::{Account, ScopedConfigDir, State};
+
+    let _g = ScopedConfigDir::new();
+
+    // Seed: two accounts, A active with a "stale" access token.
+    let mut a = Account::from_keychain_blob(
+        r#"{"claudeAiOauth":{"accessToken":"stale","refreshToken":"r","expiresAt":0}}"#,
+    )
+    .unwrap();
+    a.email = Some("a@e.com".into());
+    let mut b = Account::from_keychain_blob(
+        r#"{"claudeAiOauth":{"accessToken":"bt","refreshToken":"br","expiresAt":0}}"#,
+    )
+    .unwrap();
+    b.email = Some("b@e.com".into());
+    let mut seed = State::default();
+    seed.accounts.push(a);
+    seed.accounts.push(b);
+    seed.active = Some("a@e.com".into());
+    seed.save().unwrap();
+
+    // Model switch_to_guarded's ordering: (1) load, (2) simulate
+    // absorb_before_switch by writing a fresher token for A on disk via a
+    // NESTED with_state_lock (matches the real reentrant absorb path), (3)
+    // reload, (4) mutate AFTER reload, (5) save.
+    with_state_lock(|| {
+        let _st = State::load()?;
+
+        // Nested lock frame simulates absorb_before_switch's on-disk write
+        // for the outgoing account A.
+        with_state_lock(|| {
+            let mut st_nested = State::load()?;
+            if let Some(x) = st_nested.find_mut("a@e.com") {
+                x.access_token = "absorbed_fresh".into();
+                x.expires_at = 999_999;
+            }
+            st_nested.save()
+        })?;
+
+        // Reload — pre-reload mutations would be discarded here.
+        let mut st = State::load()?;
+        // Post-reload mutation: bump B's expiry as a stand-in for what
+        // sync_active_from_keychain / apply_account bookkeeping do.
+        if let Some(x) = st.find_mut("b@e.com") {
+            x.expires_at = 111_111;
+        }
+        st.active = Some("b@e.com".into());
+        st.save()
+    })
+    .unwrap();
+
+    // A's absorbed rotation survived (fresher token persisted, not clobbered).
+    let disk = State::load().unwrap();
+    let a_on_disk = disk.find("a@e.com").expect("A still present");
+    assert_eq!(
+        a_on_disk.access_token, "absorbed_fresh",
+        "reload+save must preserve the fresher token absorbed for the outgoing account (H1)"
+    );
+    // And B's post-reload mutation persisted.
+    let b_on_disk = disk.find("b@e.com").expect("B still present");
+    assert_eq!(
+        b_on_disk.expires_at, 111_111,
+        "post-reload mutations must survive the final save (H_R2_1 sibling)"
+    );
+    assert_eq!(disk.active.as_deref(), Some("b@e.com"));
+}

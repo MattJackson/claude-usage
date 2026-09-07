@@ -228,10 +228,18 @@ impl Provider for CodexProvider {
                         .get("used_percent")
                         .and_then(|x| x.as_f64())
                         .or_else(|| w.get("used").and_then(|x| x.as_f64()));
+                    // R2-P1 (round-2 codeaudit): use checked_add_signed so a
+                    // hostile / buggy vendor JSON with resets_in_seconds near
+                    // i64::MAX (or otherwise producing an out-of-range year)
+                    // doesn't panic the refresh loop. Also clamp to ~400d,
+                    // matching notifications::evaluate_pace.
                     let resets_at = w
                         .get("resets_in_seconds")
                         .and_then(|x| x.as_i64())
-                        .map(|s| Utc::now() + chrono::Duration::seconds(s));
+                        .and_then(|s| {
+                            let capped = s.clamp(0, 60 * 60 * 24 * 400);
+                            Utc::now().checked_add_signed(chrono::Duration::seconds(capped))
+                        });
                     windows.push(UsageWindow {
                         id: id.to_string(),
                         label: if id == "primary" {
@@ -406,6 +414,7 @@ mod tests {
         assert!(!caps.supports_switching);
         assert!(caps.supports_email_capture);
         assert_eq!(caps.secret_backend, SecretBackend::File);
+        assert_eq!(caps.capture_mode, CaptureMode::CredsOnDisk);
         assert_eq!(p.window_order(), &["primary", "secondary"]);
     }
 

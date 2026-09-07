@@ -513,10 +513,23 @@ pub fn save_state_safe(state: &State) -> Result<()> {
                 let ts = chrono::Utc::now().timestamp();
                 let backups_dir = dir.join("backups");
                 let _ = ensure_dir_0700(&backups_dir);
-                let dump_path = backups_dir.join(format!("state-rejected-{ts}.json"));
+                // R2-2 (round-2 codeaudit): uniquify with `-N` if two refusals
+                // land in the same second, mirroring write_rolling_backup, so
+                // the second dump doesn't silently overwrite the first.
+                let mut dump_path = backups_dir.join(format!("state-rejected-{ts}.json"));
+                let mut n: u32 = 1;
+                while dump_path.exists() {
+                    dump_path = backups_dir.join(format!("state-rejected-{ts}-{n}.json"));
+                    n += 1;
+                }
                 let redacted = redact_state_for_dump(state);
                 let dump_bytes = serde_json::to_vec_pretty(&redacted).unwrap_or_default();
                 let _ = write_private(&dump_path, &dump_bytes);
+                // R2-1: cap the rejected-dump family separately so a run of
+                // consecutive refusals cannot grow unbounded, and cannot
+                // dilute the BACKUP_KEEP_COUNT cap shared with real backups
+                // (prune_backups matches both `state-*` prefixes).
+                let _ = prune_rejected_dumps(&backups_dir, BACKUP_KEEP_COUNT);
                 let msg = format!(
                     "REFUSED save_state: would drop {} account(s) without an explicit \
                      remove(): {:?}. Redacted (token-free) diagnostic written to {}. \
@@ -615,6 +628,39 @@ pub(crate) fn prune_backups(dir: &Path, keep: usize) -> Result<()> {
         let name = e.file_name();
         let name = name.to_string_lossy();
         if !name.starts_with("state-") || !name.ends_with(".json") {
+            continue;
+        }
+        // R2-1: rolling-backup cap must not evict/count rejected dumps —
+        // they have their own cap via `prune_rejected_dumps`.
+        if name.starts_with("state-rejected-") {
+            continue;
+        }
+        let mtime = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        entries.push((e.path(), mtime));
+    }
+    entries.sort_by_key(|(_, m)| *m);
+    while entries.len() > keep {
+        let (p, _) = entries.remove(0);
+        let _ = std::fs::remove_file(&p);
+    }
+    Ok(())
+}
+
+/// R2-1: cap `state-rejected-*.json` diagnostic dumps at `keep` so a run of
+/// consecutive save refusals cannot grow unbounded. Oldest are evicted first.
+pub(crate) fn prune_rejected_dumps(dir: &Path, keep: usize) -> Result<()> {
+    let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    for e in std::fs::read_dir(dir).context("read backups dir")? {
+        let e = match e {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("state-rejected-") || !name.ends_with(".json") {
             continue;
         }
         let mtime = e
