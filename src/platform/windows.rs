@@ -725,16 +725,38 @@ mod tests {
         );
     }
 
+    /// Drop guard that deletes `label` from the real `HKCU` Run key when it
+    /// goes out of scope — including on an early `panic!`/assertion failure
+    /// mid-test, so a red assertion never leaves a stray
+    /// `usagio-test-<pid>` value behind in CI's registry.
+    struct RunKeyCleanup<'a> {
+        autostart: &'a WindowsAutostart,
+        label: String,
+    }
+
+    impl Drop for RunKeyCleanup<'_> {
+        fn drop(&mut self) {
+            let _ = self.autostart.uninstall(&self.label);
+        }
+    }
+
     /// Registry round-trip against the real `HKCU` Run key. `#[ignore]`d by
     /// default — this is the one test in this module with a real side
     /// effect on the machine running it. Run explicitly on Windows with
-    /// `cargo test -- --ignored windows_autostart_writes_registry_key`.
+    /// `cargo test --all-features -- --ignored windows_autostart_writes_registry_key`,
+    /// or via CI's Windows-only "cargo test --ignored" step
+    /// (`.github/workflows/ci.yml`), which runs on every push since
+    /// `windows-latest` runners are disposable per-job VMs.
     #[test]
     #[ignore = "writes to the real HKCU Run key; run with --ignored on Windows"]
     fn windows_autostart_writes_registry_key() {
-        let label = format!("usagio-platform-test-{}", std::process::id());
+        let label = format!("usagio-test-{}", std::process::id());
         let autostart = WindowsAutostart;
         let binary = Path::new(r"C:\Path\To\usagio-test.exe");
+        let _cleanup = RunKeyCleanup {
+            autostart: &autostart,
+            label: label.clone(),
+        };
 
         let _ = autostart.uninstall(&label);
         assert!(!autostart.is_installed(&label).unwrap());

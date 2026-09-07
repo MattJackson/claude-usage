@@ -61,6 +61,17 @@ jobs:
         # would race the lock across binaries. See M7 in the round-1 codeaudit.
         run: cargo test --tests --all-features -- --test-threads=1
 
+      # Windows-only: exercises the one #[ignore]d test with a REAL side
+      # effect — windows_autostart_writes_registry_key round-trips an actual
+      # HKCU\...\Run key (writes a usagio-platform-test-<pid> value, reads it
+      # back, then deletes it in the test body). Safe here because
+      # windows-latest runners are disposable per-job VMs. Closes the
+      # "compile-only" gap on the real registry-write path (gap 3 of the
+      # v0.5.0 CI matrix).
+      - name: cargo test --ignored (real HKCU registry write)
+        if: matrix.os == 'windows-latest'
+        run: cargo test --all-features -- --ignored --test-threads=1
+
       # Cheap, Ubuntu-only lint: every `#[cfg(target_os = ...)]` (or the
       # `cfg!(...)` macro form) outside src/platform/* is a scattered
       # platform check that should instead be routed through the `Platform`
