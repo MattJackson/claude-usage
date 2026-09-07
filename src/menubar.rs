@@ -1248,8 +1248,7 @@ use objc2_app_kit::{
     NSTextTab, NSTextTabOptionKey,
 };
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange,
-    NSString,
+    NSArray, NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange, NSString,
 };
 
 fn color_for(sev: Severity) -> Retained<NSColor> {
@@ -2173,8 +2172,16 @@ mod tests {
     fn main_row_includes_provider_name_padded() {
         // Item 2 of the redesign: the provider name gets its own column-like
         // padding, then the email, then the tab-stopped `S n%  W n%` run.
-        let claude = main_row("Claude", &acct("a@x.com", Some(1.0), Some(2.0), false), bands());
-        let codex = main_row("Codex", &acct("b@x.com", Some(1.0), Some(2.0), false), bands());
+        let claude = main_row(
+            "Claude",
+            &acct("a@x.com", Some(1.0), Some(2.0), false),
+            bands(),
+        );
+        let codex = main_row(
+            "Codex",
+            &acct("b@x.com", Some(1.0), Some(2.0), false),
+            bands(),
+        );
         let (claude_label, _) = claude.plain.split_once('\t').unwrap();
         let (codex_label, _) = codex.plain.split_once('\t').unwrap();
         assert!(claude_label.starts_with("Claude"));
@@ -2824,7 +2831,11 @@ mod tests {
         with_now(now, || {
             let reset = now + chrono::Duration::minutes(45);
             let st = State {
-                accounts: vec![account_with_usage("matt@example.com", Some(100.0), Some(reset))],
+                accounts: vec![account_with_usage(
+                    "matt@example.com",
+                    Some(100.0),
+                    Some(reset),
+                )],
                 ..State::default()
             };
             let cd = switch_target_lock_countdown(&st, CLAUDE_SLUG, "matt@example.com");
@@ -2874,7 +2885,10 @@ mod tests {
 
         let (_, api_key_before) = partition_capture_providers(&regs, &[]);
         assert_eq!(
-            api_key_before.iter().map(|p| p.provider_id()).collect::<Vec<_>>(),
+            api_key_before
+                .iter()
+                .map(|p| p.provider_id())
+                .collect::<Vec<_>>(),
             vec!["openrouter-like"],
             "not yet captured → still offered under Paste API key ▸",
         );
@@ -2900,11 +2914,7 @@ mod tests {
         assert!(full_len > 0);
         let mut effective = objc2_foundation::NSRange::new(0, 0);
         let value = unsafe {
-            attr.attribute_atIndex_effectiveRange(
-                NSForegroundColorAttributeName,
-                0,
-                &mut effective,
-            )
+            attr.attribute_atIndex_effectiveRange(NSForegroundColorAttributeName, 0, &mut effective)
         };
         assert!(value.is_some(), "expected a foreground-color attribute");
         assert_eq!(
@@ -2922,11 +2932,7 @@ mod tests {
         let attr = attributed(&style);
         let mut effective = objc2_foundation::NSRange::new(0, 0);
         let value = unsafe {
-            attr.attribute_atIndex_effectiveRange(
-                NSForegroundColorAttributeName,
-                0,
-                &mut effective,
-            )
+            attr.attribute_atIndex_effectiveRange(NSForegroundColorAttributeName, 0, &mut effective)
         };
         assert!(
             value.is_none(),
