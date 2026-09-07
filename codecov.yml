@@ -1,0 +1,16 @@
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+        target: 75%
+    patch:
+      default:
+        informational: true
+
+comment: false
+
+ignore:
+  - "**/tests"
+  - "**/*_tests.rs"
+  - "**/*.md"
