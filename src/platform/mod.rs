@@ -84,6 +84,13 @@ pub enum MenuItem {
     },
 }
 
+/// **Threading invariant**: `create_status_item` and `run_event_loop` MUST
+/// be called on the same OS thread. Windows enforces this at runtime via a
+/// thread-id check in `TrayState` (see `windows.rs`); Linux relies on a
+/// `thread_local!` that silently drops mutations if violated (see
+/// `LinuxMenu` in `linux.rs`). Callers responsible for wiring the menu
+/// backend must arrange the main-thread call sequence documented in
+/// `menubar.rs::run`.
 pub trait MenuBackend: Send + Sync {
     /// Create the status-bar item. Called once at startup. Handle lives for
     /// the process lifetime; the backend owns the event loop.

@@ -107,11 +107,23 @@ enum UiCmd {
     SetMenu(MenuTree),
 }
 
+/// Doc string for the threading invariant `TrayState`'s `unsafe impl Send`
+/// depends on. Factored into a constant (rather than only living in prose
+/// comments) so `run_event_loop`'s panic message and a unit test both quote
+/// the exact same wording — see `MenuBackend` in `platform/mod.rs` for the
+/// cross-backend version of this contract.
+const SAME_THREAD_INVARIANT: &str =
+    "create_status_item and run_event_loop MUST be called on the same thread.";
+
 /// Wraps the thread-confined `TrayIcon` (see module doc). Never touched
 /// outside `run_event_loop`, which the `MenuBackend` contract requires to
 /// run on the same (main) thread `create_status_item` was called from.
+/// `creation_thread` records which thread created it so `run_event_loop` can
+/// assert the invariant at runtime instead of relying on caller discipline
+/// alone.
 struct TrayState {
     tray: TrayIcon,
+    creation_thread: std::thread::ThreadId,
 }
 
 // SAFETY: `TrayState` holds a `tray_icon::TrayIcon`, which is `!Send`
@@ -123,6 +135,8 @@ struct TrayState {
 // `TrayState` — is documented (see `MenuBackend::create_status_item`) as
 // being called once at startup on that same main thread. Every other
 // thread only ever sends plain owned data through the `UiCmd` channel.
+// `run_event_loop` additionally asserts `creation_thread` matches at entry,
+// so a violation panics loudly instead of producing UB.
 unsafe impl Send for TrayState {}
 
 /// Type alias for the click-handler callback slot — factored out so the
@@ -295,7 +309,10 @@ impl MenuBackend for WindowsMenu {
             .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
 
         let (tx, rx) = mpsc::channel::<UiCmd>();
-        *self.tray_state.lock().unwrap() = Some(TrayState { tray });
+        *self.tray_state.lock().unwrap() = Some(TrayState {
+            tray,
+            creation_thread: std::thread::current().id(),
+        });
         *self.cmd_rx.lock().unwrap() = Some(rx);
         *self.cmd_tx.lock().unwrap() = Some(tx.clone());
 
@@ -327,6 +344,17 @@ impl MenuBackend for WindowsMenu {
         let state = guard
             .as_mut()
             .context("run_event_loop called before create_status_item")?;
+
+        // `TrayState`'s `unsafe impl Send` is only sound if create_status_item
+        // and run_event_loop share a thread (see the SAFETY comment on
+        // `TrayState`). Nothing else enforces that at compile time, so check
+        // it here and fail loudly rather than let a violation manifest as UB
+        // deep inside `tray-icon`/Win32.
+        assert_eq!(
+            state.creation_thread,
+            std::thread::current().id(),
+            "{SAME_THREAD_INVARIANT}"
+        );
 
         let menu_rx = MenuEvent::receiver();
         loop {
@@ -799,6 +827,15 @@ mod tests {
 
         // Deleting again must stay Ok (idempotent) rather than erroring.
         secrets.delete(&service, account).unwrap();
+    }
+
+    // --- M10: TrayState's same-thread invariant is documented + checkable --
+
+    #[test]
+    fn same_thread_invariant_message_names_both_methods() {
+        assert!(SAME_THREAD_INVARIANT.contains("create_status_item"));
+        assert!(SAME_THREAD_INVARIANT.contains("run_event_loop"));
+        assert!(SAME_THREAD_INVARIANT.contains("same thread"));
     }
 
     // --- M7: request_quit() before run_event_loop() must not be a no-op ----
