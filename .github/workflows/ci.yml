@@ -67,6 +67,14 @@ jobs:
         # `cfg(target_os = ...)` as example text — false positives).
         run: cargo test --tests --all-features -- --test-threads=1
 
+      # Windows-only: real side-effect tests (Credential Manager round-trip,
+      # HKCU Run key round-trip) are `#[ignore]`d in the default run above so
+      # `cargo test` stays hermetic on every OS/dev machine. Run them here,
+      # for real, on the one OS that has a Credential Manager / registry.
+      - name: cargo test --ignored (Windows-only side-effect tests)
+        if: matrix.os == 'windows-latest'
+        run: cargo test --all-features -- --ignored --test-threads=1
+
   # Full lane — release build, only on the qa and main branches.
   build:
     name: release build

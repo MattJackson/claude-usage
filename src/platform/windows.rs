@@ -760,4 +760,36 @@ mod tests {
         autostart.uninstall(&label).unwrap();
         assert!(!autostart.is_installed(&label).unwrap());
     }
+
+    /// Round-trip against the real Credential Manager. `#[ignore]`d by
+    /// default — same rationale as `windows_autostart_writes_registry_key`:
+    /// a real side effect on the machine running it. Run explicitly on
+    /// Windows with `cargo test -- --ignored windows_secrets_set_get_roundtrip`.
+    #[test]
+    #[ignore = "writes to the real Credential Manager; run with --ignored on Windows"]
+    fn windows_secrets_set_get_roundtrip() {
+        let service = format!("usagio-ci-test-{}", std::process::id());
+        let account = "ci-test-account";
+        let secrets = WindowsSecrets;
+
+        // Start from a clean slate in case a previous run was interrupted.
+        let _ = secrets.delete(&service, account);
+        assert_eq!(secrets.get(&service, account).unwrap(), None);
+
+        secrets.set(&service, account, "s3cr3t-value").unwrap();
+        assert_eq!(
+            secrets.get(&service, account).unwrap(),
+            Some("s3cr3t-value".to_string())
+        );
+
+        secrets.delete(&service, account).unwrap();
+        assert_eq!(
+            secrets.get(&service, account).unwrap(),
+            None,
+            "delete-then-get must return the documented NoEntry sentinel (None)"
+        );
+
+        // Deleting again must stay Ok (idempotent) rather than erroring.
+        secrets.delete(&service, account).unwrap();
+    }
 }
