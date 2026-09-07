@@ -1683,12 +1683,24 @@ fn handle_backup_save() {
 
 /// "Restore…" click: opens a native OPEN panel (`rfd::FileDialog::pick_file`)
 /// defaulting to the automatic rolling-backups directory, validates the
-/// chosen file is state-shaped, warns before a restore would drop accounts
-/// (a "downgrade"), then atomically replaces `state.json`. The rolling
-/// backups already snapshot the pre-restore state on every ordinary save, but
-/// we ALSO stash the live file to a `/tmp` sidecar right before overwriting
-/// it, so the restore itself is reversible even if the user picked a very old
-/// backup.
+/// chosen file is state-shaped, warns — by NAME, not just count — before a
+/// restore would drop accounts, then replaces `state.json` through the same
+/// `save_state_safe` drop-protection every other write goes through. The
+/// rolling backups already snapshot the pre-restore state on every ordinary
+/// save, but we ALSO stash the live file to `<config_dir>/backups/` right
+/// before overwriting it, so the restore itself is reversible even if the
+/// user picked a very old backup.
+///
+/// H2 (v0.5.0 codeaudit): this used to (1) stash the live state — full OAuth
+/// tokens, non-redacted — to a `/tmp` sidecar, a world-writable shared
+/// directory, and (2) bypass `save_state_safe`'s drop-protection guard and
+/// the cross-process state lock entirely, gating the write on nothing but an
+/// account *count* comparison (same-count-different-accounts sailed through
+/// with zero confirmation). Both are fixed here: the stash moves under
+/// `config_dir()/backups/` (owner-only permissions), and the whole
+/// read-confirm-write sequence runs under `with_state_lock` with the actual
+/// write routed through `store::save_state_restore` (a thin, explicitly-
+/// authorized wrapper around `save_state_safe`).
 fn handle_backup_restore_dialog() {
     let mut dialog = rfd::FileDialog::new().add_filter("usagio state (*.json)", &["json"]);
     if let Ok(p) = crate::store::state_json_path() {
@@ -1716,48 +1728,36 @@ fn handle_backup_restore_dialog() {
             return;
         }
     };
-    let Some(new_accounts) = value.get("accounts").and_then(|a| a.as_array()) else {
+    if value.get("accounts").and_then(|a| a.as_array()).is_none() {
         notify("Restore failed: not a usagio state file (missing 'accounts')");
         return;
-    };
-    let new_count = new_accounts.len();
-    let old_count = State::load().unwrap_or_default().accounts.len();
-    if new_count < old_count {
-        let question = format!(
-            "Selected file has {new_count} account(s); current state has {old_count}. \
-             Restoring will drop {} account(s). Continue?",
-            old_count - new_count
-        );
-        if !confirm(&question) {
-            return;
+    }
+    let new_state = State::from_value(&value);
+
+    let outcome = with_state_lock(|| -> Result<bool> {
+        let dropped = crate::store::accounts_dropped_by(&new_state)?;
+        if !dropped.is_empty() && !confirm(&restore_drop_confirmation(&dropped)) {
+            return Ok(false); // user declined; not an error
         }
+        let dir = crate::store::config_dir()?;
+        crate::store::stash_pre_restore(&dir)?;
+        crate::store::save_state_restore(new_state.clone())?;
+        Ok(true)
+    });
+
+    match outcome {
+        Ok(true) => notify(&format!("Restored state from {}", path.display())),
+        Ok(false) => {} // user declined the drop confirmation; no-op
+        Err(e) => notify(&format!("Restore failed: {e}")),
     }
-    if let Err(e) = atomic_replace_state_bytes(&bytes) {
-        notify(&format!("Restore failed: {e}"));
-        return;
-    }
-    notify(&format!("Restored state from {}", path.display()));
 }
 
-/// Move the live `state.json` to a `pre-restore` sidecar under `/tmp` (best
-/// effort — a missing live file is not an error, there's simply nothing to
-/// preserve), then write `new_bytes` into place with mode 0600. Bypasses
-/// `State::save`'s overwrite-protection guard deliberately: THIS is the
-/// user-confirmed, explicit "replace everything" path that guard exists to
-/// gate everywhere else.
-fn atomic_replace_state_bytes(new_bytes: &[u8]) -> Result<(), String> {
-    let live = crate::store::state_json_path().map_err(|e| e.to_string())?;
-    if live.exists() {
-        let ts = chrono::Utc::now().timestamp();
-        let pre_restore =
-            std::path::PathBuf::from(format!("/tmp/usagio-state-pre-restore-{ts}.json"));
-        if std::fs::rename(&live, &pre_restore).is_err() {
-            std::fs::copy(&live, &pre_restore)
-                .and_then(|_| std::fs::remove_file(&live))
-                .map_err(|e| format!("while moving current state: {e}"))?;
-        }
-    }
-    crate::store::write_private(&live, new_bytes).map_err(|e| e.to_string())
+/// Build the confirmation question shown before a restore that would drop
+/// accounts. Names the specific dropped emails (H2, v0.5.0 codeaudit — the
+/// prior wording was "will drop 2 account(s)", which told the user nothing
+/// about *which* accounts they were about to lose).
+fn restore_drop_confirmation(dropped: &[String]) -> String {
+    format!("Restoring will drop {}. Continue?", dropped.join(", "))
 }
 
 /// "Refresh usage now" click (Settings ▸ Advanced ▸). Runs one poll +
@@ -2938,5 +2938,95 @@ mod tests {
             value.is_none(),
             "a plain row must not carry a forced foreground color",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // H2 (v0.5.0 codeaudit) — Restore… drop-confirmation wording + store-level
+    // wiring. `handle_backup_restore_dialog` itself opens a native file panel
+    // and shells out to osascript for confirmation, neither of which is
+    // unit-testable; these tests cover the pure logic it's built from.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn restore_drop_confirmation_names_dropped_emails_not_just_a_count() {
+        let msg = super::restore_drop_confirmation(&[
+            "dev@getbusbar.com".to_string(),
+            "matthew@pq.io".to_string(),
+        ]);
+        assert_eq!(
+            msg,
+            "Restoring will drop dev@getbusbar.com, matthew@pq.io. Continue?"
+        );
+    }
+
+    /// Minimal restore-test account: only the fields `accounts_dropped_by`
+    /// (keyed on email) and `save`/`load` round-tripping care about.
+    fn restore_test_acct(email: &str) -> crate::store::Account {
+        let blob = serde_json::json!({
+            "claudeAiOauth": { "accessToken": "at", "refreshToken": "rt", "expiresAt": 0 }
+        })
+        .to_string();
+        let mut a = crate::store::Account::from_keychain_blob(&blob).unwrap();
+        a.email = Some(email.to_string());
+        a
+    }
+
+    #[test]
+    fn restore_that_only_adds_an_account_reports_no_drops() {
+        use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
+        let _g = ScopedConfigDir::new();
+        let mut current = State::default();
+        current.accounts.push(restore_test_acct("a@e.com"));
+        current.save().unwrap();
+
+        let mut restore_target = State::load().unwrap();
+        restore_target.accounts.push(restore_test_acct("b@e.com"));
+
+        // Adding an account must never surface a drop-confirmation — the menu
+        // handler only calls `confirm()` when this list is non-empty.
+        let dropped = accounts_dropped_by(&restore_target).unwrap();
+        assert!(
+            dropped.is_empty(),
+            "adding an account must not be reported as a drop"
+        );
+    }
+
+    #[test]
+    fn restore_that_drops_an_account_reports_exactly_that_email() {
+        use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
+        let _g = ScopedConfigDir::new();
+        let mut current = State::default();
+        for email in ["dev@getbusbar.com", "matthew@pq.io"] {
+            current.accounts.push(restore_test_acct(email));
+        }
+        current.save().unwrap();
+
+        let mut restore_target = State::default();
+        restore_target
+            .accounts
+            .push(restore_test_acct("dev@getbusbar.com"));
+
+        let dropped = accounts_dropped_by(&restore_target).unwrap();
+        assert_eq!(dropped, vec!["matthew@pq.io".to_string()]);
+        assert_eq!(
+            restore_drop_confirmation(&dropped),
+            "Restoring will drop matthew@pq.io. Continue?"
+        );
+    }
+
+    #[test]
+    fn pre_restore_stash_lands_under_config_backups_not_tmp() {
+        use crate::store::{config_dir, stash_pre_restore, ScopedConfigDir, State};
+        let g = ScopedConfigDir::new();
+        let mut current = State::default();
+        current.accounts.push(restore_test_acct("a@e.com"));
+        current.save().unwrap();
+
+        let dir = config_dir().unwrap();
+        let stash = stash_pre_restore(&dir)
+            .unwrap()
+            .expect("live state existed");
+        assert!(stash.starts_with(g.home().join(".config/usagio/backups")));
+        assert!(!stash.starts_with("/tmp"));
     }
 }
