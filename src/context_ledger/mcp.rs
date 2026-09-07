@@ -15,7 +15,7 @@
 use super::tokenize;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,13 @@ impl Drop for ChildGuard {
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// R3-RES-01: per-line byte cap for stdio JSON-RPC reads. A misbehaving MCP
+/// server that streams bytes without a newline would otherwise grow the read
+/// buffer unboundedly (BufRead::read_line has no size limit and the 3s
+/// timeout is only checked between successive read_line calls). 1 MiB sits
+/// well above realistic tools/list responses.
+const MAX_LINE_BYTES: u64 = 1 << 20;
 
 #[derive(Debug)]
 pub struct McpSummary {
@@ -156,15 +163,26 @@ fn read_line_with_timeout(
         if start.elapsed() > RPC_TIMEOUT {
             return Err(format!("timeout after {:?}", RPC_TIMEOUT));
         }
-        let mut buf = String::new();
-        match reader.read_line(&mut buf) {
+        // R3-RES-01: cap per-line reads at MAX_LINE_BYTES so a server that
+        // streams bytes without a newline can't grow this buffer unboundedly
+        // between timeout polls.
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut limited = reader.by_ref().take(MAX_LINE_BYTES);
+        match limited.read_until(b'\n', &mut bytes) {
             Ok(0) => return Err("eof before response".into()),
             Ok(_) => {
-                let trimmed = buf.trim();
-                if trimmed.is_empty() {
+                if bytes.len() as u64 >= MAX_LINE_BYTES && !bytes.ends_with(b"\n") {
+                    return Err(format!(
+                        "line exceeded {} bytes without newline",
+                        MAX_LINE_BYTES
+                    ));
+                }
+                let s =
+                    String::from_utf8(bytes).map_err(|e| format!("non-utf8 in response: {}", e))?;
+                if s.trim().is_empty() {
                     continue;
                 }
-                return Ok(buf);
+                return Ok(s);
             }
             Err(e) => return Err(format!("read: {}", e)),
         }

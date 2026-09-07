@@ -335,7 +335,7 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
     use notify::{Event, RecursiveMode, Watcher};
 
     let (tx, rx) = mpsc::channel::<Event>();
-    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+    let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         match res {
             Ok(ev) => {
                 let _ = tx.send(ev);
@@ -347,8 +347,18 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
                 crate::logging::log(&format!("credentials: notify event error: {e}"));
             }
         }
-    })
-    .ok()?;
+    });
+    // R3-EH-01: log watcher-construction failure (previously .ok()? silently
+    // dropped the error, contradicting the doc-comment's "logged and swallowed").
+    let mut watcher = match watcher {
+        Ok(w) => w,
+        Err(e) => {
+            crate::logging::log(&format!(
+                "credentials: recommended_watcher construction failed: {e}"
+            ));
+            return None;
+        }
+    };
 
     let mut any_watched = false;
     for p in &providers {
@@ -415,8 +425,16 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
                 let active = State::load().ok().and_then(|s| s.active.clone());
                 refresh_inactive_if_stale(active.as_deref());
             }
-        })
-        .ok()?;
+        });
+    // R3-EH-01: log watcher-thread spawn failure (previously .ok()? silently
+    // dropped ENOMEM/EAGAIN/RLIMIT_NPROC without a signal).
+    let thread = match thread {
+        Ok(t) => t,
+        Err(e) => {
+            crate::logging::log(&format!("credentials: watcher thread spawn failed: {e}"));
+            return None;
+        }
+    };
 
     Some(WatcherHandle {
         _watcher: watcher,
