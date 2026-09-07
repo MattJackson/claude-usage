@@ -14,6 +14,8 @@ mod context_ledger;
 mod cost_tracking;
 mod countdown;
 mod credentials;
+#[cfg(test)]
+mod env_lock;
 #[cfg(target_os = "macos")]
 mod icons;
 mod logging;

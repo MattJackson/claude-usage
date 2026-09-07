@@ -267,27 +267,23 @@ mod tests {
 
     #[test]
     fn paths_config_dir_uses_home_dot_config() {
-        // Snapshot + restore HOME so the process-global env change stays local
-        // to this test. cargo test threads share HOME, but we only assert on
-        // the value we set here, so a racing sibling test that reads HOME sees
-        // its own snapshot.
-        let orig = std::env::var_os("HOME");
-        // SAFETY: single-threaded env mutation, restored on exit.
-        std::env::set_var("HOME", "/tmp/platform-test-home");
-        let got = MacOsPaths.config_dir("usagio");
-        assert_eq!(
-            got,
-            std::path::PathBuf::from("/tmp/platform-test-home/.config/usagio")
-        );
-        let cache = MacOsPaths.cache_dir("usagio");
-        assert_eq!(
-            cache,
-            std::path::PathBuf::from("/tmp/platform-test-home/Library/Caches/usagio")
-        );
-        match orig {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
+        // Serialised against every other in-crate `$HOME` mutator via the
+        // crate-wide `env_lock::ENV_LOCK`. Before this was hoisted out of
+        // per-module mutexes, this test raced other tests' `$HOME` swaps and
+        // one of those interleavings wiped a live developer state.json
+        // (see the never-re-login postmortem).
+        crate::env_lock::scoped_env_var("HOME", Some("/tmp/platform-test-home"), || {
+            let got = MacOsPaths.config_dir("usagio");
+            assert_eq!(
+                got,
+                std::path::PathBuf::from("/tmp/platform-test-home/.config/usagio")
+            );
+            let cache = MacOsPaths.cache_dir("usagio");
+            assert_eq!(
+                cache,
+                std::path::PathBuf::from("/tmp/platform-test-home/Library/Caches/usagio")
+            );
+        });
     }
 
     /// SecretStore round-trip against the real login keychain. `#[ignore]`d by

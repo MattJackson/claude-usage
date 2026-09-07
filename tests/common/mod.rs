@@ -11,6 +11,13 @@
 //! add more than one.
 
 #![allow(dead_code)]
+// Integration-test binaries can't reach the binary crate's `env_lock` module
+// (they link against a separate compilation without `cfg(test)`), and each
+// integration test binary is a separate process so the process-global `$HOME`
+// races that motivated `env_lock` don't cross binaries. The `disallowed_methods`
+// guard applies to the in-crate build; suppress it here at the module scope
+// with an explanation so the fixture stays readable.
+#![allow(clippy::disallowed_methods)]
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

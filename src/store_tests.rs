@@ -463,3 +463,63 @@ fn migrates_old_name_keyed_state() {
     // active migrated from the legacy name to that account's email
     assert_eq!(s.active.as_deref(), Some("matthew@pq.io"));
 }
+
+// ---------------------------------------------------------------------------
+// Reconciler defensiveness (never-re-login part 2)
+//
+// The v0.3.x menu-bar reconciler deleted keychain items whenever an account
+// went missing from state.json — the incident. v0.4.0 has no such
+// deletion path (the only SecretStore::delete callers are tests), and
+// `save_state_safe` refuses to persist a state that has silently dropped
+// an account. This test pins that invariant so a future refactor can't
+// reintroduce the reconciler foot-gun without a red test.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reconciler_never_persists_silent_account_drop() {
+    // Seed disk with three accounts — represents three keychain items indexed
+    // by these emails.
+    let _g = ScopedConfigDir::new();
+    make_state_with(&["a@e.com", "b@e.com", "c@e.com"])
+        .save()
+        .unwrap();
+
+    // Simulate a buggy reconciler: load state, then remove an account from
+    // the in-memory Vec *directly* (not via `State::remove`), so
+    // `pending_removals` is NOT populated. This is exactly the shape the
+    // v0.3.x code took before the shrink triggered a keychain purge.
+    let mut buggy = State::load().unwrap();
+    buggy.accounts.retain(|a| a.key() != "b@e.com");
+    assert_eq!(buggy.accounts.len(), 2, "reconciler shrunk in-memory state");
+
+    // save_state_safe MUST refuse the write.
+    let err = buggy
+        .save()
+        .expect_err("silent shrink must be refused by save_state_safe");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("REFUSED save_state"),
+        "refusal is loud: {msg}"
+    );
+    assert!(
+        msg.contains("b@e.com"),
+        "refusal names the vanished account: {msg}"
+    );
+
+    // The on-disk state is untouched — every account key that any keychain
+    // index would resolve is still present, so no downstream reconciler
+    // could compute an "orphan" set and start purging.
+    let on_disk = State::load().unwrap();
+    let keys: Vec<String> = on_disk
+        .accounts
+        .iter()
+        .map(|a| a.key().to_string())
+        .collect();
+    assert_eq!(keys.len(), 3, "all three accounts still on disk");
+    for want in ["a@e.com", "b@e.com", "c@e.com"] {
+        assert!(
+            keys.iter().any(|k| k == want),
+            "{want} preserved after silent-shrink attempt"
+        );
+    }
+}

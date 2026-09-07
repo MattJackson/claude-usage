@@ -1,0 +1,18 @@
+# Crate-wide clippy config.
+#
+# `disallowed-methods` blocks direct `std::env::set_var` / `remove_var` calls
+# on process-global state. Every legitimate use in this crate flips one of
+# `$HOME`, `$XDG_CONFIG_HOME`, or `$CODEX_HOME` in a test, and every such
+# flip MUST go through `crate::env_lock::scoped_env_var` so it serialises on
+# the crate-wide `ENV_LOCK`. Without this guard, a new test can silently
+# reintroduce the never-re-login incident (a `HOME` swap racing another
+# test's config-dir resolution wiped a live developer state.json).
+#
+# If a rare non-test caller ever needs raw env mutation, prefer wrapping in
+# `scoped_env_var` anyway; the escape hatch is
+# `#[allow(clippy::disallowed_methods)]` on the exact call site with a
+# comment explaining why the lock isn't needed.
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "use crate::env_lock::scoped_env_var (crate-wide HOME/XDG_CONFIG_HOME/CODEX_HOME lock)" },
+    { path = "std::env::remove_var", reason = "use crate::env_lock::scoped_env_var (crate-wide HOME/XDG_CONFIG_HOME/CODEX_HOME lock)" },
+]

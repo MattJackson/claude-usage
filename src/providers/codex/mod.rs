@@ -528,19 +528,14 @@ mod tests {
 
     #[test]
     fn credential_paths_uses_codex_home_when_set() {
-        // Save + restore any existing value so we don't leak into other tests.
-        // std::env is process-global — this test is #[test] not #[test(serial)],
-        // but the assertion checks the joined path shape regardless of ordering.
-        let prior = std::env::var_os("CODEX_HOME");
-        std::env::set_var("CODEX_HOME", "/tmp/codex-fixture");
-        let paths = CodexProvider.credential_paths();
-        assert_eq!(paths.len(), 1);
-        assert!(paths[0].ends_with("auth.json"));
-        assert!(paths[0].starts_with("/tmp/codex-fixture"));
-        match prior {
-            Some(v) => std::env::set_var("CODEX_HOME", v),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
+        // Serialised across the crate via `env_lock::ENV_LOCK` — no other
+        // test can flip `$CODEX_HOME` mid-assertion.
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some("/tmp/codex-fixture"), || {
+            let paths = CodexProvider.credential_paths();
+            assert_eq!(paths.len(), 1);
+            assert!(paths[0].ends_with("auth.json"));
+            assert!(paths[0].starts_with("/tmp/codex-fixture"));
+        });
     }
 
     #[test]
