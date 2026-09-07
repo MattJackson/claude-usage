@@ -27,9 +27,9 @@ use crate::countdown::{self, AccountUsage, BlockingWindow, DisplayState};
 use crate::providers::{self, CaptureMode, Provider, SeverityBands};
 use crate::store::State;
 use crate::{
-    age_str, capture_current, env_override_active, menu_order, next_interval, notify,
-    optimize_now, remove_account, row_from_account, switch_to, watch_cycle, with_state_lock,
-    Row, SwapGuard, CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
+    age_str, capture_current, env_override_active, menu_order, next_interval, notify, optimize_now,
+    remove_account, row_from_account, switch_to, watch_cycle, with_state_lock, Row, SwapGuard,
+    CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
 };
 
 /// Name shown for our Login Item in System Events.
@@ -250,7 +250,7 @@ fn header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
         let trailing = format!("locked · {cd}");
         let plain = format!("{}\t{trailing}", a.display);
         let off = u16len(&a.display) + 1; // + '\t'
-        // A "locked" account is by definition red — no need to consult bands.
+                                          // A "locked" account is by definition red — no need to consult bands.
         let colors = vec![(off, u16len(&trailing), Severity::Red)];
         return RowStyle {
             plain,
@@ -599,6 +599,16 @@ fn env_override_for(provider_id: &str) -> bool {
     env_override_active(provider_id)
 }
 
+/// Compare two `AcctView` values by their weekly-reset instant, treating a
+/// `None` reset as "furthest in the future" so accounts without data yet sort
+/// last. Used inside `build_snapshot` and asserted directly in the
+/// `sort_by_expiration_orders_accounts_soonest_first` test.
+pub(crate) fn sort_by_expiration(a: &AcctView, b: &AcctView) -> std::cmp::Ordering {
+    let ka = a.weekly_reset_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let kb = b.weekly_reset_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
+    ka.cmp(&kb)
+}
+
 /// Build one account's rendered view from a v1 `Row`. v1 state only has
 /// Claude accounts, so the window set is fixed (session / weekly / opus); the
 /// window IDs come from `provider.window_order()` so this is trivially
@@ -681,8 +691,7 @@ fn build_snapshot() -> Snapshot {
         let slug = provider.provider_id();
         // In v1 every stored row is a Claude account. Once state carries a
         // per-account slug this becomes `rows.iter().filter(|r| r.provider_id == slug)`.
-        let provider_rows: Vec<&Row> =
-            rows.iter().filter(|r| r.provider_id == slug).collect();
+        let provider_rows: Vec<&Row> = rows.iter().filter(|r| r.provider_id == slug).collect();
         if provider_rows.is_empty() {
             continue; // no captured accounts → no section (no header, no rows).
         }
@@ -690,9 +699,15 @@ fn build_snapshot() -> Snapshot {
             .into_iter()
             .map(|r| acctview_from_row(r, &active, slug, provider.window_order()))
             .collect();
+        // Primary sort: soonest-to-expire first, using the weekly-reset instant
+        // as the "expiration" signal (accounts with no data yet sort last).
+        // Without this, a newly-captured account lands at the tail of the vec
+        // (State::upsert appends) and stays there in the menu — the "sort-by-
+        // expiration on add" bug the user reported.
+        accounts.sort_by(sort_by_expiration);
         // Flat-list rule: within a provider section the active account renders
-        // first, then everyone else in the order menu_order already picked.
-        // Stable sort so the fallback ordering is preserved among inactives.
+        // first, then everyone else in the order picked above. Stable sort so
+        // the expiration ordering is preserved among the inactives.
         accounts.sort_by(|a, b| b.active.cmp(&a.active));
         let caps = provider.capabilities();
         sections.push(ProviderSection {
@@ -712,10 +727,8 @@ fn build_snapshot() -> Snapshot {
     // Providers with `capture_mode == ApiKey` go into the "Paste API key ▸"
     // sub-submenu instead of the main list.
     let (creds_providers, api_key_providers) = capture_menu_providers();
-    let capture_creds: Vec<RegisteredProvider> = creds_providers
-        .into_iter()
-        .map(register_provider)
-        .collect();
+    let capture_creds: Vec<RegisteredProvider> =
+        creds_providers.into_iter().map(register_provider).collect();
     let capture_api_key: Vec<RegisteredProvider> = api_key_providers
         .into_iter()
         .map(register_provider)
@@ -755,8 +768,7 @@ fn register_provider(p: &'static dyn Provider) -> RegisteredProvider {
 /// - the second renders under a "Paste API key ▸" sub-submenu.
 ///
 /// Pure function: no I/O, no state — only reads `Provider::capabilities`.
-pub(crate) fn capture_menu_providers() -> (Vec<&'static dyn Provider>, Vec<&'static dyn Provider>)
-{
+pub(crate) fn capture_menu_providers() -> (Vec<&'static dyn Provider>, Vec<&'static dyn Provider>) {
     partition_capture_providers(providers::all())
 }
 
@@ -998,8 +1010,7 @@ fn build_menu(snap: &Snapshot) -> Menu {
             if !snap.capture_creds.is_empty() {
                 let _ = capture.append(&PredefinedMenuItem::separator());
             }
-            let paste =
-                Submenu::with_id("capture:apikey", "Paste API key", true);
+            let paste = Submenu::with_id("capture:apikey", "Paste API key", true);
             for reg in &snap.capture_api_key {
                 let title = if reg.installed {
                     reg.display_name.to_string()
@@ -1042,6 +1053,47 @@ fn build_menu(snap: &Snapshot) -> Menu {
             None,
         ),
     );
+
+    // Backup Config ▸ — one-click "copy current state to /tmp" plus a live
+    // "Restore from backup ▸" submenu listing the rolling backups the store
+    // writes on every save. Both entries are wired to click ids the dispatcher
+    // routes to `handle_backup_*`.
+    let backup = Submenu::with_id("backup", "Backup Config", true);
+    let _ = backup.append(&MenuItem::with_id(
+        "backup:copy",
+        "Copy current state to /tmp",
+        true,
+        None,
+    ));
+    let restore = Submenu::with_id("backup:restore", "Restore from backup", true);
+    let backups = crate::store::list_backups().unwrap_or_default();
+    if backups.is_empty() {
+        let _ = restore.append(&MenuItem::with_id("noop", "(no backups yet)", false, None));
+    } else {
+        for (path, _mtime) in &backups {
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unnamed>")
+                .to_string();
+            // Human-facing label: strip the "state-" prefix and ".json" suffix
+            // so the user sees just "20260906-131204" (its captured moment).
+            let label = name
+                .strip_prefix("state-")
+                .and_then(|s| s.strip_suffix(".json"))
+                .unwrap_or(&name)
+                .to_string();
+            let _ = restore.append(&MenuItem::with_id(
+                format!("backup:restore:{name}"),
+                label,
+                true,
+                None,
+            ));
+        }
+    }
+    let _ = backup.append(&restore);
+    let _ = menu.append(&backup);
+
     let _ = menu.append(&PredefinedMenuItem::separator());
     add(
         &menu,
@@ -1063,11 +1115,7 @@ fn build_menu(snap: &Snapshot) -> Menu {
 /// for a `(no usage endpoint — headers only)` disabled row.
 fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
     let head = header_row(a, sec.severity_bands).plain;
-    let sub = Submenu::with_id(
-        format!("sub:{}:{}", sec.provider_id, a.key),
-        head,
-        true,
-    );
+    let sub = Submenu::with_id(format!("sub:{}:{}", sec.provider_id, a.key), head, true);
     if sec.supports_switching {
         if a.active {
             let _ = sub.append(&MenuItem::with_id("noop", "✓ Active", false, None));
@@ -1186,9 +1234,9 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
     use objc2::runtime::AnyObject;
     use objc2::AllocAnyThread;
     use objc2_app_kit::{
-        NSColor, NSControlStateValueOn, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
-        NSImage, NSMenu, NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSTextAlignment,
-        NSTextTab, NSTextTabOptionKey,
+        NSColor, NSControlStateValueOn, NSFont, NSFontAttributeName,
+        NSForegroundColorAttributeName, NSImage, NSMenu, NSMutableParagraphStyle,
+        NSParagraphStyleAttributeName, NSTextAlignment, NSTextTab, NSTextTabOptionKey,
     };
     use objc2_foundation::{
         NSArray, NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange,
@@ -1398,10 +1446,16 @@ fn menu_signature(snap: &Snapshot) -> String {
             // `header_row`/`top_header_row`/`header_line` render from.
             let now = now_utc();
             let lock = match countdown::compute_display(&account_usage_for(a), now) {
-                DisplayState::Locked { window: BlockingWindow::Session, until } => {
+                DisplayState::Locked {
+                    window: BlockingWindow::Session,
+                    until,
+                } => {
                     format!("L=S|cd={}", countdown::format_countdown(until - now))
                 }
-                DisplayState::Locked { window: BlockingWindow::Weekly, until } => {
+                DisplayState::Locked {
+                    window: BlockingWindow::Weekly,
+                    until,
+                } => {
                     format!("L=W|cd={}", countdown::format_countdown(until - now))
                 }
                 DisplayState::Usage { .. } => "L=0".to_string(),
@@ -1489,12 +1543,7 @@ fn tooltip_for(snap: &Snapshot) -> String {
         Some((_sec, a)) => {
             let s = a.windows.first().and_then(|w| w.pct);
             let w = a.windows.get(1).and_then(|w| w.pct);
-            format!(
-                "{} — session {}, weekly {}",
-                a.display,
-                pct(s),
-                pct(w)
-            )
+            format!("{} — session {}, weekly {}", a.display, pct(s), pct(w))
         }
         None => "claude-usage: no active account".to_string(),
     }
@@ -1552,11 +1601,125 @@ fn handle_click(id: &str) {
         ("switch", Some(slug), Some(key)) => handle_switch(slug, key),
         ("remove", Some(slug), Some(key)) => handle_remove(slug, key),
         ("launch", Some(slug), Some(key)) => handle_launch(slug, key),
+        ("backup", Some("copy"), None) => handle_backup_copy(),
+        // For a restore click the third segment is the backup filename (e.g.
+        // "state-20260906-131204.json"); `parse_click_id` uses splitn(3), so
+        // the filename lands intact in `key` even though it contains dashes.
+        ("backup", Some("restore"), Some(filename)) => handle_backup_restore(filename),
         // Ignore unrecognized ids (e.g. the top-level "capture"/"capture:apikey"
         // submenu titles or a future action added by a later phase we don't
         // yet handle).
         _ => {}
     }
+}
+
+// ---------------------------------------------------------------------------
+// Backup Config ▸ handlers
+// ---------------------------------------------------------------------------
+
+/// "Copy current state to /tmp" click. Copies the live `state.json` to a
+/// timestamped file under `/tmp`, then opens Finder pointed at it so the user
+/// can drag it out. Best-effort: any failure surfaces as a notification.
+fn handle_backup_copy() {
+    let src = match crate::store::state_json_path() {
+        Ok(p) => p,
+        Err(e) => {
+            notify(&format!("Backup failed: {e}"));
+            return;
+        }
+    };
+    if !src.exists() {
+        notify("Backup failed: state.json doesn't exist yet");
+        return;
+    }
+    let ts = chrono::Utc::now().timestamp();
+    let dst = std::path::PathBuf::from(format!("/tmp/usagio-backup-{ts}.json"));
+    if let Err(e) = std::fs::copy(&src, &dst) {
+        notify(&format!("Backup failed: {e}"));
+        return;
+    }
+    // `open -R <file>` reveals the file in Finder.
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(&dst)
+        .status();
+    notify(&format!("Copied state.json to {}", dst.display()));
+}
+
+/// "Restore from backup ▸ <ts>" click. Prompts the user via NSAlert (routed
+/// through `osascript` for consistency with the existing `confirm` helper),
+/// then — if confirmed — moves the current `state.json` to a `pre-restore`
+/// sidecar in `/tmp` and copies the chosen backup into place.
+fn handle_backup_restore(filename: &str) {
+    let backups_dir = match crate::store::state_json_path() {
+        Ok(p) => p.parent().map(|d| d.join("backups")),
+        Err(_) => None,
+    };
+    let Some(backups_dir) = backups_dir else {
+        notify("Restore failed: could not resolve backups directory");
+        return;
+    };
+    let src = backups_dir.join(filename);
+    if !src.exists() {
+        notify(&format!("Restore failed: backup {filename} is gone"));
+        return;
+    }
+    // Human-facing timestamp label — strip the "state-" prefix and ".json"
+    // suffix so the confirm dialog shows e.g. "20260906-131204".
+    let label = filename
+        .strip_prefix("state-")
+        .and_then(|s| s.strip_suffix(".json"))
+        .unwrap_or(filename);
+    let ts = chrono::Utc::now().timestamp();
+    let pre_restore = std::path::PathBuf::from(format!("/tmp/usagio-state-pre-restore-{ts}.json"));
+    let question = format!(
+        "Restore backup from {label}? Current state will be moved to {}.",
+        pre_restore.display()
+    );
+    if !confirm(&question) {
+        return;
+    }
+
+    let live = match crate::store::state_json_path() {
+        Ok(p) => p,
+        Err(e) => {
+            notify(&format!("Restore failed: {e}"));
+            return;
+        }
+    };
+    // Move the CURRENT state.json out of the way so the user can inspect /
+    // revert. rename() only works within the same filesystem; fall back to
+    // copy+remove if it doesn't.
+    if live.exists() {
+        if std::fs::rename(&live, &pre_restore).is_err() {
+            if let Err(e) =
+                std::fs::copy(&live, &pre_restore).and_then(|_| std::fs::remove_file(&live))
+            {
+                notify(&format!("Restore failed while moving current state: {e}"));
+                return;
+            }
+        }
+    }
+    // Copy the backup into place. Preserves 0600 via write_private-style
+    // permissions on the destination: we go through a read + write so the
+    // umask doesn't accidentally widen the mode.
+    let backup_bytes = match std::fs::read(&src) {
+        Ok(b) => b,
+        Err(e) => {
+            notify(&format!("Restore failed reading backup: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&live, backup_bytes) {
+        notify(&format!("Restore failed writing state: {e}"));
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600));
+    }
+    notify(&format!("Restored backup {label}"));
 }
 
 /// Capture the current login for `slug`. For Claude, use the full v1 flow
@@ -1575,7 +1738,9 @@ fn handle_capture(slug: &str) {
         return;
     }
     let Some(provider) = providers::get(slug) else {
-        notify(&format!("Capture failed: provider '{slug}' is not registered"));
+        notify(&format!(
+            "Capture failed: provider '{slug}' is not registered"
+        ));
         return;
     };
     match provider.capture_current_login() {
@@ -1610,7 +1775,9 @@ fn handle_switch(slug: &str, key: &str) {
 /// with the user-entered nickname + key.
 fn handle_apikey_capture(slug: &str) {
     let Some(provider) = providers::get(slug) else {
-        notify(&format!("Paste API key: provider '{slug}' is not registered"));
+        notify(&format!(
+            "Paste API key: provider '{slug}' is not registered"
+        ));
         return;
     };
     // Deliberately call the trait method so the error message reflects the
@@ -1659,7 +1826,9 @@ fn handle_remove(slug: &str, key: &str) {
 /// no controlling TTY is effectively indefinite.
 fn handle_launch(slug: &str, _key: &str) {
     let Some(provider) = providers::get(slug) else {
-        notify(&format!("Launch failed: provider '{slug}' is not registered"));
+        notify(&format!(
+            "Launch failed: provider '{slug}' is not registered"
+        ));
         return;
     };
     // `providers::get` returns `&'static dyn Provider`; the trait is `Send +
@@ -1696,9 +1865,7 @@ pub(crate) fn context_ledger_shell_cmd(slug: Option<&str>, bin_path: &str) -> St
     }
     // Wrap with `; echo …; read` so the Terminal window doesn't slam shut on
     // the last line of output before the user can read it.
-    format!(
-        "{cmd}; printf '\\n[press return to close]'; read _"
-    )
+    format!("{cmd}; printf '\\n[press return to close]'; read _")
 }
 
 /// Minimal POSIX single-quote escape (wrap in `'…'`, escape internal `'`).
@@ -2041,7 +2208,9 @@ mod tests {
         // (all under amber band).
         let plains: Vec<&str> = styles.iter().map(|s| s.plain.as_str()).collect();
         assert!(plains.contains(&"Claude"), "section header row present");
-        assert!(styles.iter().any(|s| s.section_header && s.plain == "Claude"));
+        assert!(styles
+            .iter()
+            .any(|s| s.section_header && s.plain == "Claude"));
         assert!(
             styles.iter().all(|s| s.colors.is_empty()),
             "all pcts are low → no colored spans"
@@ -2485,6 +2654,48 @@ mod tests {
     }
 
     #[test]
+    fn sort_by_expiration_orders_accounts_soonest_first() {
+        // Regression test for the user-reported bug: newly-added accounts land
+        // at the tail of `state.accounts` (upsert appends) and stayed at the
+        // bottom of the menu even when their weekly window resets sooner.
+        // `sort_by_expiration` fixes that — accounts sort by weekly_reset_at
+        // ASC, so the "closest to expiration" is on top.
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let mut soonest = acct("soon@x.com", Some(50.0), Some(60.0), false);
+        soonest.weekly_reset_at = Some(now + chrono::Duration::hours(6));
+        let mut middle = acct("mid@x.com", Some(50.0), Some(60.0), false);
+        middle.weekly_reset_at = Some(now + chrono::Duration::hours(48));
+        let mut latest = acct("late@x.com", Some(50.0), Some(60.0), false);
+        latest.weekly_reset_at = Some(now + chrono::Duration::hours(120));
+
+        // Insert in REVERSE-expiration order (mirrors what upsert would
+        // produce if the user added them latest-first).
+        let mut accounts = vec![latest, middle, soonest];
+        accounts.sort_by(sort_by_expiration);
+
+        let keys: Vec<&str> = accounts.iter().map(|a| a.key.as_str()).collect();
+        assert_eq!(keys, vec!["soon@x.com", "mid@x.com", "late@x.com"]);
+    }
+
+    #[test]
+    fn sort_by_expiration_places_no_data_accounts_last() {
+        // An account without cached usage yet has `weekly_reset_at == None`.
+        // The sort treats None as "furthest in the future" so a freshly-
+        // captured account (no data) sinks to the bottom rather than
+        // displacing an account with a real, soon reset.
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let mut with_data = acct("data@x.com", Some(10.0), Some(20.0), false);
+        with_data.weekly_reset_at = Some(now + chrono::Duration::hours(6));
+        let no_data = acct("nodata@x.com", None, None, false);
+        assert!(no_data.weekly_reset_at.is_none(), "precondition");
+
+        let mut accounts = vec![no_data, with_data];
+        accounts.sort_by(sort_by_expiration);
+        let keys: Vec<&str> = accounts.iter().map(|a| a.key.as_str()).collect();
+        assert_eq!(keys, vec!["data@x.com", "nodata@x.com"]);
+    }
+
+    #[test]
     fn build_snapshot_sorts_active_first_within_a_section() {
         // `build_snapshot` orders accounts so the active row renders first
         // within each provider block — the "active-first ordering" rule from
@@ -2562,7 +2773,10 @@ mod tests {
                 saw_active = true;
             }
             if s.plain.starts_with("dev@x.com") {
-                assert!(!s.checkmark, "inactive row must NOT carry the checkmark flag");
+                assert!(
+                    !s.checkmark,
+                    "inactive row must NOT carry the checkmark flag"
+                );
                 saw_inactive = true;
             }
         }
@@ -2623,8 +2837,15 @@ mod tests {
         assert!(creds_ids.contains(&"claude"), "claude in creds bucket");
         // Every registered stub with supports_usage == false must be filtered.
         for stub in [
-            "opencode", "gemini-cli", "qwen-code", "copilot-cli", "cursor-agent",
-            "amazon-q", "cline", "grok", "kimi",
+            "opencode",
+            "gemini-cli",
+            "qwen-code",
+            "copilot-cli",
+            "cursor-agent",
+            "amazon-q",
+            "cline",
+            "grok",
+            "kimi",
         ] {
             assert!(
                 !creds_ids.contains(&stub),
