@@ -18,7 +18,7 @@ env:
   BIN: usagio
 
 jobs:
-  release:
+  build-macos:
     name: Build universal macOS binary and publish release
     runs-on: macos-latest
     steps:
@@ -61,8 +61,48 @@ jobs:
           lipo -create -output "dist/${BIN}" \
             "target/aarch64-apple-darwin/release/${BIN}" \
             "target/x86_64-apple-darwin/release/${BIN}"
-          tar -C dist -czf "dist/${BIN}-${version}-universal-apple-darwin.tar.gz" "${BIN}"
-          rm -f "dist/${BIN}"
+
+      - name: Build usagio.app bundle (for Login Items icon)
+        # Wraps the universal binary from the previous step in a minimal
+        # .app bundle so macOS's Login Items UI (System Settings > General >
+        # Login Items) reads AppIcon.icns from Contents/Resources/ instead
+        # of showing the generic "exec" glyph a bare binary gets. See
+        # packaging/macos/usagio.app.template/Contents/Info.plist and
+        # packaging/macos/generate-icns.sh for the rationale.
+        #
+        # Ad-hoc signed only (`codesign --sign -`) — there's no Apple
+        # Developer account yet for a real Developer ID signature, so this
+        # is not notarised. Gatekeeper may still warn on a first *manual*
+        # double-click of usagio.app, but neither `brew install` nor
+        # `usagio install` (which launches via launchd, not Finder/LaunchServices)
+        # go through that Gatekeeper quarantine prompt path.
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          ver="${version#v}"
+
+          packaging/macos/generate-icns.sh
+
+          app_build="dist/${BIN}.app"
+          cp -R packaging/macos/usagio.app.template "$app_build"
+          sed -i '' "s/{{VERSION}}/${ver}/g" "$app_build/Contents/Info.plist"
+          cp "dist/${BIN}" "$app_build/Contents/MacOS/${BIN}"
+          chmod +x "$app_build/Contents/MacOS/${BIN}"
+          rm -f "$app_build/Contents/MacOS/.gitkeep"
+          cp packaging/macos/AppIcon.icns "$app_build/Contents/Resources/AppIcon.icns"
+          rm -f "$app_build/Contents/Resources/.gitkeep"
+
+          codesign --force --deep --sign - "$app_build"
+
+      - name: Package tarball + checksums
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+
+          # Universal tarball ships both the bare binary (backward compat
+          # with existing self-update / manual-install docs) and the .app
+          # bundle (for `usagio install` / Login Items).
+          tar -C dist -czf "dist/${BIN}-${version}-universal-apple-darwin.tar.gz" \
+            "${BIN}" "${BIN}.app"
+          rm -rf "dist/${BIN}" "dist/${BIN}.app"
 
           # Checksums: a per-asset .sha256 (consumed by the self-update
           # feature, which verifies before replacing the binary) plus a
@@ -90,6 +130,10 @@ jobs:
             dist/SHA256SUMS
 
       - name: Bump Homebrew tap formula
+        # The tap formula only ever serves macOS installs, so it only tracks
+        # the macOS (universal) artifact's SHA256. Linux/Windows have no tap
+        # equivalent yet — Linux is a to-be-drafted Snap/AppImage/AUR package
+        # and Windows a to-be-drafted MSI/scoop bucket (both v0.6+ concerns).
         env:
           TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
         run: |
@@ -110,6 +154,17 @@ jobs:
           sed -i '' -E "s|^  sha256 .*|  sha256 \"${sum}\"|" "$f"
           sed -i '' -E "s|^  version .*|  version \"${ver}\"|" "$f"
 
+          # The universal tarball now ships usagio.app alongside the bare
+          # binary (see the "Build usagio.app bundle" step above) — install
+          # both so `usagio install` can find the bundle and point launchd
+          # at it for a real Login Items icon.
+          perl -0777 -pi -e 's/def install\n(?:.*\n)*?  end\n/def install\n    bin.install "usagio"\n    prefix.install "usagio.app"\n  end\n/' "$f"
+
+          # Add a caveats block (once) pointing users at `usagio install`.
+          if ! grep -q 'def caveats' "$f"; then
+            perl -0777 -pi -e 's/(\nend\n?)\z/\n  def caveats\n    <<~EOS\n      For the app icon in Login Items, run `usagio install` — it now points\n      launchd at usagio.app\/Contents\/MacOS\/usagio.\n    EOS\n  end\n$1/' "$f"
+          fi
+
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -119,3 +174,112 @@ jobs:
             git commit -am "${BIN} ${ver}"
             git push origin HEAD:main
           fi
+
+  build-linux:
+    name: Build Linux binary and publish release asset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libssl-dev pkg-config libsecret-1-dev
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$tag" != "$cargo_ver" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $cargo_ver"
+            exit 1
+          fi
+
+      - name: Build (x86_64-unknown-linux-gnu)
+        # Dynamically linked against the system OpenSSL found via pkg-config
+        # (installed above) — no musl / static-OpenSSL cross-compile.
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Package binary
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+          tar -C "target/x86_64-unknown-linux-gnu/release" -czf \
+            "dist/${BIN}-${version}-x86_64-unknown-linux-gnu.tar.gz" "${BIN}"
+
+          cd dist
+          shasum -a 256 "${BIN}-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            > "${BIN}-${version}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: 'dist/*.tar.gz'
+
+      - name: Publish GitHub Release asset
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  build-windows:
+    name: Build Windows binary and publish release asset
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          # windows-latest already defaults to the MSVC host triple/linker;
+          # this just makes the target explicit rather than relying on it.
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$tag" != "$cargo_ver" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $cargo_ver"
+            exit 1
+          fi
+
+      - name: Build (x86_64-pc-windows-msvc)
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package binary
+        shell: bash
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+          cp "target/x86_64-pc-windows-msvc/release/${BIN}.exe" "dist/${BIN}.exe"
+          (cd dist && 7z a "${BIN}-${version}-x86_64-pc-windows-msvc.zip" "${BIN}.exe")
+          rm -f "dist/${BIN}.exe"
+          cd dist
+          sha256sum "${BIN}-${version}-x86_64-pc-windows-msvc.zip" \
+            > "${BIN}-${version}-x86_64-pc-windows-msvc.zip.sha256"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: 'dist/*.zip'
+
+      - name: Publish GitHub Release asset
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/*.sha256

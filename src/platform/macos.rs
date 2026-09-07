@@ -62,6 +62,9 @@ impl Platform for MacOsPlatform {
     fn os_display_name(&self) -> &'static str {
         "macOS"
     }
+    fn secure_permissions(&self, path: &Path) -> Result<()> {
+        super::secure_permissions_unix(path)
+    }
 }
 
 // ---- MenuBackend ---------------------------------------------------------

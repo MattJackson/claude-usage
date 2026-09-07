@@ -58,7 +58,7 @@ pub enum Trigger {
 /// Per-trigger enable flags. Thresholds and reset-back default on; pace is
 /// experimental and defaults off (the user opts in from Settings ▸
 /// Notifications).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationConfig {
     pub threshold_enabled: bool,
     pub reset_back_enabled: bool,
