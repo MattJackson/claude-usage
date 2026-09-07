@@ -59,22 +59,13 @@ jobs:
         # --test-threads=1 required: several tests mutate process-global $HOME
         # to point at a tempdir via env_lock::scoped_env_var. Parallel runs
         # would race the lock across binaries. See M7 in the round-1 codeaudit.
+        #
+        # Includes `tests/strict_cfg.rs`, which enforces the "no scattered
+        # `#[cfg(target_os)]` outside src/platform/*" rule with a proper
+        # allowlist and comment-skipping logic (the previous naive shell
+        # `grep` version tripped on doc comments that mention the string
+        # `cfg(target_os = ...)` as example text — false positives).
         run: cargo test --tests --all-features -- --test-threads=1
-
-      # Cheap, Ubuntu-only lint: every `#[cfg(target_os = ...)]` (or the
-      # `cfg!(...)` macro form) outside src/platform/* is a scattered
-      # platform check that should instead be routed through the `Platform`
-      # trait (see src/platform/mod.rs). Runs once, not per-OS, since it's a
-      # text scan of the checked-out source and doesn't depend on the runner.
-      - name: strict-cfg lint (no scattered target_os checks)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          BAD=$(grep -rn 'cfg(target_os' src/ | grep -v '^src/platform/' || true)
-          if [ -n "$BAD" ]; then
-            echo "FAIL: cfg(target_os) found outside src/platform/. Route through the Platform trait."
-            echo "$BAD"
-            exit 1
-          fi
 
   # Full lane — release build, only on the qa and main branches.
   build:
