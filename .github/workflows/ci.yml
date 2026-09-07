@@ -72,6 +72,20 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: cargo test --all-features -- --ignored --test-threads=1
 
+      # Ubuntu-only GUI smoke test: proves the real tray backend actually
+      # initializes at runtime (GTK starts, libayatana-appindicator3 links
+      # and a tray_icon::TrayIcon can be built/mutated/dropped) rather than
+      # only compiling. xvfb-run supplies a virtual X server so this can run
+      # headless on the runner. See tests/integration_tray.rs for exactly
+      # what this does and doesn't prove.
+      - name: Install xvfb
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y xvfb
+
+      - name: Linux tray init smoke test (xvfb-run)
+        if: matrix.os == 'ubuntu-latest'
+        run: xvfb-run --auto-servernum cargo test --test integration_tray --all-features -- --ignored --test-threads=1
+
       # Cheap, Ubuntu-only lint: every `#[cfg(target_os = ...)]` (or the
       # `cfg!(...)` macro form) outside src/platform/* is a scattered
       # platform check that should instead be routed through the `Platform`
