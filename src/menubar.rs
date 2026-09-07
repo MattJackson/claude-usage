@@ -32,9 +32,6 @@ use crate::{
     CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
 };
 
-/// Name shown for our Login Item in System Events.
-const LOGIN_ITEM_NAME: &str = "usagio";
-
 /// Exact title of the disabled section row inserted when a provider's env
 /// override is active. A named constant so `build_menu` and the tests
 /// asserting on the visible menu content can't drift out of sync.
@@ -120,7 +117,6 @@ struct Snapshot {
     capture_api_key: Vec<RegisteredProvider>,
     autoswap: bool,
     threshold: f64,
-    start_at_login: bool,
 }
 
 /// How near a limit a percentage is, for at-a-glance coloring.
@@ -168,6 +164,12 @@ struct RowStyle {
     /// leading checkmark glyph appears — the "✓ Active" affordance for the
     /// active account row without changing the plain title text.
     checkmark: bool,
+    /// If set, paint the run from this UTF-16 offset to the end of the row in
+    /// `NSColor::secondaryLabelColor` (macOS "grey secondary" — the same tint
+    /// disabled menu items use). Used to render "usagio vX.Y.Z" as a subdued
+    /// trailing label on the enabled Quit row: right-aligned via `tab_x`,
+    /// grey via this field, without disabling the row's click.
+    grey_tail_from: Option<usize>,
 }
 
 /// Fixed x (points) for the right-aligned trailing `S% / W%`. The menu font is
@@ -260,6 +262,7 @@ fn header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
             tab_x: Some(TAB_X),
             icon_slug: None,
             checkmark: a.active,
+            grey_tail_from: None,
         };
     }
     let (pa, pb) = summary_pcts(a);
@@ -283,6 +286,7 @@ fn header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
         tab_x: Some(TAB_X),
         icon_slug: None,
         checkmark: a.active,
+            grey_tail_from: None,
     }
 }
 
@@ -304,6 +308,7 @@ fn top_header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
             tab_x: None,
             icon_slug: None,
             checkmark: false,
+            grey_tail_from: None,
         };
     }
     let (pa, pb) = summary_pcts(a);
@@ -326,11 +331,20 @@ fn top_header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
         tab_x: None,
         icon_slug: None,
         checkmark: false,
+            grey_tail_from: None,
     }
 }
 
 /// All styling directives for the current menu, derived from the same snapshot
 /// `build_menu` renders. The native walk applies each by matching `.plain`.
+/// Plain title used both when we build the Quit row and when the style
+/// walker matches it. Keep the two in lockstep — a mismatch (e.g. a
+/// forgotten `\t`) means the walker finds no match and the item renders
+/// as plain "Quit<tab>usagio vX.Y.Z" without alignment or grey.
+fn quit_row_plain() -> String {
+    format!("Quit\tusagio v{}", env!("CARGO_PKG_VERSION"))
+}
+
 fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
     let mut styles = Vec::new();
     // Top header: pick the active account across all sections. Its own
@@ -353,6 +367,7 @@ fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
             // just leaves the row text-only — no error, no missing-image glyph.
             icon_slug: Some(sec.provider_id),
             checkmark: false,
+            grey_tail_from: None,
         });
         for a in &sec.accounts {
             styles.push(header_row(a, sec.severity_bands));
@@ -369,6 +384,7 @@ fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
                                 tab_x: None,
                                 icon_slug: None,
                                 checkmark: false,
+                                grey_tail_from: None,
                             });
                         }
                     }
@@ -376,6 +392,21 @@ fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
             }
         }
     }
+    // Quit row: "Quit\tusagio vX.Y.Z" — right-align the trailing run at
+    // TAB_X and paint everything from the tab onward in secondaryLabelColor
+    // (macOS's disabled-text grey) while the row itself stays clickable.
+    let quit_plain = quit_row_plain();
+    let grey_from = u16len("Quit") + 1; // +1 for the '\t'
+    styles.push(RowStyle {
+        plain: quit_plain,
+        bold: false,
+        section_header: false,
+        colors: Vec::new(),
+        tab_x: Some(TAB_X),
+        icon_slug: None,
+        checkmark: false,
+        grey_tail_from: Some(grey_from),
+    });
     styles
 }
 
@@ -740,7 +771,6 @@ fn build_snapshot() -> Snapshot {
         capture_api_key,
         autoswap,
         threshold,
-        start_at_login: cached_login_item_enabled(),
     }
 }
 
@@ -868,36 +898,10 @@ fn cached_backups() -> Vec<(std::path::PathBuf, std::time::SystemTime)> {
     g.items.clone()
 }
 
-/// How often to re-probe the Login Item state (an osascript subprocess).
-const LOGIN_PROBE_TTL: Duration = Duration::from_secs(60);
-
-/// Login-item enabled state, probed at most once per `LOGIN_PROBE_TTL` (the
-/// probe forks an `osascript`; doing it every 0.75s tick was the top perf cost).
-/// `set_login_item_cache` refreshes it immediately when we toggle it ourselves.
-fn cached_login_item_enabled() -> bool {
-    let mut g = login_cache().lock().unwrap_or_else(|e| e.into_inner());
-    let fresh = g
-        .map(|(_, t)| t.elapsed() < LOGIN_PROBE_TTL)
-        .unwrap_or(false);
-    if !fresh {
-        let v = login_item_enabled();
-        *g = Some((v, std::time::Instant::now()));
-    }
-    g.map(|(v, _)| v).unwrap_or(false)
-}
-
-/// Record a known Login Item state (after we toggle it) so the menu reflects it
-/// at once instead of waiting for the next probe.
-fn set_login_item_cache(enabled: bool) {
-    *login_cache().lock().unwrap_or_else(|e| e.into_inner()) =
-        Some((enabled, std::time::Instant::now()));
-}
-
-fn login_cache() -> &'static std::sync::Mutex<Option<(bool, std::time::Instant)>> {
-    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<(bool, std::time::Instant)>>> =
-        std::sync::OnceLock::new();
-    CELL.get_or_init(|| std::sync::Mutex::new(None))
-}
+// (Login-item probe cache removed in 0.4.3 alongside the osascript path —
+// see the comment on the removed "Launch at login" menu row for rationale.
+// `usagio install` / `usagio uninstall` are the sole autostart entry
+// points now, backed by a launchd LaunchAgent plist.)
 
 // ---------------------------------------------------------------------------
 // Menu building
@@ -1067,16 +1071,15 @@ fn build_menu(snap: &Snapshot) -> Menu {
     // menu's job is account usage, not diagnostics; the CLI stays available
     // for the rare "wait, what's Claude injecting?" moment.
 
-    add_check(
-        &menu,
-        CheckMenuItem::with_id(
-            "startlogin",
-            "Launch at login",
-            true,
-            snap.start_at_login,
-            None,
-        ),
-    );
+    // The "Launch at login" checkbox used to live here, backed by
+    // `osascript -e 'tell application "System Events" to make login item …'`.
+    // On every brew upgrade the binary hash changes → macOS treats it as a
+    // new app → it re-prompts "usagio wants access to control System
+    // Events" on the next poll. That path was redundant with `usagio
+    // install` (which registers a proper launchd LaunchAgent), so we removed
+    // the toggle in 0.4.3 and rely on the CLI for autostart. To clean out
+    // the stale System Events entry a prior version installed, remove
+    // "usagio" from System Settings → General → Login Items → Open at Login.
 
     // Backup Config ▸ — one-click "copy current state to /tmp" plus a live
     // "Restore from backup ▸" submenu listing the rolling backups the store
@@ -1123,15 +1126,15 @@ fn build_menu(snap: &Snapshot) -> Menu {
     let _ = menu.append(&backup);
 
     let _ = menu.append(&PredefinedMenuItem::separator());
-    // Version was on its own disabled row above Quit; folded into the Quit
-    // label to save a row per user request ("1 row"). macOS NSMenu doesn't
-    // support arbitrary right-alignment for a submenu item — just adjacent
-    // text — so it reads left-to-right rather than being hard-right-aligned.
+    // Quit on the left, version grey + right-aligned on the same row using
+    // the same attributedTitle + right tab-stop machinery the account rows
+    // already use for `S% / W%`. The style walker matches on the plain
+    // title, so QUIT_ROW_PLAIN below MUST equal what we build here.
     add(
         &menu,
         MenuItem::with_id(
             "quit",
-            format!("Quit  ·  usagio v{}", env!("CARGO_PKG_VERSION")),
+            format!("Quit\tusagio v{}", env!("CARGO_PKG_VERSION")),
             true,
             None,
         ),
@@ -1333,6 +1336,23 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
             }
         }
 
+        // Optional grey trailing run (Quit row: version rendered in
+        // NSColor::secondaryLabelColor — the same tint disabled items use,
+        // without actually disabling the row).
+        if let Some(from) = style.grey_tail_from {
+            if from < full_len {
+                let grey = NSColor::secondaryLabelColor();
+                // SAFETY: value type matches the foreground-color attribute key.
+                unsafe {
+                    attr.addAttribute_value_range(
+                        NSForegroundColorAttributeName,
+                        &grey,
+                        NSRange::new(from, full_len - from),
+                    );
+                }
+            }
+        }
+
         // Tint high percentages (amber approaching, red near the wall).
         for &(off, len, sev) in &style.colors {
             if len == 0 || off >= full_len {
@@ -1529,10 +1549,7 @@ fn menu_signature(snap: &Snapshot) -> String {
             reg.provider_id, reg.display_name, reg.installed
         ));
     }
-    s.push_str(&format!(
-        "as={} th={:.0} li={}",
-        snap.autoswap, snap.threshold, snap.start_at_login
-    ));
+    s.push_str(&format!("as={} th={:.0}", snap.autoswap, snap.threshold));
     s
 }
 
@@ -1545,10 +1562,6 @@ fn header_line(a: &AcctView) -> String {
 }
 
 fn add(menu: &Menu, item: MenuItem) {
-    let _ = menu.append(&item);
-}
-
-fn add_check(menu: &Menu, item: CheckMenuItem) {
     let _ = menu.append(&item);
 }
 
@@ -1620,7 +1633,6 @@ fn handle_click(id: &str) {
     match (c.action, c.slug, c.key) {
         ("quit", _, _) => std::process::exit(0),
         ("noop", _, _) => {}
-        ("startlogin", _, _) => toggle_login_item(),
         ("autoswap", Some("off"), None) => set_autoswap(false),
         ("autoswap", Some("now"), None) => match optimize_now() {
             Ok(Some(email)) => notify(&format!("Switched to {email}")),
@@ -1922,69 +1934,12 @@ fn confirm(question: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Start-at-login (System Events Login Item)
-// ---------------------------------------------------------------------------
-
-/// Path to point the Login Item at: the .app bundle if we're inside one,
-/// otherwise the bare binary.
-fn app_path() -> String {
-    let Ok(exe) = std::env::current_exe() else {
-        return String::new();
-    };
-    let s = exe.to_string_lossy().to_string();
-    match s.find(".app/Contents/MacOS/") {
-        Some(idx) => s[..idx + 4].to_string(), // keep through ".app"
-        None => s,
-    }
-}
-
-fn login_item_enabled() -> bool {
-    let out = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg("tell application \"System Events\" to get the name of every login item")
-        .output();
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).contains(LOGIN_ITEM_NAME),
-        _ => false,
-    }
-}
-
-fn toggle_login_item() {
-    // Probe fresh here (a click is rare) so we don't act on a stale cached state.
-    let currently_on = login_item_enabled();
-    let (script, desired) = if currently_on {
-        (
-            format!("tell application \"System Events\" to delete login item {LOGIN_ITEM_NAME:?}"),
-            false,
-        )
-    } else {
-        let path = app_path();
-        if path.is_empty() {
-            notify("Could not determine the app path for launch-at-login");
-            return;
-        }
-        // {name:?}/{path:?} use Rust's Debug quoting so a name or path containing
-        // a quote/backslash can't break out of the AppleScript string literal.
-        (
-            format!(
-                "tell application \"System Events\" to make login item at end with properties \
-                 {{name:{LOGIN_ITEM_NAME:?}, path:{path:?}, hidden:true}}"
-            ),
-            true,
-        )
-    };
-    match std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .status()
-    {
-        Ok(s) if s.success() => set_login_item_cache(desired),
-        _ => notify(
-            "Could not change launch-at-login (grant Automation access to System Events in \
-             System Settings › Privacy & Security)",
-        ),
-    }
-}
+// Start-at-login used to live here as a menu checkbox backed by `osascript
+// → tell "System Events" → make login item …`. Removed in 0.4.3: the
+// osascript path re-prompted for Automation permission on every brew
+// upgrade (binary hash changed → macOS treated the new binary as a
+// different app), and it was redundant with `usagio install` which
+// registers a proper launchd LaunchAgent (no osascript, no prompt).
 
 #[cfg(test)]
 mod tests {
@@ -2073,7 +2028,6 @@ mod tests {
             capture_api_key: Vec::new(),
             autoswap: false,
             threshold: 95.0,
-            start_at_login: false,
         }
     }
 
@@ -2341,7 +2295,6 @@ mod tests {
             capture_api_key: Vec::new(),
             autoswap: false,
             threshold: 95.0,
-            start_at_login: false,
         };
         let (sec, acc) = active_account(&snap).expect("active row found");
         assert_eq!(sec.provider_id, "codex");
@@ -2661,7 +2614,6 @@ mod tests {
             capture_api_key: Vec::new(),
             autoswap: false,
             threshold: 95.0,
-            start_at_login: false,
         };
         let styles = menu_styles(&snap);
         // Only inspect the per-account submenu-header rows (they carry a tab
