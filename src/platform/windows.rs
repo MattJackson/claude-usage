@@ -234,7 +234,7 @@ fn build_native_menu(tree: &MenuTree) -> Result<Menu> {
 /// clicks / menu commands on the notification icon to turn into
 /// `TrayIconEvent`/`MenuEvent` channel entries at all.
 fn pump_windows_messages() {
-    use windows::Win32::UI::WindowsAndMessaging::{
+    use ::windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
     };
     let mut msg = MSG::default();

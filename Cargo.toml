@@ -96,6 +96,12 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "c
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status
 # menu's NSEventTrackingRunLoopMode and dismisses the open menu. A native loop
 # plus an NSTimer scheduled in the default mode only avoids that entirely.
+# Unix-common bits (macOS + Linux). libc for getrlimit/setrlimit
+# (raise_nofile_limit in main.rs, #[cfg(unix)]-guarded) and getuid where
+# needed. Windows has neither.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
@@ -123,7 +129,6 @@ objc2-app-kit = { version = "0.3", features = [
     "objc2-core-foundation", # REQUIRED: CGFloat-typed methods are cfg-gated on it
 ] }
 block2 = "0.6"
-libc = "0.2" # getuid() for the launchctl kickstart restart target
 
 # Linux platform impl deps. Only pulled in when building for Linux — cargo
 # skips these on macOS/Windows targets. See src/platform/linux.rs for the
