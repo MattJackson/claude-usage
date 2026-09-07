@@ -1,4 +1,4 @@
-//! Codex (OpenAI) provider — USAGE ONLY, NO SWITCHING.
+//! Codex (OpenAI) provider.
 //!
 //! Codex CLI stores its login in `$CODEX_HOME/auth.json` (default
 //! `~/.codex/auth.json`, mode 0600). The blob is an `AuthDotJson` object:
@@ -19,10 +19,14 @@
 //! The `id_token` JWT payload carries `email` plus the ChatGPT plan/account
 //! identifiers — no network call is needed to attach an email to the account.
 //!
-//! Per the refactor's locked decisions, this provider implements capture +
-//! usage but explicitly refuses `write_active_account` / `launch_client` with
-//! `ProviderError::Unsupported`. A future phase adds switching (auth.json
-//! rewrite + optional `CODEX_HOME` multiplex).
+//! Unlike Claude, Codex doesn't use the macOS keychain at all — the `codex`
+//! CLI itself signs in by writing this file directly. Switching therefore has
+//! no keychain half: `write_active_account` rewrites `auth.json` atomically
+//! (tmp file + rename) with parent-dir/file permissions matching what the
+//! vendor CLI itself would produce (`0700`/`0600`). There is no separate
+//! identity file to touch (unlike `~/.claude.json`), so the auth.json write
+//! *is* the entire switch. `launch_client` remains unimplemented
+//! (`ProviderError::Unsupported`) — a future phase may shell out to `codex`.
 
 #![allow(dead_code)]
 
@@ -63,7 +67,7 @@ impl Provider for CodexProvider {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             supports_usage: true,
-            supports_switching: false,
+            supports_switching: true,
             supports_email_capture: true,
             secret_backend: SecretBackend::File,
             capture_mode: CaptureMode::CredsOnDisk,
@@ -259,10 +263,45 @@ impl Provider for CodexProvider {
         })
     }
 
-    // --- Switching (explicitly Unsupported for v1) -------------------------
-    // `write_active_account`, `read_active_identity`, and `launch_client`
-    // inherit the trait defaults, which return `ProviderError::Unsupported`.
-    // Do not override them until the switching phase lands.
+    // --- Switching -----------------------------------------------------------
+
+    /// Make `blob` the active Codex login by rewriting `auth.json` in place.
+    /// `identity` is accepted for trait-signature parity with Claude (which
+    /// needs it to rebuild `~/.claude.json`) but Codex has no analogous
+    /// identity file, so it's unused here — the id_token JWT embedded in
+    /// `blob` already carries everything `capture_current_login` needs to
+    /// re-derive the identity on the next read.
+    ///
+    /// Validates that `blob` is a well-formed Codex auth blob (JSON, non-empty
+    /// `tokens.access_token`) before writing, so a caller can't corrupt
+    /// `auth.json` with garbage. Writes atomically (tmp file + rename) so a
+    /// concurrent reader (the `codex` CLI, or our own credential-sync watcher)
+    /// never observes a partially-written file.
+    fn write_active_account(&self, blob: &str, _identity: &IdentitySnapshot) -> PResult<()> {
+        // Defense in depth: an empty blob means the caller couldn't find a
+        // stored secret for this account (shouldn't happen — state should
+        // never hand us an account with no secret bytes — but distinguish it
+        // from "malformed JSON" so callers can prompt a fresh login instead
+        // of reporting a generic parse error).
+        if blob.trim().is_empty() {
+            return Err(ProviderError::NotLoggedIn);
+        }
+        // Sanity: refuse a blob that isn't a usable Codex auth.json rather
+        // than corrupt the file the vendor CLI reads on every invocation.
+        parse_codex_blob(blob)?;
+
+        let path = auth_json_path().ok_or_else(|| {
+            ProviderError::Other("could not resolve $CODEX_HOME / $HOME for auth.json".into())
+        })?;
+        write_auth_json_atomically(&path, blob)?;
+        Ok(())
+    }
+
+    // `read_active_identity` and `launch_client` inherit the trait defaults,
+    // which return `ProviderError::Unsupported`. Codex has no separate
+    // "currently active identity" file to read independently of auth.json
+    // (capture_current_login already covers that), and no wired-up client
+    // launch yet.
 
     // --- Credential sync ---------------------------------------------------
 
@@ -377,6 +416,50 @@ fn auth_json_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".codex").join("auth.json"))
 }
 
+/// Write `contents` to `path` atomically (tmp file in the same directory +
+/// rename), matching the permissions the `codex` CLI itself uses: parent
+/// directory `0700` (created if missing), file `0600`. Rename is atomic on
+/// the same filesystem, so a concurrent reader never observes a partial
+/// write.
+#[cfg(unix)]
+fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| ProviderError::Other("auth.json path has no parent directory".into()))?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+
+    // Tmp file lives in the same directory as the target so the rename below
+    // is guaranteed to be on the same filesystem (atomic).
+    let tmp_path = dir.join(format!(
+        ".auth.json.tmp.{}.{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    std::fs::write(&tmp_path, contents)?;
+    std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| ProviderError::Other("auth.json path has no parent directory".into()))?;
+    std::fs::create_dir_all(dir)?;
+    let tmp_path = dir.join(format!(
+        ".auth.json.tmp.{}.{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    std::fs::write(&tmp_path, contents)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
 /// Decode a JWT and return its payload claims as a JSON map. Signature is not
 /// verified — Codex's id_token is bearer-signed by OpenAI; we're only reading
 /// claims we would trust the provider to have written.
@@ -411,7 +494,7 @@ mod tests {
         assert_eq!(p.display_name(), "Codex");
         let caps = p.capabilities();
         assert!(caps.supports_usage);
-        assert!(!caps.supports_switching);
+        assert!(caps.supports_switching);
         assert!(caps.supports_email_capture);
         assert_eq!(caps.secret_backend, SecretBackend::File);
         assert_eq!(caps.capture_mode, CaptureMode::CredsOnDisk);
@@ -419,7 +502,20 @@ mod tests {
     }
 
     #[test]
-    fn switching_methods_return_unsupported() {
+    fn launch_client_is_still_unsupported() {
+        // No wired-up client launch yet; only `write_active_account` (the
+        // auth.json rewrite) implements switching so far.
+        let p = CodexProvider;
+        assert!(matches!(
+            p.launch_client(crate::providers::trait_def::LaunchMode::Fresh),
+            Err(ProviderError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn write_active_account_rejects_malformed_blob() {
+        // A blob missing tokens.access_token must not be written to disk —
+        // parse_codex_blob's validation runs before any filesystem write.
         let p = CodexProvider;
         let id = IdentitySnapshot {
             email: None,
@@ -427,14 +523,99 @@ mod tests {
             display_name: None,
             native_blob: Value::Null,
         };
-        assert!(matches!(
-            p.write_active_account("{}", &id),
-            Err(ProviderError::Unsupported)
-        ));
-        assert!(matches!(
-            p.launch_client(crate::providers::trait_def::LaunchMode::Fresh),
-            Err(ProviderError::Unsupported)
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+            let bad_blob = serde_json::json!({ "tokens": { "refresh_token": "rt" } }).to_string();
+            assert!(p.write_active_account(&bad_blob, &id).is_err());
+            assert!(!dir.path().join("auth.json").exists());
+        });
+    }
+
+    #[test]
+    fn switch_account_writes_auth_json_atomically() {
+        let p = CodexProvider;
+        let id = IdentitySnapshot {
+            email: Some("switcher@example.com".into()),
+            uuid: None,
+            display_name: None,
+            native_blob: Value::Null,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join("codex-home-nonexistent");
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(codex_home.to_str().unwrap()), || {
+            let blob = make_blob("switcher@example.com", Utc::now().timestamp() + 3600);
+            p.write_active_account(&blob, &id).unwrap();
+
+            let auth_path = codex_home.join("auth.json");
+            assert!(auth_path.exists());
+            let on_disk = std::fs::read_to_string(&auth_path).unwrap();
+            assert_eq!(on_disk, blob);
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&auth_path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+                let dir_mode = std::fs::metadata(&codex_home).unwrap().permissions().mode();
+                assert_eq!(dir_mode & 0o777, 0o700);
+            }
+        });
+    }
+
+    #[test]
+    fn switch_account_round_trips_through_absorb() {
+        // Switch to A, absorb() the file we just wrote → identify_credential
+        // reports A. Switch to B, absorb again → reports B. This is the
+        // guarantee `credentials::absorb_before_switch` / the fsnotify
+        // watcher depend on: whatever we just wrote is exactly what a fresh
+        // read (and identity extraction) produces.
+        let p = CodexProvider;
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+            let id_a = IdentitySnapshot {
+                email: Some("a@example.com".into()),
+                uuid: None,
+                display_name: None,
+                native_blob: Value::Null,
+            };
+            let blob_a = make_blob("a@example.com", Utc::now().timestamp() + 3600);
+            p.write_active_account(&blob_a, &id_a).unwrap();
+            let on_disk_a = std::fs::read_to_string(dir.path().join("auth.json")).unwrap();
+            let key_a = p.identify_credential(&on_disk_a).unwrap();
+            assert_eq!(key_a, AccountKey::new("codex", "a@example.com"));
+
+            let id_b = IdentitySnapshot {
+                email: Some("b@example.com".into()),
+                uuid: None,
+                display_name: None,
+                native_blob: Value::Null,
+            };
+            let blob_b = make_blob("b@example.com", Utc::now().timestamp() + 3600);
+            p.write_active_account(&blob_b, &id_b).unwrap();
+            let on_disk_b = std::fs::read_to_string(dir.path().join("auth.json")).unwrap();
+            let key_b = p.identify_credential(&on_disk_b).unwrap();
+            assert_eq!(key_b, AccountKey::new("codex", "b@example.com"));
+        });
+    }
+
+    #[test]
+    fn switch_account_missing_secret_errors() {
+        // Defense in depth: an empty/absent secret blob (the caller couldn't
+        // find one in state) must surface a clean error, not panic or write
+        // garbage to auth.json.
+        let p = CodexProvider;
+        let id = IdentitySnapshot {
+            email: None,
+            uuid: None,
+            display_name: None,
+            native_blob: Value::Null,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+            let err = p.write_active_account("", &id).unwrap_err();
+            assert!(matches!(err, ProviderError::NotLoggedIn));
+            assert!(!dir.path().join("auth.json").exists());
+        });
     }
 
     #[test]
