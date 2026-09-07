@@ -84,6 +84,13 @@ thiserror = "1"
 toml = "0.8"
 tiktoken-rs = { version = "0.7", optional = true }
 
+# Native file-open/save dialogs. Cross-platform (Win32 IFileOpenDialog /
+# IFileSaveDialog on Windows, NSOpenPanel/NSSavePanel on macOS, xdg-desktop-portal
+# on Linux) — no per-OS wiring needed in `src/platform/`. Not yet called from
+# anywhere; it's the primitive the menu-redesign import/export flow will use.
+# `src/platform/windows.rs::pick_file` is a thin proof-of-wiring wrapper.
+rfd = "0.17"
+
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status
 # menu's NSEventTrackingRunLoopMode and dismisses the open menu. A native loop
@@ -128,11 +135,36 @@ secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
 # Windows platform impl deps. Same story as the Linux block — only fetched
 # when the target is Windows.
 [target.'cfg(target_os = "windows")'.dependencies]
+# Only the pieces `src/platform/windows.rs` actually calls: MSG / HWND types
+# and the GetMessage/PeekMessage/DispatchMessage pump the tray-icon window
+# needs driven from our own event loop. Credential storage goes through
+# `keyring` (Credential Manager) and the registry Run key goes through
+# `winreg`, so we don't hand-roll those Win32 calls ourselves.
 windows = { version = "0.60", features = [
-    "Win32_Security_Credentials",
-    "Win32_System_Registry",
     "Win32_Foundation",
-    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Credential Manager-backed secret storage (Platform::secrets()). `v1` gives
+# the simple Entry::new/get_password/set_password/delete_credential surface;
+# `windows-native-keyring-store` is the only backend we need on this target.
+keyring = { version = "4", default-features = false, features = [
+    "v1",
+    "windows-native-keyring-store",
+] }
+# HKCU\...\Run key read/write for autostart — a thin, well-tested wrapper
+# over RegOpenKeyEx/RegSetValueEx/RegDeleteValue so we don't hand-roll UTF-16
+# buffer management for the registry API.
+winreg = "0.56"
+# Probe PATH for wt.exe / cmd.exe / powershell.exe when picking a terminal to
+# launch a vendor CLI REPL in.
+which = "8"
+# Decode whatever icon bytes the caller hands `MenuHandle::set_icon` (ICO/BMP
+# per the trait doc, but PNG works too) into the raw RGBA buffer tray-icon's
+# `Icon::from_rgba` wants.
+image = { version = "0.25", default-features = false, features = [
+    "ico",
+    "png",
+    "bmp",
 ] }
 
 [dev-dependencies]

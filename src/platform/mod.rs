@@ -30,6 +30,13 @@ pub trait Platform: Send + Sync + 'static {
     fn paths(&self) -> &dyn Paths;
     /// Human name used in error messages / diagnostics.
     fn os_display_name(&self) -> &'static str;
+    /// Restrict `path` to owner-only access: `0700` for a directory, `0600`
+    /// for a file. Unix backends `chmod` based on the path's file type.
+    /// Windows has no chmod equivalent worth forging here — `%APPDATA%` /
+    /// `%LOCALAPPDATA%` are already per-user directories protected by the
+    /// user's NTFS ACL, so this is a documented no-op on that backend rather
+    /// than a scattered `#[cfg(unix)]` at every call site. `path` must exist.
+    fn secure_permissions(&self, path: &Path) -> Result<()>;
 }
 
 // ---------- MenuBackend ---------------------------------------------------
@@ -159,6 +166,23 @@ mod linux;
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+
+/// Shared Unix chmod backing `Platform::secure_permissions` on both macOS and
+/// Linux: `0700` for a directory, `0600` for a file, based on the path's
+/// actual file type rather than a caller-supplied mode. Lives here (rather
+/// than in `macos.rs`) because macOS and Linux are mutually-exclusive
+/// `cfg(target_os = ...)` modules that never compile together — a helper
+/// defined in one wouldn't be visible from the other.
+#[cfg(unix)]
+fn secure_permissions_unix(path: &Path) -> Result<()> {
+    use anyhow::Context;
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("stat {} for secure_permissions", path.display()))?;
+    let mode = if meta.is_dir() { 0o700 } else { 0o600 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod {} for secure_permissions", path.display()))
+}
 
 /// Return the platform impl for this OS. Panics only in the impossible case
 /// of an unsupported target that got past the cfg guard.
