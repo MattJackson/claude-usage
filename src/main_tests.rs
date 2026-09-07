@@ -90,6 +90,8 @@ fn cell(pct: Option<f64>) -> Cell {
 
 fn row(session: Option<f64>, weekly: Option<f64>) -> Row {
     Row {
+        provider_id: CLAUDE_SLUG.to_string(),
+        needs_relogin: false,
         email: "x@e.com".to_string(),
         session: cell(session),
         weekly: cell(weekly),
@@ -101,7 +103,21 @@ fn row(session: Option<f64>, weekly: Option<f64>) -> Row {
 
 /// A row with an email and a weekly reset time, for pick/order tests.
 fn row_full(email: &str, session: f64, weekly: f64, weekly_reset: DateTime<Utc>) -> Row {
+    row_full_with_provider(CLAUDE_SLUG, email, session, weekly, weekly_reset)
+}
+
+/// Like `row_full`, but with an explicit provider slug — for tests that need
+/// to verify the swap-capability gate on non-Claude / unregistered slugs.
+fn row_full_with_provider(
+    provider_id: &str,
+    email: &str,
+    session: f64,
+    weekly: f64,
+    weekly_reset: DateTime<Utc>,
+) -> Row {
     Row {
+        provider_id: provider_id.to_string(),
+        needs_relogin: false,
         email: email.to_string(),
         session: Cell {
             pct: Some(session),
@@ -366,6 +382,57 @@ fn choose_swap_target_respects_cooldown() {
 }
 
 #[test]
+fn choose_swap_target_skips_target_whose_provider_is_unregistered() {
+    // A row tagged with a provider slug that isn't in the registry (a stub /
+    // reporting-only agent that phase 4+ hasn't wired up yet) must NOT be
+    // selected as a swap target, even if its usage looks great.
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full_with_provider("no-such-provider", "free@e.com", 5.0, 5.0, reset),
+    ];
+    let guard = SwapGuard::default();
+    // Only candidate was filtered by the capability gate → no swap.
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+}
+
+#[test]
+fn choose_swap_target_still_picks_claude_target_after_capability_filter() {
+    // Regression guard for the capability filter: adding it must not have
+    // stopped Claude accounts (the only registered v1 provider) from being
+    // chosen. Baseline swap decision unchanged.
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full("free@e.com", 20.0, 20.0, reset),
+    ];
+    let guard = SwapGuard::default();
+    assert_eq!(
+        choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).as_deref(),
+        Some("free@e.com")
+    );
+}
+
+#[test]
+fn provider_supports_swap_reflects_registered_claude() {
+    // Claude is registered, has both usage and switching → swappable.
+    assert!(provider_supports_swap(CLAUDE_SLUG));
+    // Unknown slugs are treated as non-candidates (safest default).
+    assert!(!provider_supports_swap("nope"));
+}
+
+#[test]
+fn row_from_account_tags_provider_id_claude() {
+    // Every v1-migrated row must carry the "claude" slug so the swap gate
+    // recognizes it. Phase 3 (state v2) replaces this with a bucket lookup.
+    let a = Account::from_keychain_blob(
+        r#"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":0}}"#,
+    )
+    .unwrap();
+    assert_eq!(row_from_account(&a).provider_id, CLAUDE_SLUG);
+}
+
+#[test]
 fn choose_swap_target_skips_ceiling_and_maxed_targets() {
     let reset = Utc::now() + Duration::hours(24);
     let rows = vec![
@@ -421,6 +488,52 @@ fn choose_swap_target_skips_target_whose_weekly_hit_trigger() {
     ];
     let guard = SwapGuard::default();
     assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+}
+
+// --- env-override guard (CLAUDE_CODE_OAUTH_TOKEN) ---
+
+#[test]
+fn choose_swap_target_skips_env_overridden_provider_end_to_end() {
+    // Active is over the trigger and there IS a healthy candidate — without
+    // an env-override, we'd swap to it. With `CLAUDE_CODE_OAUTH_TOKEN`
+    // active on the Claude provider, `claude` ignores whatever token we
+    // write, so any swap is a silent no-op and `watch_cycle` must skip it.
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full("free@e.com", 20.0, 20.0, reset),
+    ];
+    let guard = SwapGuard::default();
+
+    // Baseline sanity: with no override, the swap fires.
+    assert_eq!(
+        choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).as_deref(),
+        Some("free@e.com"),
+        "baseline: without env-override the auto-swap picks free@e.com",
+    );
+
+    // With the override active for `claude`, both the active row's provider
+    // and every candidate row's provider are gated off → no swap.
+    with_env_override_hook(&[CLAUDE_SLUG], || {
+        assert!(
+            choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none(),
+            "env-override active: watch_cycle must NOT swap claude accounts",
+        );
+    });
+}
+
+#[test]
+fn env_override_active_reads_shared_slug_map() {
+    // The hook drives both the menu (via menubar::env_override_for) and the
+    // swap filter — one source of truth for the whole app.
+    assert!(!env_override_active(CLAUDE_SLUG));
+    with_env_override_hook(&[CLAUDE_SLUG], || {
+        assert!(env_override_active(CLAUDE_SLUG));
+        // Unknown / non-Claude slugs are unaffected by the Claude env var.
+        assert!(!env_override_active("codex"));
+    });
+    // Restored on exit.
+    assert!(!env_override_active(CLAUDE_SLUG));
 }
 
 // --- next_interval (backoff) ---
@@ -507,7 +620,7 @@ fn write_bytes_atomic_mode_applies_requested_mode() {
         "the requested mode must be applied to the final file"
     );
     // No temp file left behind.
-    assert!(!path.with_extension("json.claude-usage.tmp").exists());
+    assert!(!path.with_extension("json.usagio.tmp").exists());
 }
 
 // --- consumption_deltas (report same-account guard) ---
@@ -580,7 +693,7 @@ fn merged_cached_usage_none_for_new_account() {
 fn rotate_if_large_rotates_over_threshold_with_correct_name() {
     let dir = tempfile::tempdir().unwrap();
     for (name, rotated) in [
-        ("claude-usage.log", "claude-usage.log.1"),
+        ("usagio.log", "usagio.log.1"),
         ("history.jsonl", "history.jsonl.1"),
     ] {
         let path = dir.path().join(name);
@@ -597,9 +710,142 @@ fn rotate_if_large_rotates_over_threshold_with_correct_name() {
 #[test]
 fn rotate_if_large_leaves_small_file_alone() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("claude-usage.log");
+    let path = dir.path().join("usagio.log");
     std::fs::write(&path, b"tiny").unwrap();
     logging::rotate_if_large(&path, 1_000_000);
     assert!(path.exists());
-    assert!(!dir.path().join("claude-usage.log.1").exists());
+    assert!(!dir.path().join("usagio.log.1").exists());
+}
+
+// --- needs_relogin filtering in the swap picker ---
+
+/// Construct a row with the needs_relogin flag set. Everything else mirrors
+/// `row_full` so we can build side-by-side "both would otherwise win" tests.
+fn row_full_flagged(email: &str, session: f64, weekly: f64, weekly_reset: DateTime<Utc>) -> Row {
+    let mut r = row_full(email, session, weekly, weekly_reset);
+    r.needs_relogin = true;
+    r
+}
+
+#[test]
+fn choose_swap_target_skips_needs_relogin_candidate() {
+    // The would-be candidate has the flag: even though it's healthier and
+    // would win auto-pick, choose_swap_target must not return it. With only
+    // one candidate and it's flagged, we get back None.
+    let reset = Utc::now() + chrono::Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full_flagged("dead@e.com", 10.0, 10.0, reset),
+    ];
+    let guard = SwapGuard::default();
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+}
+
+#[test]
+fn choose_swap_target_prefers_unflagged_candidate_over_flagged_winner() {
+    // The flagged candidate would win by auto-pick priority (soonest reset,
+    // more headroom), but must be filtered out; the unflagged runner-up
+    // wins instead.
+    let soon = Utc::now() + chrono::Duration::hours(2);
+    let later = Utc::now() + chrono::Duration::hours(48);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, later),
+        row_full_flagged("dead@e.com", 10.0, 10.0, soon),
+        row_full("ok@e.com", 20.0, 20.0, later),
+    ];
+    let guard = SwapGuard::default();
+    let target = choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard);
+    assert_eq!(target.as_deref(), Some("ok@e.com"));
+}
+
+#[test]
+fn row_from_account_propagates_needs_relogin_flag() {
+    let blob = r#"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":0}}"#;
+    let mut a = Account::from_keychain_blob(blob).unwrap();
+    a.email = Some("x@e.com".into());
+    assert!(!row_from_account(&a).needs_relogin);
+    a.needs_relogin = true;
+    assert!(row_from_account(&a).needs_relogin);
+}
+
+// -----------------------------------------------------------------------------
+// switch_to_guarded lock-closure invariant (H1 round-1 + H_R2_1 round-2)
+//
+// switch_to_guarded's contract is: any in-memory mutation to the state
+// snapshot that happens BEFORE `st = State::load()?;` (the reload that
+// absorbs `absorb_before_switch`'s disk writes) is DISCARDED and must not be
+// relied on. Mutations AFTER the reload survive `st.save()`.
+//
+// This pins that contract at the state-lock/save layer without dragging in
+// the keychain + apply_account plumbing. Red-before-green: swap the order
+// (mutate after reload → mutate before reload) and this test fails.
+// -----------------------------------------------------------------------------
+#[test]
+fn switch_lock_closure_invariant_mutations_after_reload_survive() {
+    use crate::credentials::with_state_lock;
+    use crate::store::{Account, ScopedConfigDir, State};
+
+    let _g = ScopedConfigDir::new();
+
+    // Seed: two accounts, A active with a "stale" access token.
+    let mut a = Account::from_keychain_blob(
+        r#"{"claudeAiOauth":{"accessToken":"stale","refreshToken":"r","expiresAt":0}}"#,
+    )
+    .unwrap();
+    a.email = Some("a@e.com".into());
+    let mut b = Account::from_keychain_blob(
+        r#"{"claudeAiOauth":{"accessToken":"bt","refreshToken":"br","expiresAt":0}}"#,
+    )
+    .unwrap();
+    b.email = Some("b@e.com".into());
+    let mut seed = State::default();
+    seed.accounts.push(a);
+    seed.accounts.push(b);
+    seed.active = Some("a@e.com".into());
+    seed.save().unwrap();
+
+    // Model switch_to_guarded's ordering: (1) load, (2) simulate
+    // absorb_before_switch by writing a fresher token for A on disk via a
+    // NESTED with_state_lock (matches the real reentrant absorb path), (3)
+    // reload, (4) mutate AFTER reload, (5) save.
+    with_state_lock(|| {
+        let _st = State::load()?;
+
+        // Nested lock frame simulates absorb_before_switch's on-disk write
+        // for the outgoing account A.
+        with_state_lock(|| {
+            let mut st_nested = State::load()?;
+            if let Some(x) = st_nested.find_mut("a@e.com") {
+                x.access_token = "absorbed_fresh".into();
+                x.expires_at = 999_999;
+            }
+            st_nested.save()
+        })?;
+
+        // Reload — pre-reload mutations would be discarded here.
+        let mut st = State::load()?;
+        // Post-reload mutation: bump B's expiry as a stand-in for what
+        // sync_active_from_keychain / apply_account bookkeeping do.
+        if let Some(x) = st.find_mut("b@e.com") {
+            x.expires_at = 111_111;
+        }
+        st.active = Some("b@e.com".into());
+        st.save()
+    })
+    .unwrap();
+
+    // A's absorbed rotation survived (fresher token persisted, not clobbered).
+    let disk = State::load().unwrap();
+    let a_on_disk = disk.find("a@e.com").expect("A still present");
+    assert_eq!(
+        a_on_disk.access_token, "absorbed_fresh",
+        "reload+save must preserve the fresher token absorbed for the outgoing account (H1)"
+    );
+    // And B's post-reload mutation persisted.
+    let b_on_disk = disk.find("b@e.com").expect("B still present");
+    assert_eq!(
+        b_on_disk.expires_at, 111_111,
+        "post-reload mutations must survive the final save (H_R2_1 sibling)"
+    );
+    assert_eq!(disk.active.as_deref(), Some("b@e.com"));
 }

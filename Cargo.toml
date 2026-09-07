@@ -1,25 +1,88 @@
 [package]
-name = "claude-usage"
-version = "0.3.1"
+name = "usagio"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Check usage / limits across multiple Claude Max accounts, and switch between them."
+description = "Track usage / limits across every AI coding CLI you use, and switch between accounts."
+homepage = "https://usagio.dev"
+repository = "https://github.com/MattJackson/claude-usage"
+license = "MIT"
+readme = "README.md"
+categories = ["command-line-utilities"]
+keywords = ["claude", "codex", "usage", "menubar", "macos"]
 
 [[bin]]
-name = "claude-usage"
+name = "usagio"
 path = "src/main.rs"
+
+[features]
+default = [
+    "claude",
+    "codex",
+    "opencode",
+    "gemini-cli",
+    "qwen-code",
+    "copilot-cli",
+    "cursor-agent",
+    "amazon-q",
+    "cline",
+    "grok",
+    "kimi",
+    "openrouter",
+    "deepseek",
+    "zai",
+    "fireworks",
+    "synthetic",
+    "vertex-ai",
+]
+# Opt in to real OpenAI tokenization (o200k_base BPE) for Context Ledger. Off by
+# default — the ~2MB tiktoken binary cost isn't worth it for a ±20% signal that
+# the fallback (chars/3.6) already provides.
+tiktoken = ["dep:tiktoken-rs"]
+claude = []
+codex = []
+opencode = []
+gemini-cli = []
+qwen-code = []
+copilot-cli = []
+cursor-agent = []
+amazon-q = []
+cline = []
+grok = []
+kimi = []
+openrouter = []
+deepseek = []
+zai = []
+fireworks = []
+synthetic = []
+vertex-ai = []
 
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-chrono = { version = "0.4", features = ["clock"], default-features = false }
+chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
 ureq = { version = "2", features = ["json", "tls"] }
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 fs2 = "0.4"
 tray-icon = "0.24.2"
+# Desktop notifications for the notifications module. Best-effort — a broken
+# dbus / user-notification connection never fails a watch cycle.
+notify-rust = "4"
+# fsnotify (filesystem change notifications) for the credential-sync layer:
+# watches every provider's credential_paths and drives absorb_all_lagging +
+# refresh_inactive_if_stale in response to vendor-CLI rotations.
+notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
+
+# Context Ledger deps: home/config discovery, typed errors, TOML config parsing
+# (Codex config.toml), and optional real tokenization behind the `tiktoken`
+# feature. The fallback path (chars-per-token approximation) works without it.
+dirs = "6"
+thiserror = "1"
+toml = "0.8"
+tiktoken-rs = { version = "0.7", optional = true }
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status
@@ -36,6 +99,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSArray",            # tab-stops array
     "NSDictionary",       # empty NSTextTab options dict
     "NSGeometry",         # NSRange (re-exported at crate root)
+    "NSData",             # NSImage::initWithData for bundled provider PNGs
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
@@ -47,10 +111,29 @@ objc2-app-kit = { version = "0.3", features = [
     "NSParagraphStyle",   # NSTextTab right-align tab stop
     "NSText",             # NSTextAlignment
     "NSAttributedString", # attribute-name constants live here
+    "NSImage",            # 16px provider icons on section header rows
     "objc2-core-foundation", # REQUIRED: CGFloat-typed methods are cfg-gated on it
 ] }
 block2 = "0.6"
 libc = "0.2" # getuid() for the launchctl kickstart restart target
+
+# Linux platform impl deps. Only pulled in when building for Linux — cargo
+# skips these on macOS/Windows targets. Real impls land in a follow-up commit;
+# the stubs in src/platform/linux.rs don't reference the crates yet, so having
+# them declared costs nothing on cross-compile until the real code lands.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.3"                     # KDE StatusNotifierItem (works on GNOME + KDE + tiling WMs)
+secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
+
+# Windows platform impl deps. Same story as the Linux block — only fetched
+# when the target is Windows.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.60", features = [
+    "Win32_Security_Credentials",
+    "Win32_System_Registry",
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+] }
 
 [dev-dependencies]
 assert_cmd = "2"

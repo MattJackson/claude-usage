@@ -1,4 +1,4 @@
-//! Lightweight append-only debug log at `~/.config/claude-usage/claude-usage.log`.
+//! Lightweight append-only debug log at `~/.config/usagio/usagio.log`.
 //!
 //! Records poll ticks, fetch outcomes (including 429s and backoff), swaps, and
 //! switches so behaviour can be diagnosed after the fact. Never logs tokens or
@@ -35,7 +35,7 @@ pub fn log(msg: &str) {
         return;
     };
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("claude-usage.log");
+    let path = dir.join("usagio.log");
 
     // Rotate if the file has grown too large (keep one previous generation).
     rotate_if_large(&path, MAX_BYTES);

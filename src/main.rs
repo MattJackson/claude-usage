@@ -1,25 +1,63 @@
-//! claude-usage — usage/limits across multiple Claude accounts, keyed by the
-//! account email, and account switching by writing the shared keychain login
-//! plus the `~/.claude.json` identity Claude Code reads. New `claude` sessions
-//! use the switched account; already-running sessions keep theirs until
-//! restarted.
+//! usagio — usage/limits across multiple Claude / Codex accounts (and every
+//! AI-coding CLI we grow support for), keyed by the account email, and
+//! account switching by writing the shared keychain login plus the
+//! `~/.claude.json` identity Claude Code reads. New `claude` sessions use the
+//! switched account; already-running sessions keep theirs until restarted.
+//!
+//! Renamed from `claude-usage` in v0.4.0. Config dir, launchd label, and
+//! Login Items entry migrate transparently on first run; the macOS Keychain
+//! service string is intentionally frozen at "claude-usage" to preserve
+//! existing tokens (see `providers/state.rs`).
 
-mod config;
+mod burn_rate;
+mod context_ledger;
+mod cost_tracking;
+mod countdown;
+mod credentials;
+#[cfg(test)]
+mod env_lock;
+#[cfg(target_os = "macos")]
+mod icons;
 mod logging;
 #[cfg(target_os = "macos")]
 mod menubar;
-mod oauth;
+mod notifications;
+mod paths;
+mod platform;
+mod pricing;
+mod providers;
 mod store;
-mod usage;
+mod usage_log;
+
+use providers::claude::{oauth, usage};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 
+use providers::Provider;
 use store::{Account, CachedUsage, State};
 
+/// Slug of the sole first-class provider in v1 (state.json is still keyed as
+/// a flat list of Claude accounts). Any code that needs to resolve "the
+/// provider for this account" today uses this; phase 3 (state v2) replaces
+/// the constant with a per-account lookup keyed on the containing bucket.
+const CLAUDE_SLUG: &str = "claude";
+
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
-/// Refresh a token if it expires within this many seconds.
-const REFRESH_SKEW_SECS: i64 = 300;
+/// App slug used everywhere we ask the platform for a per-app directory
+/// (`~/.config/usagio` on macOS, `$XDG_CONFIG_HOME/usagio` on Linux,
+/// `%APPDATA%\usagio` on Windows). The one-shot rename from `claude-usage`
+/// → `usagio` migrates the on-disk directory transparently at first run
+/// (see `paths::migrate_config_dir_if_needed`).
+pub(crate) const APP_SLUG: &str = "usagio";
+/// Previous slug (pre-v0.4.0). Referenced only by the one-shot migration
+/// in `paths::migrate_config_dir_if_needed` — do not use for any live
+/// path construction.
+pub(crate) const LEGACY_APP_SLUG: &str = "claude-usage";
+/// Refresh a token if it expires within this many seconds. Sourced from the
+/// credential-sync module so the reactive (switch / cmd_token / poll) path
+/// and the proactive (fsnotify + inactive-refresh) path can never drift.
+const REFRESH_SKEW_SECS: i64 = credentials::REFRESH_SKEW_SECS;
 
 // --- watch (auto-swap daemon) defaults ---
 /// How often the watcher polls, in seconds.
@@ -40,8 +78,26 @@ const NO_RETURN_SECS: u64 = 1200;
 /// weekly-reset primary key is stable; the headroom tiebreak fluctuates as you
 /// work, so this margin keeps two near-equal accounts from ping-ponging.
 const PROACTIVE_HEADROOM_MARGIN: f64 = 10.0;
-/// Bundle id / label for the launchd agent (runs the menu-bar app at login).
-pub(crate) const LAUNCHD_LABEL: &str = "com.claude-usage.menubar";
+/// Reverse-DNS label for the OS's autostart registration (runs the menu-bar
+/// app at login). Reused across install / uninstall on every platform: it's
+/// the launchd Label on macOS, the .desktop filename on Linux, and the
+/// registry value name on Windows.
+pub(crate) const AUTOSTART_LABEL: &str = "com.mattjackson.usagio.menubar";
+/// Previous launchd label (pre-v0.4.0). Referenced only by the one-shot
+/// migration in `cmd_install` — unload + remove the old plist before
+/// registering the new label so upgraded users don't run two agents.
+pub(crate) const LEGACY_AUTOSTART_LABEL: &str = "com.claude-usage.menubar";
+
+/// Process-global handle to the platform impl. `platform::current()` builds
+/// once at first use; every host-OS call (keychain, autostart, paths) routes
+/// through this so we never sprinkle `#[cfg(target_os = ...)]` across
+/// business logic.
+static PLATFORM: std::sync::OnceLock<Box<dyn platform::Platform>> = std::sync::OnceLock::new();
+
+/// Return the process-global platform impl, initializing it on first call.
+pub(crate) fn platform() -> &'static dyn platform::Platform {
+    PLATFORM.get_or_init(platform::current).as_ref()
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -51,6 +107,79 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // One-shot rename migration: if `~/.config/claude-usage/` still exists
+    // and `~/.config/usagio/` doesn't, atomically move it (with a
+    // cross-device copy+delete fallback). Idempotent and safe to run on
+    // every subsequent boot. Must run BEFORE the first state-load or
+    // logging init so the new dir is populated before anyone reads it.
+    match paths::migrate_config_dir_if_needed() {
+        Ok(paths::MigrationResult::Migrated { from, to }) => {
+            eprintln!(
+                "usagio: migrated config directory {} -> {}",
+                from.display(),
+                to.display()
+            );
+        }
+        Ok(paths::MigrationResult::BothExisted { new, old }) => {
+            eprintln!(
+                "usagio: both {} and {} exist; using {} and leaving the old one \
+                 in place for inspection",
+                old.display(),
+                new.display(),
+                new.display()
+            );
+        }
+        Ok(_) => {}
+        Err(paths::MigrationError::OldRemovalFailed { new, source }) => {
+            // The NEW tree is populated and mode-correct — proceed as if the
+            // migration succeeded. Log the leftover so the user can inspect.
+            // See H6 in the round-1 codeaudit findings and M1 for the variant.
+            eprintln!(
+                "usagio: migrated config to {}; old tree left in place ({source})",
+                new.display()
+            );
+        }
+        Err(e) => {
+            // Any other migration failure means the new tree is NOT populated.
+            // Falling straight through to State::default (an ENOENT from
+            // State::load) would look like a fresh install and prompt every
+            // user to re-login. Fire a menu-bar notification AND log loudly.
+            // We still proceed (State::default), but the user is at least
+            // told and can retry.
+            let msg = format!(
+                "usagio: config migration FAILED — accounts may appear missing. \
+                 See ~/.config/usagio/logs; try again or copy the old dir manually. \
+                 Details: {e:?}"
+            );
+            eprintln!("{msg}");
+            logging::log(&msg);
+            notify(&msg);
+        }
+    }
+
+    // Populate the provider registry once, before any command handler runs.
+    // Cheap (a `Vec::push` per feature-gated provider) and idempotent, so
+    // handlers that never touch the registry (today: all of them) pay
+    // nothing meaningful. Later phases route `menubar::run` through
+    // `providers::get`, at which point this call is load-bearing — do it
+    // here so it always precedes the dispatch below.
+    providers::init();
+
+    // Spawn fsnotify watchers on every provider's credential paths so
+    // rotations the vendor CLI writes (or another usagio process makes)
+    // are absorbed as they happen, not just on the next 150s watch tick.
+    // Only long-running command paths (watch / menubar) actually benefit;
+    // one-shot commands complete before any event fires, but the setup is
+    // cheap and self-contained.
+    // Leaked deliberately: the watcher owns a thread and must outlive the
+    // process. `Box::leak` on a heap allocation is the standard trick for
+    // "live for program lifetime" without introducing a global mutex.
+    let providers_static: Vec<&'static dyn Provider> =
+        providers::all().iter().map(|b| &**b).collect();
+    if let Some(handle) = credentials::spawn_watchers(providers_static) {
+        Box::leak(Box::new(handle));
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None => cmd_list(&[]),
@@ -66,6 +195,7 @@ fn run() -> Result<()> {
         #[cfg(target_os = "macos")]
         Some("menubar") => menubar::run(),
         Some("report") => cmd_report(&args[1..]),
+        Some("context") => cmd_context(&args[1..]),
         Some("install") => cmd_install(),
         Some("uninstall") => cmd_uninstall(),
         Some("rm") | Some("remove") => cmd_rm(args.get(1).map(String::as_str)),
@@ -74,7 +204,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some("-V") | Some("--version") | Some("version") => {
-            println!("claude-usage {}", env!("CARGO_PKG_VERSION"));
+            println!("usagio {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some(other) => {
@@ -87,27 +217,33 @@ fn run() -> Result<()> {
 
 fn print_help() {
     println!(
-        "claude-usage — usage & instant account switching for Claude\n\n\
+        "usagio — usage & instant account switching for Claude\n\n\
          Accounts are identified by their email; commands accept a full email or a\n\
          unique prefix (e.g. `dev` for dev@example.com).\n\n\
          USAGE:\n  \
-         claude-usage                   Show cached usage for every account (default)\n  \
-         claude-usage list --refresh    Fetch usage now, then show it\n  \
-         claude-usage capture           Save the account you're currently logged into\n  \
-         claude-usage switch [email]    Make <email> the active login (no launch)\n  \
-         claude-usage start [email]     Switch, then launch a fresh `claude`\n  \
-         claude-usage continue [email]  Switch, then launch `claude --continue`\n  \
-         claude-usage token [email]     Print a fresh access token\n  \
-         claude-usage watch             Auto-swap at 95%, keep working (foreground)\n  \
-         claude-usage menubar           Run the macOS menu-bar app (usage + auto-swap)\n  \
-         claude-usage install           Run the menu-bar app at every login (via launchd)\n  \
-         claude-usage uninstall         Stop running the menu-bar app at login\n  \
-         claude-usage report            Usage patterns by weekday / hour / account\n  \
-         claude-usage rm <email>        Forget an account\n\n\
+         usagio                   Show cached usage for every account (default)\n  \
+         usagio list --refresh    Fetch usage now, then show it\n  \
+         usagio capture           Save the account you're currently logged into\n  \
+         usagio switch [email]    Make <email> the active login (no launch)\n  \
+         usagio start [email]     Switch, then launch a fresh `claude`\n  \
+         usagio continue [email]  Switch, then launch `claude --continue`\n  \
+         usagio token [email]     Print a fresh access token\n  \
+         usagio watch             Auto-swap at 95%, keep working (foreground)\n  \
+         usagio menubar           Run the macOS menu-bar app (usage + auto-swap)\n  \
+         usagio install           Run the menu-bar app at every login (via launchd)\n  \
+         usagio uninstall         Stop running the menu-bar app at login\n  \
+         usagio report            Usage patterns by weekday / hour / account\n  \
+         usagio report --pace     Per-account burn-rate forecast (empty-in ETA)\n  \
+         usagio report --pricing  Model → USD-per-1M-tokens lookup table\n  \
+         usagio report --verdict  Cancel/downgrade/keep/upgrade classifier\n  \
+         usagio context [OPTS]    Audit CLI auto-injected context (per turn)\n  \
+                                        --provider <slug>  claude|codex|opencode\n  \
+                                        --project  <path>  scope in-tree instructions to this project\n  \
+         usagio rm <email>        Forget an account\n\n\
          With no [email], switch/start/continue auto-pick the account that has room\n  \
          and whose weekly limit resets soonest (use it before the quota resets).\n\n\
          Onboarding: log into an account with `claude` as usual, then\n  \
-         `claude-usage capture`. Repeat once per account.\n"
+         `usagio capture`. Repeat once per account.\n"
     );
 }
 
@@ -207,7 +343,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
     }
     let state = State::load()?;
     if state.accounts.is_empty() {
-        println!("No accounts yet. Log into one with `claude`, then: claude-usage capture");
+        println!("No accounts yet. Log into one with `claude`, then: usagio capture");
         return Ok(());
     }
     let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
@@ -222,7 +358,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
 fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
     let state = State::load()?;
     if state.accounts.is_empty() {
-        bail!("no accounts yet; capture one with: claude-usage capture");
+        bail!("no accounts yet; capture one with: usagio capture");
     }
     let email = select_email(&state, selector)?;
     let label = switch_to(&email)?;
@@ -262,35 +398,213 @@ fn select_email(state: &State, selector: Option<&str>) -> Result<String> {
     }
 }
 
+/// Resolve a provider by slug, mapping "not registered" to a clear error.
+fn provider_by_slug(slug: &str) -> Result<&'static dyn Provider> {
+    providers::get(slug)
+        .with_context(|| format!("provider '{slug}' is not registered in this build"))
+}
+
+/// True iff the provider registered under `slug` is eligible as an auto-swap
+/// candidate — i.e. it exposes both a usage signal (so we can compare
+/// candidates) and a way to switch to it. An unknown slug returns `false`:
+/// the safest thing when a Row's `provider_id` doesn't correspond to any
+/// registered provider is to leave it out of the auto-swap decision.
+fn provider_supports_swap(slug: &str) -> bool {
+    match providers::get(slug) {
+        Some(p) => {
+            let c = p.capabilities();
+            c.supports_usage && c.supports_switching
+        }
+        None => false,
+    }
+}
+
+/// Env var whose presence forces the Claude CLI to use a specific OAuth token,
+/// bypassing the keychain login. When set, any swap we perform is silently
+/// ignored by `claude`, so we skip Claude from auto-swap candidacy AND surface
+/// a disabled "env override active — swap disabled" row in the menu section.
+pub(crate) const CLAUDE_ENV_OVERRIDE_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// The env var (if any) whose presence overrides `slug`'s stored login.
+pub(crate) fn env_override_var_for(slug: &str) -> Option<&'static str> {
+    match slug {
+        CLAUDE_SLUG => Some(CLAUDE_ENV_OVERRIDE_VAR),
+        _ => None,
+    }
+}
+
+/// Whether the given provider currently has its env-override active in this
+/// process's environment. `#[cfg(test)]` builds also consult a thread-local
+/// hook (`set_env_override_hook_for_test`) so tests can toggle overrides
+/// deterministically without racing on the real environment.
+pub(crate) fn env_override_active(slug: &str) -> bool {
+    #[cfg(test)]
+    {
+        if let Some(v) = env_override_hook_lookup(slug) {
+            return v;
+        }
+    }
+    env_override_var_for(slug)
+        .map(|var| {
+            std::env::var_os(var)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set of slugs to report as env-overridden. `None` means "consult the
+    /// real environment", `Some(set)` means "report only these slugs".
+    static ENV_OVERRIDE_TEST_HOOK: std::cell::RefCell<Option<std::collections::HashSet<String>>>
+        = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn env_override_hook_lookup(slug: &str) -> Option<bool> {
+    ENV_OVERRIDE_TEST_HOOK.with(|h| h.borrow().as_ref().map(|s| s.contains(slug)))
+}
+
+/// Run `f` with the env-override lookup answering `true` only for `overrides`.
+/// Restores the previous state on exit (including a panicking `f`, via `Drop`).
+#[cfg(test)]
+pub(crate) fn with_env_override_hook<F, R>(overrides: &[&str], f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    struct Guard(Option<std::collections::HashSet<String>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            ENV_OVERRIDE_TEST_HOOK.with(|h| *h.borrow_mut() = prev);
+        }
+    }
+    let prev = ENV_OVERRIDE_TEST_HOOK.with(|h| h.borrow().clone());
+    let set: std::collections::HashSet<String> = overrides.iter().map(|s| s.to_string()).collect();
+    ENV_OVERRIDE_TEST_HOOK.with(|h| *h.borrow_mut() = Some(set));
+    let _g = Guard(prev);
+    f()
+}
+
 /// Make `email` the active login. Does all network work (token refresh, identity
 /// backfill) OUTSIDE the state lock, then commits keychain + ~/.claude.json +
 /// state under the lock with a fresh reload. Returns the display label.
 pub(crate) fn switch_to(email: &str) -> Result<String> {
-    let (acct, identity, backfilled) = prepare_switch(email)?;
+    // v1 state is Claude-only; look up the "claude" provider now so later
+    // phases can key the switch on the account's containing bucket instead.
+    let provider = provider_by_slug(CLAUDE_SLUG)?;
+    let (acct, identity, backfilled) = prepare_switch(provider, email)?;
     let label = acct.email.clone().unwrap_or_else(|| email.to_string());
-    Ok(switch_to_guarded(email, &acct, &identity, backfilled, None)?.unwrap_or(label))
+    Ok(switch_to_guarded(provider, email, &acct, &identity, backfilled, None)?.unwrap_or(label))
 }
 
 /// Like `switch_to`, but only if `expect_active` is still the active account
 /// when the lock is taken (a compare-and-set). Used by the auto-swap daemon so a
 /// concurrent manual switch isn't overridden by a stale decision. Returns the
 /// label on a real switch, or `None` if it was skipped.
-fn switch_to_if_still_active(email: &str, expect_active: &str) -> Result<Option<String>> {
-    let (acct, identity, backfilled) = prepare_switch(email)?;
-    switch_to_guarded(email, &acct, &identity, backfilled, Some(expect_active))
+fn switch_to_if_still_active(
+    provider: &'static dyn Provider,
+    email: &str,
+    expect_active: &str,
+) -> Result<Option<String>> {
+    let (acct, identity, backfilled) = prepare_switch(provider, email)?;
+    switch_to_guarded(
+        provider,
+        email,
+        &acct,
+        &identity,
+        backfilled,
+        Some(expect_active),
+    )
 }
 
 /// Phase 1 of a switch (no lock): refresh the token and resolve the identity
 /// over the network, returning what the locked commit phase needs.
-fn prepare_switch(email: &str) -> Result<(Account, serde_json::Value, bool)> {
+fn prepare_switch(
+    provider: &'static dyn Provider,
+    email: &str,
+) -> Result<(Account, serde_json::Value, bool)> {
     let state = State::load()?;
     let mut acct = state
         .find(email)
         .cloned()
         .with_context(|| format!("no account matches '{email}'"))?;
-    oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS)?;
-    let (identity, backfilled) = resolve_identity(&acct)?;
+    // Reactive refresh with a clear signal on hard failure. If the refresh
+    // token has been invalidated (single-use / rotated elsewhere / revoked),
+    // bail with a distinctive error so the menu / CLI can prompt a fresh
+    // login instead of silently overwriting the keychain with a stale token
+    // that `claude` will then reject.
+    match ensure_fresh_with_fallback(provider, email, &mut acct) {
+        Ok(_) => {}
+        Err(oauth::RefreshError::InvalidGrant) => {
+            flag_needs_relogin(email);
+            bail!(
+                "account {email} needs re-login (refresh token rejected); run \
+                 `claude /login` for it or click the account row in the menu"
+            );
+        }
+        Err(e) => bail!("token refresh for {email} failed: {e}"),
+    }
+    let (identity, backfilled) = resolve_identity(provider, &acct)?;
     Ok((acct, identity, backfilled))
+}
+
+/// `ensure_fresh` with a disk-fallback safety net for the reactive paths
+/// (`cmd_token`, `prepare_switch`). If the initial refresh fails with
+/// `InvalidGrant`, the stored refresh token may just be behind a rotation the
+/// vendor CLI (or another usagio process) already wrote to disk — or fsnotify
+/// may have missed the FSEvent (common after a suspend/resume). Rescan every
+/// registered credential path via `credentials::last_chance_fallback`; if a
+/// usable blob for this account is sitting on disk, adopt it into state.json
+/// and retry the refresh once with the fresh grant. This matches the policy
+/// `refresh_inactive_if_stale` already uses on the proactive path so all three
+/// entry points agree before we surface "needs re-login" to the user.
+fn ensure_fresh_with_fallback(
+    provider: &'static dyn Provider,
+    email: &str,
+    acct: &mut Account,
+) -> std::result::Result<bool, oauth::RefreshError> {
+    match oauth::ensure_fresh(acct, REFRESH_SKEW_SECS) {
+        Ok(b) => Ok(b),
+        Err(oauth::RefreshError::InvalidGrant) => {
+            let key = crate::providers::trait_def::AccountKey::new(provider.provider_id(), email);
+            if credentials::last_chance_fallback(provider, &key) {
+                // Reload the account with the tokens the fallback just
+                // adopted, then retry the refresh once. If the reload fails
+                // or the account vanished, fall through to InvalidGrant.
+                if let Ok(st) = State::load() {
+                    if let Some(fresh) = st.find(email).cloned() {
+                        *acct = fresh;
+                        return oauth::ensure_fresh(acct, REFRESH_SKEW_SECS);
+                    }
+                }
+            }
+            Err(oauth::RefreshError::InvalidGrant)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Best-effort: mark an account `needs_relogin=true` in state.json. If the
+/// state lock is held or the save fails, the next `refresh_usage_cache` tick
+/// re-observes the invalid_grant and sets it again — callers that need
+/// certainty already surface a distinct error to the user.
+fn flag_needs_relogin(email: &str) {
+    // L7 (round-1 codeaudit): the previous `let _ =` swallowed save errors
+    // silently, so a persistent state.json write failure would never be
+    // visible in the log. The next `refresh_usage_cache` tick re-sets the
+    // flag from the invalid_grant observation, so we still make progress,
+    // but the failure should be noisy.
+    if let Err(e) = with_state_lock(|| {
+        let mut st = State::load()?;
+        if let Some(a) = st.find_mut(email) {
+            a.needs_relogin = true;
+        }
+        st.save()
+    }) {
+        logging::log(&format!("flag_needs_relogin({email}): save failed: {e:#}"));
+    }
 }
 
 /// The locked phase of a switch, optionally guarded by `expect_active`: if given
@@ -300,6 +614,7 @@ fn prepare_switch(email: &str) -> Result<(Account, serde_json::Value, bool)> {
 /// stale choice. `acct`/`identity`/`backfilled` come from the caller's unlocked
 /// phase-1 network work. Returns the display label on a real switch.
 fn switch_to_guarded(
+    provider: &'static dyn Provider,
     email: &str,
     acct: &Account,
     identity: &serde_json::Value,
@@ -318,8 +633,27 @@ fn switch_to_guarded(
                 return Ok(false);
             }
         }
-        // Preserve any token rotation the currently-active session picked up.
-        sync_active_from_keychain(&mut st);
+        // Provider-agnostic: absorb any lagging on-disk rotations for the
+        // outgoing account BEFORE we overwrite path[0] with the incoming
+        // account's blob. This catches every configured credential file.
+        credentials::absorb_before_switch(provider);
+        // absorb_before_switch reaches back through the reentrant state lock
+        // and rewrites state.json with any freshly-absorbed rotations. Our
+        // in-memory `st` snapshot from a few lines above is now stale; reload
+        // it here or our final `st.save()` will clobber the absorbed changes
+        // (reintroducing the never-re-login regression). See H1 in the
+        // round-1 codeaudit findings.
+        //
+        // NOTE: sync_active_from_keychain MUST run AFTER this reload, not
+        // before it — otherwise the reload discards any keychain-derived
+        // mutations to the in-memory snapshot, causing apply_account (via
+        // the stale `st`) to later re-push pre-rotation tokens on switch-
+        // back. See H_R2_1 in the round-2 codeaudit findings.
+        st = State::load()?;
+        // Preserve any token rotation the currently-active session picked up
+        // and wrote into the keychain (Claude legacy path). This mutates `st`
+        // in memory; the final `st.save()` below persists the freshest tokens.
+        sync_active_from_keychain(provider, &mut st);
         // A concurrent poll may have rotated this account's token after our
         // phase-1 snapshot; use whichever tokens are fresher so we never write a
         // stale (possibly already-superseded) refresh token to the keychain.
@@ -334,7 +668,7 @@ fn switch_to_guarded(
             }
         }
         // ~/.claude.json first, keychain last (the commit point), rollback on fail.
-        apply_account(&acct, identity)?;
+        apply_account(provider, &acct, identity)?;
         if let Some(a) = st.find_mut(email) {
             a.set_tokens_if_newer(
                 acct.access_token.clone(),
@@ -361,11 +695,16 @@ fn switch_to_guarded(
     }
 }
 
-/// Resolve the `oauthAccount` identity to write for this account.
-/// Returns (identity, backfilled_from_network). Errors if it can't be resolved
-/// (e.g. offline and never captured) — the caller then does NOT switch, rather
-/// than half-applying one.
-fn resolve_identity(acct: &Account) -> Result<(serde_json::Value, bool)> {
+/// Resolve the identity to write for this account. Returns (identity,
+/// backfilled_from_network). Errors if it can't be resolved (e.g. offline and
+/// never captured) — the caller then does NOT switch, rather than half-applying
+/// one. `provider` is threaded through so later phases can dispatch off it; the
+/// v1 body still uses the Claude-specific profile endpoint (behavior-preserving).
+fn resolve_identity(
+    provider: &'static dyn Provider,
+    acct: &Account,
+) -> Result<(serde_json::Value, bool)> {
+    let _ = provider;
     if let Some(v) = &acct.oauth_account {
         return Ok((v.clone(), false));
     }
@@ -375,7 +714,7 @@ fn resolve_identity(acct: &Account) -> Result<(serde_json::Value, bool)> {
     built.map(|v| (v, true)).ok_or_else(|| {
         anyhow!(
             "could not resolve this account's identity (offline?) — \
-             run `claude-usage capture` for it while logged in"
+             run `usagio capture` for it while logged in"
         )
     })
 }
@@ -384,7 +723,14 @@ fn resolve_identity(acct: &Account) -> Result<(serde_json::Value, bool)> {
 /// (atomic tmp+rename), then the keychain token LAST (the flaky commit point).
 /// If the keychain write fails, roll ~/.claude.json back to its prior contents
 /// so both halves stay consistent, and return Err (never a half-applied switch).
-fn apply_account(acct: &Account, identity: &serde_json::Value) -> Result<()> {
+/// `provider` is threaded through for the same forward-compat reason as
+/// `resolve_identity`; the v1 body is the Claude-specific keychain path.
+fn apply_account(
+    provider: &'static dyn Provider,
+    acct: &Account,
+    identity: &serde_json::Value,
+) -> Result<()> {
+    let _ = provider;
     let prior = read_claude_json_raw();
     write_claude_identity(identity, acct.user_id.as_deref())?;
     if let Err(e) = keychain_write(&acct.keychain_blob) {
@@ -396,7 +742,7 @@ fn apply_account(acct: &Account, identity: &serde_json::Value) -> Result<()> {
                 return Err(e).context(format!(
                     "writing the account into the keychain, and rolling back \
                      ~/.claude.json failed too ({re:#}); it may now point at the new \
-                     account while the keychain holds the old — run `claude-usage \
+                     account while the keychain holds the old — run `usagio \
                      switch` again to reconcile"
                 ));
             }
@@ -432,7 +778,8 @@ fn identity_matches(
 /// oauthAccount, so a mismatch means the keychain is not our active account and
 /// we must NOT overwrite its stored tokens. In-place rotation keeps the same
 /// account uuid/email, so legitimate rotation is still captured.
-fn sync_active_from_keychain(state: &mut State) {
+fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State) {
+    let _ = provider;
     let Some(active) = state.active.clone() else {
         return;
     };
@@ -490,7 +837,7 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
         Some(sel) => state.resolve(sel)?,
         None => match state.accounts.as_slice() {
             [only] => only.key().to_string(),
-            [] => bail!("no accounts; capture one with: claude-usage capture"),
+            [] => bail!("no accounts; capture one with: usagio capture"),
             _ => bail!("multiple accounts; specify one by email or prefix"),
         },
     };
@@ -501,7 +848,23 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
         .find(&email)
         .cloned()
         .with_context(|| format!("no account matches '{email}'"))?;
-    let refreshed = oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS)?;
+    // Reactive path: try the disk fallback before flagging so a rotation the
+    // vendor CLI wrote to ~/.claude/.credentials.json (or that fsnotify missed)
+    // is adopted here instead of tripping needs_relogin on a token that's
+    // already been superseded on disk.
+    let provider = providers::get(CLAUDE_SLUG)
+        .ok_or_else(|| anyhow!("internal: provider '{CLAUDE_SLUG}' not registered"))?;
+    let refreshed = match ensure_fresh_with_fallback(provider, &email, &mut acct) {
+        Ok(b) => b,
+        Err(oauth::RefreshError::InvalidGrant) => {
+            flag_needs_relogin(&email);
+            bail!(
+                "account {email} needs re-login (refresh token rejected); run \
+                 `claude /login` for it or click the account row in the menu"
+            );
+        }
+        Err(e) => bail!("token refresh for {email} failed: {e}"),
+    };
     let token = acct.access_token.clone();
     // Phase 2 (locked): persist a rotation without clobbering a fresher one.
     if refreshed {
@@ -518,7 +881,7 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
             // persist it, say so — the stored refresh token is now stale.
             st.save().context(
                 "the token was refreshed but recording the rotation in state.json \
-                 failed; if refreshes start failing, run `claude-usage capture` for \
+                 failed; if refreshes start failing, run `usagio capture` for \
                  this account",
             )
         })?;
@@ -532,7 +895,7 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_rm(selector: Option<&str>) -> Result<()> {
-    let selector = selector.context("usage: claude-usage rm <email>")?;
+    let selector = selector.context("usage: usagio rm <email>")?;
     let state = State::load()?;
     let email = state.resolve(selector)?;
     remove_account(&email)?;
@@ -545,6 +908,16 @@ fn cmd_rm(selector: Option<&str>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 struct Row {
+    /// Slug of the provider that owns this row's account (matches a registered
+    /// `Provider::provider_id`). Threaded through swap decisions so we can
+    /// consult `providers::get(...).capabilities()` without re-reading state.
+    /// In v1 every row is `"claude"`; a Row whose slug isn't registered is
+    /// simply skipped as an auto-swap candidate.
+    provider_id: String,
+    /// True when the OAuth token endpoint has permanently rejected this
+    /// account's refresh token. Filtered out of the auto-swap picker and
+    /// surfaced by the menu as a re-login row.
+    needs_relogin: bool,
     email: String,
     session: Cell,
     weekly: Cell,
@@ -572,6 +945,11 @@ impl Cell {
 fn row_from_account(a: &Account) -> Row {
     let c = a.cached_usage.as_ref();
     Row {
+        // v1 state stores only Claude accounts; phase 3 (state v2) tags each
+        // account with its containing provider slug and this becomes a real
+        // per-account lookup.
+        provider_id: CLAUDE_SLUG.to_string(),
+        needs_relogin: a.needs_relogin,
         email: a.key().to_string(),
         session: cell_from_parts(
             c.and_then(|c| c.session_pct),
@@ -659,7 +1037,7 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
 fn auto_pick(rows: &[Row]) -> Result<String> {
     if !rows.iter().any(|r| r.has_data()) {
         bail!(
-            "no usage data yet — let the menu-bar app or `claude-usage watch` \
+            "no usage data yet — let the menu-bar app or `usagio watch` \
              populate it, or pass an explicit account email"
         );
     }
@@ -742,99 +1120,46 @@ fn cell_from_parts(pct: Option<f64>, reset: Option<&str>) -> Cell {
 // Cross-process state lock
 // ---------------------------------------------------------------------------
 
-/// Run `f` holding an exclusive advisory lock on ~/.config/claude-usage/lock,
+/// Run `f` holding an exclusive advisory lock on ~/.config/usagio/lock,
 /// serializing state read-modify-write across processes (the daemon poll and
 /// concurrent CLI/menu commands). The lock is fd-scoped, so the kernel releases
-/// it if the holder dies. Do NOT do network I/O inside `f`.
+/// it if the holder dies. Reentrant on the current thread, so provider-
+/// implemented callbacks (e.g. `absorb_credential`) can safely take the lock
+/// again from inside another `with_state_lock` frame without self-deadlocking
+/// (see credentials::with_state_lock for the depth-tracking rationale). Do NOT
+/// do network I/O inside `f`.
 fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
-    use fs2::FileExt;
-    let dir = store::config_dir()?;
-    std::fs::create_dir_all(&dir).context("creating ~/.config/claude-usage")?;
-    let lock_path = dir.join("lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .context("opening state lock")?;
-    file.lock_exclusive().context("acquiring state lock")?;
-    let r = f();
-    // Fully-qualified to fs2's trait: std 1.89 added an inherent `File::unlock`
-    // that would otherwise shadow it and break the 1.88 MSRV (fs2 has no such
-    // requirement). Keep this qualified so the call can't drift onto std's.
-    let _ = fs2::FileExt::unlock(&file);
-    r
+    credentials::with_state_lock(f)
 }
 
 // ---------------------------------------------------------------------------
-// Keychain helpers (macOS, via Security.framework — no token in argv)
+// Keychain helpers — delegate to the platform SecretStore
 // ---------------------------------------------------------------------------
 
 fn keychain_account() -> String {
     std::env::var("USER").unwrap_or_else(|_| "claude".to_string())
 }
 
-// NOTE: we use the `security` CLI rather than the Security.framework
-// (`security-framework`) API on purpose. SecItem access from this unsigned,
-// brew-installed binary makes macOS prompt on every launch (an unsigned binary
-// has no stable identity for "Always Allow" to pin to). The CLI path doesn't
-// prompt. The only downside is the write blob appears in `security`'s argv,
-// which is LOW risk under this tool's single-user threat model. TODO: switch
-// back to security-framework once we ship a code-signed (Developer ID) build,
-// where "Always Allow" persists.
-#[cfg(target_os = "macos")]
+// NOTE: on macOS the SecretStore impl uses the `security` CLI rather than the
+// Security.framework (`security-framework`) API on purpose. SecItem access
+// from this unsigned, brew-installed binary makes macOS prompt on every
+// launch (an unsigned binary has no stable identity for "Always Allow" to pin
+// to). The CLI path doesn't prompt. The only downside is the write blob
+// appears in `security`'s argv, which is LOW risk under this tool's
+// single-user threat model. TODO: switch back to security-framework once we
+// ship a code-signed (Developer ID) build, where "Always Allow" persists.
 fn keychain_read() -> Option<String> {
-    let out = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            &keychain_account(),
-            "-w",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    platform()
+        .secrets()
+        .get(KEYCHAIN_SERVICE, &keychain_account())
+        .ok()
+        .flatten()
 }
 
-#[cfg(target_os = "macos")]
 fn keychain_write(blob: &str) -> Result<()> {
-    let status = std::process::Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U", // update if it already exists
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            &keychain_account(),
-            "-w",
-            blob,
-        ])
-        .status()
-        .context("running `security`")?;
-    if !status.success() {
-        return Err(anyhow!("`security add-generic-password` failed"));
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_read() -> Option<String> {
-    None
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_write(_blob: &str) -> Result<()> {
-    Err(anyhow!("keychain is only supported on macOS"))
+    platform()
+        .secrets()
+        .set(KEYCHAIN_SERVICE, &keychain_account(), blob)
 }
 
 fn claude_json_path() -> Result<std::path::PathBuf> {
@@ -895,7 +1220,7 @@ fn restore_claude_json_raw(bytes: &[u8], mode: u32) -> Result<()> {
 /// these files carry OAuth tokens; `mode` is then applied before the rename.
 /// Shared by the `~/.claude.json` identity write and rollback, and unit-tested.
 fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let tmp = path.with_extension("json.claude-usage.tmp");
+    let tmp = path.with_extension("json.usagio.tmp");
     if let Err(e) = store::write_private(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).context("writing temp file");
@@ -969,23 +1294,85 @@ fn refresh_usage_cache() -> RefreshOutcome {
             };
         }
     };
-    sync_active_from_keychain(&mut state);
+    // v1 state is Claude-only; resolve the provider once at the top of the
+    // cycle. Phase 3 (state v2) makes this a per-account bucket lookup — the
+    // per-account body below already runs inside a loop, so the transition is
+    // additive rather than restructural.
+    let provider = match provider_by_slug(CLAUDE_SLUG) {
+        Ok(p) => p,
+        Err(e) => {
+            logging::log(&format!("poll: provider unavailable: {e:#}"));
+            return RefreshOutcome {
+                rate_limited: false,
+            };
+        }
+    };
+    sync_active_from_keychain(provider, &mut state);
     logging::log("poll: refreshing usage cache");
 
     let mut rate_limited = false;
-    // (email, refreshed account after ensure_fresh, new cached usage or None)
-    let mut updates: Vec<(String, Account, Option<CachedUsage>)> = Vec::new();
+    // (email, refreshed account after ensure_fresh, new cached usage or None,
+    // updated notif state or None)
+    let mut updates: Vec<(
+        String,
+        Account,
+        Option<CachedUsage>,
+        Option<notifications::NotifState>,
+    )> = Vec::new();
     let emails: Vec<String> = state.accounts.iter().map(|a| a.key().to_string()).collect();
+    let notif_cfg = notifications::NotificationConfig::default();
     for email in &emails {
         let Some(acct) = state.find(email).cloned() else {
             continue;
         };
         let mut acct = acct;
-        if let Err(e) = oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
-            logging::log(&format!(
-                "token refresh failed for {email}: {e} (keeping cache)"
-            ));
+        // Skip accounts already flagged needs_relogin — no useful token to
+        // reason about, and hammering an invalid_grant refresh both wastes
+        // requests and can trip rate limits shared across the tenant.
+        if acct.needs_relogin {
             continue;
+        }
+        match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
+            Ok(_) => {}
+            Err(oauth::RefreshError::InvalidGrant) => {
+                // Last-chance disk fallback: a rotation may have landed on
+                // disk (from `claude` or another usagio process) DURING this
+                // refresh cycle — after the pre-cycle absorb_all_lagging ran
+                // — so re-scan credential paths for this account and retry
+                // once with the freshly-adopted grant before flagging. This
+                // closes the mid-loop race the pre-cycle absorb can't cover.
+                let key = crate::providers::trait_def::AccountKey::new(CLAUDE_SLUG, email);
+                let adopted = credentials::last_chance_fallback(provider, &key);
+                let recovered = if adopted {
+                    match State::load().ok().and_then(|s| s.find(email).cloned()) {
+                        Some(fresh) => {
+                            acct = fresh;
+                            oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS).is_ok()
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                if !recovered {
+                    logging::log(&format!(
+                        "token refresh permanently rejected for {email} (invalid_grant); \
+                         flagging for re-login"
+                    ));
+                    acct.needs_relogin = true;
+                    // Fall through to the merge step so the flag is persisted;
+                    // skip the usage fetch — a rejected refresh means we don't
+                    // have a usable access token to try the usage endpoint with.
+                    updates.push((email.clone(), acct, None, None));
+                    continue;
+                }
+            }
+            Err(e) => {
+                logging::log(&format!(
+                    "token refresh failed for {email}: {e} (keeping cache)"
+                ));
+                continue;
+            }
         }
         let cu = match usage::fetch(&acct.access_token) {
             Ok(u) => Some(cached_from_usage(&u)),
@@ -999,13 +1386,54 @@ fn refresh_usage_cache() -> RefreshOutcome {
                 None
             }
         };
-        updates.push((email.clone(), acct, cu));
+        // Persist a per-tick snapshot into the long-form history log, then run
+        // notifications against the (prev, curr) pair. Best-effort throughout:
+        // a full disk / permission failure never breaks the poll cycle.
+        let mut new_notif_state: Option<notifications::NotifState> = None;
+        if let Some(cu) = &cu {
+            let account_key = usage_log::AccountKey::new(CLAUDE_SLUG, email.clone());
+            let prev_snap = usage_log::last_snapshot(&account_key);
+            let curr_snap = usage_log::Snapshot {
+                ts: Utc::now(),
+                provider: CLAUDE_SLUG.to_string(),
+                account: email.clone(),
+                session_pct: cu.session_pct.map(|p| p as f32),
+                weekly_pct: cu.weekly_pct.map(|p| p as f32),
+                active_model: None,
+            };
+            if let Err(e) = usage_log::append(&curr_snap) {
+                logging::log(&format!("usage_log: append failed for {email}: {e:#}"));
+            }
+            if let Some(prev) = prev_snap {
+                let mut ns = acct.notif_state.clone();
+                let raw = notifications::evaluate(&prev, &curr_snap, &notif_cfg);
+                let mut kept = notifications::dedup_and_apply(&mut ns, &prev, &curr_snap, raw);
+                // Pace check (default off) — feeds through the same dedup path.
+                let pace = usage_log::pace(&account_key);
+                if let Some(pt) =
+                    notifications::evaluate_pace(pace.as_ref(), &curr_snap, &notif_cfg, Utc::now())
+                {
+                    let extra =
+                        notifications::dedup_and_apply(&mut ns, &prev, &curr_snap, vec![pt]);
+                    kept.extend(extra);
+                }
+                for trig in &kept {
+                    if let Err(e) = notifications::fire(trig, &account_key) {
+                        logging::log(&format!("notify: {email}: {e:#}"));
+                    }
+                }
+                if ns != acct.notif_state {
+                    new_notif_state = Some(ns);
+                }
+            }
+        }
+        updates.push((email.clone(), acct, cu, new_notif_state));
     }
 
     // Merge under the lock with a fresh reload so we don't clobber a switch.
     let merged = with_state_lock(|| {
         let mut st = State::load()?;
-        for (email, acct, cu) in &updates {
+        for (email, acct, cu, ns) in &updates {
             if let Some(a) = st.find_mut(email) {
                 // Recency-guarded (matching switch_to): a concurrent switch that
                 // adopted a keychain rotation while we were fetching must not be
@@ -1015,8 +1443,15 @@ fn refresh_usage_cache() -> RefreshOutcome {
                     acct.refresh_token.clone(),
                     acct.expires_at,
                 );
+                // Propagate the flag from the phase-1 snapshot to the locked
+                // state. `set_tokens_if_newer` only writes on a real refresh,
+                // so we mirror this bit explicitly here.
+                a.needs_relogin = acct.needs_relogin;
                 if let Some(cu) = cu {
                     a.cached_usage = Some(cu.clone());
+                }
+                if let Some(ns) = ns {
+                    a.notif_state = ns.clone();
                 }
             }
         }
@@ -1048,9 +1483,7 @@ fn cmd_watch(args: &[String]) -> Result<()> {
         }
     }
 
-    eprintln!(
-        "claude-usage watch: every {interval}s, swap at {trigger:.0}%, target <= {ceiling:.0}%"
-    );
+    eprintln!("usagio watch: every {interval}s, swap at {trigger:.0}%, target <= {ceiling:.0}%");
 
     let base = interval;
     let mut current = base;
@@ -1137,6 +1570,12 @@ fn choose_swap_target(
     if !act.has_data() {
         return None;
     }
+    // If the active account's provider has its env-override active, the CLI
+    // ignores whatever token we install into the keychain — swapping is a
+    // no-op. Bail before we churn the state file.
+    if env_override_active(&act.provider_id) {
+        return None;
+    }
     if guard
         .last_swap
         .map(|t| t.elapsed().as_secs() < SWAP_COOLDOWN_SECS)
@@ -1146,6 +1585,19 @@ fn choose_swap_target(
     }
     let mut candidates: Vec<&Row> = rows
         .iter()
+        // A row is only a valid swap candidate if its owning provider has both
+        // a usage signal (so we can compare its cached utilization to the
+        // ceiling) and a way to actually switch to it. This is the sole
+        // capability gate for auto-swap: reporting-only or stub providers
+        // never surface here, even if their rows carry a stale utilization.
+        .filter(|r| provider_supports_swap(&r.provider_id))
+        // Skip candidates the token endpoint has permanently rejected —
+        // swapping to a needs-relogin account would just re-write the same
+        // dead credentials into the keychain.
+        .filter(|r| !r.needs_relogin)
+        // Skip candidates whose provider has its env-override active — a
+        // switch to them would be silently ignored by the vendor CLI.
+        .filter(|r| !env_override_active(&r.provider_id))
         .filter(|r| r.has_data() && r.email != active && r.eligible_target(ceiling, trigger))
         .filter(|r| {
             guard
@@ -1171,8 +1623,18 @@ fn choose_swap_target(
 
 /// Poll usage for every account (the only network path), record history, and
 /// auto-swap away from the active account if it has reached `trigger` and a
-/// healthy target exists. Shared by `claude-usage watch` and the menu-bar poller.
+/// healthy target exists. Shared by `usagio watch` and the menu-bar poller.
 fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<CycleOutcome> {
+    // Pre-cycle: absorb any on-disk credential rotations the vendor CLI made
+    // behind our back (fsnotify may not fire on remote/network volumes, and
+    // we want the invariant to hold even on the polling path). Then refresh
+    // INACTIVE Claude accounts eagerly so a user who switches to one later
+    // doesn't have to wait for the reactive path to notice.
+    for p in providers::all() {
+        let _ = credentials::absorb_all_lagging(p.as_ref());
+    }
+    credentials::refresh_inactive_if_stale(State::load().ok().and_then(|s| s.active).as_deref());
+
     let refresh = refresh_usage_cache();
     let state = State::load()?;
     if state.accounts.is_empty() {
@@ -1190,11 +1652,14 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
     if let Some(active_email) = active.clone() {
         match choose_swap_target(&rows, &active_email, trigger, ceiling, guard) {
             Some(target) => {
-                let (pick_s, pick_w) = rows
+                let target_row = rows
                     .iter()
                     .find(|r| r.email == target)
-                    .map(|r| (r.session.pct.unwrap_or(0.0), r.weekly.pct.unwrap_or(0.0)))
-                    .unwrap_or((0.0, 0.0));
+                    .expect("choose_swap_target returned an email absent from `rows`");
+                let (pick_s, pick_w) = (
+                    target_row.session.pct.unwrap_or(0.0),
+                    target_row.weekly.pct.unwrap_or(0.0),
+                );
                 // Proactive flip-back if the account we're leaving wasn't itself
                 // over the trigger — a better account simply freed up.
                 let proactive = rows
@@ -1202,9 +1667,26 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                     .find(|r| r.email == active_email)
                     .map(|r| r.max_pct() < trigger)
                     .unwrap_or(false);
+                // Resolve the target row's provider. `choose_swap_target`
+                // already filtered on `provider_supports_swap`, so this must
+                // succeed for any row it returned; a mismatch is a bug.
+                let target_provider = match provider_by_slug(&target_row.provider_id) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        logging::log(&format!(
+                            "swap to {target} skipped: provider unavailable: {e:#}"
+                        ));
+                        return Ok(CycleOutcome {
+                            swapped: None,
+                            rate_limited: refresh.rate_limited,
+                        });
+                    }
+                };
                 // Compare-and-set on the active account: if a manual switch landed
                 // since choose_swap_target read the snapshot, skip this swap.
-                let Some(label) = switch_to_if_still_active(&target, &active_email)? else {
+                let Some(label) =
+                    switch_to_if_still_active(target_provider, &target, &active_email)?
+                else {
                     return Ok(CycleOutcome {
                         swapped: None,
                         rate_limited: refresh.rate_limited,
@@ -1271,11 +1753,19 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
 
 /// Fire a native macOS notification (best effort).
 fn notify(msg: &str) {
-    let script = format!("display notification {msg:?} with title \"claude-usage\"");
-    let _ = std::process::Command::new("osascript")
+    let script = format!("display notification {msg:?} with title \"usagio\"");
+    // R2-EH-04: log osascript spawn/exit failures so H6's user-facing
+    // notification guarantee has diagnostic backing when the channel is
+    // silently unavailable (headless SSH, Automation permission denied).
+    match std::process::Command::new("osascript")
         .arg("-e")
         .arg(script)
-        .status();
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(s) => logging::log(&format!("notify: osascript exited {:?}", s.code())),
+        Err(e) => logging::log(&format!("notify: osascript spawn failed: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1358,12 +1848,63 @@ fn consumption_deltas(active: &[&Sample]) -> Vec<(i64, f64)> {
     out
 }
 
-fn cmd_report(_args: &[String]) -> Result<()> {
+// ---------------------------------------------------------------------------
+// context — Context Ledger
+// ---------------------------------------------------------------------------
+
+/// `usagio context [--provider SLUG] [--project PATH]` — audit what a
+/// CLI auto-injects into the model context per turn, with token cost per item.
+/// Delegates parsing (positional-agnostic) to a pure helper so the arg parsing
+/// stays unit-testable without a subprocess.
+fn cmd_context(args: &[String]) -> Result<()> {
+    let (provider, project) = parse_context_args(args)?;
+    context_ledger::cli::run(provider, project)
+}
+
+/// Parse the `context` subcommand's two supported flags. Unknown flags are
+/// rejected so a typo doesn't silently degrade to "audit every provider".
+fn parse_context_args(args: &[String]) -> Result<(Option<String>, Option<std::path::PathBuf>)> {
+    let mut provider: Option<String> = None;
+    let mut project: Option<std::path::PathBuf> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--provider" => {
+                provider = Some(it.next().cloned().context("--provider requires a value")?);
+            }
+            "--project" => {
+                project = Some(std::path::PathBuf::from(
+                    it.next().context("--project requires a value")?,
+                ));
+            }
+            other => bail!("unknown context option: {other}"),
+        }
+    }
+    Ok((provider, project))
+}
+
+fn cmd_report(args: &[String]) -> Result<()> {
+    // Analytics subflavours share the same command surface so `report` stays
+    // the one-stop CLI for usage insight. `--pace` prints per-account burn-
+    // rate forecasts; `--pricing` dumps the model→price lookup table;
+    // `--verdict` classifies each captured account as cancel/downgrade/keep/
+    // upgrade based on the last few weekly cycles. With no flag we fall
+    // through to the classic weekday/hour histogram.
+    if args.iter().any(|a| a == "--pace") {
+        return cmd_report_pace();
+    }
+    if args.iter().any(|a| a == "--pricing") {
+        return cmd_report_pricing();
+    }
+    if args.iter().any(|a| a == "--verdict") {
+        return cmd_report_verdict();
+    }
+
     use chrono::{Datelike, Local, TimeZone, Timelike};
 
     let path = history_path()?;
     let data = std::fs::read_to_string(&path)
-        .context("no history yet — run `claude-usage watch` (or `install`) to collect it")?;
+        .context("no history yet — run `usagio watch` (or `install`) to collect it")?;
     let samples: Vec<Sample> = data
         .lines()
         .filter_map(|l| serde_json::from_str::<Sample>(l).ok())
@@ -1447,6 +1988,155 @@ fn cmd_report(_args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// --- report --pace / --pricing / --verdict --------------------------------
+//
+// The three flag paths reuse the burn_rate / pricing / cost_tracking modules,
+// so the CLI stays a thin renderer over the same data the menu bar consumes.
+// Every flag prints the "estimate, not billing" disclaimer once so users read
+// the output with appropriate skepticism.
+
+fn cmd_report_pace() -> Result<()> {
+    use crate::providers::trait_def::Window;
+    use crate::usage_log::AccountKey;
+    let state = State::load()?;
+    if state.accounts.is_empty() {
+        println!("No accounts captured yet — run `usagio capture` first.");
+        return Ok(());
+    }
+    println!("\nBurn-rate forecast");
+    println!("  {}\n", crate::cost_tracking::DISCLAIMER);
+    let now = Utc::now();
+    for acct in &state.accounts {
+        let Some(email) = acct.email.clone() else {
+            continue;
+        };
+        let key = AccountKey::new(CLAUDE_SLUG, &email);
+        println!("  {email}");
+        for window in [Window::Session, Window::Weekly] {
+            if let Some(est) = crate::burn_rate::estimate(&key, window, now) {
+                println!("    {}", crate::burn_rate::format_menu_row(&est));
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+fn cmd_report_pricing() -> Result<()> {
+    // Static table dump — useful for verifying which model → dollar rate the
+    // cost estimator will use before it renders in the menu.
+    println!("\nModel pricing (USD per 1M tokens)");
+    println!("  Source: vendor pricing pages, compiled 2026-09-06.\n");
+    // We enumerate provider-slug guesses; unknown lookups are silently skipped.
+    let probes: &[(&str, &[&str])] = &[
+        (
+            "claude",
+            &[
+                "claude-fable-5-1",
+                "claude-opus-5",
+                "claude-opus-4-1",
+                "claude-sonnet-5",
+                "claude-sonnet-4-5",
+                "claude-haiku-4-5",
+            ],
+        ),
+        (
+            "codex",
+            &[
+                "gpt-6-astra",
+                "gpt-5-6-sol",
+                "gpt-5-6-luna",
+                "gpt-5",
+                "gpt-4-1",
+                "o3",
+            ],
+        ),
+        (
+            "gemini-cli",
+            &[
+                "gemini-2-5-pro",
+                "gemini-2-5-flash",
+                "gemini-2-5-flash-lite",
+            ],
+        ),
+        (
+            "deepseek",
+            &["deepseek-v4", "deepseek-chat", "deepseek-reasoner"],
+        ),
+        (
+            "qwen-code",
+            &["qwen-max", "qwen-plus", "qwen-turbo", "qwen-coder-3"],
+        ),
+        ("zai", &["glm-4-5", "glm-4-air", "glm-4-plus"]),
+        (
+            "fireworks",
+            &["llama-3-3-70b", "llama-4-scout", "llama-4-maverick"],
+        ),
+    ];
+    for (provider, models) in probes {
+        println!("  {provider}");
+        for m in *models {
+            if let Some(p) = crate::pricing::lookup(provider, m) {
+                println!(
+                    "    {m:<24} in ${:>5.2} / out ${:>6.2}",
+                    p.input_per_million, p.output_per_million
+                );
+            }
+        }
+        println!();
+    }
+    println!("  Passthrough providers (billed per-request against the vendor's API):");
+    for p in ["openrouter", "synthetic"] {
+        if crate::pricing::is_passthrough(p) {
+            println!("    {p} — cost pulled live from the underlying model");
+        } else {
+            // synthetic is not tagged as passthrough today; still enumerate so
+            // the user sees why it has no local rate.
+            println!("    {p} — no local rate table");
+        }
+    }
+    println!();
+    Ok(())
+}
+
+fn cmd_report_verdict() -> Result<()> {
+    use crate::cost_tracking::{subscription_verdict, Verdict};
+    use crate::usage_log::AccountKey;
+    let state = State::load()?;
+    if state.accounts.is_empty() {
+        println!("No accounts captured yet — run `usagio capture` first.");
+        return Ok(());
+    }
+    println!("\nSubscription verdict");
+    println!("  {}\n", crate::cost_tracking::DISCLAIMER);
+    // Four weekly cycles ≈ one month, the window we quote as "recoverable per
+    // month" downstream.
+    const CYCLES: usize = 4;
+    for acct in &state.accounts {
+        let Some(email) = acct.email.clone() else {
+            continue;
+        };
+        let key = AccountKey::new(CLAUDE_SLUG, &email);
+        match subscription_verdict(&key, CYCLES) {
+            None => println!("  {email}: not enough history yet"),
+            Some(sv) => {
+                let label = match sv.verdict {
+                    Verdict::Cancel => "cancel",
+                    Verdict::Downgrade => "downgrade",
+                    Verdict::Keep => "keep",
+                    Verdict::Upgrade => "upgrade",
+                };
+                println!(
+                    "  {email}: {label}  (avg {:.0}%, peak {:.0}%, ~${:.2} recoverable/mo)",
+                    sv.avg_utilization_pct, sv.peak_utilization_pct, sv.recoverable_dollars,
+                );
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
 fn print_bars(labels: &[String], values: &[f64]) {
     let max = values.iter().cloned().fold(0.0_f64, f64::max).max(1e-9);
     for (label, v) in labels.iter().zip(values.iter()) {
@@ -1457,27 +2147,19 @@ fn print_bars(labels: &[String], values: &[f64]) {
 }
 
 // ---------------------------------------------------------------------------
-// launchd install / uninstall
+// Autostart install / uninstall — delegate to the platform Autostart backend
 // ---------------------------------------------------------------------------
-
-fn plist_path() -> Result<std::path::PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(std::path::PathBuf::from(home)
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist")))
-}
 
 /// Path to invoke for the login item and for a post-upgrade relaunch, chosen to
 /// survive `brew upgrade`. `current_exe()` resolves symlinks to the versioned
 /// Homebrew Cellar path, which an upgrade deletes; map that back to the stable
-/// `<prefix>/bin/claude-usage` symlink brew keeps repointing. For a from-source
+/// `<prefix>/bin/usagio` symlink brew keeps repointing. For a from-source
 /// install the resolved path is already stable.
 pub(crate) fn stable_exe_path() -> std::path::PathBuf {
     let exe = std::env::current_exe().unwrap_or_default();
     let s = exe.to_string_lossy();
-    if let Some(idx) = s.find("/Cellar/claude-usage/") {
-        let stable = std::path::PathBuf::from(format!("{}/bin/claude-usage", &s[..idx]));
+    if let Some(idx) = s.find("/Cellar/usagio/") {
+        let stable = std::path::PathBuf::from(format!("{}/bin/usagio", &s[..idx]));
         if stable.exists() {
             return stable;
         }
@@ -1486,62 +2168,66 @@ pub(crate) fn stable_exe_path() -> std::path::PathBuf {
 }
 
 fn cmd_install() -> Result<()> {
-    let exe = stable_exe_path();
-    // No StandardOut/ErrorPath: the app has its own rotated ~/.config log; letting
-    // launchd capture stdout/stderr would accumulate an uncapped file forever.
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{exe}</string>
-    <string>menubar</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><false/>
-</dict>
-</plist>
-"#,
-        label = LAUNCHD_LABEL,
-        exe = exe.display(),
-    );
-    let path = plist_path()?;
-    if let Some(p) = path.parent() {
-        std::fs::create_dir_all(p)?;
-    }
-    std::fs::write(&path, plist).context("writing LaunchAgent plist")?;
+    // One-shot launchd migration: unload + remove the pre-v0.4.0 plist so
+    // an upgrading user doesn't end up with two agents fighting for the
+    // menu bar. Best-effort — a failed unload (e.g. label not loaded)
+    // is fine; only the file-remove failure is worth surfacing.
+    migrate_launchd_if_needed();
 
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", &path.to_string_lossy()])
-        .status();
-    let status = std::process::Command::new("launchctl")
-        .args(["load", "-w", &path.to_string_lossy()])
-        .status()
-        .context("launchctl load")?;
-    if !status.success() {
-        bail!("launchctl load failed for {}", path.display());
-    }
-    println!("Installed and started the claude-usage menu bar app — it now runs at every login.");
+    let exe = stable_exe_path();
+    platform()
+        .autostart()
+        .install(AUTOSTART_LABEL, &exe, &["menubar"])?;
+    println!("Installed and started the usagio menu bar app — it now runs at every login.");
     println!(
         "Logs: {}",
-        store::config_dir()?.join("claude-usage.log").display()
+        store::config_dir()?.join("usagio.log").display()
     );
     Ok(())
 }
 
 fn cmd_uninstall() -> Result<()> {
-    let path = plist_path()?;
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", &path.to_string_lossy()])
-        .status();
-    if path.exists() {
-        std::fs::remove_file(&path).context("removing plist")?;
-    }
+    platform().autostart().uninstall(AUTOSTART_LABEL)?;
+    // Also clean up the pre-v0.4.0 plist if the user last installed under
+    // the `claude-usage` name.
+    migrate_launchd_if_needed();
     println!("Uninstalled — the menu-bar app will no longer start at login.");
     Ok(())
+}
+
+/// One-shot launchd label migration. If a pre-v0.4.0 plist named
+/// `com.claude-usage.menubar.plist` still exists in `~/Library/LaunchAgents/`,
+/// unload it (best-effort) and remove the file so it doesn't run in parallel
+/// with the new `com.mattjackson.usagio.menubar` agent.
+fn migrate_launchd_if_needed() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let old_plist = std::path::PathBuf::from(home)
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LEGACY_AUTOSTART_LABEL}.plist"));
+    if !old_plist.exists() {
+        return;
+    }
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", &old_plist.to_string_lossy()])
+        .status();
+    match std::fs::remove_file(&old_plist) {
+        Ok(()) => {
+            eprintln!(
+                "usagio: removed legacy launchd plist {}",
+                old_plist.display()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "usagio: could not remove legacy launchd plist {}: {}",
+                old_plist.display(),
+                e
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1571,7 +2257,7 @@ fn render_table(rows: &[Row], active: Option<&str>) {
         };
         if !r.has_data() {
             println!(
-                "{marker}  {:<28} no data yet (run the menu-bar app or `claude-usage watch`)",
+                "{marker}  {:<28} no data yet (run the menu-bar app or `usagio watch`)",
                 truncate(&r.email, 28),
             );
             continue;
@@ -1601,8 +2287,8 @@ fn render_table(rows: &[Row], active: Option<&str>) {
         println!("(no active account tracked yet — `capture` the one you're on)");
     }
     println!(
-        "Usage updates on a schedule (menu-bar app / `claude-usage watch`). \
-         Run `claude-usage list --refresh` to fetch now.\n"
+        "Usage updates on a schedule (menu-bar app / `usagio watch`). \
+         Run `usagio list --refresh` to fetch now.\n"
     );
 }
 
