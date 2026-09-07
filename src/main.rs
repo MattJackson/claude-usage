@@ -462,7 +462,7 @@ fn prepare_switch(
     // bail with a distinctive error so the menu / CLI can prompt a fresh
     // login instead of silently overwriting the keychain with a stale token
     // that `claude` will then reject.
-    match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
+    match ensure_fresh_with_fallback(provider, email, &mut acct) {
         Ok(_) => {}
         Err(oauth::RefreshError::InvalidGrant) => {
             flag_needs_relogin(email);
@@ -475,6 +475,42 @@ fn prepare_switch(
     }
     let (identity, backfilled) = resolve_identity(provider, &acct)?;
     Ok((acct, identity, backfilled))
+}
+
+/// `ensure_fresh` with a disk-fallback safety net for the reactive paths
+/// (`cmd_token`, `prepare_switch`). If the initial refresh fails with
+/// `InvalidGrant`, the stored refresh token may just be behind a rotation the
+/// vendor CLI (or another usagio process) already wrote to disk — or fsnotify
+/// may have missed the FSEvent (common after a suspend/resume). Rescan every
+/// registered credential path via `credentials::last_chance_fallback`; if a
+/// usable blob for this account is sitting on disk, adopt it into state.json
+/// and retry the refresh once with the fresh grant. This matches the policy
+/// `refresh_inactive_if_stale` already uses on the proactive path so all three
+/// entry points agree before we surface "needs re-login" to the user.
+fn ensure_fresh_with_fallback(
+    provider: &'static dyn Provider,
+    email: &str,
+    acct: &mut Account,
+) -> std::result::Result<bool, oauth::RefreshError> {
+    match oauth::ensure_fresh(acct, REFRESH_SKEW_SECS) {
+        Ok(b) => Ok(b),
+        Err(oauth::RefreshError::InvalidGrant) => {
+            let key = crate::providers::trait_def::AccountKey::new(provider.provider_id(), email);
+            if credentials::last_chance_fallback(provider, &key) {
+                // Reload the account with the tokens the fallback just
+                // adopted, then retry the refresh once. If the reload fails
+                // or the account vanished, fall through to InvalidGrant.
+                if let Ok(st) = State::load() {
+                    if let Some(fresh) = st.find(email).cloned() {
+                        *acct = fresh;
+                        return oauth::ensure_fresh(acct, REFRESH_SKEW_SECS);
+                    }
+                }
+            }
+            Err(oauth::RefreshError::InvalidGrant)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Best-effort: mark an account `needs_relogin=true` in state.json. If the
@@ -718,7 +754,13 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
         .find(&email)
         .cloned()
         .with_context(|| format!("no account matches '{email}'"))?;
-    let refreshed = match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
+    // Reactive path: try the disk fallback before flagging so a rotation the
+    // vendor CLI wrote to ~/.claude/.credentials.json (or that fsnotify missed)
+    // is adopted here instead of tripping needs_relogin on a token that's
+    // already been superseded on disk.
+    let provider = providers::get(CLAUDE_SLUG)
+        .ok_or_else(|| anyhow!("internal: provider '{CLAUDE_SLUG}' not registered"))?;
+    let refreshed = match ensure_fresh_with_fallback(provider, &email, &mut acct) {
         Ok(b) => b,
         Err(oauth::RefreshError::InvalidGrant) => {
             flag_needs_relogin(&email);
@@ -987,25 +1029,13 @@ fn cell_from_parts(pct: Option<f64>, reset: Option<&str>) -> Cell {
 /// Run `f` holding an exclusive advisory lock on ~/.config/claude-usage/lock,
 /// serializing state read-modify-write across processes (the daemon poll and
 /// concurrent CLI/menu commands). The lock is fd-scoped, so the kernel releases
-/// it if the holder dies. Do NOT do network I/O inside `f`.
+/// it if the holder dies. Reentrant on the current thread, so provider-
+/// implemented callbacks (e.g. `absorb_credential`) can safely take the lock
+/// again from inside another `with_state_lock` frame without self-deadlocking
+/// (see credentials::with_state_lock for the depth-tracking rationale). Do NOT
+/// do network I/O inside `f`.
 fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
-    use fs2::FileExt;
-    let dir = store::config_dir()?;
-    std::fs::create_dir_all(&dir).context("creating ~/.config/claude-usage")?;
-    let lock_path = dir.join("lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .context("opening state lock")?;
-    file.lock_exclusive().context("acquiring state lock")?;
-    let r = f();
-    // Fully-qualified to fs2's trait: std 1.89 added an inherent `File::unlock`
-    // that would otherwise shadow it and break the 1.88 MSRV (fs2 has no such
-    // requirement). Keep this qualified so the call can't drift onto std's.
-    let _ = fs2::FileExt::unlock(&file);
-    r
+    credentials::with_state_lock(f)
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,16 +1237,39 @@ fn refresh_usage_cache() -> RefreshOutcome {
         match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
             Ok(_) => {}
             Err(oauth::RefreshError::InvalidGrant) => {
-                logging::log(&format!(
-                    "token refresh permanently rejected for {email} (invalid_grant); \
-                     flagging for re-login"
-                ));
-                acct.needs_relogin = true;
-                // Fall through to the merge step so the flag is persisted;
-                // skip the usage fetch — a rejected refresh means we don't
-                // have a usable access token to try the usage endpoint with.
-                updates.push((email.clone(), acct, None, None));
-                continue;
+                // Last-chance disk fallback: a rotation may have landed on
+                // disk (from `claude` or another usagio process) DURING this
+                // refresh cycle — after the pre-cycle absorb_all_lagging ran
+                // — so re-scan credential paths for this account and retry
+                // once with the freshly-adopted grant before flagging. This
+                // closes the mid-loop race the pre-cycle absorb can't cover.
+                let key = crate::providers::trait_def::AccountKey::new(
+                    CLAUDE_SLUG, email,
+                );
+                let adopted = credentials::last_chance_fallback(provider, &key);
+                let recovered = if adopted {
+                    match State::load().ok().and_then(|s| s.find(email).cloned()) {
+                        Some(fresh) => {
+                            acct = fresh;
+                            matches!(oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS), Ok(_))
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                if !recovered {
+                    logging::log(&format!(
+                        "token refresh permanently rejected for {email} (invalid_grant); \
+                         flagging for re-login"
+                    ));
+                    acct.needs_relogin = true;
+                    // Fall through to the merge step so the flag is persisted;
+                    // skip the usage fetch — a rejected refresh means we don't
+                    // have a usable access token to try the usage endpoint with.
+                    updates.push((email.clone(), acct, None, None));
+                    continue;
+                }
             }
             Err(e) => {
                 logging::log(&format!(

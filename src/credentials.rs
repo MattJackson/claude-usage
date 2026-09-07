@@ -12,6 +12,7 @@
 //! adding a new provider just means implementing those four methods on its
 //! trait impl.
 
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -28,9 +29,11 @@ use crate::store::{self, State};
 /// happens well before another `claude` invocation could race us.
 pub const REFRESH_SKEW_SECS: i64 = 900;
 
-/// Run `f` holding the shared advisory lock on state.json. Duplicated from
-/// `main::with_state_lock` so provider `absorb_credential` implementations
-/// can commit without importing `main` (which owns the CLI dispatch tree).
+/// Run `f` holding the shared advisory lock on state.json. Provider
+/// `absorb_credential` implementations use this to commit without importing
+/// `main` (which owns the CLI dispatch tree). Reentrant on the current
+/// thread (see `with_state_lock`), so it's safe to call from inside another
+/// `with_state_lock` critical section.
 pub(crate) fn with_state_lock_absorb<F>(f: F) -> PResult<()>
 where
     F: FnOnce(&mut State) -> Result<()>,
@@ -43,8 +46,31 @@ where
     .map_err(|e| ProviderError::Other(format!("state lock: {e:#}")))
 }
 
-fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+thread_local! {
+    /// Depth of nested `with_state_lock` frames on the current thread. The
+    /// outermost frame owns the actual fs2 advisory lock; nested frames
+    /// short-circuit and just run the closure. Without this a call chain like
+    /// `switch_to_guarded` -> `absorb_before_switch` ->
+    /// `Provider::absorb_credential` -> `with_state_lock_absorb` -> `with_state_lock`
+    /// would `open()` the lock file a second time in the same process and
+    /// `flock(LOCK_EX)` on that fresh open file description, which blocks
+    /// forever on both macOS and Linux (per-open-fd semantics).
+    static STATE_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Run `f` holding the shared exclusive advisory lock on the state file.
+/// Serialises state read-modify-write across processes; reentrant within a
+/// single thread so callers can nest without self-deadlocking.
+pub fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     use fs2::FileExt;
+    // Reentrant fast path: we already hold the OS lock on this thread; just
+    // run the closure. The outer frame will unlock when it unwinds.
+    if STATE_LOCK_DEPTH.with(|d| d.get()) > 0 {
+        STATE_LOCK_DEPTH.with(|d| d.set(d.get() + 1));
+        let r = f();
+        STATE_LOCK_DEPTH.with(|d| d.set(d.get() - 1));
+        return r;
+    }
     let dir = store::config_dir()?;
     std::fs::create_dir_all(&dir).context("creating ~/.config/claude-usage")?;
     let lock_path = dir.join("lock");
@@ -55,7 +81,9 @@ fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
         .open(&lock_path)
         .context("opening state lock")?;
     file.lock_exclusive().context("acquiring state lock")?;
+    STATE_LOCK_DEPTH.with(|d| d.set(1));
     let r = f();
+    STATE_LOCK_DEPTH.with(|d| d.set(0));
     // Fully-qualified to fs2's trait: std 1.89 added an inherent unlock() that
     // would otherwise shadow it and break the 1.88 MSRV.
     let _ = fs2::FileExt::unlock(&file);
@@ -109,29 +137,55 @@ pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
 /// token is within REFRESH_SKEW_SECS of expiry. The active account is
 /// deliberately skipped — let the vendor CLI own its own rotation so our
 /// refresh can't race the tokens it's about to write.
-pub fn refresh_inactive_if_stale(active_email: Option<&str>) {
-    let state = match State::load() {
-        Ok(s) => s,
-        Err(e) => {
-            crate::logging::log(&format!("credentials: state load failed: {e:#}"));
-            return;
-        }
-    };
-    let emails: Vec<String> = state
-        .accounts
-        .iter()
-        .filter(|a| !a.needs_relogin)
-        .filter(|a| Some(a.key()) != active_email)
-        .map(|a| a.key().to_string())
-        .collect();
+pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
+    // Snapshot {accounts, active} atomically under the state lock. Using the
+    // hint the caller computed outside the lock is unsafe: a switch that
+    // lands between the caller's read and this function's iteration could
+    // make the "inactive" list include what is now the active account, which
+    // we'd then proactively refresh — reintroducing the race with `claude`'s
+    // own rotation that this whole path is designed to avoid.
+    let (emails, mut active_at_snapshot): (Vec<String>, Option<String>) =
+        match with_state_lock(|| {
+            let st = State::load()?;
+            let active = st.active.clone();
+            let emails = st
+                .accounts
+                .iter()
+                .filter(|a| !a.needs_relogin)
+                .filter(|a| Some(a.key()) != active.as_deref())
+                .map(|a| a.key().to_string())
+                .collect();
+            Ok((emails, active))
+        }) {
+            Ok(t) => t,
+            Err(e) => {
+                crate::logging::log(&format!("credentials: snapshot failed: {e:#}"));
+                return;
+            }
+        };
     for email in emails {
-        let Some(mut acct) = state.find(&email).cloned() else {
+        // Re-check active before doing network work: a concurrent switch may
+        // have promoted this account since the snapshot. Skip if so — the
+        // vendor CLI now owns rotation for it.
+        if let Ok(st) = State::load() {
+            active_at_snapshot = st.active.clone();
+        }
+        if active_at_snapshot.as_deref() == Some(email.as_str()) {
+            continue;
+        }
+        let Some(mut acct) = State::load().ok().and_then(|s| s.find(&email).cloned()) else {
             continue;
         };
         match crate::providers::claude::oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
             Ok(true) => {
                 let _ = with_state_lock(|| {
                     let mut st = State::load()?;
+                    // Belt-and-braces: don't clobber tokens for what is now
+                    // the active account (a switch may have completed while
+                    // we were doing the network refresh).
+                    if st.active.as_deref() == Some(email.as_str()) {
+                        return Ok(());
+                    }
                     if let Some(a) = st.find_mut(&email) {
                         a.set_tokens_if_newer(
                             acct.access_token.clone(),
@@ -261,8 +315,27 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
                 Some(par) if !par.as_os_str().is_empty() => par.to_path_buf(),
                 _ => continue,
             };
+            // Fresh install: ~/.claude may not exist yet at daemon startup.
+            // Create it (0700 on Unix) BEFORE registering the watcher so the
+            // vendor CLI's first write lands under an inode we're already
+            // watching — otherwise we'd miss every fsnotify event until the
+            // next full-scan tick.
             if !parent.exists() {
-                continue;
+                if let Err(e) = std::fs::create_dir_all(&parent) {
+                    crate::logging::log(&format!(
+                        "credentials: mkdir {} failed: {e}",
+                        parent.display()
+                    ));
+                    continue;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &parent,
+                        std::fs::Permissions::from_mode(0o700),
+                    );
+                }
             }
             if watcher.watch(&parent, RecursiveMode::NonRecursive).is_ok() {
                 any_watched = true;

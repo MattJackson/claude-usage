@@ -182,7 +182,18 @@ pub struct State {
 /// `Result` for callsite stability; the underlying trait call is infallible
 /// today.
 pub fn config_dir() -> Result<PathBuf> {
-    Ok(crate::platform().paths().config_dir(crate::APP_SLUG))
+    let p = crate::platform().paths().config_dir(crate::APP_SLUG);
+    // Guard against a platform Paths impl returning an empty or relative path
+    // because e.g. HOME is unset. Every downstream call to `config_dir()`
+    // joins onto this, so a bad root would silently create state under CWD —
+    // fail loudly with actionable context instead.
+    if p.as_os_str().is_empty() || p.is_relative() {
+        anyhow::bail!(
+            "cannot resolve config directory: platform returned {p:?} \
+             (is $HOME set?)"
+        );
+    }
+    Ok(p)
 }
 
 fn state_path() -> Result<PathBuf> {

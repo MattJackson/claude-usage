@@ -307,6 +307,144 @@ fn refresh_skew_is_fifteen_minutes() {
 }
 
 // -----------------------------------------------------------------------------
+// with_state_lock reentrancy — regression test for the switch-time deadlock
+// where absorb_before_switch -> Provider::absorb_credential ->
+// with_state_lock_absorb -> with_state_lock reopens the same lock file and
+// flock(LOCK_EX) blocks forever on the same process's outer frame.
+// -----------------------------------------------------------------------------
+static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn with_isolated_home<F: FnOnce()>(f: F) {
+    let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", td.path());
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+    let _r = Restore(prev);
+    f();
+}
+
+#[test]
+fn nested_with_state_lock_does_not_deadlock() {
+    // The switch path takes with_state_lock, then calls absorb_before_switch
+    // which recurses into with_state_lock_absorb (a Provider::absorb_credential
+    // implementation) which in turn takes with_state_lock again. Before the
+    // reentrancy fix this second flock(LOCK_EX) blocked forever on the same
+    // process's outer frame. Run the nested call on a worker thread and fail
+    // the test if it doesn't complete quickly. Uses the direct `with_state_lock`
+    // (not `with_state_lock_absorb`) so we don't depend on state.json being
+    // seeded — the second flock is what the deadlock hinged on, and the direct
+    // recursion exercises the same reentrancy path.
+    with_isolated_home(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let r: Result<()> = with_state_lock(|| {
+                // Nested direct call — before the fix this blocked forever.
+                with_state_lock(|| Ok(()))?;
+                Ok(())
+            });
+            let _ = tx.send(());
+            r.unwrap();
+        });
+        // 5s is generous; a healthy nested call returns instantly.
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("nested with_state_lock deadlocked (should be reentrant)");
+        handle.join().unwrap();
+    });
+}
+
+// -----------------------------------------------------------------------------
+// spawn_watchers must create a missing credential-parent directory (fresh
+// installs where ~/.claude doesn't exist yet) BEFORE registering the notify
+// watcher — otherwise the vendor CLI's first write lands under an inode we
+// aren't watching and we miss every fsnotify event until the next full-scan.
+// -----------------------------------------------------------------------------
+#[test]
+fn spawn_watchers_creates_missing_parent_dir() {
+    let td = tempfile::tempdir().unwrap();
+    // Parent dir does NOT exist yet — this is the fresh-install condition.
+    let missing_parent = td.path().join("dot-claude");
+    let cred_path = missing_parent.join(".credentials.json");
+    assert!(!missing_parent.exists(), "precondition: parent must be missing");
+
+    let prov = FakeProvider::new("fake-watch").with_path(cred_path.clone());
+    // spawn_watchers requires 'static providers; leak for the test.
+    let prov_static: &'static FakeProvider = Box::leak(Box::new(prov));
+    let handle = spawn_watchers(vec![prov_static as &'static dyn Provider]);
+
+    assert!(
+        missing_parent.exists(),
+        "spawn_watchers should have created the missing parent dir"
+    );
+    assert!(handle.is_some(), "watcher should have registered on the newly-created dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&missing_parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "credential parent must be 0700 for privacy");
+    }
+    // Drop handle → notify watcher stops, thread exits.
+    drop(handle);
+}
+
+// -----------------------------------------------------------------------------
+// refresh_inactive_if_stale: snapshot must come from inside the state lock,
+// and the mid-tick re-check must skip an account that has BECOME active since
+// the snapshot. We validate the pure state-inspection behaviour: if the only
+// account is also the active one, the function returns without doing any
+// provider-visible work — proving the filter honors the intra-lock snapshot
+// rather than the (possibly stale) hint the caller passed.
+// -----------------------------------------------------------------------------
+#[test]
+fn refresh_inactive_if_stale_skips_currently_active_account() {
+    use crate::store::{Account, State};
+    with_isolated_home(|| {
+        // Seed state.json: one account, marked active. If the fn refreshed it
+        // we'd race the vendor CLI's rotation — which is the whole bug.
+        with_state_lock(|| {
+            let mut st = State::default();
+            let a = Account {
+                email: Some("only@e.com".into()),
+                access_token: "tok".into(),
+                refresh_token: "rt".into(),
+                // Well in the future so ensure_fresh would be a no-op if it
+                // did (incorrectly) run — the assertion below still holds
+                // because we assert nothing FLIPPED, not that no call was made.
+                expires_at: (chrono::Utc::now().timestamp() + 3600) * 1000,
+                keychain_blob: String::new(),
+                oauth_account: None,
+                user_id: None,
+                cached_usage: None,
+                notif_state: crate::notifications::NotifState::default(),
+                needs_relogin: false,
+            };
+            st.accounts.push(a);
+            st.active = Some("only@e.com".into());
+            st.save()
+        })
+        .unwrap();
+
+        // Pass a DELIBERATELY WRONG hint (None) — the fn must ignore it and
+        // read `active` from inside the state lock. If it trusted the hint it
+        // would proceed to ensure_fresh (network) on the active account.
+        refresh_inactive_if_stale(None);
+
+        // State unchanged, active preserved, no needs_relogin flip.
+        let st = State::load().unwrap();
+        assert_eq!(st.active.as_deref(), Some("only@e.com"));
+        assert!(!st.accounts[0].needs_relogin);
+    });
+}
+
+// -----------------------------------------------------------------------------
 // Silence the unused-import warning on `Value` — kept around for future test
 // growth and to document that fixtures traffic in raw JSON strings, not
 // pre-parsed structures (the sync layer only ever sees blobs).
