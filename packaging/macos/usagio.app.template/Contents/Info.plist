@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Bundle scaffold for `usagio.app`.
+
+  This is a *template*: release.yml copies this directory into a build dir,
+  sed-substitutes {{VERSION}}, drops the universal (lipo'd) binary into
+  Contents/MacOS/usagio and the generated AppIcon.icns into
+  Contents/Resources/, then ad-hoc codesigns the result. It exists purely so
+  macOS's Login Items UI (System Settings > General > Login Items) reads a
+  real bundle icon instead of the generic "exec" glyph a bare binary gets —
+  see packaging/macos/generate-icns.sh and the "Bump Homebrew tap formula"
+  step of .github/workflows/release.yml.
+
+  Not signed with a Developer ID (no Apple Developer account yet) — only
+  ad-hoc signed. Gatekeeper may still warn on first manual launch of the
+  bundle, but `brew install` / `usagio install` never trigger that path.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.mattjackson.usagio</string>
+
+  <key>CFBundleName</key>
+  <string>usagio</string>
+
+  <key>CFBundleDisplayName</key>
+  <string>usagio</string>
+
+  <key>CFBundleVersion</key>
+  <string>{{VERSION}}</string>
+
+  <key>CFBundleShortVersionString</key>
+  <string>{{VERSION}}</string>
+
+  <key>CFBundleExecutable</key>
+  <string>usagio</string>
+
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+
+  <!-- Menu-bar only: no Dock icon, no app switcher entry. -->
+  <key>LSUIElement</key>
+  <true/>
+
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
+
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>

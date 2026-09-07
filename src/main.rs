@@ -2176,6 +2176,56 @@ pub(crate) fn stable_exe_path() -> std::path::PathBuf {
     exe
 }
 
+/// Path to hand `launchctl` for the LaunchAgent's `ProgramArguments`, chosen
+/// so Login Items shows the usagio app icon (see `packaging/macos/`) instead
+/// of the generic "exec" glyph a bare binary gets. Resolution order:
+///
+/// 1. If we're already executing from inside a bundle — `current_exe()`
+///    contains `.app/Contents/MacOS/` — use that path as-is. This is the
+///    case once `usagio install` itself is invoked via the bundled
+///    executable (e.g. a future launcher), and it's already the
+///    Cellar-versioned bundle path brew keeps stable per version.
+/// 2. Otherwise, probe for a sibling `usagio.app` next to the resolved
+///    stable binary: a Homebrew install lays out
+///    `<Cellar>/usagio/<version>/bin/usagio` alongside
+///    `<Cellar>/usagio/<version>/usagio.app/Contents/MacOS/usagio`, so from
+///    the binary's `bin/` directory, `usagio.app` is one level up.
+/// 3. Fall back to the bare [`stable_exe_path`] if no bundle is found (a
+///    from-source install, or a brew formula version predating the bundle).
+pub(crate) fn launch_agent_exe_path() -> std::path::PathBuf {
+    let current = std::env::current_exe().unwrap_or_default();
+    if current.to_string_lossy().contains(".app/Contents/MacOS/") {
+        return current;
+    }
+    let stable = stable_exe_path();
+    sibling_app_bundle_exe(&stable).unwrap_or(stable)
+}
+
+/// Given a path to `.../<version>/bin/usagio` (or a symlink resolving to
+/// it), look for `.../<version>/usagio.app/Contents/MacOS/usagio` next to
+/// it. Checks both the path as given and its canonicalized form, so tests
+/// can point directly at a `bin/` directory without a real Homebrew symlink
+/// chain.
+fn sibling_app_bundle_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut candidates = vec![exe.to_path_buf()];
+    if let Ok(resolved) = std::fs::canonicalize(exe) {
+        candidates.push(resolved);
+    }
+    for path in candidates {
+        let bin_dir = path.parent()?; // .../<version>/bin
+        let version_dir = bin_dir.parent()?; // .../<version>
+        let bundle_exe = version_dir
+            .join("usagio.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("usagio");
+        if bundle_exe.exists() {
+            return Some(bundle_exe);
+        }
+    }
+    None
+}
+
 fn cmd_install() -> Result<()> {
     // One-shot launchd migration: unload + remove the pre-v0.4.0 plist so
     // an upgrading user doesn't end up with two agents fighting for the
@@ -2183,7 +2233,7 @@ fn cmd_install() -> Result<()> {
     // is fine; only the file-remove failure is worth surfacing.
     migrate_launchd_if_needed();
 
-    let exe = stable_exe_path();
+    let exe = launch_agent_exe_path();
     platform()
         .autostart()
         .install(AUTOSTART_LABEL, &exe, &["menubar"])?;
