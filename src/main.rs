@@ -408,9 +408,38 @@ fn prepare_switch(
         .find(email)
         .cloned()
         .with_context(|| format!("no account matches '{email}'"))?;
-    oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS)?;
+    // Reactive refresh with a clear signal on hard failure. If the refresh
+    // token has been invalidated (single-use / rotated elsewhere / revoked),
+    // bail with a distinctive error so the menu / CLI can prompt a fresh
+    // login instead of silently overwriting the keychain with a stale token
+    // that `claude` will then reject.
+    match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
+        Ok(_) => {}
+        Err(oauth::RefreshError::InvalidGrant) => {
+            flag_needs_relogin(email);
+            bail!(
+                "account {email} needs re-login (refresh token rejected); run \
+                 `claude /login` for it or click the account row in the menu"
+            );
+        }
+        Err(e) => bail!("token refresh for {email} failed: {e}"),
+    }
     let (identity, backfilled) = resolve_identity(provider, &acct)?;
     Ok((acct, identity, backfilled))
+}
+
+/// Best-effort: mark an account `needs_relogin=true` in state.json. If the
+/// state lock is held or the save fails, the next `refresh_usage_cache` tick
+/// re-observes the invalid_grant and sets it again — callers that need
+/// certainty already surface a distinct error to the user.
+fn flag_needs_relogin(email: &str) {
+    let _ = with_state_lock(|| {
+        let mut st = State::load()?;
+        if let Some(a) = st.find_mut(email) {
+            a.needs_relogin = true;
+        }
+        st.save()
+    });
 }
 
 /// The locked phase of a switch, optionally guarded by `expect_active`: if given
@@ -635,7 +664,17 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
         .find(&email)
         .cloned()
         .with_context(|| format!("no account matches '{email}'"))?;
-    let refreshed = oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS)?;
+    let refreshed = match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
+        Ok(b) => b,
+        Err(oauth::RefreshError::InvalidGrant) => {
+            flag_needs_relogin(&email);
+            bail!(
+                "account {email} needs re-login (refresh token rejected); run \
+                 `claude /login` for it or click the account row in the menu"
+            );
+        }
+        Err(e) => bail!("token refresh for {email} failed: {e}"),
+    };
     let token = acct.access_token.clone();
     // Phase 2 (locked): persist a rotation without clobbering a fresher one.
     if refreshed {
@@ -685,6 +724,10 @@ struct Row {
     /// In v1 every row is `"claude"`; a Row whose slug isn't registered is
     /// simply skipped as an auto-swap candidate.
     provider_id: String,
+    /// True when the OAuth token endpoint has permanently rejected this
+    /// account's refresh token. Filtered out of the auto-swap picker and
+    /// surfaced by the menu as a re-login row.
+    needs_relogin: bool,
     email: String,
     session: Cell,
     weekly: Cell,
@@ -716,6 +759,7 @@ fn row_from_account(a: &Account) -> Row {
         // account with its containing provider slug and this becomes a real
         // per-account lookup.
         provider_id: CLAUDE_SLUG.to_string(),
+        needs_relogin: a.needs_relogin,
         email: a.key().to_string(),
         session: cell_from_parts(
             c.and_then(|c| c.session_pct),
@@ -1141,11 +1185,32 @@ fn refresh_usage_cache() -> RefreshOutcome {
             continue;
         };
         let mut acct = acct;
-        if let Err(e) = oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
-            logging::log(&format!(
-                "token refresh failed for {email}: {e} (keeping cache)"
-            ));
+        // Skip accounts already flagged needs_relogin — no useful token to
+        // reason about, and hammering an invalid_grant refresh both wastes
+        // requests and can trip rate limits shared across the tenant.
+        if acct.needs_relogin {
             continue;
+        }
+        match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
+            Ok(_) => {}
+            Err(oauth::RefreshError::InvalidGrant) => {
+                logging::log(&format!(
+                    "token refresh permanently rejected for {email} (invalid_grant); \
+                     flagging for re-login"
+                ));
+                acct.needs_relogin = true;
+                // Fall through to the merge step so the flag is persisted;
+                // skip the usage fetch — a rejected refresh means we don't
+                // have a usable access token to try the usage endpoint with.
+                updates.push((email.clone(), acct, None, None));
+                continue;
+            }
+            Err(e) => {
+                logging::log(&format!(
+                    "token refresh failed for {email}: {e} (keeping cache)"
+                ));
+                continue;
+            }
         }
         let cu = match usage::fetch(&acct.access_token) {
             Ok(u) => Some(cached_from_usage(&u)),
@@ -1224,6 +1289,10 @@ fn refresh_usage_cache() -> RefreshOutcome {
                     acct.refresh_token.clone(),
                     acct.expires_at,
                 );
+                // Propagate the flag from the phase-1 snapshot to the locked
+                // state. `set_tokens_if_newer` only writes on a real refresh,
+                // so we mirror this bit explicitly here.
+                a.needs_relogin = acct.needs_relogin;
                 if let Some(cu) = cu {
                     a.cached_usage = Some(cu.clone());
                 }
@@ -1370,6 +1439,10 @@ fn choose_swap_target(
         // capability gate for auto-swap: reporting-only or stub providers
         // never surface here, even if their rows carry a stale utilization.
         .filter(|r| provider_supports_swap(&r.provider_id))
+        // Skip candidates the token endpoint has permanently rejected —
+        // swapping to a needs-relogin account would just re-write the same
+        // dead credentials into the keychain.
+        .filter(|r| !r.needs_relogin)
         // Skip candidates whose provider has its env-override active — a
         // switch to them would be silently ignored by the vendor CLI.
         .filter(|r| !env_override_active(&r.provider_id))

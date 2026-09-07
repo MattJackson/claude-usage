@@ -46,6 +46,26 @@ fn needs_refresh_saturates_on_corrupt_expiry() {
 }
 
 #[test]
+fn refresh_with_empty_refresh_token_returns_invalid_grant_without_network() {
+    // No refresh token to send is treated identically to a rejected grant so
+    // the caller flags for re-login instead of hammering the endpoint.
+    let mut a = acct_expiring_at(0);
+    a.refresh_token.clear();
+    let err = refresh(&mut a).expect_err("empty refresh token must not succeed");
+    assert!(matches!(err, RefreshError::InvalidGrant));
+}
+
+#[test]
+fn refresh_error_display_carries_variant() {
+    // Callers log these; make sure the InvalidGrant string is stable enough
+    // to be recognized (the fix hinges on catching invalid_grant explicitly).
+    assert!(RefreshError::InvalidGrant.to_string().contains("invalid_grant"));
+    assert!(RefreshError::RateLimited.to_string().contains("429"));
+    let s = RefreshError::Transient("boom".into()).to_string();
+    assert!(s.contains("boom"));
+}
+
+#[test]
 fn token_response_allows_missing_refresh_token() {
     // RFC 6749 §6: refresh_token is OPTIONAL in a refresh-grant response.
     let r: TokenResponse =
