@@ -161,9 +161,13 @@ pub struct State {
     pub trigger_pct: Option<f64>,
 }
 
+/// Per-app config directory. Delegates to the platform Paths backend so the
+/// path resolves to the OS-appropriate location (`~/.config/claude-usage` on
+/// macOS, XDG on Linux, `%APPDATA%\claude-usage` on Windows). Kept as a
+/// `Result` for callsite stability; the underlying trait call is infallible
+/// today.
 pub fn config_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".config").join("claude-usage"))
+    Ok(crate::platform().paths().config_dir(crate::APP_SLUG))
 }
 
 fn state_path() -> Result<PathBuf> {

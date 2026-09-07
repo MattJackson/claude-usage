@@ -386,69 +386,30 @@ fn map_usage_error(e: usage::FetchError) -> ProviderError {
     }
 }
 
-// ---- Keychain (macOS: `security` CLI; other OSes: unsupported) -----------
+// ---- Keychain — delegate to the platform SecretStore ---------------------
+//
+// The macOS impl uses the `security` CLI to sidestep the Security.framework
+// prompt on unsigned binaries; Linux uses secret-service; Windows uses
+// Credential Manager. See `crate::platform::macos` for the historical
+// rationale.
 
 fn keychain_account() -> String {
     std::env::var("USER").unwrap_or_else(|_| "claude".to_string())
 }
 
-#[cfg(target_os = "macos")]
 fn keychain_read() -> Option<String> {
-    let out = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            &keychain_account(),
-            "-w",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    crate::platform()
+        .secrets()
+        .get(KEYCHAIN_SERVICE, &keychain_account())
+        .ok()
+        .flatten()
 }
 
-#[cfg(target_os = "macos")]
 fn keychain_write(blob: &str) -> PResult<()> {
-    let status = std::process::Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            &keychain_account(),
-            "-w",
-            blob,
-        ])
-        .status()
-        .map_err(ProviderError::Io)?;
-    if !status.success() {
-        return Err(ProviderError::Other(
-            "`security add-generic-password` failed".into(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_read() -> Option<String> {
-    None
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_write(_blob: &str) -> PResult<()> {
-    Err(ProviderError::Other(
-        "keychain is only supported on macOS".into(),
-    ))
+    crate::platform()
+        .secrets()
+        .set(KEYCHAIN_SERVICE, &keychain_account(), blob)
+        .map_err(|e| ProviderError::Other(format!("{e:#}")))
 }
 
 // ---- ~/.claude.json identity read/write (mirrors main.rs helpers) --------
