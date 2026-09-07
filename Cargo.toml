@@ -1,6 +1,6 @@
 [package]
 name = "usagio"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Track usage / limits across every AI coding CLI you use, and switch between accounts."
@@ -83,6 +83,12 @@ dirs = "6"
 thiserror = "1"
 toml = "0.8"
 tiktoken-rs = { version = "0.7", optional = true }
+
+# Native Save/Restore file panels for the menu-bar "Backups ▸" submenu. Default
+# features pick the lightest working backend per OS (native NSSavePanel/
+# NSOpenPanel on macOS and the Win32 common dialog on Windows; XDG portal on
+# Linux) without pulling GTK.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "common-controls-v6"] }
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status

@@ -214,6 +214,12 @@ pub struct State {
     /// Menu-bar: swap trigger threshold percent (defaults to 95).
     #[serde(default)]
     pub trigger_pct: Option<f64>,
+    /// Menu-bar: Settings ▸ Notifications ▸ per-trigger enable checkboxes
+    /// (threshold crossings / reset-back / weekly-pace projection). Read by
+    /// `watch_cycle` on every poll so a menu toggle takes effect on the next
+    /// cycle without a restart.
+    #[serde(default)]
+    pub notification_config: crate::notifications::NotificationConfig,
     /// Emails this in-memory state has explicitly requested be dropped via
     /// `remove()`. NOT serialized — transient authorization consumed by
     /// `save_state_safe`, so `save()` can distinguish "the caller meant to
@@ -367,6 +373,10 @@ impl State {
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
             trigger_pct: v.get("trigger_pct").and_then(|x| x.as_f64()),
+            notification_config: v
+                .get("notification_config")
+                .and_then(|x| serde_json::from_value(x.clone()).ok())
+                .unwrap_or_default(),
             pending_removals: HashSet::new(),
         }
     }
@@ -570,7 +580,7 @@ pub fn save_state_safe(state: &State) -> Result<()> {
 /// dump when `save_state_safe` refuses a write. Preserves account keys,
 /// emails, `active`, and `pending_removals` so the developer can reason
 /// about what was rejected — replaces every secret string with "<redacted>".
-fn redact_state_for_dump(state: &State) -> serde_json::Value {
+pub(crate) fn redact_state_for_dump(state: &State) -> serde_json::Value {
     let accounts: Vec<serde_json::Value> = state
         .accounts
         .iter()
@@ -677,8 +687,13 @@ pub(crate) fn prune_rejected_dumps(dir: &Path, keep: usize) -> Result<()> {
     Ok(())
 }
 
-/// List backup files (name, mtime) newest-first. Used by the "Restore from
-/// backup ▸" menu to render its entries.
+/// List backup files (name, mtime) newest-first. v0.5.0 dropped the menu-bar
+/// "Restore from backup ▸ <list>" submenu that used to render these directly
+/// (replaced by a native file panel defaulting to the backups directory —
+/// see `menubar::handle_backup_restore_dialog`), but this stays a public,
+/// tested entry point for anything that wants to enumerate rolling backups
+/// (a future `usagio backups list` CLI command, or a test).
+#[allow(dead_code)]
 pub fn list_backups() -> Result<Vec<(PathBuf, std::time::SystemTime)>> {
     let dir = config_dir()?.join("backups");
     if !dir.exists() {
