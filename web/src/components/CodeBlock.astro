@@ -1,0 +1,13 @@
+---
+// Dark terminal-style code block with a mac-window bar. Slot in raw text or
+// pre-highlighted spans (.c comment, .p prompt, .s string).
+export interface Props { label?: string }
+const { label = 'shell' } = Astro.props;
+---
+<div class="codeblock">
+  <div class="codeblock-bar" aria-hidden="true">
+    <span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span>
+    <span class="label">{label}</span>
+  </div>
+  <pre><code><slot /></code></pre>
+</div>

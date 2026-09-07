@@ -1,0 +1,167 @@
+---
+// Shell for every page: HTML head with SEO + OG + JSON-LD, header, main slot,
+// footer, and one tiny inline IntersectionObserver that adds `is-in` to any
+// `.fade-up` element as it scrolls into view (respects prefers-reduced-motion,
+// per global.css).
+import '../styles/global.css';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+
+export interface Props {
+  title: string;
+  description: string;
+  path?: string;                       // e.g. "/download/"
+  current?: 'home' | 'download';
+}
+const {
+  title,
+  description,
+  path = '/',
+  current = 'home',
+} = Astro.props;
+
+const site = Astro.site?.toString().replace(/\/$/, '') ?? 'https://usagio.dev';
+const canonical = `${site}${path}`;
+const ogImage = `${site}/favicon.svg`;
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={ogImage} />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+
+    <!-- Theme init BEFORE first paint. If user has an explicit choice in
+         localStorage, apply it; else defer to prefers-color-scheme via the
+         CSS media query. Kept tiny + inline to avoid FOUC. -->
+    <script is:inline>
+      (function () {
+        try {
+          var t = localStorage.getItem('usagio-theme');
+          if (t === 'dark' || t === 'light') {
+            document.documentElement.setAttribute('data-theme', t);
+          }
+        } catch (_) {}
+      })();
+    </script>
+
+    <script
+      type="application/ld+json"
+      set:html={JSON.stringify({
+        '@context': 'https://schema.org',
+        '@graph': [
+          {
+            '@type': 'WebSite',
+            '@id': `${site}/#website`,
+            url: `${site}/`,
+            name: 'usagio',
+            description,
+          },
+          {
+            '@type': 'SoftwareApplication',
+            '@id': `${site}/#app`,
+            name: 'usagio',
+            applicationCategory: 'DeveloperApplication',
+            operatingSystem: 'macOS',
+            url: `${site}/`,
+            downloadUrl: `${site}/download/`,
+            license: 'https://opensource.org/licenses/MIT',
+            isAccessibleForFree: true,
+            offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+          },
+        ],
+      })}
+    />
+  </head>
+  <body>
+    <Header current={current} />
+    <main><slot /></main>
+    <Footer />
+
+    <script is:inline>
+      // Progressive fade-up on scroll. No-op when the browser opts out.
+      (function () {
+        var mql = window.matchMedia('(prefers-reduced-motion: reduce)');
+        if (mql.matches || !('IntersectionObserver' in window)) {
+          document.querySelectorAll('.fade-up').forEach(function (el) { el.classList.add('is-in'); });
+          return;
+        }
+        var io = new IntersectionObserver(function (entries) {
+          entries.forEach(function (entry) {
+            if (entry.isIntersecting) {
+              entry.target.classList.add('is-in');
+              io.unobserve(entry.target);
+            }
+          });
+        }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+        document.querySelectorAll('.fade-up').forEach(function (el) { io.observe(el); });
+      })();
+    </script>
+
+    <script is:inline>
+      // Theme toggle click handler. Cycles: user-picked ↔ opposite,
+      // persisted to localStorage. Reading current effective mode uses
+      // matchMedia so we invert whatever is actually painted.
+      (function () {
+        var btn = document.getElementById('theme-toggle');
+        if (!btn) return;
+        btn.addEventListener('click', function () {
+          var explicit = document.documentElement.getAttribute('data-theme');
+          var current = explicit
+            || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+          var next = current === 'dark' ? 'light' : 'dark';
+          document.documentElement.setAttribute('data-theme', next);
+          try { localStorage.setItem('usagio-theme', next); } catch (_) {}
+        });
+      })();
+    </script>
+
+    <script is:inline>
+      // Copy-command buttons. Any element with [data-copy] gets a click
+      // handler: copy the attribute value to clipboard, swap the button's
+      // label to "Copied ✓" for ~1.5s, then revert. Vanilla, no framework.
+      (function () {
+        var COPIED_MS = 1500;
+        function bind(el) {
+          var original = el.textContent;
+          var text = el.getAttribute('data-copy') || '';
+          el.addEventListener('click', function (e) {
+            e.preventDefault();
+            var done = function () {
+              el.classList.add('is-copied');
+              el.textContent = 'Copied ✓';
+              window.setTimeout(function () {
+                el.classList.remove('is-copied');
+                el.textContent = original;
+                el.blur();
+              }, COPIED_MS);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(text).then(done, function () {
+                // Clipboard denied — still give feedback so nothing feels stuck.
+                el.textContent = 'Copy failed';
+                window.setTimeout(function () { el.textContent = original; }, COPIED_MS);
+              });
+            } else {
+              done();
+            }
+          });
+        }
+        document.querySelectorAll('[data-copy]').forEach(bind);
+      })();
+    </script>
+  </body>
+</html>

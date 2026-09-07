@@ -1,5 +1,7 @@
 # usagio
 
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/MattJackson)
+
 [![CI](https://github.com/MattJackson/claude-usage/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/claude-usage/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/usagio?display_name=tag&sort=semver)](https://github.com/MattJackson/claude-usage/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -24,8 +26,10 @@ interrupts your work.
 ## Install
 
 ```sh
-brew install MattJackson/tap/usagio
-usagio install     # menu-bar app + auto-swap, now and at every login
+brew tap mattjackson/tap
+brew tap --trust mattjackson/tap        # third-party tap — approve once
+brew install mattjackson/tap/usagio
+usagio install                          # menu-bar app + auto-swap, now and at every login
 ```
 
 Upgrades come through Homebrew: `brew upgrade usagio` — a running menu-bar app

@@ -1,0 +1,37 @@
+usagio marketing site — third-party notices
+============================================
+
+Vendor icons displayed on the "supported CLIs" grid (web/public/icons/) are
+redistributed under the licenses below. The usagio project is not affiliated
+with any of the vendors these logos represent.
+
+Icon sources
+------------
+
+Simple Icons — https://simpleicons.org
+    License: CC0-1.0 (public domain dedication)
+    Used for: claude-code, opencode, qwen-code, copilot-cli, cursor-agent,
+              cline, kimi, deepseek, openrouter
+
+Lobe Icons — https://github.com/lobehub/lobe-icons
+    License: MIT
+    Used for: codex, gemini-cli, amazon-q, grok, zai, fireworks
+
+Monogram placeholder (generated in-house)
+    Used for: synthetic
+
+The full per-icon source mapping is preserved in the upstream manifest.json
+that accompanied the icon delivery.
+
+Trademarks
+----------
+
+Claude and Claude Code are trademarks of Anthropic, PBC.
+Codex is a trademark of OpenAI, Inc.
+Cursor is a trademark of Anysphere, Inc.
+Copilot is a trademark of GitHub, Inc.
+Gemini is a trademark of Google LLC.
+Other product names may be trademarks of their respective owners.
+
+usagio is an independent open-source project and is not affiliated with,
+endorsed by, or sponsored by any of these vendors.

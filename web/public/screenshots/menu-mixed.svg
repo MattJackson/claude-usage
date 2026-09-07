@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- TODO(usagio): replace with real screenshot after menu redesign lands -->
+<!-- Mixed state: one account amber (82%), one red (94%), some healthy. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter', system-ui, sans-serif" role="img" aria-label="usagio menu dropdown, mixed usage state">
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feGaussianBlur stdDeviation="8" in="SourceAlpha"/>
+      <feOffset dy="6"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.22"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <linearGradient id="chrome" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.98"/>
+      <stop offset="1" stop-color="#f6f6f4" stop-opacity="0.98"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="640" height="360" fill="#ecebe6"/>
+  <circle cx="120" cy="60" r="180" fill="#f4e0d8" opacity="0.55"/>
+  <circle cx="560" cy="320" r="200" fill="#e2ecff" opacity="0.55"/>
+
+  <g filter="url(#shadow)">
+    <rect x="40" y="30" width="560" height="300" rx="10" fill="url(#chrome)" stroke="#d9d8d2" stroke-width="1"/>
+
+    <!-- Row 1: amber warning at 82% -->
+    <g font-size="13">
+      <text x="60" y="63" fill="#17171a">
+        <tspan font-weight="600">Claude</tspan>
+        <tspan fill="#6b6b74"> · </tspan>
+        <tspan>matt@example.com</tspan>
+        <tspan fill="#6b6b74"> · </tspan>
+        <tspan fill="#16a34a" font-weight="600">S 42%</tspan>
+        <tspan fill="#6b6b74"> · </tspan>
+        <tspan fill="#d97706" font-weight="700">W 82%</tspan>
+      </text>
+      <text x="548" y="63" fill="#17171a" font-weight="600">✓</text>
+      <text x="574" y="63" fill="#9a9aa3">▸</text>
+    </g>
+
+    <!-- Row 2: red critical at 94% -->
+    <g font-size="13">
+      <text x="60" y="93" fill="#17171a">
+        <tspan font-weight="600">Claude</tspan>
+        <tspan fill="#6b6b74"> · </tspan>
+        <tspan>matt+work@example.com</tspan>
+        <tspan fill="#6b6b74"> · </tspan>
+        <tspan fill="#dc2626" font-weight="700">S 94%</tspan>
+        <tspan fill="#6b6b74"> · </tspan>
+        <tspan fill="#d97706" font-weight="700">W 71%</tspan>
+      </text>
+      <text x="574" y="93" fill="#9a9aa3">▸</text>
+    </g>
+
+    <line x1="52" y1="112" x2="588" y2="112" stroke="#ececea" stroke-width="1"/>
+
+    <!-- Row 3: healthy Codex -->
+    <g font-size="13">
+      <text x="60" y="135" fill="#17171a">
+        <tspan font-weight="600">Codex</tspan>
+        <tspan fill="#6b6b74"> · </tspan>
+        <tspan>matt@example.com</tspan>
+        <tspan fill="#6b6b74"> · </tspan>
+        <tspan fill="#16a34a" font-weight="600">S 33%</tspan>
+        <tspan fill="#6b6b74"> · </tspan>
+        <tspan fill="#9a9aa3">W —</tspan>
+      </text>
+      <text x="574" y="135" fill="#9a9aa3">▸</text>
+    </g>
+
+    <line x1="52" y1="154" x2="588" y2="154" stroke="#ececea" stroke-width="1"/>
+
+    <text x="60" y="177" font-size="13" fill="#17171a">Capture current login</text>
+    <text x="574" y="177" font-size="13" fill="#9a9aa3">▸</text>
+
+    <line x1="52" y1="196" x2="588" y2="196" stroke="#ececea" stroke-width="1"/>
+
+    <text x="60" y="219" font-size="13" fill="#17171a">Settings</text>
+    <text x="574" y="219" font-size="13" fill="#9a9aa3">▸</text>
+
+    <line x1="52" y1="238" x2="588" y2="238" stroke="#ececea" stroke-width="1"/>
+
+    <text x="60" y="261" font-size="13" fill="#17171a">Quit</text>
+  </g>
+</svg>

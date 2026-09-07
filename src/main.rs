@@ -2210,8 +2210,15 @@ fn migrate_launchd_if_needed() {
     if !old_plist.exists() {
         return;
     }
+    // Best-effort: the plist may already be unloaded (typical after a reboot
+    // or `brew uninstall`). launchctl prints "Unload failed: 5: Input/output
+    // error" to stderr in that case, which surfaces as a scary line during
+    // `usagio install`. Swallow stdout+stderr — we only care whether the
+    // file removal below succeeds.
     let _ = std::process::Command::new("launchctl")
         .args(["unload", &old_plist.to_string_lossy()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     match std::fs::remove_file(&old_plist) {
         Ok(()) => {

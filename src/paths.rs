@@ -72,11 +72,9 @@ pub fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, Migrat
     match (old_exists, new_exists) {
         (false, false) => Ok(MigrationResult::FreshInstall),
         (true, true) => {
-            eprintln!(
-                "usagio: both {} and {} exist; using new, old left in place",
-                old.display(),
-                new.display()
-            );
+            // Caller (main.rs) prints the user-facing warning with more
+            // context. Keep this branch silent so users don't see two
+            // near-identical lines about the same event.
             Ok(MigrationResult::BothExisted {
                 new: new.to_path_buf(),
                 old: old.to_path_buf(),
