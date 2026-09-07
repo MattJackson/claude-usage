@@ -375,7 +375,15 @@ impl State {
             trigger_pct: v.get("trigger_pct").and_then(|x| x.as_f64()),
             notification_config: v
                 .get("notification_config")
-                .and_then(|x| serde_json::from_value(x.clone()).ok())
+                .and_then(|x| match serde_json::from_value(x.clone()) {
+                    Ok(cfg) => Some(cfg),
+                    Err(e) => {
+                        crate::logging::log(&format!(
+                            "warn: failed to parse notification_config, resetting to defaults: {e}"
+                        ));
+                        None
+                    }
+                })
                 .unwrap_or_default(),
             pending_removals: HashSet::new(),
         }
