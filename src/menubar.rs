@@ -1689,6 +1689,20 @@ fn handle_backup_save() {
 /// we ALSO stash the live file to a `/tmp` sidecar right before overwriting
 /// it, so the restore itself is reversible even if the user picked a very old
 /// backup.
+/// Resolve the "how many accounts does the CURRENT state have" half of the
+/// restore drop-count check. A `State::load()` failure (e.g. a transient read
+/// racing the poll daemon's own write) must NOT silently become "0 accounts"
+/// — that would make `new_count < old_count` false and skip the drop-warning
+/// prompt exactly when it matters most. Instead we abort the restore loudly.
+fn restore_old_account_count(loaded: Result<State>) -> Result<usize, String> {
+    match loaded {
+        Ok(s) => Ok(s.accounts.len()),
+        Err(e) => Err(format!(
+            "Restore aborted: couldn't read current state to compare (retry in a moment): {e}"
+        )),
+    }
+}
+
 fn handle_backup_restore_dialog() {
     let mut dialog = rfd::FileDialog::new().add_filter("usagio state (*.json)", &["json"]);
     if let Ok(p) = crate::store::state_json_path() {
@@ -1721,7 +1735,13 @@ fn handle_backup_restore_dialog() {
         return;
     };
     let new_count = new_accounts.len();
-    let old_count = State::load().unwrap_or_default().accounts.len();
+    let old_count = match restore_old_account_count(State::load()) {
+        Ok(n) => n,
+        Err(msg) => {
+            notify(&msg);
+            return;
+        }
+    };
     if new_count < old_count {
         let question = format!(
             "Selected file has {new_count} account(s); current state has {old_count}. \
@@ -2102,6 +2122,29 @@ mod tests {
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
         }
+    }
+
+    #[test]
+    fn restore_old_account_count_aborts_loudly_on_load_error() {
+        let err = restore_old_account_count(Err(anyhow::anyhow!("disk read failed")))
+            .expect_err("a State::load() error must abort, not default to 0");
+        assert!(
+            err.starts_with("Restore aborted:"),
+            "abort message must be unambiguous: {err}"
+        );
+        assert!(
+            err.contains("disk read failed"),
+            "abort message should surface the underlying error: {err}"
+        );
+    }
+
+    #[test]
+    fn restore_old_account_count_passes_through_on_success() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let state = State::default();
+        let n =
+            restore_old_account_count(Ok(state.clone())).expect("a successful load must not abort");
+        assert_eq!(n, state.accounts.len());
     }
 
     #[test]
