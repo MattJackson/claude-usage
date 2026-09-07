@@ -15,6 +15,7 @@ mod logging;
 #[cfg(target_os = "macos")]
 mod menubar;
 mod notifications;
+mod platform;
 mod pricing;
 mod providers;
 mod store;
@@ -35,6 +36,11 @@ use store::{Account, CachedUsage, State};
 const CLAUDE_SLUG: &str = "claude";
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+/// App slug used everywhere we ask the platform for a per-app directory
+/// (`~/.config/claude-usage` on macOS, `$XDG_CONFIG_HOME/claude-usage` on
+/// Linux, `%APPDATA%\claude-usage` on Windows). Kept as a single const so a
+/// future rename (usagio) is one line.
+pub(crate) const APP_SLUG: &str = "claude-usage";
 /// Refresh a token if it expires within this many seconds. Sourced from the
 /// credential-sync module so the reactive (switch / cmd_token / poll) path
 /// and the proactive (fsnotify + inactive-refresh) path can never drift.
@@ -59,8 +65,22 @@ const NO_RETURN_SECS: u64 = 1200;
 /// weekly-reset primary key is stable; the headroom tiebreak fluctuates as you
 /// work, so this margin keeps two near-equal accounts from ping-ponging.
 const PROACTIVE_HEADROOM_MARGIN: f64 = 10.0;
-/// Bundle id / label for the launchd agent (runs the menu-bar app at login).
-pub(crate) const LAUNCHD_LABEL: &str = "com.claude-usage.menubar";
+/// Reverse-DNS label for the OS's autostart registration (runs the menu-bar
+/// app at login). Reused across install / uninstall on every platform: it's
+/// the launchd Label on macOS, the .desktop filename on Linux, and the
+/// registry value name on Windows.
+pub(crate) const AUTOSTART_LABEL: &str = "com.claude-usage.menubar";
+
+/// Process-global handle to the platform impl. `platform::current()` builds
+/// once at first use; every host-OS call (keychain, autostart, paths) routes
+/// through this so we never sprinkle `#[cfg(target_os = ...)]` across
+/// business logic.
+static PLATFORM: std::sync::OnceLock<Box<dyn platform::Platform>> = std::sync::OnceLock::new();
+
+/// Return the process-global platform impl, initializing it on first call.
+pub(crate) fn platform() -> &'static dyn platform::Platform {
+    PLATFORM.get_or_init(platform::current).as_ref()
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -989,74 +1009,33 @@ fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 }
 
 // ---------------------------------------------------------------------------
-// Keychain helpers (macOS, via Security.framework — no token in argv)
+// Keychain helpers — delegate to the platform SecretStore
 // ---------------------------------------------------------------------------
 
 fn keychain_account() -> String {
     std::env::var("USER").unwrap_or_else(|_| "claude".to_string())
 }
 
-// NOTE: we use the `security` CLI rather than the Security.framework
-// (`security-framework`) API on purpose. SecItem access from this unsigned,
-// brew-installed binary makes macOS prompt on every launch (an unsigned binary
-// has no stable identity for "Always Allow" to pin to). The CLI path doesn't
-// prompt. The only downside is the write blob appears in `security`'s argv,
-// which is LOW risk under this tool's single-user threat model. TODO: switch
-// back to security-framework once we ship a code-signed (Developer ID) build,
-// where "Always Allow" persists.
-#[cfg(target_os = "macos")]
+// NOTE: on macOS the SecretStore impl uses the `security` CLI rather than the
+// Security.framework (`security-framework`) API on purpose. SecItem access
+// from this unsigned, brew-installed binary makes macOS prompt on every
+// launch (an unsigned binary has no stable identity for "Always Allow" to pin
+// to). The CLI path doesn't prompt. The only downside is the write blob
+// appears in `security`'s argv, which is LOW risk under this tool's
+// single-user threat model. TODO: switch back to security-framework once we
+// ship a code-signed (Developer ID) build, where "Always Allow" persists.
 fn keychain_read() -> Option<String> {
-    let out = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            &keychain_account(),
-            "-w",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    platform()
+        .secrets()
+        .get(KEYCHAIN_SERVICE, &keychain_account())
+        .ok()
+        .flatten()
 }
 
-#[cfg(target_os = "macos")]
 fn keychain_write(blob: &str) -> Result<()> {
-    let status = std::process::Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U", // update if it already exists
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            &keychain_account(),
-            "-w",
-            blob,
-        ])
-        .status()
-        .context("running `security`")?;
-    if !status.success() {
-        return Err(anyhow!("`security add-generic-password` failed"));
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_read() -> Option<String> {
-    None
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_write(_blob: &str) -> Result<()> {
-    Err(anyhow!("keychain is only supported on macOS"))
+    platform()
+        .secrets()
+        .set(KEYCHAIN_SERVICE, &keychain_account(), blob)
 }
 
 fn claude_json_path() -> Result<std::path::PathBuf> {
@@ -2007,16 +1986,8 @@ fn print_bars(labels: &[String], values: &[f64]) {
 }
 
 // ---------------------------------------------------------------------------
-// launchd install / uninstall
+// Autostart install / uninstall — delegate to the platform Autostart backend
 // ---------------------------------------------------------------------------
-
-fn plist_path() -> Result<std::path::PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(std::path::PathBuf::from(home)
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist")))
-}
 
 /// Path to invoke for the login item and for a post-upgrade relaunch, chosen to
 /// survive `brew upgrade`. `current_exe()` resolves symlinks to the versioned
@@ -2037,43 +2008,9 @@ pub(crate) fn stable_exe_path() -> std::path::PathBuf {
 
 fn cmd_install() -> Result<()> {
     let exe = stable_exe_path();
-    // No StandardOut/ErrorPath: the app has its own rotated ~/.config log; letting
-    // launchd capture stdout/stderr would accumulate an uncapped file forever.
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{exe}</string>
-    <string>menubar</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><false/>
-</dict>
-</plist>
-"#,
-        label = LAUNCHD_LABEL,
-        exe = exe.display(),
-    );
-    let path = plist_path()?;
-    if let Some(p) = path.parent() {
-        std::fs::create_dir_all(p)?;
-    }
-    std::fs::write(&path, plist).context("writing LaunchAgent plist")?;
-
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", &path.to_string_lossy()])
-        .status();
-    let status = std::process::Command::new("launchctl")
-        .args(["load", "-w", &path.to_string_lossy()])
-        .status()
-        .context("launchctl load")?;
-    if !status.success() {
-        bail!("launchctl load failed for {}", path.display());
-    }
+    platform()
+        .autostart()
+        .install(AUTOSTART_LABEL, &exe, &["menubar"])?;
     println!("Installed and started the claude-usage menu bar app — it now runs at every login.");
     println!(
         "Logs: {}",
@@ -2083,13 +2020,7 @@ fn cmd_install() -> Result<()> {
 }
 
 fn cmd_uninstall() -> Result<()> {
-    let path = plist_path()?;
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", &path.to_string_lossy()])
-        .status();
-    if path.exists() {
-        std::fs::remove_file(&path).context("removing plist")?;
-    }
+    platform().autostart().uninstall(AUTOSTART_LABEL)?;
     println!("Uninstalled — the menu-bar app will no longer start at login.");
     Ok(())
 }

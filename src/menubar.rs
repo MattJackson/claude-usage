@@ -545,7 +545,7 @@ fn relaunch_via_launchd() -> LaunchdRestart {
         return LaunchdRestart::NotManaged;
     }
     let uid = unsafe { libc::getuid() };
-    let target = format!("gui/{uid}/{}", crate::LAUNCHD_LABEL);
+    let target = format!("gui/{uid}/{}", crate::AUTOSTART_LABEL);
     crate::logging::log(&format!("relaunching via launchctl kickstart -k {target}"));
     match std::process::Command::new("launchctl")
         .args(["kickstart", "-k", &target])
@@ -572,7 +572,7 @@ fn is_launchd_managed() -> bool {
 
 /// Pure predicate behind `is_launchd_managed`, split out for testing.
 fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
-    xpc_service_name == Some(crate::LAUNCHD_LABEL)
+    xpc_service_name == Some(crate::AUTOSTART_LABEL)
 }
 
 /// Run one poll+auto-swap cycle; returns whether it was rate limited.
@@ -2067,7 +2067,7 @@ mod tests {
 
     #[test]
     fn launchd_managed_detects_matching_service_name() {
-        assert!(launchd_managed_from_env(Some(crate::LAUNCHD_LABEL)));
+        assert!(launchd_managed_from_env(Some(crate::AUTOSTART_LABEL)));
         assert!(!launchd_managed_from_env(Some("com.other.service")));
         assert!(!launchd_managed_from_env(None));
     }
