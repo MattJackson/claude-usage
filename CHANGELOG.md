@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-09-07
+
+Silences a recurring macOS Automation permission prompt and restores the
+disabled/grey version row.
+
+### Removed
+- **"Launch at login" menu checkbox** (the one backed by
+  `osascript → tell application "System Events" → make login item …`).
+  Every `brew upgrade` changed the binary hash → macOS treated the new
+  binary as a different app → re-prompted "usagio wants access to
+  control System Events" on the next poll. Path was already redundant
+  with `usagio install`, which registers a proper launchd
+  `LaunchAgent` plist. **`usagio install` / `usagio uninstall`** are
+  now the sole autostart entry points. To clean out the stale System
+  Events entry a prior version installed, remove **usagio** from
+  System Settings → General → Login Items → Open at Login.
+
+### Changed
+- **Version row is back to its own grey (disabled) row above Quit.**
+  0.4.2 folded it into the Quit label to save a row; users noted the
+  grey look and preferred right-alignment. NSMenu doesn't right-align
+  a single label on a sibling item's row without dropping to
+  `NSMenuItem.attributedTitle` + a right tab-stop paragraph style via
+  objc, which is planned for 0.5.0's broader menu redesign.
+
 ## [0.4.2] - 2026-09-07
 
 Menu declutter — removes a broken row and consolidates the footer.
