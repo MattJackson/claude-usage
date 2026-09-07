@@ -4,6 +4,7 @@
 //! use the switched account; already-running sessions keep theirs until
 //! restarted.
 
+mod context_ledger;
 mod countdown;
 mod credentials;
 #[cfg(target_os = "macos")]
@@ -104,6 +105,7 @@ fn run() -> Result<()> {
         #[cfg(target_os = "macos")]
         Some("menubar") => menubar::run(),
         Some("report") => cmd_report(&args[1..]),
+        Some("context") => cmd_context(&args[1..]),
         Some("install") => cmd_install(),
         Some("uninstall") => cmd_uninstall(),
         Some("rm") | Some("remove") => cmd_rm(args.get(1).map(String::as_str)),
@@ -141,6 +143,9 @@ fn print_help() {
          claude-usage install           Run the menu-bar app at every login (via launchd)\n  \
          claude-usage uninstall         Stop running the menu-bar app at login\n  \
          claude-usage report            Usage patterns by weekday / hour / account\n  \
+         claude-usage context [OPTS]    Audit CLI auto-injected context (per turn)\n  \
+                                        --provider <slug>  claude|codex|opencode\n  \
+                                        --project  <path>  scope in-tree instructions to this project\n  \
          claude-usage rm <email>        Forget an account\n\n\
          With no [email], switch/start/continue auto-pick the account that has room\n  \
          and whose weekly limit resets soonest (use it before the quota resets).\n\n\
@@ -1709,6 +1714,45 @@ fn consumption_deltas(active: &[&Sample]) -> Vec<(i64, f64)> {
         prev = Some(s);
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// context — Context Ledger
+// ---------------------------------------------------------------------------
+
+/// `claude-usage context [--provider SLUG] [--project PATH]` — audit what a
+/// CLI auto-injects into the model context per turn, with token cost per item.
+/// Delegates parsing (positional-agnostic) to a pure helper so the arg parsing
+/// stays unit-testable without a subprocess.
+fn cmd_context(args: &[String]) -> Result<()> {
+    let (provider, project) = parse_context_args(args)?;
+    context_ledger::cli::run(provider, project)
+}
+
+/// Parse the `context` subcommand's two supported flags. Unknown flags are
+/// rejected so a typo doesn't silently degrade to "audit every provider".
+fn parse_context_args(args: &[String]) -> Result<(Option<String>, Option<std::path::PathBuf>)> {
+    let mut provider: Option<String> = None;
+    let mut project: Option<std::path::PathBuf> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--provider" => {
+                provider = Some(
+                    it.next()
+                        .cloned()
+                        .context("--provider requires a value")?,
+                );
+            }
+            "--project" => {
+                project = Some(std::path::PathBuf::from(
+                    it.next().context("--project requires a value")?,
+                ));
+            }
+            other => bail!("unknown context option: {other}"),
+        }
+    }
+    Ok((provider, project))
 }
 
 fn cmd_report(_args: &[String]) -> Result<()> {
