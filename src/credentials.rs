@@ -411,12 +411,8 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
                     ));
                     continue;
                 }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700));
-                }
+                // Best-effort, no-op on Windows — see `Platform::secure_permissions`.
+                let _ = crate::platform::current().secure_permissions(&parent);
             }
             // R2-EH-02: log watch failures (EMFILE/ENOSPC/permission/unsupported
             // FS) so a silent watch drop doesn't degrade us to the 150s poll

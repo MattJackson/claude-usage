@@ -719,11 +719,10 @@ pub fn state_json_path() -> Result<PathBuf> {
 
 fn ensure_dir_0700(p: &Path) -> Result<()> {
     std::fs::create_dir_all(p).context("creating dir")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
-    }
+    // Best-effort, matching the prior `#[cfg(unix)]` behavior: a chmod
+    // failure here shouldn't fail the caller, only the mkdir above should.
+    // No-op on Windows — see `Platform::secure_permissions`.
+    let _ = crate::platform::current().secure_permissions(p);
     Ok(())
 }
 

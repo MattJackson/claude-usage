@@ -44,6 +44,9 @@ impl Platform for LinuxPlatform {
     fn os_display_name(&self) -> &'static str {
         "Linux"
     }
+    fn secure_permissions(&self, path: &Path) -> Result<()> {
+        super::secure_permissions_unix(path)
+    }
 }
 
 pub struct LinuxMenu;

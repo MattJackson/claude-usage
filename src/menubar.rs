@@ -1759,11 +1759,8 @@ fn handle_backup_restore(filename: &str) {
         notify(&format!("Restore failed writing state: {e}"));
         return;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600));
-    }
+    // Best-effort, no-op on Windows — see `Platform::secure_permissions`.
+    let _ = crate::platform::current().secure_permissions(&live);
     notify(&format!("Restored backup {label}"));
 }
 
