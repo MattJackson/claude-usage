@@ -5,9 +5,9 @@ import Base from '../layouts/Base.astro';
 import CodeBlock from '../components/CodeBlock.astro';
 import InstallSnippet from '../components/InstallSnippet.astro';
 
-const title = 'usagio — see and swap your AI coding CLI quotas from the macOS menu bar';
+const title = 'usagio — see and swap your AI coding CLI quotas from the menu bar';
 const description =
-  'usagio is a native macOS menu-bar app and CLI that tracks usage and quotas across Claude Code, OpenAI Codex, and other AI coding CLIs. Multi-account per provider, no /login dance, auto-swap when a weekly limit hits. Free, MIT-licensed, single Rust binary.';
+  'usagio is a native menu-bar app and CLI for macOS, Linux, and Windows that tracks usage and quotas across Claude Code, OpenAI Codex, and other AI coding CLIs. Multi-account per provider, no /login dance, auto-swap when a weekly limit hits. Free, MIT-licensed, single Rust binary.';
 ---
 <Base title={title} description={description} path="/" current="home">
 
@@ -15,7 +15,7 @@ const description =
   <section class="hero">
     <div class="container hero-inner">
       <div class="hero-copy fade-up">
-        <span class="eyebrow">MIT&nbsp;Licensed · 100%&nbsp;Rust · macOS&nbsp;Menu&nbsp;Bar</span>
+        <span class="eyebrow">MIT&nbsp;Licensed · 100%&nbsp;Rust · macOS · Linux · Windows</span>
         <h1 class="h-display hero-title">
           Every AI&nbsp;coding&nbsp;CLI. <br />
           <span class="hero-title-accent">One menu&nbsp;bar.</span>
@@ -27,10 +27,10 @@ const description =
           limit hits.
         </p>
         <div class="btn-row hero-cta">
-          <a class="btn btn-brand" href="/download/">Download for macOS</a>
+          <a class="btn btn-brand" href="/download/">Download</a>
           <a class="btn btn-secondary" href="https://github.com/MattJackson/usagio" target="_blank" rel="noopener noreferrer">View on GitHub</a>
         </div>
-        <p class="hero-foot">Free &amp; open source · macOS&nbsp;13+ · Intel &amp; Apple Silicon</p>
+        <p class="hero-foot">Free &amp; open source · macOS · Linux · Windows</p>
       </div>
 
       <!-- Product shot: menu dropdown mock over a soft blurred desktop -->
@@ -120,8 +120,8 @@ const description =
           <p>The same single Rust binary powers the menu-bar app and a scriptable CLI. Pipe usage into your shell prompt, or check it in a Raycast script.</p>
         </article>
         <article class="feature fade-up">
-          <h3>Keychain-backed, no webview</h3>
-          <p>Tokens live in the macOS Keychain. State lives in <code>~/.config/usagio</code>. No Electron, no bundled Chromium — one binary, launched by <code>launchd</code>.</p>
+          <h3>OS-native secret storage, no webview</h3>
+          <p>Tokens live in the OS-native secret store (macOS Keychain, Windows Credential Manager, Linux Secret Service). State lives in <code>~/.config/usagio</code> (Unix) or <code>%APPDATA%\usagio\</code> (Windows). No Electron, no bundled Chromium — one binary per OS, launched by <code>launchd</code> (macOS), Windows Autostart Registry, or an XDG autostart <code>.desktop</code> file (Linux).</p>
         </article>
         <article class="feature feature-oss fade-up">
           <h3>Open source, single binary</h3>
@@ -217,7 +217,7 @@ const description =
         didn't know you were about to hit.
       </p>
       <div class="btn-row" style="justify-content: center;">
-        <a class="btn btn-brand" href="/download/">Download for macOS</a>
+        <a class="btn btn-brand" href="/download/">Download</a>
         <a class="btn btn-ghost" style="color: #fff;" href="https://github.com/MattJackson/usagio" target="_blank" rel="noopener noreferrer">GitHub&nbsp;→</a>
       </div>
     </div>

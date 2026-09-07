@@ -2,9 +2,9 @@
 import Base from '../layouts/Base.astro';
 import CodeBlock from '../components/CodeBlock.astro';
 
-const title = 'Download usagio for macOS';
+const title = 'Download usagio';
 const description =
-  'Install usagio on macOS with one Homebrew command. Requires macOS 12 or later. Free & MIT-licensed. Prebuilt binaries and instructions for building from source.';
+  'Install usagio on macOS, Linux, or Windows. One Homebrew command on macOS and Linux, prebuilt archives for all three platforms. Free & MIT-licensed. Instructions for building from source.';
 
 const github = 'https://github.com/MattJackson/usagio';
 const releases = `${github}/releases`;
@@ -18,8 +18,9 @@ const releases = `${github}/releases`;
       <span class="eyebrow fade-up">Latest release</span>
       <h1 class="h-display fade-up" style="font-size: clamp(2.2rem, 5vw, 3.4rem); margin-top: 0.5rem;">Install usagio</h1>
       <p class="lede fade-up" style="margin: 1rem auto 0;">
-        One Homebrew command puts the binary on your PATH and the menu-bar
-        app in your dock — well, in your menu bar.
+        macOS, Linux, and Windows are all supported. On macOS and Linux, one
+        Homebrew command puts the binary on your PATH and the tray app in
+        your menu bar.
       </p>
     </div>
   </section>
@@ -30,7 +31,7 @@ const releases = `${github}/releases`;
       <div class="dl-primary-card fade-up">
         <div class="dl-primary-head">
           <span class="eyebrow">Recommended</span>
-          <h2 class="h-section">Homebrew</h2>
+          <h2 class="h-section">macOS</h2>
           <p class="dl-primary-lede">
             Installs the binary, wires up the menu-bar agent, and auto-launches
             it on login. Upgrades come through <code>brew upgrade</code>; a running
@@ -58,17 +59,69 @@ const releases = `${github}/releases`;
         </div>
       </div>
 
+      <!-- ============ LINUX INSTALL ============ -->
+      <div class="dl-primary-card fade-up" style="margin-top: 1.5rem;">
+        <div class="dl-primary-head">
+          <span class="eyebrow">Linux</span>
+          <h2 class="h-section">Homebrew (linuxbrew) or tarball</h2>
+          <p class="dl-primary-lede">
+            The same tap works on Linux via <a href="https://brew.sh" target="_blank" rel="noopener noreferrer">linuxbrew</a>.
+            Prefer not to install Homebrew? Grab the tarball directly from the
+            releases page instead.
+          </p>
+        </div>
+        <CodeBlock label="install (linuxbrew)">
+<span class="p">$</span> brew tap --trust mattjackson/tap
+<span class="p">$</span> brew install mattjackson/tap/usagio
+<span class="p">$</span> usagio install
+</CodeBlock>
+        <p class="dl-p" style="margin-top: 1.25rem;">Or, without Homebrew:</p>
+        <CodeBlock label="install (tarball)">
+<span class="c"># Download from the releases page, then:</span>
+<span class="p">$</span> tar xzf usagio-v0.5.0-x86_64-unknown-linux-gnu.tar.gz
+<span class="p">$</span> ./usagio watch
+
+<span class="c"># Or register the tray app + auto-swap daemon at login</span>
+<span class="c"># (writes ~/.config/autostart/usagio.desktop)</span>
+<span class="p">$</span> ./usagio install
+</CodeBlock>
+      </div>
+
+      <!-- ============ WINDOWS INSTALL ============ -->
+      <div class="dl-primary-card fade-up" style="margin-top: 1.5rem;">
+        <div class="dl-primary-head">
+          <span class="eyebrow">Windows</span>
+          <h2 class="h-section">Prebuilt archive</h2>
+          <p class="dl-primary-lede">
+            Download the zip from the releases page, extract it, and add it to
+            your PATH.
+          </p>
+        </div>
+        <CodeBlock label="install">
+<span class="c"># Download usagio-v0.5.0-x86_64-pc-windows-msvc.zip from the releases page,</span>
+<span class="c"># then extract to %LOCALAPPDATA%\Programs\usagio\ and add it to PATH.</span>
+
+<span class="c"># Register the tray app + auto-swap daemon at login</span>
+<span class="c"># (writes to HKCU\Software\Microsoft\Windows\CurrentVersion\Run)</span>
+<span class="p">&gt;</span> usagio install
+</CodeBlock>
+        <p class="dl-p dl-p-fine">
+          The exe is unsigned, so Windows Defender may show a SmartScreen
+          warning on first run — choose "More info" → "Run anyway". See
+          <code>packaging/windows/DEPENDENCIES.md</code> in the repo for details.
+        </p>
+      </div>
+
       <!-- ============ VERIFY ============ -->
       <div class="dl-verify fade-up">
         <h3 class="dl-h3">Verify the install</h3>
         <p class="dl-p">
-          Confirm the binary is on your PATH, the version matches what you
-          expected, and the menu-bar agent is registered with <code>launchd</code>.
+          Confirm the binary is on your PATH and the version matches what you
+          expected.
         </p>
         <CodeBlock label="verify">
 <span class="p">$</span> usagio --version
 <span class="p">$</span> usagio status
-<span class="p">$</span> launchctl list | grep usagio
 </CodeBlock>
       </div>
 
@@ -79,8 +132,49 @@ const releases = `${github}/releases`;
             <div class="dl-req-label">Requires</div>
             <div class="dl-req-body">
               <strong>macOS 13 Ventura</strong> or later &middot; Apple Silicon or Intel.
-              Uses the macOS Keychain and <code>launchd</code>; no other daemons or
-              runtimes. Windows and Linux are not currently supported.
+              Uses the macOS Keychain and <code>launchd</code>.
+            </div>
+            <div class="dl-req-body" style="margin-top: 0.6rem;">
+              <strong>Linux</strong> &middot; x86_64. Needs GTK 3,
+              <code>libayatana-appindicator3</code>, <code>libsecret</code>, and
+              an <code>xdg-desktop-portal</code> for the tray icon, credential
+              storage, and autostart entry respectively.
+            </div>
+            <div class="dl-req-body" style="margin-top: 0.6rem;">
+              <strong>Windows 10</strong> or later &middot; x86_64. Uses Windows
+              Credential Manager and the Autostart Registry key.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ HONESTY NOTE ============ -->
+      <div class="dl-req fade-up" style="margin-top: 1.25rem;">
+        <div class="dl-req-inner">
+          <div>
+            <div class="dl-req-label">v0.5.0 platform notes</div>
+            <div class="dl-req-body">
+              This is the first usagio release with Linux and Windows support.
+              All three platforms build and pass CI, but real-world validation
+              on Linux and Windows is still ongoing — please
+              <a href={`${github}/issues`} target="_blank" rel="noopener noreferrer">file an issue</a>
+              if something doesn't work as expected.
+            </div>
+            <div class="dl-req-body" style="margin-top: 0.6rem;">
+              The macOS build is signed ad-hoc, not notarised, so the first
+              launch may need a Right-Click → Open instead of a double-click.
+              Signed and notarised builds are planned once the project has an
+              Apple Developer account.
+            </div>
+            <div class="dl-req-body" style="margin-top: 0.6rem;">
+              The Linux tray icon needs <code>libayatana-appindicator3</code>:
+              <code>sudo apt install libayatana-appindicator3-1</code> on
+              Ubuntu/Debian, <code>sudo dnf install libayatana-appindicator-gtk3</code>
+              on Fedora, or <code>libayatana-appindicator</code> from the AUR on Arch.
+            </div>
+            <div class="dl-req-body" style="margin-top: 0.6rem;">
+              The Windows build is unsigned, so Defender may need an exception
+              on first run.
             </div>
           </div>
         </div>
