@@ -1970,9 +1970,24 @@ fn set_autoswap(enabled: bool) {
 /// on-disk state currently says, rather than assuming a fixed target — so a
 /// stale menu (built just before an external `usagio` CLI toggle) can't
 /// un-toggle a setting it never actually observed.
+///
+/// Read-modify-write happens entirely INSIDE `with_state_lock`, atomic with
+/// respect to other in-process AND cross-process writers (the CLI `usagio`
+/// binary and the menu-bar app both take the same advisory file lock — see
+/// `with_state_lock`). A previous version read the current value with a
+/// separate `State::load()` call *outside* the lock, decided the new bool
+/// from that stale read, and only entered the lock to write it — a
+/// concurrent writer between the read and the write could have its own
+/// toggle silently lost ("toggle lost" under contention).
 fn toggle_autoswap() {
-    let currently_enabled = !State::load().unwrap_or_default().autoswap_disabled;
-    set_autoswap(!currently_enabled);
+    let r = with_state_lock(|| {
+        let mut st = State::load()?;
+        st.autoswap_disabled = !st.autoswap_disabled;
+        st.save()
+    });
+    if let Err(e) = r {
+        notify(&format!("Could not save auto-swap setting: {e}"));
+    }
 }
 
 /// Flip one Settings ▸ Notifications ▸ per-trigger checkbox. `trigger` is one
@@ -2122,6 +2137,49 @@ mod tests {
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
         }
+    }
+
+    #[test]
+    fn toggle_autoswap_read_modify_write_is_atomic_under_contention() {
+        let g = crate::store::ScopedConfigDir::new();
+        let home = g.home();
+
+        State::default().save().expect("seed initial state");
+        let initial = State::load().unwrap().autoswap_disabled;
+
+        const ITERATIONS: usize = 100;
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let home = home.clone();
+                std::thread::spawn(move || {
+                    // HOME_OVERRIDE is thread-local (see store::ScopedConfigDir);
+                    // each worker thread must repoint it at the same tempdir
+                    // the parent test set up.
+                    crate::store::set_home_override(Some(home));
+                    for _ in 0..ITERATIONS {
+                        toggle_autoswap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let total_toggles = 2 * ITERATIONS;
+        let expected = if total_toggles % 2 == 1 {
+            !initial
+        } else {
+            initial
+        };
+        let final_state = State::load().unwrap();
+        assert_eq!(
+            final_state.autoswap_disabled, expected,
+            "final parity must match initial XOR (total_toggles % 2 == 1); a lost \
+             toggle under contention would flip this"
+        );
+
+        drop(g);
     }
 
     #[test]
