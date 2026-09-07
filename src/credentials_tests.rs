@@ -36,7 +36,12 @@ impl FakeProvider {
         self.paths.push(p);
         self
     }
-    fn route(mut self, blob: &str, key: Option<AccountKey>, freshness: CredentialFreshness) -> Self {
+    fn route(
+        mut self,
+        blob: &str,
+        key: Option<AccountKey>,
+        freshness: CredentialFreshness,
+    ) -> Self {
         self.routing.push((blob.to_string(), key, freshness));
         self
     }
@@ -112,9 +117,11 @@ fn absorb_all_lagging_absorbs_recognised_blob() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_blob(dir.path(), "creds.json", "BLOB_A");
     let key = AccountKey::new("fake", "a@e.com");
-    let prov = FakeProvider::new("fake")
-        .with_path(path)
-        .route("BLOB_A", Some(key.clone()), CredentialFreshness::Fresh);
+    let prov = FakeProvider::new("fake").with_path(path).route(
+        "BLOB_A",
+        Some(key.clone()),
+        CredentialFreshness::Fresh,
+    );
     let seen = absorb_all_lagging(&prov);
     assert_eq!(seen, vec![key.clone()]);
     let absorbs = prov.absorbs();
@@ -141,11 +148,16 @@ fn absorb_all_lagging_skips_invalid_freshness() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_blob(dir.path(), "creds.json", "PARTIAL");
     let key = AccountKey::new("fake", "a@e.com");
-    let prov = FakeProvider::new("fake")
-        .with_path(path)
-        .route("PARTIAL", Some(key), CredentialFreshness::Invalid);
+    let prov = FakeProvider::new("fake").with_path(path).route(
+        "PARTIAL",
+        Some(key),
+        CredentialFreshness::Invalid,
+    );
     let _ = absorb_all_lagging(&prov);
-    assert!(prov.absorbs().is_empty(), "invalid blobs must not be absorbed");
+    assert!(
+        prov.absorbs().is_empty(),
+        "invalid blobs must not be absorbed"
+    );
 }
 
 #[test]
@@ -215,9 +227,11 @@ fn last_chance_fallback_returns_false_when_target_absent() {
     let p = write_blob(dir.path(), "creds.json", "SOMEONE_ELSE");
     let other = AccountKey::new("fake", "b@e.com");
     let target = AccountKey::new("fake", "a@e.com");
-    let prov = FakeProvider::new("fake")
-        .with_path(p)
-        .route("SOMEONE_ELSE", Some(other.clone()), CredentialFreshness::Fresh);
+    let prov = FakeProvider::new("fake").with_path(p).route(
+        "SOMEONE_ELSE",
+        Some(other.clone()),
+        CredentialFreshness::Fresh,
+    );
     assert!(!last_chance_fallback(&prov, &target));
     // But free-sync did absorb the other tracked account.
     let absorbs = prov.absorbs();
@@ -232,14 +246,19 @@ fn last_chance_fallback_returns_false_when_target_blob_is_expired() {
     let dir = tempfile::tempdir().unwrap();
     let p = write_blob(dir.path(), "creds.json", "DEAD_A");
     let target = AccountKey::new("fake", "a@e.com");
-    let prov = FakeProvider::new("fake")
-        .with_path(p)
-        .route("DEAD_A", Some(target.clone()), CredentialFreshness::Expired);
+    let prov = FakeProvider::new("fake").with_path(p).route(
+        "DEAD_A",
+        Some(target.clone()),
+        CredentialFreshness::Expired,
+    );
     assert!(!last_chance_fallback(&prov, &target));
     // And we must NOT have absorbed the expired blob for the target.
     let absorbs = prov.absorbs();
     let target_absorbs = absorbs.iter().filter(|(k, _)| k == &target).count();
-    assert_eq!(target_absorbs, 0, "expired target blobs must not be absorbed");
+    assert_eq!(
+        target_absorbs, 0,
+        "expired target blobs must not be absorbed"
+    );
 }
 
 #[test]
@@ -260,7 +279,10 @@ fn last_chance_fallback_bonus_absorbs_other_tracked_account() {
     // Looking for A: B is picked up along the way.
     let _ = last_chance_fallback(&prov, &a);
     let absorbs = prov.absorbs();
-    assert!(absorbs.iter().any(|(k, _)| k == &b), "B should be free-synced");
+    assert!(
+        absorbs.iter().any(|(k, _)| k == &b),
+        "B should be free-synced"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -272,9 +294,11 @@ fn absorb_before_switch_reads_credential_paths() {
     let dir = tempfile::tempdir().unwrap();
     let p = write_blob(dir.path(), "creds.json", "OUTGOING_BLOB");
     let key = AccountKey::new("fake", "outgoing@e.com");
-    let prov = FakeProvider::new("fake")
-        .with_path(p)
-        .route("OUTGOING_BLOB", Some(key.clone()), CredentialFreshness::Fresh);
+    let prov = FakeProvider::new("fake").with_path(p).route(
+        "OUTGOING_BLOB",
+        Some(key.clone()),
+        CredentialFreshness::Fresh,
+    );
     absorb_before_switch(&prov);
     assert_eq!(prov.absorbs(), vec![(key, "OUTGOING_BLOB".to_string())]);
 }
@@ -317,18 +341,20 @@ static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn with_isolated_home<F: FnOnce()>(f: F) {
     let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let td = tempfile::tempdir().unwrap();
-    let prev = std::env::var_os("HOME");
-    std::env::set_var("HOME", td.path());
-    struct Restore(Option<std::ffi::OsString>);
+    // Only install the store::HOME_OVERRIDE thread-local — no env HOME churn.
+    // `store::config_dir()` prefers the override, and the tests here don't
+    // hit any code path that reads `$HOME` directly. Skipping the env swap
+    // keeps this helper from racing with other test modules (notably
+    // `context_ledger::tests`) that also touch `$HOME` under their own locks.
+    let prev_override = crate::store::home_override();
+    crate::store::set_home_override(Some(td.path().to_path_buf()));
+    struct Restore(Option<std::path::PathBuf>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            match self.0.take() {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
+            crate::store::set_home_override(self.0.take());
         }
     }
-    let _r = Restore(prev);
+    let _r = Restore(prev_override);
     f();
 }
 
@@ -344,8 +370,15 @@ fn nested_with_state_lock_does_not_deadlock() {
     // seeded — the second flock is what the deadlock hinged on, and the direct
     // recursion exercises the same reentrancy path.
     with_isolated_home(|| {
+        // Thread-local HOME_OVERRIDE doesn't cross `std::thread::spawn`, so
+        // capture the path and re-install it inside the worker. Without this
+        // the crate's cfg(test) tripwire in `config_dir()` fires the moment
+        // the child thread's `with_state_lock` calls it.
+        let home_path =
+            crate::store::home_override().expect("with_isolated_home installs HOME_OVERRIDE");
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
+            crate::store::set_home_override(Some(home_path));
             let r: Result<()> = with_state_lock(|| {
                 // Nested direct call — before the fix this blocked forever.
                 with_state_lock(|| Ok(()))?;
@@ -373,7 +406,10 @@ fn spawn_watchers_creates_missing_parent_dir() {
     // Parent dir does NOT exist yet — this is the fresh-install condition.
     let missing_parent = td.path().join("dot-claude");
     let cred_path = missing_parent.join(".credentials.json");
-    assert!(!missing_parent.exists(), "precondition: parent must be missing");
+    assert!(
+        !missing_parent.exists(),
+        "precondition: parent must be missing"
+    );
 
     let prov = FakeProvider::new("fake-watch").with_path(cred_path.clone());
     // spawn_watchers requires 'static providers; leak for the test.
@@ -384,11 +420,18 @@ fn spawn_watchers_creates_missing_parent_dir() {
         missing_parent.exists(),
         "spawn_watchers should have created the missing parent dir"
     );
-    assert!(handle.is_some(), "watcher should have registered on the newly-created dir");
+    assert!(
+        handle.is_some(),
+        "watcher should have registered on the newly-created dir"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&missing_parent).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&missing_parent)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o700, "credential parent must be 0700 for privacy");
     }
     // Drop handle → notify watcher stops, thread exits.

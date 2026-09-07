@@ -64,11 +64,9 @@ impl TestLogDir {
     /// with the same shape as `usage_log::Snapshot` (kept generic so this
     /// helper doesn't have to depend on the crate's internal type).
     pub fn append_snapshot<S: Serialize>(&self, ts: DateTime<Utc>, snap: &S) {
-        let path = self.config_dir().join(format!(
-            "history.{:04}-{:02}.ndjson",
-            ts.year(),
-            ts.month()
-        ));
+        let path =
+            self.config_dir()
+                .join(format!("history.{:04}-{:02}.ndjson", ts.year(), ts.month()));
         let line = serde_json::to_string(snap).expect("serialize snap");
         let mut existing = std::fs::read_to_string(&path).unwrap_or_default();
         existing.push_str(&line);
@@ -78,6 +76,80 @@ impl TestLogDir {
 }
 
 impl Drop for TestLogDir {
+    fn drop(&mut self) {
+        match self.prev_home.take() {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestConfigDir — the general-purpose RAII fixture integration tests should
+// use when they touch state.json (directly or via the CLI subprocess). It's a
+// thinner cousin of `TestLogDir`: no history-file convenience methods, just an
+// isolated `$HOME` and (optionally) a pre-seeded `state.json` inside it.
+//
+// Both this and the in-crate `store::ScopedConfigDir` funnel through the same
+// contract: no test process (parent OR spawned CLI) ever touches the real
+// `~/.config/claude-usage`. The parent-side `$HOME` swap here isolates any
+// spawned subprocess (which inherits `HOME` from us); the in-crate
+// `ScopedConfigDir` layers on top of the same thread-local `HOME_OVERRIDE`
+// that the crate's `cfg(test)` tripwire enforces.
+// ---------------------------------------------------------------------------
+
+/// A scoped `$HOME` guard for integration tests that spawn `claude-usage` as a
+/// subprocess. The child inherits `$HOME` from the current process, so pinning
+/// `HOME` here plus asserting inside the subprocess-safe `cfg(not(test))` path
+/// (the built binary is compiled without `cfg(test)`) keeps every state.json
+/// read/write inside the tempdir.
+pub struct TestConfigDir {
+    _home: TempDir,
+    home_path: PathBuf,
+    prev_home: Option<OsString>,
+}
+
+impl TestConfigDir {
+    /// Fresh tempdir, `$HOME` repointed at it, `~/.config/claude-usage`
+    /// pre-created so callers can seed a state.json without extra ceremony.
+    pub fn new() -> Self {
+        let home = tempfile::tempdir().expect("tempdir for TestConfigDir");
+        let home_path = home.path().to_path_buf();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home_path);
+        let cfg = home_path.join(".config").join("claude-usage");
+        std::fs::create_dir_all(&cfg).expect("create config dir");
+        Self {
+            _home: home,
+            home_path,
+            prev_home,
+        }
+    }
+
+    pub fn home(&self) -> &Path {
+        &self.home_path
+    }
+
+    pub fn config_dir(&self) -> PathBuf {
+        self.home_path.join(".config").join("claude-usage")
+    }
+
+    pub fn state_path(&self) -> PathBuf {
+        self.config_dir().join("state.json")
+    }
+
+    /// Write `contents` to the fixture's state.json (creating the parent dir
+    /// if it isn't there yet). Convenience for seeding a starting state.
+    pub fn seed_state(&self, contents: &str) {
+        let p = self.state_path();
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).expect("create config dir");
+        }
+        std::fs::write(&p, contents).expect("seed state.json");
+    }
+}
+
+impl Drop for TestConfigDir {
     fn drop(&mut self) {
         match self.prev_home.take() {
             Some(p) => std::env::set_var("HOME", p),
