@@ -467,8 +467,14 @@ impl SecretStore for LinuxSecrets {
 /// - `glib::MainLoop` (used for `request_quit`) genuinely is `Send + Sync` —
 ///   GLib documents `g_main_loop_quit` as callable from any thread — so it's
 ///   stored directly as an `Arc<Mutex<Option<glib::MainLoop>>>` field.
+/// Type alias for the click-handler callback slot — factored out so the
+/// `LinuxMenu::click_cb` field type stays under clippy's type-complexity
+/// threshold and so any future ClickCb-typed variable inherits the same
+/// signature (mirror of `WindowsMenu`'s `ClickCb`).
+type ClickCb = Box<dyn Fn(&str) + Send + Sync + 'static>;
+
 pub struct LinuxMenu {
-    click_cb: Arc<Mutex<Option<Box<dyn Fn(&str) + Send + Sync + 'static>>>>,
+    click_cb: Arc<Mutex<Option<ClickCb>>>,
     main_loop: Arc<Mutex<Option<gtk::glib::MainLoop>>>,
     gtk_init: OnceLock<Result<(), String>>,
 }
@@ -493,6 +499,10 @@ impl LinuxMenu {
     }
 }
 
+/// The `Set*` naming is deliberate — each variant is a setter operation
+/// on the tray. Renaming to drop the shared prefix would only obscure
+/// the intent for clippy's benefit (mirror of `WindowsMenu`'s `UiCmd`).
+#[allow(clippy::enum_variant_names)]
 enum HandleMsg {
     SetIcon(Vec<u8>),
     SetTitle(String),
