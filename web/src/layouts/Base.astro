@@ -20,7 +20,7 @@ const {
   current = 'home',
 } = Astro.props;
 
-const site = Astro.site?.toString().replace(/\/$/, '') ?? 'https://usagio.app';
+const site = Astro.site?.toString().replace(/\/$/, '') ?? 'https://usagio.dev';
 const canonical = `${site}${path}`;
 const ogImage = `${site}/favicon.svg`;
 ---
@@ -32,7 +32,7 @@ const ogImage = `${site}/favicon.svg`;
     <title>{title}</title>
     <meta name="description" content={description} />
     <link rel="canonical" href={canonical} />
-    <link rel="icon" href="/claude-usage/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 
     <meta property="og:type" content="website" />
     <meta property="og:title" content={title} />
