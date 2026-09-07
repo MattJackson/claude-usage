@@ -1329,7 +1329,9 @@ fn refresh_usage_cache() -> RefreshOutcome {
         Option<notifications::NotifState>,
     )> = Vec::new();
     let emails: Vec<String> = state.accounts.iter().map(|a| a.key().to_string()).collect();
-    let notif_cfg = notifications::NotificationConfig::default();
+    // Settings ▸ Notifications ▸: per-trigger enable flags, persisted on
+    // `State` and toggled from the menu bar (`menubar::toggle_notification_trigger`).
+    let notif_cfg = state.notification_config.clone();
     for email in &emails {
         let Some(acct) = state.find(email).cloned() else {
             continue;
