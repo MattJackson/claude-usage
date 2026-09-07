@@ -1086,6 +1086,37 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
             for w in &a.windows {
                 let _ = sub.append(&stat_item(stat_display_label(w), w.pct, &w.reset));
             }
+            // Burn-rate + cost estimator rows sit under the raw window stats,
+            // above the "updated" footer. Cheap best-effort reads against the
+            // usage log — if we don't have enough samples yet the rows are
+            // simply skipped.
+            let account_key =
+                crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
+            if let Some(est) = crate::burn_rate::estimate(
+                &account_key,
+                crate::providers::trait_def::Window::Weekly,
+                Utc::now(),
+            ) {
+                if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
+                    let _ = sub.append(&MenuItem::with_id(
+                        "noop",
+                        crate::burn_rate::format_menu_row(&est),
+                        false,
+                        None,
+                    ));
+                }
+            }
+            if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
+                &account_key,
+                crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
+            ) {
+                let _ = sub.append(&MenuItem::with_id(
+                    "noop",
+                    format!("~${:.2} this cycle (est)", cost.estimated_usd),
+                    false,
+                    None,
+                ));
+            }
             let _ = sub.append(&MenuItem::with_id(
                 "noop",
                 format!("updated {}", a.updated),

@@ -4,7 +4,9 @@
 //! use the switched account; already-running sessions keep theirs until
 //! restarted.
 
+mod burn_rate;
 mod context_ledger;
+mod cost_tracking;
 mod countdown;
 mod credentials;
 #[cfg(target_os = "macos")]
@@ -13,6 +15,7 @@ mod logging;
 #[cfg(target_os = "macos")]
 mod menubar;
 mod notifications;
+mod pricing;
 mod providers;
 mod store;
 mod usage_log;
@@ -143,6 +146,9 @@ fn print_help() {
          claude-usage install           Run the menu-bar app at every login (via launchd)\n  \
          claude-usage uninstall         Stop running the menu-bar app at login\n  \
          claude-usage report            Usage patterns by weekday / hour / account\n  \
+         claude-usage report --pace     Per-account burn-rate forecast (empty-in ETA)\n  \
+         claude-usage report --pricing  Model → USD-per-1M-tokens lookup table\n  \
+         claude-usage report --verdict  Cancel/downgrade/keep/upgrade classifier\n  \
          claude-usage context [OPTS]    Audit CLI auto-injected context (per turn)\n  \
                                         --provider <slug>  claude|codex|opencode\n  \
                                         --project  <path>  scope in-tree instructions to this project\n  \
@@ -1755,7 +1761,23 @@ fn parse_context_args(args: &[String]) -> Result<(Option<String>, Option<std::pa
     Ok((provider, project))
 }
 
-fn cmd_report(_args: &[String]) -> Result<()> {
+fn cmd_report(args: &[String]) -> Result<()> {
+    // Analytics subflavours share the same command surface so `report` stays
+    // the one-stop CLI for usage insight. `--pace` prints per-account burn-
+    // rate forecasts; `--pricing` dumps the model→price lookup table;
+    // `--verdict` classifies each captured account as cancel/downgrade/keep/
+    // upgrade based on the last few weekly cycles. With no flag we fall
+    // through to the classic weekday/hour histogram.
+    if args.iter().any(|a| a == "--pace") {
+        return cmd_report_pace();
+    }
+    if args.iter().any(|a| a == "--pricing") {
+        return cmd_report_pricing();
+    }
+    if args.iter().any(|a| a == "--verdict") {
+        return cmd_report_verdict();
+    }
+
     use chrono::{Datelike, Local, TimeZone, Timelike};
 
     let path = history_path()?;
@@ -1839,6 +1861,137 @@ fn cmd_report(_args: &[String]) -> Result<()> {
         println!("You approached your weekly limit but never needed a swap — one account is close to enough.");
     } else {
         println!("You hit {swaps} swap(s) — multiple accounts are earning their keep.");
+    }
+    println!();
+    Ok(())
+}
+
+// --- report --pace / --pricing / --verdict --------------------------------
+//
+// The three flag paths reuse the burn_rate / pricing / cost_tracking modules,
+// so the CLI stays a thin renderer over the same data the menu bar consumes.
+// Every flag prints the "estimate, not billing" disclaimer once so users read
+// the output with appropriate skepticism.
+
+fn cmd_report_pace() -> Result<()> {
+    use crate::providers::trait_def::Window;
+    use crate::usage_log::AccountKey;
+    let state = State::load()?;
+    if state.accounts.is_empty() {
+        println!("No accounts captured yet — run `claude-usage capture` first.");
+        return Ok(());
+    }
+    println!("\nBurn-rate forecast");
+    println!("  {}\n", crate::cost_tracking::DISCLAIMER);
+    let now = Utc::now();
+    for acct in &state.accounts {
+        let Some(email) = acct.email.clone() else {
+            continue;
+        };
+        let key = AccountKey::new(CLAUDE_SLUG, &email);
+        println!("  {email}");
+        for window in [Window::Session, Window::Weekly] {
+            if let Some(est) = crate::burn_rate::estimate(&key, window, now) {
+                println!("    {}", crate::burn_rate::format_menu_row(&est));
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+fn cmd_report_pricing() -> Result<()> {
+    // Static table dump — useful for verifying which model → dollar rate the
+    // cost estimator will use before it renders in the menu.
+    println!("\nModel pricing (USD per 1M tokens)");
+    println!("  Source: vendor pricing pages, compiled 2026-09-06.\n");
+    // We enumerate provider-slug guesses; unknown lookups are silently skipped.
+    let probes: &[(&str, &[&str])] = &[
+        (
+            "claude",
+            &[
+                "claude-fable-5-1",
+                "claude-opus-5",
+                "claude-opus-4-1",
+                "claude-sonnet-5",
+                "claude-sonnet-4-5",
+                "claude-haiku-4-5",
+            ],
+        ),
+        (
+            "codex",
+            &["gpt-6-astra", "gpt-5-6-sol", "gpt-5-6-luna", "gpt-5", "gpt-4-1", "o3"],
+        ),
+        (
+            "gemini-cli",
+            &["gemini-2-5-pro", "gemini-2-5-flash", "gemini-2-5-flash-lite"],
+        ),
+        ("deepseek", &["deepseek-v4", "deepseek-chat", "deepseek-reasoner"]),
+        ("qwen-code", &["qwen-max", "qwen-plus", "qwen-turbo", "qwen-coder-3"]),
+        ("zai", &["glm-4-5", "glm-4-air", "glm-4-plus"]),
+        ("fireworks", &["llama-3-3-70b", "llama-4-scout", "llama-4-maverick"]),
+    ];
+    for (provider, models) in probes {
+        println!("  {provider}");
+        for m in *models {
+            if let Some(p) = crate::pricing::lookup(provider, m) {
+                println!(
+                    "    {m:<24} in ${:>5.2} / out ${:>6.2}",
+                    p.input_per_million, p.output_per_million
+                );
+            }
+        }
+        println!();
+    }
+    println!(
+        "  Passthrough providers (billed per-request against the vendor's API):"
+    );
+    for p in ["openrouter", "synthetic"] {
+        if crate::pricing::is_passthrough(p) {
+            println!("    {p} — cost pulled live from the underlying model");
+        } else {
+            // synthetic is not tagged as passthrough today; still enumerate so
+            // the user sees why it has no local rate.
+            println!("    {p} — no local rate table");
+        }
+    }
+    println!();
+    Ok(())
+}
+
+fn cmd_report_verdict() -> Result<()> {
+    use crate::cost_tracking::{subscription_verdict, Verdict};
+    use crate::usage_log::AccountKey;
+    let state = State::load()?;
+    if state.accounts.is_empty() {
+        println!("No accounts captured yet — run `claude-usage capture` first.");
+        return Ok(());
+    }
+    println!("\nSubscription verdict");
+    println!("  {}\n", crate::cost_tracking::DISCLAIMER);
+    // Four weekly cycles ≈ one month, the window we quote as "recoverable per
+    // month" downstream.
+    const CYCLES: usize = 4;
+    for acct in &state.accounts {
+        let Some(email) = acct.email.clone() else {
+            continue;
+        };
+        let key = AccountKey::new(CLAUDE_SLUG, &email);
+        match subscription_verdict(&key, CYCLES) {
+            None => println!("  {email}: not enough history yet"),
+            Some(sv) => {
+                let label = match sv.verdict {
+                    Verdict::Cancel => "cancel",
+                    Verdict::Downgrade => "downgrade",
+                    Verdict::Keep => "keep",
+                    Verdict::Upgrade => "upgrade",
+                };
+                println!(
+                    "  {email}: {label}  (avg {:.0}%, peak {:.0}%, ~${:.2} recoverable/mo)",
+                    sv.avg_utilization_pct, sv.peak_utilization_pct, sv.recoverable_dollars,
+                );
+            }
+        }
     }
     println!();
     Ok(())
