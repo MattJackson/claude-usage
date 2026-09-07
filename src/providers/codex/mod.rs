@@ -34,7 +34,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::providers::trait_def::{
-    Capabilities, CapturedAccount, IdentitySnapshot, PResult, Provider, ProviderError,
+    Capabilities, CaptureMode, CapturedAccount, IdentitySnapshot, PResult, Provider, ProviderError,
     SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
 };
 
@@ -64,6 +64,7 @@ impl Provider for CodexProvider {
             supports_switching: false,
             supports_email_capture: true,
             secret_backend: SecretBackend::File,
+            capture_mode: CaptureMode::CredsOnDisk,
         }
     }
 

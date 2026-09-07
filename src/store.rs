@@ -56,6 +56,11 @@ pub struct Account {
     /// Last usage snapshot; populated only by the scheduler poll.
     #[serde(default)]
     pub cached_usage: Option<CachedUsage>,
+    /// Per-account notification bookkeeping (crossings we've already fired,
+    /// pace-fired-this-window bit). Persisted alongside the account so a
+    /// menu-bar restart doesn't re-fire the same "70% crossed" notification.
+    #[serde(default)]
+    pub notif_state: crate::notifications::NotifState,
 }
 
 impl Account {
@@ -87,6 +92,7 @@ impl Account {
             oauth_account: None,
             user_id: None,
             cached_usage: None,
+            notif_state: crate::notifications::NotifState::default(),
         })
     }
 
@@ -227,6 +233,10 @@ impl State {
                     cached_usage: obj
                         .get("cached_usage")
                         .and_then(|x| serde_json::from_value(x.clone()).ok()),
+                    notif_state: obj
+                        .get("notif_state")
+                        .and_then(|x| serde_json::from_value(x.clone()).ok())
+                        .unwrap_or_default(),
                 });
             }
         }

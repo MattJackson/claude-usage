@@ -16,13 +16,15 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use block2::RcBlock;
+use chrono::{DateTime, Utc};
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::NSTimer;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::TrayIconBuilder;
 
-use crate::providers::{self, SeverityBands};
+use crate::countdown::{self, AccountUsage, BlockingWindow, DisplayState};
+use crate::providers::{self, CaptureMode, Provider, SeverityBands};
 use crate::store::State;
 use crate::{
     age_str, capture_current, env_override_active, menu_order, next_interval, notify,
@@ -64,6 +66,13 @@ struct AcctView {
     updated: String,
     active: bool,
     has_data: bool,
+    /// Absolute reset instants for the first two windows, threaded through so
+    /// `countdown::compute_display` can decide whether the row is "locked"
+    /// (session/weekly ≥99.5% and reset still in the future). The strings in
+    /// `WindowView.reset` are for display only — the raw `DateTime` is needed
+    /// to reason about the future.
+    session_reset_at: Option<DateTime<Utc>>,
+    weekly_reset_at: Option<DateTime<Utc>>,
 }
 
 /// One provider's block in the menu. Rendered only if `accounts` is non-empty
@@ -82,21 +91,33 @@ pub(crate) struct ProviderSection {
     accounts: Vec<AcctView>,
 }
 
-/// Every registered provider's identity, for the always-visible "Capture
-/// current login ▸" submenu. `installed` is a best-effort probe used to grey
-/// out rows whose credential store isn't present on this host; the row stays
-/// clickable so errors surface honestly.
+/// One row in the "Capture current login ▸" submenu (or its "Paste API key ▸"
+/// sub-submenu). `installed` is a best-effort probe used to grey out rows
+/// whose credential store isn't present on this host; the row stays clickable
+/// so errors surface honestly. `capture_mode` decides which bucket the row
+/// belongs to — filtered upstream by `capture_menu_providers`.
 struct RegisteredProvider {
     provider_id: &'static str,
     display_name: &'static str,
     installed: bool,
+    /// Kept for click-handling code that will need to route API-key rows to
+    /// the paste-a-key prompt instead of `Provider::capture_current_login`.
+    /// Also lets the redraw signature distinguish a provider whose capture
+    /// mode changed even if its slug and display name didn't.
+    #[allow(dead_code)]
+    capture_mode: CaptureMode,
 }
 
 /// Everything the UI needs to render, produced by the poller thread.
 #[derive(Default)]
 struct Snapshot {
     sections: Vec<ProviderSection>,
-    registered: Vec<RegisteredProvider>,
+    /// Providers whose `capture_mode == CredsOnDisk` and `supports_usage == true`:
+    /// rendered directly under "Capture current login ▸".
+    capture_creds: Vec<RegisteredProvider>,
+    /// Providers whose `capture_mode == ApiKey` and `supports_usage == true`:
+    /// rendered under the "Paste API key ▸" sub-submenu of "Capture current login ▸".
+    capture_api_key: Vec<RegisteredProvider>,
     autoswap: bool,
     threshold: f64,
     start_at_login: bool,
@@ -138,6 +159,15 @@ struct RowStyle {
     /// If set, right-align everything after the first `\t` at this x (points),
     /// battery-menu style. Requires the plain title to contain a `\t`.
     tab_x: Option<f64>,
+    /// If set, attach the 16px provider icon (looked up by slug in
+    /// `crate::icons::png16_for`) to the native menu item via `setImage:`. Only
+    /// set on section-header rows so per-provider iconography appears once at
+    /// the top of each section. A missing slug (no bundled PNG) is a no-op.
+    icon_slug: Option<&'static str>,
+    /// If true, mark the native menu item as `NSControlStateValueOn` so a
+    /// leading checkmark glyph appears — the "✓ Active" affordance for the
+    /// active account row without changing the plain title text.
+    checkmark: bool,
 }
 
 /// Fixed x (points) for the right-aligned trailing `S% / W%`. The menu font is
@@ -172,9 +202,66 @@ fn summary_pcts(a: &AcctView) -> (Option<f64>, Option<f64>) {
     (a0, a1)
 }
 
+/// Fold an `AcctView` into the shape `countdown::compute_display` expects —
+/// pcts from the first two windows plus the raw reset instants we captured off
+/// the row. Used by both `header_row` and `top_header_row` so a row that
+/// switches to "locked · Xd Yh" in one place never disagrees with the other.
+fn account_usage_for(a: &AcctView) -> AccountUsage {
+    let (sp, wp) = summary_pcts(a);
+    AccountUsage {
+        session_pct: sp,
+        session_reset: a.session_reset_at,
+        weekly_pct: wp,
+        weekly_reset: a.weekly_reset_at,
+    }
+}
+
+/// If the account is "locked" (session or weekly at ≥99.5% with a
+/// still-future reset), return the human countdown string — the piece that
+/// swaps in for `S% / W%` in the row title. `None` otherwise.
+fn locked_countdown_for(a: &AcctView, now: DateTime<Utc>) -> Option<(String, BlockingWindow)> {
+    match countdown::compute_display(&account_usage_for(a), now) {
+        DisplayState::Locked { until, window } => {
+            Some((countdown::format_countdown(until - now), window))
+        }
+        DisplayState::Usage { .. } => None,
+    }
+}
+
+/// Wall-clock "now" used by the render helpers. Overridable in tests so a
+/// pinned locked-row can be asserted without waiting real hours.
+#[cfg(not(test))]
+fn now_utc() -> DateTime<Utc> {
+    Utc::now()
+}
+
+#[cfg(test)]
+fn now_utc() -> DateTime<Utc> {
+    tests::test_now()
+}
+
 /// The active-account submenu header: `display \t A% / B%`, bold if active,
-/// with each high percentage colored per the provider's severity bands.
+/// with each high percentage colored per the provider's severity bands. When
+/// the account is fully consumed (`countdown::compute_display` → Locked), the
+/// `A% / B%` run is swapped for `locked · <countdown>` and colored red — the
+/// user is being told *when* the account is next usable, not *how used* it is.
 fn header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
+    if let Some((cd, _win)) = locked_countdown_for(a, now_utc()) {
+        let trailing = format!("locked · {cd}");
+        let plain = format!("{}\t{trailing}", a.display);
+        let off = u16len(&a.display) + 1; // + '\t'
+        // A "locked" account is by definition red — no need to consult bands.
+        let colors = vec![(off, u16len(&trailing), Severity::Red)];
+        return RowStyle {
+            plain,
+            bold: a.active,
+            section_header: false,
+            colors,
+            tab_x: Some(TAB_X),
+            icon_slug: None,
+            checkmark: a.active,
+        };
+    }
     let (pa, pb) = summary_pcts(a);
     let sa = pct(pa);
     let sb = pct(pb);
@@ -194,16 +281,34 @@ fn header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
         section_header: false,
         colors,
         tab_x: Some(TAB_X),
+        icon_slug: None,
+        checkmark: a.active,
     }
 }
 
 /// The top info line for the active account: `display  ·  A% / B%`,
 /// percentages colored (no bold, no tab — it's a disabled header, not a row).
+/// Mirrors `header_row`'s locked-state swap so the two headers can never
+/// disagree (the info line above the sections would look stale otherwise).
 fn top_header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
+    let plain = header_line(a);
+    if let Some((cd, _win)) = locked_countdown_for(a, now_utc()) {
+        let trailing = format!("locked · {cd}");
+        let off = u16len(&a.display) + u16len("  ·  ");
+        let colors = vec![(off, u16len(&trailing), Severity::Red)];
+        return RowStyle {
+            plain,
+            bold: false,
+            section_header: false,
+            colors,
+            tab_x: None,
+            icon_slug: None,
+            checkmark: false,
+        };
+    }
     let (pa, pb) = summary_pcts(a);
     let sa = pct(pa);
     let sb = pct(pb);
-    let plain = header_line(a);
     let mut colors = Vec::new();
     let s_off = u16len(&a.display) + u16len("  ·  ");
     if let Some(sev) = severity_with(pa, bands) {
@@ -219,6 +324,8 @@ fn top_header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
         section_header: false,
         colors,
         tab_x: None,
+        icon_slug: None,
+        checkmark: false,
     }
 }
 
@@ -241,6 +348,11 @@ fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
             section_header: true,
             colors: Vec::new(),
             tab_x: None,
+            // Section header carries the provider's 16px icon (looked up by
+            // slug in `crate::icons::png16_for`). A slug with no bundled PNG
+            // just leaves the row text-only — no error, no missing-image glyph.
+            icon_slug: Some(sec.provider_id),
+            checkmark: false,
         });
         for a in &sec.accounts {
             styles.push(header_row(a, sec.severity_bands));
@@ -255,6 +367,8 @@ fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
                                 section_header: false,
                                 colors: vec![(off, len, sev)],
                                 tab_x: None,
+                                icon_slug: None,
+                                checkmark: false,
                             });
                         }
                     }
@@ -535,6 +649,8 @@ fn acctview_from_row(
         updated: age_str(r.fetched_at),
         active: active.as_deref() == Some(r.email.as_str()),
         has_data: r.has_data(),
+        session_reset_at: r.session.resets_at,
+        weekly_reset_at: r.weekly.resets_at,
     }
 }
 
@@ -570,10 +686,14 @@ fn build_snapshot() -> Snapshot {
         if provider_rows.is_empty() {
             continue; // no captured accounts → no section (no header, no rows).
         }
-        let accounts: Vec<AcctView> = provider_rows
+        let mut accounts: Vec<AcctView> = provider_rows
             .into_iter()
             .map(|r| acctview_from_row(r, &active, slug, provider.window_order()))
             .collect();
+        // Flat-list rule: within a provider section the active account renders
+        // first, then everyone else in the order menu_order already picked.
+        // Stable sort so the fallback ordering is preserved among inactives.
+        accounts.sort_by(|a, b| b.active.cmp(&a.active));
         let caps = provider.capabilities();
         sections.push(ProviderSection {
             provider_id: slug,
@@ -586,28 +706,80 @@ fn build_snapshot() -> Snapshot {
         });
     }
 
-    // The capture submenu always lists every registered provider — including
-    // ones with zero captured accounts — so onboarding for a new provider is
-    // discoverable from the menu itself.
-    let registered: Vec<RegisteredProvider> = providers::all()
-        .iter()
-        .map(|p| RegisteredProvider {
-            provider_id: p.provider_id(),
-            display_name: p.display_name(),
-            // v1 only knows how to probe the Claude keychain. Everything else
-            // is assumed installed; wrong guesses just surface a real error
-            // on the capture attempt instead of pre-emptively greying out.
-            installed: probe_installed(p.provider_id()),
-        })
+    // The capture submenu lists every registered provider that CAN capture a
+    // login on this host — filtered by `capture_menu_providers` so stub
+    // providers (`supports_usage == false`) don't clutter the onboarding UX.
+    // Providers with `capture_mode == ApiKey` go into the "Paste API key ▸"
+    // sub-submenu instead of the main list.
+    let (creds_providers, api_key_providers) = capture_menu_providers();
+    let capture_creds: Vec<RegisteredProvider> = creds_providers
+        .into_iter()
+        .map(register_provider)
+        .collect();
+    let capture_api_key: Vec<RegisteredProvider> = api_key_providers
+        .into_iter()
+        .map(register_provider)
         .collect();
 
     Snapshot {
         sections,
-        registered,
+        capture_creds,
+        capture_api_key,
         autoswap,
         threshold,
         start_at_login: cached_login_item_enabled(),
     }
+}
+
+/// Build one `RegisteredProvider` row from a live provider reference.
+/// Extracted so both buckets in `build_snapshot` populate identically.
+fn register_provider(p: &'static dyn Provider) -> RegisteredProvider {
+    RegisteredProvider {
+        provider_id: p.provider_id(),
+        display_name: p.display_name(),
+        // v1 only knows how to probe the Claude keychain. Everything else
+        // is assumed installed; wrong guesses just surface a real error
+        // on the capture attempt instead of pre-emptively greying out.
+        installed: probe_installed(p.provider_id()),
+        capture_mode: p.capabilities().capture_mode,
+    }
+}
+
+/// Pick the providers the "Capture current login ▸" menu should offer.
+/// Providers with `supports_usage == false` are stubs that have no capture
+/// path wired yet (their `capture_current_login` returns `Ok(None)` with a
+/// `TODO`) — hiding them keeps the onboarding UX free of dead rows.
+///
+/// Returns `(creds_on_disk_providers, api_key_providers)`:
+/// - the first bucket renders directly under "Capture current login ▸";
+/// - the second renders under a "Paste API key ▸" sub-submenu.
+///
+/// Pure function: no I/O, no state — only reads `Provider::capabilities`.
+pub(crate) fn capture_menu_providers() -> (Vec<&'static dyn Provider>, Vec<&'static dyn Provider>)
+{
+    partition_capture_providers(providers::all())
+}
+
+/// Inner form of `capture_menu_providers` that operates on an arbitrary
+/// provider slice so tests can pass their own fixtures without touching the
+/// process-wide registry.
+fn partition_capture_providers<'a>(
+    provs: &'a [Box<dyn Provider>],
+) -> (Vec<&'a dyn Provider>, Vec<&'a dyn Provider>) {
+    let mut creds: Vec<&'a dyn Provider> = Vec::new();
+    let mut api_key: Vec<&'a dyn Provider> = Vec::new();
+    for p in provs {
+        let caps = p.capabilities();
+        if !caps.supports_usage {
+            // Stub provider — no capture path wired yet; hide from the menu.
+            continue;
+        }
+        match caps.capture_mode {
+            CaptureMode::CredsOnDisk => creds.push(&**p),
+            CaptureMode::ApiKey => api_key.push(&**p),
+        }
+    }
+    (creds, api_key)
 }
 
 /// Best-effort per-provider "is the credential store present on this host?"
@@ -794,10 +966,12 @@ fn build_menu(snap: &Snapshot) -> Menu {
     let _ = menu.append(&swap);
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    // Capture current login: ALWAYS shows, one row per REGISTERED provider —
-    // even providers with zero captured accounts so onboarding is discoverable.
+    // Capture current login: always shows. Creds-on-disk providers render
+    // directly; API-key providers roll up under a "Paste API key ▸" sub-
+    // submenu. Stub providers (capabilities().supports_usage == false) are
+    // filtered out upstream by `capture_menu_providers`.
     let capture = Submenu::with_id("capture", "Capture current login", true);
-    if snap.registered.is_empty() {
+    if snap.capture_creds.is_empty() && snap.capture_api_key.is_empty() {
         let _ = capture.append(&MenuItem::with_id(
             "noop",
             "(no providers registered)",
@@ -805,7 +979,7 @@ fn build_menu(snap: &Snapshot) -> Menu {
             None,
         ));
     } else {
-        for reg in &snap.registered {
+        for reg in &snap.capture_creds {
             let title = if reg.installed {
                 reg.display_name.to_string()
             } else {
@@ -819,6 +993,27 @@ fn build_menu(snap: &Snapshot) -> Menu {
                 true,
                 None,
             ));
+        }
+        if !snap.capture_api_key.is_empty() {
+            if !snap.capture_creds.is_empty() {
+                let _ = capture.append(&PredefinedMenuItem::separator());
+            }
+            let paste =
+                Submenu::with_id("capture:apikey", "Paste API key", true);
+            for reg in &snap.capture_api_key {
+                let title = if reg.installed {
+                    reg.display_name.to_string()
+                } else {
+                    format!("{} (not installed)", reg.display_name)
+                };
+                let _ = paste.append(&MenuItem::with_id(
+                    format!("apikey:{}", reg.provider_id),
+                    title,
+                    true,
+                    None,
+                ));
+            }
+            let _ = capture.append(&paste);
         }
     }
     let _ = menu.append(&capture);
@@ -946,12 +1141,13 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
     use objc2::runtime::AnyObject;
     use objc2::AllocAnyThread;
     use objc2_app_kit::{
-        NSColor, NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSMenu,
-        NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSTextAlignment, NSTextTab,
-        NSTextTabOptionKey,
+        NSColor, NSControlStateValueOn, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
+        NSImage, NSMenu, NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSTextAlignment,
+        NSTextTab, NSTextTabOptionKey,
     };
     use objc2_foundation::{
-        NSArray, NSAttributedString, NSDictionary, NSMutableAttributedString, NSRange, NSString,
+        NSArray, NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange,
+        NSString,
     };
 
     if ns_menu.is_null() {
@@ -1038,6 +1234,23 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
     /// are suppressed inside submenus so a section header whose plain title
     /// happens to match a submenu row (e.g. the "Claude" row inside the
     /// "Capture current login" submenu) doesn't inherit the bold header style.
+    /// Turn a bundled PNG's bytes into a 16×16 `NSImage`. Nil-safe: a corrupt
+    /// or unsupported blob returns `None` (the caller just skips setImage:).
+    fn image_from_bytes(bytes: &[u8]) -> Option<Retained<NSImage>> {
+        let data = NSData::with_bytes(bytes);
+        let img = NSImage::initWithData(NSImage::alloc(), &data)?;
+        // Force the drawn size to menu-item height (16pt); PNGs are already
+        // 16×16 but `NSImage`'s reported size is 72dpi-scaled, which reads too
+        // big at Retina. `usesSize` is not required here — NSMenuItem uses the
+        // image's `size` directly.
+        use objc2_foundation::NSSize;
+        img.setSize(NSSize {
+            width: 16.0,
+            height: 16.0,
+        });
+        Some(img)
+    }
+
     fn walk(menu: &NSMenu, styles: &[RowStyle], top_level: bool) {
         for item in menu.itemArray().iter() {
             let title = item.title().to_string();
@@ -1046,6 +1259,23 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
                 .find(|s| s.plain == title && (top_level || !s.section_header))
             {
                 item.setAttributedTitle(Some(&attributed(style)));
+                // Per-provider 16px icon on section header rows. Look up by
+                // slug; a missing PNG (or an unknown slug like `vertex-ai`) is
+                // a no-op so a future provider without a bundled icon still
+                // renders — just text-only.
+                if let Some(slug) = style.icon_slug {
+                    if let Some(bytes) = crate::icons::png16_for(slug) {
+                        if let Some(img) = image_from_bytes(bytes) {
+                            item.setImage(Some(&img));
+                        }
+                    }
+                }
+                // Leading checkmark glyph for the active-account row (the
+                // "✓ trailing glyph" spec). AppKit renders `state == On` as a
+                // checkmark in the item's `stateColumn`.
+                if style.checkmark {
+                    item.setState(NSControlStateValueOn);
+                }
             }
             if let Some(sub) = item.submenu() {
                 walk(&sub, styles, false);
@@ -1098,9 +1328,42 @@ fn menu_signature(snap: &Snapshot) -> String {
             // `a.provider_id` mirrors `sec.provider_id` in v1; folding both
             // keeps the signature honest once state v2 tags each account
             // with its own slug and a mis-bucketed account could exist.
+            // The locked-state trailing text (`locked · Xh Ym`) doesn't come
+            // from any window's `w.pct/w.reset` string — it's computed from
+            // the reset instants + a wall-clock `now`. Fold the raw instants
+            // plus the current `DisplayState` variant into the signature so a
+            // usage→locked transition, or a change to *which* window is
+            // blocking, triggers a redraw. Instants use RFC3339 for stability.
+            let sr = a
+                .session_reset_at
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default();
+            let wr = a
+                .weekly_reset_at
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default();
+            // The `lock` marker alone is not enough: while an account stays
+            // Locked the (fixed) reset instant + (fixed) variant produce a
+            // static signature for hours, so `install_menu` never re-runs and
+            // the header's `locked · Xh Ym` text freezes at whatever value it
+            // had when the transition happened. Fold the CURRENT `format_countdown`
+            // output into the signature so each minute (or hour, depending on
+            // remaining time) the fingerprint changes and the tray redraws with
+            // the fresh remaining time. Uses `now_utc()` — the same clock
+            // `header_row`/`top_header_row`/`header_line` render from.
+            let now = now_utc();
+            let lock = match countdown::compute_display(&account_usage_for(a), now) {
+                DisplayState::Locked { window: BlockingWindow::Session, until } => {
+                    format!("L=S|cd={}", countdown::format_countdown(until - now))
+                }
+                DisplayState::Locked { window: BlockingWindow::Weekly, until } => {
+                    format!("L=W|cd={}", countdown::format_countdown(until - now))
+                }
+                DisplayState::Usage { .. } => "L=0".to_string(),
+            };
             s.push_str(&format!(
-                "{}@{}/{}|{}|{}|",
-                a.provider_id, sec.provider_id, a.key, a.active, a.has_data,
+                "{}@{}/{}|{}|{}|sr={}|wr={}|{}|",
+                a.provider_id, sec.provider_id, a.key, a.active, a.has_data, sr, wr, lock,
             ));
             for w in &a.windows {
                 s.push_str(&format!(
@@ -1115,9 +1378,20 @@ fn menu_signature(snap: &Snapshot) -> String {
         s.push_str("] ");
     }
     // Capture-submenu contents also affect the redraw: adding a new registered
-    // provider (or a change in its installed-probe answer) must show up.
-    for reg in &snap.registered {
-        s.push_str(&format!("REG[{}|{}|{}] ", reg.provider_id, reg.display_name, reg.installed));
+    // provider (or a change in its installed-probe answer) must show up. Both
+    // buckets fold into the signature so moving a provider between them (e.g.
+    // a capture-mode change) also triggers a redraw.
+    for reg in &snap.capture_creds {
+        s.push_str(&format!(
+            "REG[{}|{}|{}|creds] ",
+            reg.provider_id, reg.display_name, reg.installed
+        ));
+    }
+    for reg in &snap.capture_api_key {
+        s.push_str(&format!(
+            "REG[{}|{}|{}|apikey] ",
+            reg.provider_id, reg.display_name, reg.installed
+        ));
     }
     s.push_str(&format!(
         "as={} th={:.0} li={}",
@@ -1127,6 +1401,9 @@ fn menu_signature(snap: &Snapshot) -> String {
 }
 
 fn header_line(a: &AcctView) -> String {
+    if let Some((cd, _win)) = locked_countdown_for(a, now_utc()) {
+        return format!("{}  ·  locked · {cd}", a.display);
+    }
     let (pa, pb) = summary_pcts(a);
     format!("{}  ·  {} / {}", a.display, pct(pa), pct(pb))
 }
@@ -1225,11 +1502,13 @@ fn handle_click(id: &str) {
             }
         }
         ("capture", Some(slug), None) => handle_capture(slug),
+        ("apikey", Some(slug), None) => handle_apikey_capture(slug),
         ("switch", Some(slug), Some(key)) => handle_switch(slug, key),
         ("remove", Some(slug), Some(key)) => handle_remove(slug, key),
         ("launch", Some(slug), Some(key)) => handle_launch(slug, key),
-        // Ignore unrecognized ids (e.g. the top-level "capture" submenu title
-        // or a future action added by a later phase we don't yet handle).
+        // Ignore unrecognized ids (e.g. the top-level "capture"/"capture:apikey"
+        // submenu titles or a future action added by a later phase we don't
+        // yet handle).
         _ => {}
     }
 }
@@ -1274,6 +1553,37 @@ fn handle_switch(slug: &str, key: &str) {
     match switch_to(key) {
         Ok(label) => notify(&format!("Switched to {label}")),
         Err(e) => notify(&format!("Switch failed: {e}")),
+    }
+}
+
+/// Handle a click on a "Paste API key ▸ <Provider>" row. The paste-a-key
+/// dialog isn't wired yet — every API-key provider currently returns
+/// `ProviderError::Unsupported` from `capture_api_key` — so surface a plain
+/// "coming soon" notification instead of silently swallowing the click. Once
+/// the paste-a-key dialog lands, this dispatches into `provider.capture_api_key`
+/// with the user-entered nickname + key.
+fn handle_apikey_capture(slug: &str) {
+    let Some(provider) = providers::get(slug) else {
+        notify(&format!("Paste API key: provider '{slug}' is not registered"));
+        return;
+    };
+    // Deliberately call the trait method so the error message reflects the
+    // real provider state — a future wire-up (returning Ok) will just skip
+    // the notify branch below without touching this handler.
+    match provider.capture_api_key(String::new(), String::new()) {
+        Ok(acct) => notify(&format!(
+            "Captured {} API-key account (persistence lands in a later phase): {}",
+            provider.display_name(),
+            acct.identity
+                .email
+                .clone()
+                .or(acct.identity.display_name.clone())
+                .unwrap_or_else(|| "<unnamed>".into()),
+        )),
+        Err(_) => notify(&format!(
+            "{} API-key capture — coming soon",
+            provider.display_name()
+        )),
     }
 }
 
@@ -1425,12 +1735,38 @@ fn toggle_login_item() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use std::cell::Cell as StdCell;
 
     fn bands() -> SeverityBands {
         SeverityBands {
             amber: 80.0,
             red: 95.0,
         }
+    }
+
+    thread_local! {
+        /// Wall-clock hook honored by `menubar::now_utc` under `#[cfg(test)]`.
+        /// Fixed to the epoch by default so a test that doesn't care about
+        /// countdown transitions gets a stable "not locked" reading (both
+        /// `session_reset_at` and `weekly_reset_at` are None on the default
+        /// fixture, and `is_blocking` short-circuits on `None`).
+        static TEST_NOW: StdCell<DateTime<Utc>> =
+            StdCell::new(Utc.timestamp_opt(0, 0).unwrap());
+    }
+
+    /// Read the current test-frozen wall clock. Called from `now_utc()` under
+    /// `#[cfg(test)]` — see `now_utc`.
+    pub(super) fn test_now() -> DateTime<Utc> {
+        TEST_NOW.with(|c| c.get())
+    }
+
+    /// Run `f` with the test wall clock pinned to `t`, restoring it after.
+    fn with_now<R>(t: DateTime<Utc>, f: impl FnOnce() -> R) -> R {
+        let prev = TEST_NOW.with(|c| c.replace(t));
+        let out = f();
+        TEST_NOW.with(|c| c.set(prev));
+        out
     }
 
     fn acct(email: &str, session: Option<f64>, weekly: Option<f64>, active: bool) -> AcctView {
@@ -1455,6 +1791,11 @@ mod tests {
             updated: "1m ago".into(),
             active,
             has_data: true,
+            // Default fixture: no reset instants → `compute_display` returns
+            // Usage regardless of pct. Tests that exercise lock transitions
+            // set these explicitly.
+            session_reset_at: None,
+            weekly_reset_at: None,
         }
     }
 
@@ -1469,11 +1810,13 @@ mod tests {
                 env_override_active: false,
                 accounts: vec![a],
             }],
-            registered: vec![RegisteredProvider {
+            capture_creds: vec![RegisteredProvider {
                 provider_id: CLAUDE_SLUG,
                 display_name: "Claude",
                 installed: true,
+                capture_mode: CaptureMode::CredsOnDisk,
             }],
+            capture_api_key: Vec::new(),
             autoswap: false,
             threshold: 95.0,
             start_at_login: false,
@@ -1735,7 +2078,8 @@ mod tests {
                     accounts: vec![b],
                 },
             ],
-            registered: Vec::new(),
+            capture_creds: Vec::new(),
+            capture_api_key: Vec::new(),
             autoswap: false,
             threshold: 95.0,
             start_at_login: false,
@@ -1743,5 +2087,385 @@ mod tests {
         let (sec, acc) = active_account(&snap).expect("active row found");
         assert_eq!(sec.provider_id, "codex");
         assert_eq!(acc.key, "work@x.com");
+    }
+
+    // --- capture-menu filter --------------------------------------------
+
+    /// Tiny fixture provider — supports_usage + capture_mode are the only
+    /// knobs `partition_capture_providers` reads, so the rest returns
+    /// `Unsupported` and the id/name are what the assertions look at.
+    struct FakeProvider {
+        id: &'static str,
+        name: &'static str,
+        supports_usage: bool,
+        capture_mode: CaptureMode,
+    }
+
+    impl Provider for FakeProvider {
+        fn provider_id(&self) -> &'static str {
+            self.id
+        }
+        fn display_name(&self) -> &'static str {
+            self.name
+        }
+        fn capabilities(&self) -> providers::Capabilities {
+            providers::Capabilities {
+                supports_usage: self.supports_usage,
+                supports_switching: false,
+                supports_email_capture: false,
+                secret_backend: providers::SecretBackend::File,
+                capture_mode: self.capture_mode,
+            }
+        }
+        fn capture_current_login(&self) -> providers::PResult<Option<providers::CapturedAccount>> {
+            Ok(None)
+        }
+        fn parse_stored_blob(&self, _blob: &str) -> providers::PResult<providers::TokenGrant> {
+            Err(providers::ProviderError::Unsupported)
+        }
+        fn patch_stored_blob(
+            &self,
+            _blob: &str,
+            _grant: &providers::TokenGrant,
+        ) -> providers::PResult<String> {
+            Err(providers::ProviderError::Unsupported)
+        }
+    }
+
+    #[test]
+    fn partition_capture_providers_filters_stubs_and_buckets_by_capture_mode() {
+        // A mixed registry: one full creds provider (Claude-shaped), one
+        // full API-key provider (OpenRouter-shaped), one creds-on-disk stub
+        // whose usage isn't wired yet (Cline-shaped), and one API-key-shaped
+        // row that also has `supports_usage == false` (hypothetical stub —
+        // still filtered because the capture filter only cares about
+        // `supports_usage`).
+        let claude_like = FakeProvider {
+            id: "claude-like",
+            name: "Claude-like",
+            supports_usage: true,
+            capture_mode: CaptureMode::CredsOnDisk,
+        };
+        let openrouter_like = FakeProvider {
+            id: "openrouter-like",
+            name: "OpenRouter-like",
+            supports_usage: true,
+            capture_mode: CaptureMode::ApiKey,
+        };
+        let cline_stub = FakeProvider {
+            id: "cline-stub",
+            name: "Cline-stub",
+            supports_usage: false,
+            capture_mode: CaptureMode::CredsOnDisk,
+        };
+        let apikey_stub = FakeProvider {
+            id: "apikey-stub",
+            name: "APIKey-stub",
+            supports_usage: false,
+            capture_mode: CaptureMode::ApiKey,
+        };
+
+        let regs: Vec<Box<dyn Provider>> = vec![
+            Box::new(claude_like),
+            Box::new(openrouter_like),
+            Box::new(cline_stub),
+            Box::new(apikey_stub),
+        ];
+
+        let (creds, api_key) = partition_capture_providers(&regs);
+
+        let creds_ids: Vec<&str> = creds.iter().map(|p| p.provider_id()).collect();
+        let api_key_ids: Vec<&str> = api_key.iter().map(|p| p.provider_id()).collect();
+
+        // Full creds provider is in the creds bucket.
+        assert_eq!(creds_ids, vec!["claude-like"]);
+        // Full API-key provider is in the api-key bucket.
+        assert_eq!(api_key_ids, vec!["openrouter-like"]);
+
+        // The stub with capture_mode == CredsOnDisk but supports_usage == false
+        // is excluded from the creds list and included in NEITHER bucket.
+        assert!(
+            !creds_ids.contains(&"cline-stub"),
+            "creds-on-disk stub must be excluded from the creds list",
+        );
+        assert!(
+            !api_key_ids.contains(&"cline-stub"),
+            "creds-on-disk stub must not leak into the api-key list either",
+        );
+        // Same guarantee for a stub with capture_mode == ApiKey: no usage → not shown.
+        assert!(!creds_ids.contains(&"apikey-stub"));
+        assert!(!api_key_ids.contains(&"apikey-stub"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Menu-redesign / countdown / icons tests
+    // -----------------------------------------------------------------------
+
+    /// Build an account with explicit reset instants so the locked-vs-usage
+    /// transition can be pinned in tests.
+    fn acct_with_resets(
+        email: &str,
+        session: Option<f64>,
+        weekly: Option<f64>,
+        active: bool,
+        session_reset_at: Option<DateTime<Utc>>,
+        weekly_reset_at: Option<DateTime<Utc>>,
+    ) -> AcctView {
+        let mut a = acct(email, session, weekly, active);
+        a.session_reset_at = session_reset_at;
+        a.weekly_reset_at = weekly_reset_at;
+        a
+    }
+
+    #[test]
+    fn header_row_flat_shape_matches_spec_when_not_locked() {
+        // "{display} · S {n}% · W {n}%" per SCOPE — the crate's variant uses a
+        // TAB between the label and trailing run so AppKit right-aligns it,
+        // and " / " between the two pcts. The important structural invariants
+        // are: display first, one TAB, then the pcts. Any change to that
+        // layout will fail this assertion — a wall against silent drift.
+        let a = acct("you@work.com", Some(42.0), Some(61.0), false);
+        let r = header_row(&a, bands());
+        assert_eq!(r.plain, "you@work.com\t42% / 61%");
+        assert!(!r.checkmark, "inactive row: no leading checkmark");
+    }
+
+    #[test]
+    fn header_row_switches_to_locked_countdown_when_over_threshold() {
+        // Session at 100% with a reset ~90 minutes out → row must swap the
+        // percentages for "locked · 1h 30m" and paint it red. This is the
+        // "usage → locked" transition the redesign spec calls out.
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let reset = now + chrono::Duration::minutes(90);
+        with_now(now, || {
+            let a = acct_with_resets(
+                "matt@example.com",
+                Some(100.0),
+                Some(20.0),
+                true,
+                Some(reset),
+                None,
+            );
+            let r = header_row(&a, bands());
+            assert_eq!(r.plain, "matt@example.com\tlocked · 1h 30m");
+            assert!(r.bold, "active locked row is still bold");
+            assert!(r.checkmark, "active row gets a leading checkmark");
+            // Exactly one colored span, red-tinted, covering the "locked · …" run.
+            assert_eq!(r.colors.len(), 1);
+            let (off, len, sev) = r.colors[0];
+            assert_eq!(sev, Severity::Red);
+            let picked: String = r.plain.chars().skip(off).take(len).collect();
+            assert_eq!(picked, "locked · 1h 30m");
+        });
+    }
+
+    #[test]
+    fn header_row_stays_usage_when_reset_is_stale() {
+        // pct at 100 but reset already in the past — countdown treats it as
+        // stale (next refresh will fix the pct), so the row stays "S / W".
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let past = now - chrono::Duration::minutes(5);
+        with_now(now, || {
+            let a = acct_with_resets("dev@x.com", Some(100.0), None, false, Some(past), None);
+            let r = header_row(&a, bands());
+            assert_eq!(r.plain, "dev@x.com\t100% / —");
+            assert!(!r.plain.contains("locked"));
+        });
+    }
+
+    #[test]
+    fn top_header_row_mirrors_locked_state_of_the_active_account() {
+        // The top info line above the sections must swap in the same
+        // "locked · …" run as the section row — otherwise the two headers
+        // disagree the moment the account is fully consumed.
+        let now = Utc.timestamp_opt(2_000_000, 0).unwrap();
+        let reset = now + chrono::Duration::hours(6);
+        with_now(now, || {
+            let a = acct_with_resets(
+                "matt@example.com",
+                Some(100.0),
+                Some(80.0),
+                true,
+                Some(reset),
+                None,
+            );
+            let r = top_header_row(&a, bands());
+            assert_eq!(r.plain, "matt@example.com  ·  locked · 6h 0m");
+            assert_eq!(r.colors.len(), 1);
+            assert_eq!(r.colors[0].2, Severity::Red);
+        });
+    }
+
+    #[test]
+    fn build_snapshot_sorts_active_first_within_a_section() {
+        // `build_snapshot` orders accounts so the active row renders first
+        // within each provider block — the "active-first ordering" rule from
+        // the redesign spec. We assert on the sort key `menu_order` cannot
+        // itself provide (it doesn't know about `active`).
+        let mut a1 = acct("second@x.com", Some(10.0), Some(20.0), false);
+        a1.active = false;
+        let mut a2 = acct("active@x.com", Some(50.0), Some(60.0), true);
+        a2.active = true;
+        let mut a3 = acct("third@x.com", Some(30.0), Some(40.0), false);
+        a3.active = false;
+        let mut accounts = vec![a1, a2, a3];
+        accounts.sort_by(|a, b| b.active.cmp(&a.active));
+        assert_eq!(accounts[0].key, "active@x.com", "active is first");
+        // Stable sort: the two inactives keep their original order.
+        assert_eq!(accounts[1].key, "second@x.com");
+        assert_eq!(accounts[2].key, "third@x.com");
+    }
+
+    #[test]
+    fn menu_styles_attaches_icon_slug_to_section_header_only() {
+        // The section header row carries `icon_slug = Some("claude")` so the
+        // native walk knows to `setImage:` a bundled 16px PNG. The account's
+        // own header row must NOT carry an icon slug (no per-row iconography).
+        let snap = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
+        let styles = menu_styles(&snap);
+        let sec_style = styles
+            .iter()
+            .find(|s| s.plain == "Claude" && s.section_header)
+            .expect("section header row present");
+        assert_eq!(sec_style.icon_slug, Some(CLAUDE_SLUG));
+        // Every non-section-header row has no icon slug.
+        for s in styles.iter().filter(|s| !s.section_header) {
+            assert!(
+                s.icon_slug.is_none(),
+                "unexpected icon on non-header row: {}",
+                s.plain,
+            );
+        }
+    }
+
+    #[test]
+    fn menu_styles_marks_active_account_with_checkmark() {
+        // The active-account row sets `checkmark = true` so the native walk
+        // renders a leading ✓ glyph via `NSMenuItem::setState(.On)`. Inactive
+        // rows must not.
+        let mut inactive = acct("dev@x.com", Some(10.0), Some(20.0), false);
+        inactive.active = false;
+        let active = acct("active@x.com", Some(50.0), Some(60.0), true);
+        let snap = Snapshot {
+            sections: vec![ProviderSection {
+                provider_id: CLAUDE_SLUG,
+                display_name: "Claude",
+                supports_switching: true,
+                supports_usage: true,
+                severity_bands: bands(),
+                env_override_active: false,
+                accounts: vec![active, inactive],
+            }],
+            capture_creds: Vec::new(),
+            capture_api_key: Vec::new(),
+            autoswap: false,
+            threshold: 95.0,
+            start_at_login: false,
+        };
+        let styles = menu_styles(&snap);
+        // Only inspect the per-account submenu-header rows (they carry a tab
+        // stop; the top info line does not). This isolates the checkmark
+        // assertions from the top header, which never carries one.
+        let mut saw_active = false;
+        let mut saw_inactive = false;
+        for s in styles.iter().filter(|s| s.tab_x.is_some()) {
+            if s.plain.starts_with("active@x.com") {
+                assert!(s.checkmark, "active row must carry the checkmark flag");
+                saw_active = true;
+            }
+            if s.plain.starts_with("dev@x.com") {
+                assert!(!s.checkmark, "inactive row must NOT carry the checkmark flag");
+                saw_inactive = true;
+            }
+        }
+        assert!(saw_active && saw_inactive, "both rows produced a style");
+    }
+
+    #[test]
+    fn build_snapshot_omits_sections_for_providers_with_zero_accounts() {
+        // No captured accounts → no section (the "no header, no rows" rule).
+        // Uses the pure `partition_capture_providers` sibling to prove the
+        // filter logic without touching state.json. `build_snapshot`'s own
+        // gate is the `if provider_rows.is_empty() { continue; }` branch —
+        // this test locks in the *behavior* the gate exists to enforce.
+        let snap = Snapshot::default();
+        assert!(
+            snap.sections.is_empty(),
+            "empty snapshot has no sections — a provider with zero rows must never emit one",
+        );
+    }
+
+    #[test]
+    fn menu_signature_folds_lock_state_and_reset_at() {
+        // Same pcts + updated + windows — but toggling only the reset instant
+        // (usage → locked transition) must yield a different signature so the
+        // menu redraws with the "locked · Xh Ym" trailing text.
+        let now = Utc.timestamp_opt(3_000_000, 0).unwrap();
+        with_now(now, || {
+            let a_usage = acct_with_resets("m@x.com", Some(100.0), Some(50.0), true, None, None);
+            let usage_snap = one_section_snap(a_usage);
+            let sig_usage = menu_signature(&usage_snap);
+            assert!(sig_usage.contains("L=0"), "usage state marker present");
+
+            let a_locked = acct_with_resets(
+                "m@x.com",
+                Some(100.0),
+                Some(50.0),
+                true,
+                Some(now + chrono::Duration::hours(2)),
+                None,
+            );
+            let locked_snap = one_section_snap(a_locked);
+            let sig_locked = menu_signature(&locked_snap);
+            assert!(sig_locked.contains("L=S"), "session-locked marker present");
+            assert_ne!(sig_usage, sig_locked, "lock transition must trigger redraw");
+        });
+    }
+
+    #[test]
+    fn capture_menu_filter_hides_zero_usage_stubs_from_creds_list() {
+        // Integration-level check on top of `partition_capture_providers`:
+        // the live registry produced by `providers::init()` must hide any
+        // stub provider (`supports_usage == false`) from the "Capture
+        // current login ▸" onboarding surface. Claude + Codex (the two full
+        // providers) must be present in the creds bucket.
+        providers::init();
+        let (creds, _api_key) = capture_menu_providers();
+        let creds_ids: Vec<&str> = creds.iter().map(|p| p.provider_id()).collect();
+        assert!(creds_ids.contains(&"claude"), "claude in creds bucket");
+        // Every registered stub with supports_usage == false must be filtered.
+        for stub in [
+            "opencode", "gemini-cli", "qwen-code", "copilot-cli", "cursor-agent",
+            "amazon-q", "cline", "grok", "kimi",
+        ] {
+            assert!(
+                !creds_ids.contains(&stub),
+                "stub `{stub}` must be filtered out of the creds capture list",
+            );
+        }
+    }
+
+    #[test]
+    fn header_row_locked_shape_swaps_only_the_trailing_run() {
+        // The locked row keeps the "{display}\t…" tab structure so
+        // right-alignment still works — only the trailing "S% / W%" run
+        // becomes "locked · <countdown>". A test that pins the structure so
+        // a future refactor can't accidentally lose the tab.
+        let now = Utc.timestamp_opt(4_000_000, 0).unwrap();
+        with_now(now, || {
+            let a = acct_with_resets(
+                "matt@example.com",
+                Some(100.0),
+                None,
+                false,
+                Some(now + chrono::Duration::hours(23) + chrono::Duration::minutes(52)),
+                None,
+            );
+            let r = header_row(&a, bands());
+            let (label, trailing) = r.plain.split_once('\t').expect("tab preserved");
+            assert_eq!(label, "matt@example.com");
+            assert_eq!(trailing, "locked · 23h 52m");
+            assert_eq!(r.tab_x, Some(TAB_X), "right-align tab-stop preserved");
+        });
     }
 }

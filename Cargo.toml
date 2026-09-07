@@ -20,6 +20,14 @@ default = [
     "cursor-agent",
     "amazon-q",
     "cline",
+    "grok",
+    "kimi",
+    "openrouter",
+    "deepseek",
+    "zai",
+    "fireworks",
+    "synthetic",
+    "vertex-ai",
 ]
 claude = []
 codex = []
@@ -30,6 +38,14 @@ copilot-cli = []
 cursor-agent = []
 amazon-q = []
 cline = []
+grok = []
+kimi = []
+openrouter = []
+deepseek = []
+zai = []
+fireworks = []
+synthetic = []
+vertex-ai = []
 
 [dependencies]
 anyhow = "1"
@@ -42,6 +58,9 @@ base64 = "0.22"
 rand = "0.8"
 fs2 = "0.4"
 tray-icon = "0.24.2"
+# Desktop notifications for the notifications module. Best-effort — a broken
+# dbus / user-notification connection never fails a watch cycle.
+notify-rust = "4"
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status
@@ -58,6 +77,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSArray",            # tab-stops array
     "NSDictionary",       # empty NSTextTab options dict
     "NSGeometry",         # NSRange (re-exported at crate root)
+    "NSData",             # NSImage::initWithData for bundled provider PNGs
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
@@ -69,6 +89,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSParagraphStyle",   # NSTextTab right-align tab stop
     "NSText",             # NSTextAlignment
     "NSAttributedString", # attribute-name constants live here
+    "NSImage",            # 16px provider icons on section header rows
     "objc2-core-foundation", # REQUIRED: CGFloat-typed methods are cfg-gated on it
 ] }
 block2 = "0.6"

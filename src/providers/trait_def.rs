@@ -145,6 +145,20 @@ pub struct SeverityBands {
     pub red: f64,
 }
 
+/// How a provider onboards a new account. The menu's "Add account" flow uses
+/// this to pick between the on-disk credential capture UX (read whatever the
+/// vendor CLI already persisted) and the paste-an-API-key UX (prompt the
+/// user for a raw key + optional nickname).
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureMode {
+    /// Read credentials that the vendor CLI wrote to disk / keychain during
+    /// its own `login` flow (Claude, Codex, ...).
+    CredsOnDisk,
+    /// Accept a raw API key pasted by the user (OpenRouter, DeepSeek, ...).
+    ApiKey,
+}
+
 /// Runtime feature flags a provider exposes so menu code can decide what UI
 /// elements to render (Switch row, usage rows, capture entry, ...).
 #[derive(Copy, Clone, Debug)]
@@ -153,6 +167,7 @@ pub struct Capabilities {
     pub supports_switching: bool,
     pub supports_email_capture: bool,
     pub secret_backend: SecretBackend,
+    pub capture_mode: CaptureMode,
 }
 
 /// One provider (Claude, Codex, opencode, ...). Registered once at startup
@@ -199,6 +214,16 @@ pub trait Provider: Send + Sync + 'static {
     /// stores (all of the v1 providers).
     fn list_accounts(&self) -> PResult<Vec<CapturedAccount>> {
         Ok(self.capture_current_login()?.into_iter().collect())
+    }
+
+    /// Register an account onboarded via a pasted API key. `nickname` is the
+    /// user-supplied label (used for menu display and, for providers that
+    /// can't derive an email from the key alone, for `account_identifier`);
+    /// `key` is the raw API key. Default is `Unsupported` for providers whose
+    /// `capture_mode` is `CredsOnDisk`.
+    fn capture_api_key(&self, nickname: String, key: String) -> PResult<CapturedAccount> {
+        let _ = (nickname, key);
+        Err(ProviderError::Unsupported)
     }
 
     // --- Token lifecycle ---
@@ -307,6 +332,7 @@ mod tests {
                 supports_switching: false,
                 supports_email_capture: false,
                 secret_backend: SecretBackend::File,
+                capture_mode: CaptureMode::CredsOnDisk,
             }
         }
         fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
@@ -339,6 +365,16 @@ mod tests {
             p.launch_client(LaunchMode::Fresh),
             Err(ProviderError::Unsupported)
         ));
+        assert!(matches!(
+            p.capture_api_key("n".into(), "k".into()),
+            Err(ProviderError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn capture_mode_default_is_creds_on_disk() {
+        let caps = Dummy.capabilities();
+        assert_eq!(caps.capture_mode, CaptureMode::CredsOnDisk);
     }
 
     #[test]

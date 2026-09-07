@@ -28,8 +28,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::providers::trait_def::{
-    Capabilities, CapturedAccount, IdentitySnapshot, LaunchMode, PResult, Provider, ProviderError,
-    SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
+    Capabilities, CaptureMode, CapturedAccount, IdentitySnapshot, LaunchMode, PResult, Provider,
+    ProviderError, SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
 };
 
 /// Keychain generic-password service Claude Code writes to. Duplicated from
@@ -59,6 +59,7 @@ impl Provider for ClaudeProvider {
             supports_switching: true,
             supports_email_capture: true,
             secret_backend: SecretBackend::Keychain,
+            capture_mode: CaptureMode::CredsOnDisk,
         }
     }
 

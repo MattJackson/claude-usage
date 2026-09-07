@@ -36,6 +36,14 @@ use std::sync::OnceLock;
 #[cfg(feature = "cursor-agent")]  pub mod cursor_agent;
 #[cfg(feature = "amazon-q")]      pub mod amazon_q;
 #[cfg(feature = "cline")]         pub mod cline;
+#[cfg(feature = "grok")]          pub mod grok;
+#[cfg(feature = "kimi")]          pub mod kimi;
+#[cfg(feature = "openrouter")]    pub mod openrouter;
+#[cfg(feature = "deepseek")]      pub mod deepseek;
+#[cfg(feature = "zai")]           pub mod zai;
+#[cfg(feature = "fireworks")]     pub mod fireworks;
+#[cfg(feature = "synthetic")]     pub mod synthetic;
+#[cfg(feature = "vertex-ai")]     pub mod vertex_ai;
 
 static REGISTRY: OnceLock<Vec<Box<dyn Provider>>> = OnceLock::new();
 
@@ -90,6 +98,14 @@ fn build() -> Vec<Box<dyn Provider>> {
     #[cfg(feature = "cursor-agent")]  v.push(cursor_agent::new());
     #[cfg(feature = "amazon-q")]      v.push(amazon_q::new());
     #[cfg(feature = "cline")]         v.push(cline::new());
+    #[cfg(feature = "grok")]          v.push(grok::new());
+    #[cfg(feature = "kimi")]          v.push(kimi::new());
+    #[cfg(feature = "openrouter")]    v.push(openrouter::new());
+    #[cfg(feature = "deepseek")]      v.push(deepseek::new());
+    #[cfg(feature = "zai")]           v.push(zai::new());
+    #[cfg(feature = "fireworks")]     v.push(fireworks::new());
+    #[cfg(feature = "synthetic")]     v.push(synthetic::new());
+    #[cfg(feature = "vertex-ai")]     v.push(vertex_ai::new());
 
     v
 }

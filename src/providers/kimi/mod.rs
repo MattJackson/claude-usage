@@ -1,17 +1,17 @@
-//! opencode (SST / opencode.ai) provider — STUB ONLY.
+//! kimi (Moonshot AI Kimi CLI) provider — STUB ONLY.
 //!
 //! Registered so the "Capture current login" submenu can list it, but every
 //! real operation is deferred. Nothing here reads credentials or hits the
 //! network yet.
 //!
-//! Recon summary (see `wnllabvkg.output` for full detail):
-//!  - Creds path: `~/.local/share/opencode/auth.json` (`OPENCODE_AUTH_CONTENT`
-//!    env overrides it with an inline JSON string).
-//!  - Format: top-level JSON object keyed by providerID; each value is a
-//!    discriminated union `{type:"oauth"|"api"|"wellknown", ...}` with
-//!    optional `accountId` / `enterpriseUrl` — no email, no user_id.
-//!  - Single-slot per providerID; no macOS Keychain use.
-//!  - No dedicated usage/quota endpoint (only response headers).
+//! Recon summary (upstream: github.com/MoonshotAI/kimi-cli):
+//!  - Creds path: `~/.kimi/` (TOML config) plus a macOS Keychain entry under
+//!    service name `kimi-code` for the OAuth refresh material.
+//!  - OAuth client_id: `17e5f671-d194-4dfb-9706-5516cb48c098`, IdP host
+//!    `api.kimi.com`.
+//!  - Single-slot per host; switching is "awkward" (Keychain rewrite plus
+//!    TOML rewrite) and not wired yet.
+//!  - No dedicated usage/quota endpoint (headers-only quota telemetry).
 
 #![allow(dead_code)]
 
@@ -21,18 +21,18 @@ use crate::providers::trait_def::{
 };
 
 pub fn new() -> Box<dyn Provider> {
-    Box::new(OpencodeProvider)
+    Box::new(KimiProvider)
 }
 
-pub struct OpencodeProvider;
+pub struct KimiProvider;
 
-impl Provider for OpencodeProvider {
+impl Provider for KimiProvider {
     fn provider_id(&self) -> &'static str {
-        "opencode"
+        "kimi"
     }
 
     fn display_name(&self) -> &'static str {
-        "opencode"
+        "Kimi"
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -46,9 +46,9 @@ impl Provider for OpencodeProvider {
     }
 
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        // TODO: read `~/.local/share/opencode/auth.json` (or the
-        // `OPENCODE_AUTH_CONTENT` env override) and iterate its providerID
-        // keys to produce one CapturedAccount per configured provider.
+        // TODO: read `~/.kimi/` TOML plus the macOS Keychain entry under
+        // service `kimi-code`, decode the OAuth refresh material, and emit a
+        // single CapturedAccount for the currently-active slot.
         Ok(None)
     }
 
@@ -66,11 +66,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_and_capabilities_are_locked() {
-        let p = OpencodeProvider;
-        assert_eq!(p.provider_id(), "opencode");
-        assert_eq!(p.display_name(), "opencode");
-        let caps = p.capabilities();
+    fn identity_is_locked() {
+        let p = KimiProvider;
+        assert_eq!(p.provider_id(), "kimi");
+        assert_eq!(p.display_name(), "Kimi");
+    }
+
+    #[test]
+    fn capabilities_are_locked() {
+        let caps = KimiProvider.capabilities();
         assert!(!caps.supports_usage);
         assert!(!caps.supports_switching);
         assert!(!caps.supports_email_capture);
@@ -79,6 +83,6 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(OpencodeProvider.capture_current_login(), Ok(None)));
+        assert!(matches!(KimiProvider.capture_current_login(), Ok(None)));
     }
 }

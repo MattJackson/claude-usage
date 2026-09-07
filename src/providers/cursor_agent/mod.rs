@@ -16,7 +16,8 @@
 #![allow(dead_code)]
 
 use crate::providers::trait_def::{
-    Capabilities, CapturedAccount, PResult, Provider, ProviderError, SecretBackend, TokenGrant,
+    Capabilities, CaptureMode, CapturedAccount, PResult, Provider, ProviderError, SecretBackend,
+    TokenGrant,
 };
 
 pub fn new() -> Box<dyn Provider> {
@@ -40,6 +41,7 @@ impl Provider for CursorAgentProvider {
             supports_switching: false,
             supports_email_capture: false,
             secret_backend: SecretBackend::Keychain,
+            capture_mode: CaptureMode::CredsOnDisk,
         }
     }
 

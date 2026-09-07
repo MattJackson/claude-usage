@@ -4,11 +4,16 @@
 //! use the switched account; already-running sessions keep theirs until
 //! restarted.
 
+mod countdown;
+#[cfg(target_os = "macos")]
+mod icons;
 mod logging;
 #[cfg(target_os = "macos")]
 mod menubar;
+mod notifications;
 mod providers;
 mod store;
+mod usage_log;
 
 use providers::claude::{oauth, usage};
 
@@ -1125,9 +1130,12 @@ fn refresh_usage_cache() -> RefreshOutcome {
     logging::log("poll: refreshing usage cache");
 
     let mut rate_limited = false;
-    // (email, refreshed account after ensure_fresh, new cached usage or None)
-    let mut updates: Vec<(String, Account, Option<CachedUsage>)> = Vec::new();
+    // (email, refreshed account after ensure_fresh, new cached usage or None,
+    // updated notif state or None)
+    let mut updates: Vec<(String, Account, Option<CachedUsage>, Option<notifications::NotifState>)> =
+        Vec::new();
     let emails: Vec<String> = state.accounts.iter().map(|a| a.key().to_string()).collect();
+    let notif_cfg = notifications::NotificationConfig::default();
     for email in &emails {
         let Some(acct) = state.find(email).cloned() else {
             continue;
@@ -1151,13 +1159,62 @@ fn refresh_usage_cache() -> RefreshOutcome {
                 None
             }
         };
-        updates.push((email.clone(), acct, cu));
+        // Persist a per-tick snapshot into the long-form history log, then run
+        // notifications against the (prev, curr) pair. Best-effort throughout:
+        // a full disk / permission failure never breaks the poll cycle.
+        let mut new_notif_state: Option<notifications::NotifState> = None;
+        if let Some(cu) = &cu {
+            let account_key = usage_log::AccountKey::new(CLAUDE_SLUG, email.clone());
+            let prev_snap = usage_log::last_snapshot(&account_key);
+            let curr_snap = usage_log::Snapshot {
+                ts: Utc::now(),
+                provider: CLAUDE_SLUG.to_string(),
+                account: email.clone(),
+                session_pct: cu.session_pct.map(|p| p as f32),
+                weekly_pct: cu.weekly_pct.map(|p| p as f32),
+                active_model: None,
+            };
+            if let Err(e) = usage_log::append(&curr_snap) {
+                logging::log(&format!("usage_log: append failed for {email}: {e:#}"));
+            }
+            if let Some(prev) = prev_snap {
+                let mut ns = acct.notif_state.clone();
+                let raw = notifications::evaluate(&prev, &curr_snap, &notif_cfg);
+                let mut kept =
+                    notifications::dedup_and_apply(&mut ns, &prev, &curr_snap, raw);
+                // Pace check (default off) — feeds through the same dedup path.
+                let pace = usage_log::pace(&account_key);
+                if let Some(pt) = notifications::evaluate_pace(
+                    pace.as_ref(),
+                    &curr_snap,
+                    &notif_cfg,
+                    Utc::now(),
+                ) {
+                    let extra = notifications::dedup_and_apply(
+                        &mut ns,
+                        &prev,
+                        &curr_snap,
+                        vec![pt],
+                    );
+                    kept.extend(extra);
+                }
+                for trig in &kept {
+                    if let Err(e) = notifications::fire(trig, &account_key) {
+                        logging::log(&format!("notify: {email}: {e:#}"));
+                    }
+                }
+                if ns != acct.notif_state {
+                    new_notif_state = Some(ns);
+                }
+            }
+        }
+        updates.push((email.clone(), acct, cu, new_notif_state));
     }
 
     // Merge under the lock with a fresh reload so we don't clobber a switch.
     let merged = with_state_lock(|| {
         let mut st = State::load()?;
-        for (email, acct, cu) in &updates {
+        for (email, acct, cu, ns) in &updates {
             if let Some(a) = st.find_mut(email) {
                 // Recency-guarded (matching switch_to): a concurrent switch that
                 // adopted a keychain rotation while we were fetching must not be
@@ -1169,6 +1226,9 @@ fn refresh_usage_cache() -> RefreshOutcome {
                 );
                 if let Some(cu) = cu {
                     a.cached_usage = Some(cu.clone());
+                }
+                if let Some(ns) = ns {
+                    a.notif_state = ns.clone();
                 }
             }
         }

@@ -1,17 +1,17 @@
-//! opencode (SST / opencode.ai) provider — STUB ONLY.
+//! grok (xAI Grok CLI) provider — STUB ONLY.
 //!
 //! Registered so the "Capture current login" submenu can list it, but every
 //! real operation is deferred. Nothing here reads credentials or hits the
 //! network yet.
 //!
-//! Recon summary (see `wnllabvkg.output` for full detail):
-//!  - Creds path: `~/.local/share/opencode/auth.json` (`OPENCODE_AUTH_CONTENT`
-//!    env overrides it with an inline JSON string).
-//!  - Format: top-level JSON object keyed by providerID; each value is a
-//!    discriminated union `{type:"oauth"|"api"|"wellknown", ...}` with
-//!    optional `accountId` / `enterpriseUrl` — no email, no user_id.
-//!  - Single-slot per providerID; no macOS Keychain use.
-//!  - No dedicated usage/quota endpoint (only response headers).
+//! Recon summary (upstream: github.com/xai-org/grok-build):
+//!  - Creds path: `~/.grok/auth.json` plus `~/.grok/mcp_credentials.json`.
+//!  - Format: plaintext JSON, 0600, single-slot per host. OIDC ID token
+//!    carries the account email in its payload claims.
+//!  - No macOS Keychain use.
+//!  - No dedicated usage/quota endpoint (headers-only quota telemetry).
+//!  - Switching is "clean" (single-slot swap of the two files) but not wired
+//!    yet.
 
 #![allow(dead_code)]
 
@@ -21,18 +21,18 @@ use crate::providers::trait_def::{
 };
 
 pub fn new() -> Box<dyn Provider> {
-    Box::new(OpencodeProvider)
+    Box::new(GrokProvider)
 }
 
-pub struct OpencodeProvider;
+pub struct GrokProvider;
 
-impl Provider for OpencodeProvider {
+impl Provider for GrokProvider {
     fn provider_id(&self) -> &'static str {
-        "opencode"
+        "grok"
     }
 
     fn display_name(&self) -> &'static str {
-        "opencode"
+        "Grok"
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -46,9 +46,9 @@ impl Provider for OpencodeProvider {
     }
 
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        // TODO: read `~/.local/share/opencode/auth.json` (or the
-        // `OPENCODE_AUTH_CONTENT` env override) and iterate its providerID
-        // keys to produce one CapturedAccount per configured provider.
+        // TODO: read `~/.grok/auth.json` and `~/.grok/mcp_credentials.json`,
+        // decode the OIDC ID token payload to pull the account email, and
+        // emit a single CapturedAccount for the currently-active slot.
         Ok(None)
     }
 
@@ -66,11 +66,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_and_capabilities_are_locked() {
-        let p = OpencodeProvider;
-        assert_eq!(p.provider_id(), "opencode");
-        assert_eq!(p.display_name(), "opencode");
-        let caps = p.capabilities();
+    fn identity_is_locked() {
+        let p = GrokProvider;
+        assert_eq!(p.provider_id(), "grok");
+        assert_eq!(p.display_name(), "Grok");
+    }
+
+    #[test]
+    fn capabilities_are_locked() {
+        let caps = GrokProvider.capabilities();
         assert!(!caps.supports_usage);
         assert!(!caps.supports_switching);
         assert!(!caps.supports_email_capture);
@@ -79,6 +83,6 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(OpencodeProvider.capture_current_login(), Ok(None)));
+        assert!(matches!(GrokProvider.capture_current_login(), Ok(None)));
     }
 }
