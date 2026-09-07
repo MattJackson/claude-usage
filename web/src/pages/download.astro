@@ -6,7 +6,7 @@ const title = 'Download usagio for macOS';
 const description =
   'Install usagio on macOS with one Homebrew command. Requires macOS 12 or later. Free & MIT-licensed. Prebuilt binaries and instructions for building from source.';
 
-const github = 'https://github.com/MattJackson/claude-usage';
+const github = 'https://github.com/MattJackson/usagio';
 const releases = `${github}/releases`;
 ---
 <Base title={title} description={description} path="/download/" current="download">
@@ -38,17 +38,20 @@ const releases = `${github}/releases`;
           </p>
         </div>
         <CodeBlock label="install">
-<span class="c"># 1 — Tap and install</span>
-<span class="p">$</span> brew install MattJackson/tap/claude-usage
+<span class="c"># 1 — Approve the third-party tap (once)</span>
+<span class="p">$</span> brew tap --trust mattjackson/tap
 
-<span class="c"># 2 — Set up the menu-bar app + auto-swap daemon (now and every login)</span>
-<span class="p">$</span> claude-usage install
+<span class="c"># 2 — Install</span>
+<span class="p">$</span> brew install mattjackson/tap/usagio
+
+<span class="c"># 3 — Set up the menu-bar app + auto-swap daemon (now and every login)</span>
+<span class="p">$</span> usagio install
 </CodeBlock>
         <div class="btn-row" style="justify-content: center; margin-top: 1.5rem;">
           <button
             type="button"
             class="btn btn-brand btn-brand-lg"
-            data-copy="brew install MattJackson/tap/claude-usage"
+            data-copy="brew tap --trust mattjackson/tap && brew install mattjackson/tap/usagio"
             aria-label="Copy brew install command to clipboard"
           >Copy install command</button>
           <a class="btn btn-secondary" href={releases} target="_blank" rel="noopener noreferrer">All releases on GitHub&nbsp;→</a>
@@ -63,9 +66,9 @@ const releases = `${github}/releases`;
           expected, and the menu-bar agent is registered with <code>launchd</code>.
         </p>
         <CodeBlock label="verify">
-<span class="p">$</span> claude-usage --version
-<span class="p">$</span> claude-usage status
-<span class="p">$</span> launchctl list | grep claude-usage
+<span class="p">$</span> usagio --version
+<span class="p">$</span> usagio status
+<span class="p">$</span> launchctl list | grep usagio
 </CodeBlock>
       </div>
 
@@ -96,13 +99,13 @@ const releases = `${github}/releases`;
             and the CLI.
           </p>
           <CodeBlock label="build">
-<span class="p">$</span> git clone https://github.com/MattJackson/claude-usage.git
-<span class="p">$</span> cd claude-usage
+<span class="p">$</span> git clone https://github.com/MattJackson/usagio.git
+<span class="p">$</span> cd usagio
 <span class="p">$</span> cargo build --release
 
-<span class="c"># Binary at target/release/claude-usage — copy anywhere on your PATH</span>
-<span class="p">$</span> cp target/release/claude-usage /usr/local/bin/
-<span class="p">$</span> claude-usage install
+<span class="c"># Binary at target/release/usagio — copy anywhere on your PATH</span>
+<span class="p">$</span> cp target/release/usagio /usr/local/bin/
+<span class="p">$</span> usagio install
 </CodeBlock>
           <p class="dl-p dl-p-fine">
             Contributing? The repo README covers the layout, tests, and the
