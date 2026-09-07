@@ -5,6 +5,7 @@
 //! restarted.
 
 mod countdown;
+mod credentials;
 #[cfg(target_os = "macos")]
 mod icons;
 mod logging;
@@ -30,8 +31,10 @@ use store::{Account, CachedUsage, State};
 const CLAUDE_SLUG: &str = "claude";
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
-/// Refresh a token if it expires within this many seconds.
-const REFRESH_SKEW_SECS: i64 = 300;
+/// Refresh a token if it expires within this many seconds. Sourced from the
+/// credential-sync module so the reactive (switch / cmd_token / poll) path
+/// and the proactive (fsnotify + inactive-refresh) path can never drift.
+const REFRESH_SKEW_SECS: i64 = credentials::REFRESH_SKEW_SECS;
 
 // --- watch (auto-swap daemon) defaults ---
 /// How often the watcher polls, in seconds.
@@ -70,6 +73,21 @@ fn run() -> Result<()> {
     // `providers::get`, at which point this call is load-bearing — do it
     // here so it always precedes the dispatch below.
     providers::init();
+
+    // Spawn fsnotify watchers on every provider's credential paths so
+    // rotations the vendor CLI writes (or another usagio process makes)
+    // are absorbed as they happen, not just on the next 150s watch tick.
+    // Only long-running command paths (watch / menubar) actually benefit;
+    // one-shot commands complete before any event fires, but the setup is
+    // cheap and self-contained.
+    // Leaked deliberately: the watcher owns a thread and must outlive the
+    // process. `Box::leak` on a heap allocation is the standard trick for
+    // "live for program lifetime" without introducing a global mutex.
+    let providers_static: Vec<&'static dyn Provider> =
+        providers::all().iter().map(|b| &**b).collect();
+    if let Some(handle) = credentials::spawn_watchers(providers_static) {
+        Box::leak(Box::new(handle));
+    }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -470,6 +488,11 @@ fn switch_to_guarded(
         }
         // Preserve any token rotation the currently-active session picked up.
         sync_active_from_keychain(provider, &mut st);
+        // Provider-agnostic: absorb any lagging on-disk rotations for the
+        // outgoing account BEFORE we overwrite path[0] with the incoming
+        // account's blob. sync_active_from_keychain only handles the Claude
+        // legacy path; this catches every configured credential file.
+        credentials::absorb_before_switch(provider);
         // A concurrent poll may have rotated this account's token after our
         // phase-1 snapshot; use whichever tokens are fresher so we never write a
         // stale (possibly already-superseded) refresh token to the keychain.
@@ -1473,6 +1496,16 @@ fn choose_swap_target(
 /// auto-swap away from the active account if it has reached `trigger` and a
 /// healthy target exists. Shared by `claude-usage watch` and the menu-bar poller.
 fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<CycleOutcome> {
+    // Pre-cycle: absorb any on-disk credential rotations the vendor CLI made
+    // behind our back (fsnotify may not fire on remote/network volumes, and
+    // we want the invariant to hold even on the polling path). Then refresh
+    // INACTIVE Claude accounts eagerly so a user who switches to one later
+    // doesn't have to wait for the reactive path to notice.
+    for p in providers::all() {
+        let _ = credentials::absorb_all_lagging(p.as_ref());
+    }
+    credentials::refresh_inactive_if_stale(State::load().ok().and_then(|s| s.active).as_deref());
+
     let refresh = refresh_usage_cache();
     let state = State::load()?;
     if state.accounts.is_empty() {

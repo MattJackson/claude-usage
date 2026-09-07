@@ -27,9 +27,13 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
+use std::path::PathBuf;
+use std::time::Duration;
+
 use crate::providers::trait_def::{
-    Capabilities, CaptureMode, CapturedAccount, IdentitySnapshot, LaunchMode, PResult, Provider,
-    ProviderError, SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
+    AccountKey, Capabilities, CaptureMode, CapturedAccount, CredentialFreshness, IdentitySnapshot,
+    LaunchMode, PResult, Provider, ProviderError, SecretBackend, TokenGrant, UsageSnapshot,
+    UsageWindow,
 };
 
 /// Keychain generic-password service Claude Code writes to. Duplicated from
@@ -311,6 +315,108 @@ impl Provider for ClaudeProvider {
         }
         cmd.status().map_err(ProviderError::Io)
     }
+
+    // --- Credential sync ---------------------------------------------------
+
+    fn credential_paths(&self) -> Vec<PathBuf> {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Vec::new();
+        };
+        vec![
+            PathBuf::from(&home).join(".claude.json"),
+            PathBuf::from(&home).join(".claude").join(".credentials.json"),
+        ]
+    }
+
+    /// Extract an AccountKey from either shape Claude writes on disk:
+    ///
+    /// - `~/.claude.json` has `oauthAccount.emailAddress` at the top level.
+    /// - `~/.claude/.credentials.json` mirrors the keychain shape
+    ///   (`claudeAiOauth.{...}`) and may carry `oauthAccount` alongside.
+    ///
+    /// Emails are lowercased inside `AccountKey::new` so a case shift on
+    /// disk can't create a phantom second account.
+    fn identify_credential(&self, blob: &str) -> Option<AccountKey> {
+        let v: Value = serde_json::from_str(blob).ok()?;
+        let email = extract_claude_email(&v);
+        email.map(|e| AccountKey::new(self.provider_id(), e))
+    }
+
+    fn credential_freshness(&self, blob: &str) -> CredentialFreshness {
+        let Ok(v) = serde_json::from_str::<Value>(blob) else {
+            return CredentialFreshness::Invalid;
+        };
+        // Both shapes expose expiresAt under claudeAiOauth. If neither is
+        // present the blob is a bare identity file (~/.claude.json without
+        // the keychain fields); we treat that as Unknown.
+        let expires_at_ms = v
+            .get("claudeAiOauth")
+            .and_then(|o| o.get("expiresAt"))
+            .and_then(|x| x.as_i64());
+        let Some(expires_at_ms) = expires_at_ms else {
+            return CredentialFreshness::Unknown;
+        };
+        let now_ms = Utc::now().timestamp_millis();
+        let remaining_ms = expires_at_ms.saturating_sub(now_ms);
+        if remaining_ms <= 0 {
+            CredentialFreshness::Expired
+        } else if remaining_ms < crate::credentials::REFRESH_SKEW_SECS * 1000 {
+            CredentialFreshness::ExpiresIn(Duration::from_millis(remaining_ms as u64))
+        } else {
+            CredentialFreshness::Fresh
+        }
+    }
+
+    /// Absorb a rotated Claude credential into the state.json slot for
+    /// `account`. Fails cleanly if the blob isn't a Claude credential (no
+    /// `claudeAiOauth` object) — we do not want a mis-identified blob to
+    /// clobber a working slot.
+    fn absorb_credential(&self, account: &AccountKey, blob: &str) -> PResult<()> {
+        if account.provider != self.provider_id() {
+            return Ok(()); // not ours
+        }
+        // Require a real Claude token blob before touching state. A bare
+        // ~/.claude.json (identity-only) has no tokens and would zero out
+        // the slot's access_token if we naively persisted it.
+        let (access, refresh, expires_at) = match parse_claude_blob(blob) {
+            Ok(t) => t,
+            Err(_) => return Ok(()),
+        };
+        crate::credentials::with_state_lock_absorb(|st| {
+            if let Some(a) = st.find_mut(&account.key) {
+                // Only overwrite if the incoming blob is at least as new; the
+                // caller's read may race with a concurrent refresh.
+                if expires_at >= a.expires_at {
+                    a.set_tokens(access, refresh, expires_at);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Reach into a JSON blob and pull the Claude account email from wherever
+/// Claude decided to put it. Pure so the tests can hit both shapes without
+/// touching disk.
+pub(crate) fn extract_claude_email(v: &Value) -> Option<String> {
+    // Top-level oauthAccount (identity file / capture blob shape).
+    if let Some(e) = v
+        .get("oauthAccount")
+        .and_then(|o| o.get("emailAddress"))
+        .and_then(|x| x.as_str())
+    {
+        return Some(e.to_string());
+    }
+    // Nested under claudeAiOauth (some rewrites put the identity here).
+    if let Some(e) = v
+        .get("claudeAiOauth")
+        .and_then(|o| o.get("oauthAccount"))
+        .and_then(|o| o.get("emailAddress"))
+        .and_then(|x| x.as_str())
+    {
+        return Some(e.to_string());
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -616,6 +722,108 @@ mod tests {
         let now_ms = Utc::now().timestamp_millis();
         // ~30 minutes from now, allowing a generous window for slow CI.
         assert!(expires_at >= now_ms + 1_700_000 && expires_at <= now_ms + 1_900_000);
+    }
+
+    #[test]
+    fn identify_credential_from_identity_json_shape() {
+        // ~/.claude.json has oauthAccount at the top level. lowercased.
+        let blob = serde_json::json!({
+            "oauthAccount": { "emailAddress": "Alice@Example.com" }
+        })
+        .to_string();
+        let k = ClaudeProvider.identify_credential(&blob).unwrap();
+        assert_eq!(k.provider, "claude");
+        assert_eq!(k.key, "alice@example.com");
+    }
+
+    #[test]
+    fn identify_credential_from_credentials_json_shape() {
+        // The credentials-file shape nests oauthAccount under claudeAiOauth.
+        let blob = serde_json::json!({
+            "claudeAiOauth": {
+                "oauthAccount": { "emailAddress": "bob@example.com" }
+            }
+        })
+        .to_string();
+        let k = ClaudeProvider.identify_credential(&blob).unwrap();
+        assert_eq!(k.key, "bob@example.com");
+    }
+
+    #[test]
+    fn identify_credential_returns_none_for_blob_without_email() {
+        // Bare token blob with no oauthAccount — cannot identify.
+        let blob = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "t", "refreshToken": "r", "expiresAt": 0i64
+            }
+        })
+        .to_string();
+        assert!(ClaudeProvider.identify_credential(&blob).is_none());
+    }
+
+    #[test]
+    fn credential_freshness_reports_fresh_for_far_future_expiry() {
+        // 1 hour out with a 15-minute skew: Fresh (not within the window).
+        let expires = Utc::now().timestamp_millis() + 3_600_000;
+        let blob = serde_json::json!({
+            "claudeAiOauth": { "expiresAt": expires }
+        })
+        .to_string();
+        assert_eq!(
+            ClaudeProvider.credential_freshness(&blob),
+            CredentialFreshness::Fresh
+        );
+    }
+
+    #[test]
+    fn credential_freshness_reports_expires_in_within_skew() {
+        // 60 seconds out, well inside the 900-second skew window.
+        let expires = Utc::now().timestamp_millis() + 60_000;
+        let blob = serde_json::json!({
+            "claudeAiOauth": { "expiresAt": expires }
+        })
+        .to_string();
+        match ClaudeProvider.credential_freshness(&blob) {
+            CredentialFreshness::ExpiresIn(d) => {
+                // Must be < the 15-minute skew, > 0.
+                assert!(d.as_secs() > 0 && d.as_secs() < 900);
+            }
+            other => panic!("expected ExpiresIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credential_freshness_reports_expired_for_past_expiry() {
+        let blob = serde_json::json!({
+            "claudeAiOauth": { "expiresAt": 1i64 }
+        })
+        .to_string();
+        assert_eq!(
+            ClaudeProvider.credential_freshness(&blob),
+            CredentialFreshness::Expired
+        );
+    }
+
+    #[test]
+    fn credential_freshness_reports_invalid_for_bad_json() {
+        assert_eq!(
+            ClaudeProvider.credential_freshness("not json at all"),
+            CredentialFreshness::Invalid
+        );
+    }
+
+    #[test]
+    fn credential_paths_includes_both_files_when_home_is_set() {
+        // The order is [~/.claude.json, ~/.claude/.credentials.json] — the
+        // last-chance fallback iterates in this order.
+        let home = std::env::var_os("HOME");
+        if home.is_none() {
+            return; // headless CI without HOME — trivial pass
+        }
+        let paths = ClaudeProvider.credential_paths();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with(".claude.json"));
+        assert!(paths[1].ends_with(".credentials.json"));
     }
 
     #[test]

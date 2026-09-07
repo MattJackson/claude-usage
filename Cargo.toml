@@ -61,6 +61,10 @@ tray-icon = "0.24.2"
 # Desktop notifications for the notifications module. Best-effort — a broken
 # dbus / user-notification connection never fails a watch cycle.
 notify-rust = "4"
+# fsnotify (filesystem change notifications) for the credential-sync layer:
+# watches every provider's credential_paths and drives absorb_all_lagging +
+# refresh_inactive_if_stale in response to vendor-CLI rotations.
+notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status

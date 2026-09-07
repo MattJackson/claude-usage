@@ -8,7 +8,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::process::ExitStatus;
+use std::time::Duration;
 
 /// Errors returned from any `Provider` method. Kept small and structured so
 /// menu code can decide how to surface each variant (silence, retry, warn,
@@ -170,6 +172,68 @@ pub struct Capabilities {
     pub capture_mode: CaptureMode,
 }
 
+/// Stable per-provider identity for an account. `provider` is the owning
+/// provider's slug (matches `Provider::provider_id`); `key` is the lowercased
+/// account identifier (email or UUID) used to locate the account in state.
+///
+/// Used by the credential-sync subsystem so a provider-agnostic watcher can
+/// route a blob it just read from disk back to the right account slot
+/// without needing to know per-provider schemas.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AccountKey {
+    pub provider: String,
+    pub key: String,
+}
+
+impl AccountKey {
+    pub fn new(provider: impl Into<String>, key: impl Into<String>) -> Self {
+        AccountKey {
+            provider: provider.into(),
+            key: key.into().to_ascii_lowercase(),
+        }
+    }
+}
+
+/// How fresh a stored credential blob is relative to `now`. Returned by
+/// `Provider::credential_freshness` so a provider-agnostic sync layer can
+/// compare rotations across paths without knowing per-provider timestamps.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CredentialFreshness {
+    /// Access token has significant remaining life (> refresh skew).
+    Fresh,
+    /// Access token expires within `Duration` — refresh soon.
+    ExpiresIn(Duration),
+    /// Access token has already expired (still refreshable if the refresh
+    /// token is intact, but no longer usable as a bearer).
+    Expired,
+    /// The blob could not be parsed as a credential (corrupt / wrong shape).
+    Invalid,
+    /// Provider did not implement freshness detection.
+    Unknown,
+}
+
+impl CredentialFreshness {
+    /// Order for "pick the freshest of several blobs": Fresh > ExpiresIn(long
+    /// remaining) > ExpiresIn(short) > Expired > Invalid > Unknown. Used by
+    /// the last-chance fallback when re-reading credential paths.
+    pub fn rank(&self) -> i64 {
+        match self {
+            CredentialFreshness::Fresh => i64::MAX,
+            CredentialFreshness::ExpiresIn(d) => d.as_secs() as i64,
+            CredentialFreshness::Expired => -1,
+            CredentialFreshness::Invalid => -2,
+            CredentialFreshness::Unknown => -3,
+        }
+    }
+
+    /// True if we consider this blob still usable as-is (bearer + refresh).
+    /// `Expired` is deliberately not usable — we want to hand out fresh
+    /// access tokens only.
+    pub fn is_usable(&self) -> bool {
+        matches!(self, CredentialFreshness::Fresh | CredentialFreshness::ExpiresIn(_))
+    }
+}
+
 /// One provider (Claude, Codex, opencode, ...). Registered once at startup
 /// via `providers::init()`; every method is called through `&dyn Provider`.
 pub trait Provider: Send + Sync + 'static {
@@ -273,6 +337,42 @@ pub trait Provider: Send + Sync + 'static {
     fn launch_client(&self, mode: LaunchMode) -> PResult<ExitStatus> {
         let _ = mode;
         Err(ProviderError::Unsupported)
+    }
+
+    // --- Credential sync (fsnotify + proactive refresh + last-chance fallback) ---
+
+    /// On-disk paths where the vendor CLI may write this provider's
+    /// credential blob. The credential-sync watcher subscribes to these with
+    /// notify(); the last-chance fallback re-reads them on invalid_grant to
+    /// adopt whichever rotation the vendor did behind our back. Default is
+    /// empty — providers that don't persist to disk don't participate.
+    fn credential_paths(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    /// Which account does this raw credential blob belong to? Returns
+    /// `Some(AccountKey)` if the blob is recognisable and carries an
+    /// identifier this provider tracks. Default is `None` (unknown).
+    fn identify_credential(&self, blob: &str) -> Option<AccountKey> {
+        let _ = blob;
+        None
+    }
+
+    /// Report how fresh the blob's access token is right now. Used to pick
+    /// the freshest of several observed rotations, and to decide when to
+    /// pre-emptively refresh an inactive account.
+    fn credential_freshness(&self, blob: &str) -> CredentialFreshness {
+        let _ = blob;
+        CredentialFreshness::Unknown
+    }
+
+    /// Absorb a rotated blob into `account`'s stored credentials. Providers
+    /// that own a slot in state.json overwrite it in place; providers with
+    /// no first-class account storage yet may no-op. Default is a no-op so
+    /// non-tracked providers don't need to opt in.
+    fn absorb_credential(&self, account: &AccountKey, blob: &str) -> PResult<()> {
+        let _ = (account, blob);
+        Ok(())
     }
 
     // --- Account identity helpers ---
@@ -387,6 +487,56 @@ mod tests {
             native_blob: json!({}),
         };
         assert_eq!(p.account_identifier(&id), "foo@example.com");
+    }
+
+    #[test]
+    fn credential_defaults_report_nothing() {
+        // A provider that opts out of credential sync must return empty
+        // paths, unknown identity, and unknown freshness — the sync layer
+        // treats these as "nothing to do".
+        let p = Dummy;
+        assert!(p.credential_paths().is_empty());
+        assert!(p.identify_credential("{}").is_none());
+        assert_eq!(p.credential_freshness("{}"), CredentialFreshness::Unknown);
+        let k = AccountKey::new("dummy", "x");
+        assert!(p.absorb_credential(&k, "{}").is_ok());
+    }
+
+    #[test]
+    fn credential_freshness_rank_ordering_is_sane() {
+        // Fresh dominates any ExpiresIn; ExpiresIn(longer) beats ExpiresIn(shorter);
+        // Expired beats Invalid beats Unknown. Used by last_chance_fallback.
+        let fresh = CredentialFreshness::Fresh.rank();
+        let long = CredentialFreshness::ExpiresIn(std::time::Duration::from_secs(600)).rank();
+        let short = CredentialFreshness::ExpiresIn(std::time::Duration::from_secs(10)).rank();
+        let expired = CredentialFreshness::Expired.rank();
+        let invalid = CredentialFreshness::Invalid.rank();
+        let unknown = CredentialFreshness::Unknown.rank();
+        assert!(fresh > long);
+        assert!(long > short);
+        assert!(short > expired);
+        assert!(expired > invalid);
+        assert!(invalid > unknown);
+    }
+
+    #[test]
+    fn account_key_lowercases_identifier() {
+        // AccountKey identifiers are lowercased so a case shift on disk
+        // (Foo@Example.com vs foo@example.com) doesn't create a phantom
+        // second account slot.
+        let k = AccountKey::new("claude", "Foo@Example.COM");
+        assert_eq!(k.provider, "claude");
+        assert_eq!(k.key, "foo@example.com");
+    }
+
+    #[test]
+    fn credential_freshness_is_usable_excludes_expired() {
+        use std::time::Duration;
+        assert!(CredentialFreshness::Fresh.is_usable());
+        assert!(CredentialFreshness::ExpiresIn(Duration::from_secs(60)).is_usable());
+        assert!(!CredentialFreshness::Expired.is_usable());
+        assert!(!CredentialFreshness::Invalid.is_usable());
+        assert!(!CredentialFreshness::Unknown.is_usable());
     }
 
     #[test]
