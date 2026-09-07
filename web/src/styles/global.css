@@ -85,10 +85,10 @@ section { padding: clamp(3.5rem, 9vw, 6.5rem) 0; }
 
 .btn-primary {
   background: var(--ink);
-  color: #fff;
+  color: var(--bg);
   box-shadow: var(--shadow-2);
 }
-.btn-primary:hover { background: #000; }
+.btn-primary:hover { filter: brightness(0.92); }
 
 .btn-accent {
   background: var(--accent);
@@ -119,7 +119,7 @@ section { padding: clamp(3.5rem, 9vw, 6.5rem) 0; }
 .btn-brand:hover { filter: brightness(1.05); }
 
 .btn-secondary {
-  background: #fff;
+  background: var(--card-bg);
   color: var(--ink);
   border-color: var(--line-strong);
   box-shadow: var(--shadow-1);
@@ -137,7 +137,7 @@ section { padding: clamp(3.5rem, 9vw, 6.5rem) 0; }
 /* ---- header / footer chrome ------------------------------------------ */
 .site-header {
   position: sticky; top: 0; z-index: 40;
-  background: rgba(255, 255, 255, 0.78);
+  background: var(--header-bg);
   backdrop-filter: saturate(180%) blur(14px);
   -webkit-backdrop-filter: saturate(180%) blur(14px);
   border-bottom: var(--hairline);
@@ -222,4 +222,88 @@ section { padding: clamp(3.5rem, 9vw, 6.5rem) 0; }
 .fade-up.is-in { opacity: 1; transform: none; }
 @media (prefers-reduced-motion: reduce) {
   .fade-up { opacity: 1; transform: none; transition: none; }
+}
+
+/* ---- theme toggle button (in Header) --------------------------------- */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px; height: 32px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  color: var(--ink-2);
+  font-size: 1rem;
+  line-height: 1;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+.theme-toggle:hover {
+  background: var(--bg-soft);
+  border-color: var(--line);
+  color: var(--ink);
+}
+.theme-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Show the correct glyph depending on active mode. Both spans render at
+   build time; the [data-theme] rule below hides the wrong one. */
+.theme-toggle .glyph-dark { display: none; }
+.theme-toggle .glyph-light { display: inline; }
+:root[data-theme="dark"] .theme-toggle .glyph-dark { display: inline; }
+:root[data-theme="dark"] .theme-toggle .glyph-light { display: none; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .theme-toggle .glyph-dark { display: inline; }
+  :root:not([data-theme="light"]) .theme-toggle .glyph-light { display: none; }
+}
+
+/* ---- copy-button "Copied!" transient state --------------------------- */
+.btn-brand.is-copied,
+.btn.is-copied {
+  filter: brightness(0.95);
+}
+.btn-brand.is-copied::before,
+.btn.is-copied::before {
+  /* subtle scale nudge so the label swap doesn't feel instant */
+  animation: copied-pulse 300ms ease;
+}
+@keyframes copied-pulse {
+  0%   { transform: scale(0.98); }
+  100% { transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .btn.is-copied::before, .btn-brand.is-copied::before { animation: none; }
+}
+
+/* ---- 404 page -------------------------------------------------------- */
+.notfound {
+  min-height: 60vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: clamp(3rem, 8vw, 5rem) 0;
+}
+.notfound-inner { max-width: 44ch; }
+.notfound-code {
+  font-family: var(--font-mono);
+  font-size: clamp(3rem, 12vw, 5rem);
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  background: var(--brand-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  line-height: 1;
+  margin-bottom: 0.5rem;
+}
+.notfound h1 {
+  font-size: clamp(1.4rem, 3vw, 1.9rem);
+  color: var(--ink);
+  margin-bottom: 0.75rem;
+}
+.notfound p {
+  color: var(--muted);
+  line-height: 1.6;
+  margin-bottom: 1.5rem;
 }

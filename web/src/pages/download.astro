@@ -45,9 +45,12 @@ const releases = `${github}/releases`;
 <span class="p">$</span> claude-usage install
 </CodeBlock>
         <div class="btn-row" style="justify-content: center; margin-top: 1.5rem;">
-          <a class="btn btn-brand btn-brand-lg" href="#" onclick="navigator.clipboard&amp;&amp;navigator.clipboard.writeText('brew install MattJackson/tap/claude-usage');this.blur();return false;">
-            Copy install command
-          </a>
+          <button
+            type="button"
+            class="btn btn-brand btn-brand-lg"
+            data-copy="brew install MattJackson/tap/claude-usage"
+            aria-label="Copy brew install command to clipboard"
+          >Copy install command</button>
           <a class="btn btn-secondary" href={releases} target="_blank" rel="noopener noreferrer">All releases on GitHub&nbsp;→</a>
         </div>
       </div>
@@ -127,7 +130,7 @@ const releases = `${github}/releases`;
 
   .dl-primary { padding-top: clamp(2.5rem, 6vw, 4rem); }
   .dl-primary-card {
-    background: #fff;
+    background: var(--card-bg);
     border: 1px solid var(--line);
     border-radius: var(--r-xl);
     padding: clamp(1.75rem, 4vw, 2.5rem);
@@ -196,7 +199,7 @@ const releases = `${github}/releases`;
   .dl-source {
     margin-top: clamp(2rem, 5vw, 2.5rem);
     margin-bottom: clamp(3rem, 8vw, 5rem);
-    background: #fff;
+    background: var(--card-bg);
     border: 1px solid var(--line);
     border-radius: var(--r-lg);
     padding: 1rem 1.25rem;

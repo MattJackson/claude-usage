@@ -1,7 +1,12 @@
 /* usagio design tokens.
    Restrained Apple-OEM palette: warm graphite ink on white, one saturated
    indigo accent. Neutral scale is warm-tinted (not pure cool gray) to feel
-   less clinical. Shadows are soft, borders are hairline. */
+   less clinical. Shadows are soft, borders are hairline.
+
+   Dark mode: activated by prefers-color-scheme: dark, or explicit
+   [data-theme="dark"] on <html> (set by the theme toggle in Header). Both
+   paths override the same tokens; the manual toggle always wins because
+   the [data-theme=...] selector is more specific. */
 :root {
   /* ---- color: neutrals ------------------------------------------------ */
   --bg:            #ffffff;
@@ -13,6 +18,11 @@
   --muted-2:       #9a9aa3;
   --line:          #e7e6e1;   /* hairline borders */
   --line-strong:   #d9d8d2;
+
+  /* Backdrop-tint tokens for the sticky header + cards. Kept as vars so
+     dark mode can swap the base color without duplicating every rule. */
+  --header-bg:     rgba(255, 255, 255, 0.78);
+  --card-bg:       #ffffff;
 
   /* ---- color: brand (derived from the official logo) ------------------
      Use SPARINGLY: logo, primary Download CTA, one hero flourish, one link
@@ -80,8 +90,83 @@
                    0 12px 32px -18px rgba(23, 23, 26, 0.18);
 
   --hairline:      1px solid var(--line);
+
+  color-scheme: light;
+}
+
+/* ---- DARK MODE ------------------------------------------------------- */
+
+/* Auto: OS preference. Skipped if the user has manually chosen light via
+   the header toggle ([data-theme="light"] on <html>). */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:          #0A0A0B;
+    --bg-soft:     #131316;
+    --bg-sunken:   #17171B;
+    --ink:         #F0F0F2;
+    --ink-2:       #C7C7CD;
+    --muted:       #A0A0A8;
+    --muted-2:     #6E6E77;
+    --line:        #26262B;
+    --line-strong: #34343B;
+
+    --header-bg:   rgba(10, 10, 11, 0.72);
+    --card-bg:     #131316;
+
+    /* Accent tint gets a dark-friendly variant so pill/inline-code
+       backgrounds don't blaze white on dark. */
+    --accent-tint: rgba(91, 43, 234, 0.18);
+
+    --shadow-1:    0 1px 2px rgba(0, 0, 0, 0.35),
+                   0 1px 1px rgba(0, 0, 0, 0.25);
+    --shadow-2:    0 6px 20px -12px rgba(0, 0, 0, 0.6),
+                   0 2px 6px -3px rgba(0, 0, 0, 0.4);
+    --shadow-lift: 0 30px 80px -40px rgba(0, 0, 0, 0.8),
+                   0 12px 32px -18px rgba(0, 0, 0, 0.5);
+
+    color-scheme: dark;
+  }
+}
+
+/* Manual: explicit dark toggle overrides OS preference. */
+:root[data-theme="dark"] {
+  --bg:          #0A0A0B;
+  --bg-soft:     #131316;
+  --bg-sunken:   #17171B;
+  --ink:         #F0F0F2;
+  --ink-2:       #C7C7CD;
+  --muted:       #A0A0A8;
+  --muted-2:     #6E6E77;
+  --line:        #26262B;
+  --line-strong: #34343B;
+
+  --header-bg:   rgba(10, 10, 11, 0.72);
+  --card-bg:     #131316;
+
+  --accent-tint: rgba(91, 43, 234, 0.18);
+
+  --shadow-1:    0 1px 2px rgba(0, 0, 0, 0.35),
+                 0 1px 1px rgba(0, 0, 0, 0.25);
+  --shadow-2:    0 6px 20px -12px rgba(0, 0, 0, 0.6),
+                 0 2px 6px -3px rgba(0, 0, 0, 0.4);
+  --shadow-lift: 0 30px 80px -40px rgba(0, 0, 0, 0.8),
+                 0 12px 32px -18px rgba(0, 0, 0, 0.5);
+
+  color-scheme: dark;
 }
 
 @media (prefers-reduced-motion: reduce) {
   :root { scroll-behavior: auto; }
+}
+
+/* ---- narrow-viewport typography tighten ------------------------------
+   The hero title's fluid clamp bottoms out at 2.6rem, which still breaks
+   awkwardly on iPhone SE-class widths. Ease line-height and give the
+   accent phrase room to sit on its own line without hyphenation ghosts. */
+@media (max-width: 480px) {
+  :root {
+    --fs-display: 2.35rem;
+    --lh-display: 1.08;
+  }
+  .h-display { letter-spacing: -0.025em; }
 }

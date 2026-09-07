@@ -1,0 +1,24 @@
+---
+// Astro auto-serves this on GitHub Pages when a path 404s.
+import Base from '../layouts/Base.astro';
+
+const title = 'Page not found — usagio';
+const description =
+  'The page you requested does not exist. Head back to the homepage or the download page.';
+---
+<Base title={title} description={description} path="/404/" current="home">
+  <section class="notfound">
+    <div class="container container-narrow notfound-inner">
+      <div class="notfound-code fade-up">404</div>
+      <h1 class="fade-up">Not found</h1>
+      <p class="fade-up">
+        This link doesn't lead anywhere on <strong>usagio.dev</strong>. That's
+        on us if it came from our site — sorry about that.
+      </p>
+      <div class="btn-row fade-up" style="justify-content: center;">
+        <a class="btn btn-brand" href="/">Back to home</a>
+        <a class="btn btn-secondary" href="/download/">Download</a>
+      </div>
+    </div>
+  </section>
+</Base>

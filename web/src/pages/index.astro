@@ -157,19 +157,34 @@ const description =
           morning to the moment auto-swap catches a weekly ceiling.
         </p>
       </div>
-      <div class="state-grid">
-        <figure class="state fade-up">
-          <img src="/screenshots/menu-healthy.svg" alt="Healthy state — all accounts below 60% weekly usage" width="640" height="360" loading="lazy" />
-          <figcaption><strong>Healthy.</strong> Everything under 60%. No decisions to make.</figcaption>
-        </figure>
-        <figure class="state fade-up">
-          <img src="/screenshots/menu-mixed.svg" alt="Mixed state — one account at 82% (warning), one at 94% (critical)" width="640" height="360" loading="lazy" />
-          <figcaption><strong>Mixed.</strong> One account amber at 82%, another red at 94% — but you still have runway.</figcaption>
-        </figure>
-        <figure class="state fade-up">
-          <img src="/screenshots/menu-locked.svg" alt="Locked state — top account weekly-locked, next account auto-swapped in" width="640" height="360" loading="lazy" />
-          <figcaption><strong>Locked.</strong> The primary account hit its weekly wall; auto-swap already moved you to the next.</figcaption>
-        </figure>
+      <div class="states-rows">
+        <div class="states-row fade-up">
+          <a class="states-shot" href="/screenshots/menu-healthy.svg" target="_blank" rel="noopener" aria-label="Open healthy-state screenshot in a new tab">
+            <img src="/screenshots/menu-healthy.svg" alt="Healthy state — all accounts below 60% weekly usage" width="640" height="360" loading="lazy" />
+          </a>
+          <div class="states-copy">
+            <h3>Everything's under budget</h3>
+            <p>All accounts under 60% weekly. Menu stays green; auto-swap keeps its powder dry until it's actually needed.</p>
+          </div>
+        </div>
+        <div class="states-row states-row-flip fade-up">
+          <a class="states-shot" href="/screenshots/menu-mixed.svg" target="_blank" rel="noopener" aria-label="Open mixed-state screenshot in a new tab">
+            <img src="/screenshots/menu-mixed.svg" alt="Mixed state — one account at 82% (warning), one at 94% (critical)" width="640" height="360" loading="lazy" />
+          </a>
+          <div class="states-copy">
+            <h3>Two accounts, two colors</h3>
+            <p>One account at 82% starts glowing amber. Another crosses 94% and turns red. Auto-swap has already picked the next candidate — you notice the color before you notice the wall.</p>
+          </div>
+        </div>
+        <div class="states-row fade-up">
+          <a class="states-shot" href="/screenshots/menu-locked.svg" target="_blank" rel="noopener" aria-label="Open locked-state screenshot in a new tab">
+            <img src="/screenshots/menu-locked.svg" alt="Locked state — top account weekly-locked, next account auto-swapped in" width="640" height="360" loading="lazy" />
+          </a>
+          <div class="states-copy">
+            <h3>The lockout turns into a countdown</h3>
+            <p>When an account hits 100%, its percentage row swaps for a countdown to when it's usable again. Auto-swap flips to the next-priority account in the same tick — no interruption.</p>
+          </div>
+        </div>
       </div>
     </div>
   </section>
@@ -299,7 +314,7 @@ const description =
     gap: 0.55rem;
   }
   .provider {
-    background: #fff;
+    background: var(--card-bg);
     border: 1px solid var(--line);
     border-radius: var(--r-md);
     padding: 0.7rem 0.9rem;
@@ -352,7 +367,7 @@ const description =
     gap: clamp(1rem, 2.5vw, 1.4rem);
   }
   .feature {
-    background: #fff;
+    background: var(--card-bg);
     border: 1px solid var(--line);
     border-radius: var(--r-lg);
     padding: 1.4rem 1.5rem;
@@ -396,34 +411,59 @@ const description =
   .why-oss-inner a { color: var(--accent); font-weight: 600; }
   .why-oss-inner a:hover { color: var(--accent-hover); }
 
-  /* ---- state trio ---------------------------------------------------- */
+  /* ---- state trio (alternating image/text rows) ---------------------- */
   .states .section-head { text-align: center; margin-inline: auto; }
   .states .section-head .lede { margin-inline: auto; margin-top: 0.75rem; }
-  .state-grid {
+  .states-rows {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-    gap: clamp(1rem, 2.5vw, 1.5rem);
+    gap: clamp(2.5rem, 6vw, 4.5rem);
+    max-width: 960px;
+    margin: 0 auto;
   }
-  .state {
-    margin: 0;
-    background: #fff;
+  .states-row {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    gap: clamp(1.5rem, 4vw, 3rem);
+    align-items: center;
+  }
+  .states-row-flip { direction: rtl; }
+  .states-row-flip > * { direction: ltr; }
+  .states-shot {
+    display: block;
+    background: var(--card-bg);
     border: 1px solid var(--line);
     border-radius: var(--r-lg);
-    padding: 0.9rem;
+    padding: 0.75rem;
     box-shadow: var(--shadow-1);
+    transition: box-shadow 220ms ease, transform 220ms ease, border-color 220ms ease;
   }
-  .state img {
+  .states-shot:hover {
+    box-shadow: var(--shadow-2);
+    border-color: var(--line-strong);
+    transform: translateY(-2px);
+  }
+  .states-shot img {
     display: block; width: 100%; height: auto;
     border-radius: 8px;
     border: 1px solid var(--line);
   }
-  .state figcaption {
-    margin-top: 0.85rem;
-    color: var(--muted);
-    font-size: var(--fs-sm);
-    line-height: 1.55;
+  .states-copy h3 {
+    font-size: clamp(1.15rem, 2vw, 1.35rem);
+    color: var(--ink);
+    letter-spacing: -0.015em;
+    margin-bottom: 0.6rem;
   }
-  .state figcaption strong { color: var(--ink); font-weight: 650; }
+  .states-copy p {
+    color: var(--muted);
+    line-height: 1.65;
+    font-size: 1rem;
+    max-width: 44ch;
+  }
+  @media (max-width: 767px) {
+    .states-row,
+    .states-row-flip { grid-template-columns: 1fr; direction: ltr; }
+    .states-copy { text-align: left; }
+  }
 
   /* ---- install ------------------------------------------------------- */
   .install .section-head { margin-inline: auto; }
