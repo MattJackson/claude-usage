@@ -1780,19 +1780,51 @@ fn atomic_replace_state_bytes(new_bytes: &[u8]) -> Result<(), String> {
     crate::store::write_private(&live, new_bytes).map_err(|e| e.to_string())
 }
 
+/// Guards against piling up blocked threads when "Refresh usage now" is
+/// clicked repeatedly: a stalled network call (see `run_cycle`) means each
+/// new click would otherwise stack up its own throwaway `SwapGuard` and
+/// thread. `false` = no refresh in flight; CAS to `true` before spawning,
+/// reset to `false` when the spawned thread's cycle completes.
+static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// "Refresh usage now" click (Settings ▸ Advanced ▸). Runs one poll +
 /// auto-swap cycle on a background thread — same `run_cycle` the poll loop
 /// calls every `WATCH_INTERVAL_SECS` — so the menu never blocks on network
 /// I/O. The main-thread timer picks up the refreshed cache on its next tick.
+///
+/// De-duplicated via `REFRESH_IN_FLIGHT`: a second click while a refresh is
+/// still running notifies instead of spawning another thread. See
+/// `try_start_refresh` for the testable core.
 fn handle_refresh_now() {
-    std::thread::spawn(|| {
-        let mut guard = SwapGuard::default();
-        if run_cycle(&mut guard) {
-            notify("Refresh: rate limited, backing off");
-        } else {
-            notify("Usage refreshed");
-        }
-    });
+    try_start_refresh(|| {
+        std::thread::spawn(|| {
+            let mut guard = SwapGuard::default();
+            let rate_limited = run_cycle(&mut guard);
+            REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            if rate_limited {
+                notify("Refresh: rate limited, backing off");
+            } else {
+                notify("Usage refreshed");
+            }
+        });
+    })
+}
+
+/// CAS `REFRESH_IN_FLIGHT` from `false` to `true`; if it was already `true`
+/// (a refresh is still running), notify and return without calling `spawn`.
+/// Factored out from `handle_refresh_now` so a test can inject a counting
+/// closure in place of a real `std::thread::spawn` and assert the second of
+/// two rapid calls never invokes it.
+fn try_start_refresh(spawn: impl FnOnce()) {
+    use std::sync::atomic::Ordering;
+    if REFRESH_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        notify("Refresh already running");
+        return;
+    }
+    spawn();
 }
 
 /// Capture the current login for `slug`. For Claude, use the full v1 flow
@@ -2137,6 +2169,36 @@ mod tests {
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
         }
+    }
+
+    #[test]
+    fn try_start_refresh_dedupes_rapid_clicks() {
+        // Reset in case a prior test in this binary left it set (best-effort
+        // — tests run with --test-threads=1 so no other test races us here).
+        REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let spawn_count = std::rc::Rc::new(StdCell::new(0u32));
+        let c1 = spawn_count.clone();
+        try_start_refresh(move || {
+            c1.set(c1.get() + 1);
+            // Deliberately do NOT reset REFRESH_IN_FLIGHT here — this stands
+            // in for "the background thread is still running" so the second
+            // click below is the one under test.
+        });
+        assert_eq!(spawn_count.get(), 1, "first click must spawn");
+
+        let c2 = spawn_count.clone();
+        try_start_refresh(move || {
+            c2.set(c2.get() + 1);
+        });
+        assert_eq!(
+            spawn_count.get(),
+            1,
+            "second rapid click must NOT spawn a second refresh"
+        );
+
+        // Clean up so later tests in this binary see the flag cleared.
+        REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[test]
