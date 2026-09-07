@@ -603,7 +603,7 @@ fn env_override_for(provider_id: &str) -> bool {
 /// `None` reset as "furthest in the future" so accounts without data yet sort
 /// last. Used inside `build_snapshot` and asserted directly in the
 /// `sort_by_expiration_orders_accounts_soonest_first` test.
-pub(crate) fn sort_by_expiration(a: &AcctView, b: &AcctView) -> std::cmp::Ordering {
+fn sort_by_expiration(a: &AcctView, b: &AcctView) -> std::cmp::Ordering {
     let ka = a.weekly_reset_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
     let kb = b.weekly_reset_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
     ka.cmp(&kb)
@@ -708,7 +708,7 @@ fn build_snapshot() -> Snapshot {
         // Flat-list rule: within a provider section the active account renders
         // first, then everyone else in the order picked above. Stable sort so
         // the expiration ordering is preserved among the inactives.
-        accounts.sort_by(|a, b| b.active.cmp(&a.active));
+        accounts.sort_by_key(|a| std::cmp::Reverse(a.active));
         let caps = provider.capabilities();
         sections.push(ProviderSection {
             provider_id: slug,
@@ -835,6 +835,37 @@ fn cached_state() -> State {
         g.loaded = true;
     }
     g.state.clone()
+}
+
+/// M6 (round-1 codeaudit): re-list backups only when the backups dir mtime
+/// advances. Every rebuild otherwise read + sorted the whole directory.
+fn cached_backups() -> Vec<(std::path::PathBuf, std::time::SystemTime)> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::SystemTime;
+    struct C {
+        dir_mtime: Option<SystemTime>,
+        items: Vec<(std::path::PathBuf, SystemTime)>,
+        loaded: bool,
+    }
+    static CELL: OnceLock<Mutex<C>> = OnceLock::new();
+    let cell = CELL.get_or_init(|| {
+        Mutex::new(C {
+            dir_mtime: None,
+            items: Vec::new(),
+            loaded: false,
+        })
+    });
+    let dir = crate::store::config_dir()
+        .map(|d| d.join("backups"))
+        .unwrap_or_default();
+    let mtime = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+    let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.loaded || g.dir_mtime != mtime {
+        g.items = crate::store::list_backups().unwrap_or_default();
+        g.dir_mtime = mtime;
+        g.loaded = true;
+    }
+    g.items.clone()
 }
 
 /// How often to re-probe the Login Item state (an osascript subprocess).
@@ -1066,7 +1097,11 @@ fn build_menu(snap: &Snapshot) -> Menu {
         None,
     ));
     let restore = Submenu::with_id("backup:restore", "Restore from backup", true);
-    let backups = crate::store::list_backups().unwrap_or_default();
+    // M6 (round-1 codeaudit): cache the listing keyed on the backups dir's
+    // mtime so unchanged rebuilds don't re-read the directory. The dir mtime
+    // ticks on any file create/delete inside it, which is precisely when we
+    // want to refresh.
+    let backups = cached_backups();
     if backups.is_empty() {
         let _ = restore.append(&MenuItem::with_id("noop", "(no backups yet)", false, None));
     } else {
@@ -1472,7 +1507,13 @@ fn menu_signature(snap: &Snapshot) -> String {
                     w.reset,
                 ));
             }
-            s.push_str(&format!("u={};", a.updated));
+            // Deliberately EXCLUDE `a.updated` from the signature. It's the
+            // human "Xs ago" / "Xm ago" string that changes every second for
+            // the first minute after each poll — folding it in forced a full
+            // `install_menu` on every 0.75s tick (defeating the whole cache).
+            // Real underlying freshness is already captured by `a.has_data`
+            // and each window's pct+reset above. See H8 in the round-1
+            // codeaudit findings.
         }
         s.push_str("] ");
     }
@@ -1690,14 +1731,11 @@ fn handle_backup_restore(filename: &str) {
     // Move the CURRENT state.json out of the way so the user can inspect /
     // revert. rename() only works within the same filesystem; fall back to
     // copy+remove if it doesn't.
-    if live.exists() {
-        if std::fs::rename(&live, &pre_restore).is_err() {
-            if let Err(e) =
-                std::fs::copy(&live, &pre_restore).and_then(|_| std::fs::remove_file(&live))
-            {
-                notify(&format!("Restore failed while moving current state: {e}"));
-                return;
-            }
+    if live.exists() && std::fs::rename(&live, &pre_restore).is_err() {
+        if let Err(e) = std::fs::copy(&live, &pre_restore).and_then(|_| std::fs::remove_file(&live))
+        {
+            notify(&format!("Restore failed while moving current state: {e}"));
+            return;
         }
     }
     // Copy the backup into place. Preserves 0600 via write_private-style
@@ -2670,7 +2708,7 @@ mod tests {
 
         // Insert in REVERSE-expiration order (mirrors what upsert would
         // produce if the user added them latest-first).
-        let mut accounts = vec![latest, middle, soonest];
+        let mut accounts = [latest, middle, soonest];
         accounts.sort_by(sort_by_expiration);
 
         let keys: Vec<&str> = accounts.iter().map(|a| a.key.as_str()).collect();
@@ -2689,7 +2727,7 @@ mod tests {
         let no_data = acct("nodata@x.com", None, None, false);
         assert!(no_data.weekly_reset_at.is_none(), "precondition");
 
-        let mut accounts = vec![no_data, with_data];
+        let mut accounts = [no_data, with_data];
         accounts.sort_by(sort_by_expiration);
         let keys: Vec<&str> = accounts.iter().map(|a| a.key.as_str()).collect();
         assert_eq!(keys, vec!["data@x.com", "nodata@x.com"]);
@@ -2707,8 +2745,8 @@ mod tests {
         a2.active = true;
         let mut a3 = acct("third@x.com", Some(30.0), Some(40.0), false);
         a3.active = false;
-        let mut accounts = vec![a1, a2, a3];
-        accounts.sort_by(|a, b| b.active.cmp(&a.active));
+        let mut accounts = [a1, a2, a3];
+        accounts.sort_by_key(|a| std::cmp::Reverse(a.active));
         assert_eq!(accounts[0].key, "active@x.com", "active is first");
         // Stable sort: the two inactives keep their original order.
         assert_eq!(accounts[1].key, "second@x.com");

@@ -197,10 +197,7 @@ impl StateV2 {
     /// Deserialize either shape from bytes: detect the schema, migrate v1 in
     /// memory if needed. Secrets are handed to `sink`; a real caller passes a
     /// keychain writer, tests pass a `Vec`-backed sink.
-    pub fn load_and_migrate_bytes(
-        bytes: &[u8],
-        sink: &mut dyn SecretSink,
-    ) -> Result<Self> {
+    pub fn load_and_migrate_bytes(bytes: &[u8], sink: &mut dyn SecretSink) -> Result<Self> {
         let v: Value = serde_json::from_slice(bytes).context("state.json is not valid JSON")?;
         Self::load_and_migrate_value(&v, sink)
     }
@@ -442,18 +439,8 @@ fn cached_v1_to_v2(c: &crate::store::CachedUsage) -> CachedUsageV2 {
             resets_at: reset.and_then(parse_rfc3339_utc),
         });
     };
-    push(
-        "session",
-        "5h",
-        c.session_pct,
-        c.session_reset.as_deref(),
-    );
-    push(
-        "weekly",
-        "7d",
-        c.weekly_pct,
-        c.weekly_reset.as_deref(),
-    );
+    push("session", "5h", c.session_pct, c.session_reset.as_deref());
+    push("weekly", "7d", c.weekly_pct, c.weekly_reset.as_deref());
     push("opus", "Opus 7d", c.opus_pct, c.opus_reset.as_deref());
     CachedUsageV2 {
         // v1 stored seconds; v2 stores millis so it matches every other
@@ -664,8 +651,7 @@ mod tests {
             }
         });
         let mut sink = MemorySecretSink::default();
-        let loaded =
-            StateV2::load_and_migrate_value(&original, &mut sink).unwrap();
+        let loaded = StateV2::load_and_migrate_value(&original, &mut sink).unwrap();
         let bytes = loaded.to_pretty_bytes().unwrap();
         let round: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
@@ -728,11 +714,8 @@ mod tests {
         // Truly empty input — mimicking a first-run install with no state
         // file. Must not panic and must yield the same shape as `Default`.
         let mut sink = MemorySecretSink::default();
-        let s = StateV2::load_and_migrate_value(
-            &Value::Object(Default::default()),
-            &mut sink,
-        )
-        .unwrap();
+        let s =
+            StateV2::load_and_migrate_value(&Value::Object(Default::default()), &mut sink).unwrap();
         assert_eq!(s.schema, CURRENT_SCHEMA);
         assert!(s.active.is_none());
         assert!(s.providers.is_empty());

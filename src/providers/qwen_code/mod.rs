@@ -76,9 +76,6 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(
-            QwenCodeProvider.capture_current_login(),
-            Ok(None)
-        ));
+        assert!(matches!(QwenCodeProvider.capture_current_login(), Ok(None)));
     }
 }

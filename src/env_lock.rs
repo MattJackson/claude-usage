@@ -73,30 +73,36 @@ mod tests {
 
     #[test]
     fn scoped_env_var_sets_then_restores_previous_value() {
-        // Snapshot the current outer value so we can assert on the restore.
-        let outer = std::env::var_os("HOME");
-        scoped_env_var("HOME", Some("/tmp/env-lock-test-a"), || {
-            assert_eq!(
-                std::env::var_os("HOME"),
-                Some(std::ffi::OsString::from("/tmp/env-lock-test-a"))
-            );
+        // H3 (round-1 codeaudit): use a test-unique env key so the outer
+        // snapshot doesn't race sibling tests that legitimately mutate $HOME
+        // under the same ENV_LOCK — the previous form captured `outer` before
+        // acquiring the lock, then compared after the lock released, leaving
+        // a window for interleaving to make the "prior restored" assertion
+        // flaky. A per-test key removes the race entirely (nothing else in
+        // the crate touches this name).
+        let key = "USAGIO_ENV_LOCK_TEST_RESTORE";
+        let outer = std::env::var_os(key);
+        scoped_env_var(key, Some("value-a"), || {
+            assert_eq!(std::env::var_os(key), Some(OsString::from("value-a")));
         });
-        assert_eq!(std::env::var_os("HOME"), outer, "prior HOME restored");
+        assert_eq!(std::env::var_os(key), outer, "prior value restored");
     }
 
     #[test]
     fn scoped_env_var_restores_after_panic() {
-        let outer = std::env::var_os("HOME");
+        // See H3 note above — unique key avoids the outer-snapshot race.
+        let key = "USAGIO_ENV_LOCK_TEST_PANIC";
+        let outer = std::env::var_os(key);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            scoped_env_var("HOME", Some("/tmp/env-lock-test-panic"), || {
+            scoped_env_var(key, Some("value-panic"), || {
                 panic!("boom");
             });
         }));
         assert!(r.is_err(), "closure panicked");
         assert_eq!(
-            std::env::var_os("HOME"),
+            std::env::var_os(key),
             outer,
-            "HOME restored even when the closure panicked"
+            "value restored even when the closure panicked"
         );
     }
 
@@ -110,7 +116,10 @@ mod tests {
         let key = "USAGIO_ENV_LOCK_TEST_KEY";
         scoped_env_var(key, Some("seed"), || {
             // Nothing here — the seed is visible while the guard is live.
-            assert_eq!(std::env::var_os(key), Some(std::ffi::OsString::from("seed")));
+            assert_eq!(
+                std::env::var_os(key),
+                Some(std::ffi::OsString::from("seed"))
+            );
         });
         // Now exercise the None (unset) path from a fresh outer state.
         scoped_env_var(key, None, || {

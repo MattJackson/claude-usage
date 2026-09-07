@@ -13,6 +13,9 @@ pub enum TokenizerHint {
     /// Approximate — Anthropic doesn't ship a Rust tokenizer.
     Anthropic,
     /// Approximate — used for unknown provider defaults.
+    /// Constructed by the fallback path in future providers; kept present so
+    /// callers don't have to be updated when a new stub provider lands.
+    #[allow(dead_code)]
     Approx,
 }
 

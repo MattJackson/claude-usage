@@ -721,12 +721,7 @@ fn rotate_if_large_leaves_small_file_alone() {
 
 /// Construct a row with the needs_relogin flag set. Everything else mirrors
 /// `row_full` so we can build side-by-side "both would otherwise win" tests.
-fn row_full_flagged(
-    email: &str,
-    session: f64,
-    weekly: f64,
-    weekly_reset: DateTime<Utc>,
-) -> Row {
+fn row_full_flagged(email: &str, session: f64, weekly: f64, weekly_reset: DateTime<Utc>) -> Row {
     let mut r = row_full(email, session, weekly, weekly_reset);
     r.needs_relogin = true;
     r

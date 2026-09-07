@@ -10,6 +10,14 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+// Compile-time anchor for the H4 fix (round-1 codeaudit): forces
+// tests/common/mod.rs to at least compile in CI, so a future maintainer who
+// starts using its `TestLogDir` / `TestConfigDir` immediately inherits the
+// file-local `env_lock()` serialization rather than silently racing $HOME.
+// The module is empty at the call sites we compile — every item is marked
+// `#[allow(dead_code)]` — so this incurs no runtime cost.
+mod common;
+
 /// A `usagio` command pinned to an isolated HOME.
 fn bin(home: &TempDir) -> Command {
     let mut c = Command::cargo_bin("usagio").expect("binary builds");

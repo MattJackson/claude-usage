@@ -15,17 +15,23 @@ pub fn run(provider: Option<String>, project: Option<PathBuf>) -> anyhow::Result
             "opencode".to_string(),
         ],
     };
+    // L8 (round-1 codeaudit): render one section per provider unconditionally
+    // so the output order matches the iteration order (deterministic) and a
+    // provider with no items still surfaces its heading. Previously an empty
+    // ledger was suppressed until at least one other provider had already
+    // printed, so identical inputs could yield different presence-of-headings
+    // depending on which provider iterated first.
+    let mut first = true;
     let mut printed_any = false;
     for prov in providers {
         match build_ledger(&prov, project.as_deref()) {
             Ok(ledger) => {
-                if !ledger.items.is_empty() || printed_any {
-                    if printed_any {
-                        println!();
-                    }
-                    print!("{}", render_terminal(&ledger));
-                    printed_any = true;
+                if !first {
+                    println!();
                 }
+                print!("{}", render_terminal(&ledger));
+                first = false;
+                printed_any = true;
             }
             Err(super::LedgerError::UnknownProvider(_)) => {
                 eprintln!("usagio context: unknown provider '{}'", prov);

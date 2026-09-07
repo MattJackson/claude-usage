@@ -5,10 +5,20 @@
 //! writes into an isolated location. On drop the previous `HOME` is restored
 //! and the tempdir is deleted, so tests never leak state between runs.
 //!
-//! Because `HOME` is process-global, tests using `TestLogDir` must not run in
-//! parallel with anything else that touches the config dir. Wrap those tests
-//! in a `serial_test`-style mutex (or run them with `--test-threads=1`) if you
-//! add more than one.
+//! # WARNING to future maintainers (H4, round-1 codeaudit)
+//!
+//! This file is currently DEAD CODE — no integration test in `tests/`
+//! includes it via `mod common;`. Wiring it in without also serializing
+//! against every other `$HOME` mutator in the same binary is how one prior
+//! test wiped a live developer `~/.config/claude-usage/state.json`. The
+//! in-crate replacement is `src/env_lock.rs::scoped_env_var` (see the
+//! never-re-login postmortem). Integration binaries can't import
+//! `env_lock` directly (they compile without `cfg(test)`); this file's
+//! `TestLogDir` / `TestConfigDir` therefore take a file-local `Mutex` so
+//! two of them constructed on different threads within the SAME
+//! integration binary can't race each other's `$HOME` swap. Cross-binary
+//! isolation is separately provided by cargo test spawning each
+//! integration binary in its own process.
 
 #![allow(dead_code)]
 // Integration-test binaries can't reach the binary crate's `env_lock` module
@@ -21,10 +31,22 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use chrono::{DateTime, Datelike, Utc};
 use serde::Serialize;
 use tempfile::TempDir;
+
+/// File-local serialization for `$HOME` mutations across `TestLogDir` /
+/// `TestConfigDir` instances constructed on separate threads within the SAME
+/// integration binary. See the H4 warning at the top of the module. Held as
+/// a `MutexGuard<'static, ()>` for the lifetime of each fixture.
+fn env_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 /// A scoped `$HOME` override. Constructing one points every module that
 /// reads `$HOME` (notably `store::config_dir` and, via it, `usage_log`) at
@@ -34,15 +56,22 @@ pub struct TestLogDir {
     // Kept so callers can inspect / write extra fixtures without recomputing.
     home_path: PathBuf,
     prev_home: Option<OsString>,
+    // Held for the lifetime of the fixture; released on Drop. Serialises
+    // `$HOME` mutation across sibling `TestLogDir` / `TestConfigDir` in the
+    // same binary. See the H4 warning at the top of the module.
+    _env_guard: MutexGuard<'static, ()>,
 }
 
 impl TestLogDir {
     /// Allocate a fresh tempdir and repoint `$HOME` at it.
     pub fn new() -> Self {
+        // Acquire the file-local env lock BEFORE reading prev_home / mutating,
+        // so no sibling fixture in the same integration binary races with us.
+        let _env_guard = env_lock();
         let home = tempfile::tempdir().expect("tempdir for TestLogDir");
         let home_path = home.path().to_path_buf();
         let prev_home = std::env::var_os("HOME");
-        // SAFETY: process-wide env mutation. Callers coordinate access.
+        // SAFETY: process-wide env mutation, serialised on `env_lock()`.
         std::env::set_var("HOME", &home_path);
         // Pre-create the config dir so any writer that assumes existence
         // finds it without extra ceremony.
@@ -52,6 +81,7 @@ impl TestLogDir {
             _home: home,
             home_path,
             prev_home,
+            _env_guard,
         }
     }
 
@@ -114,12 +144,15 @@ pub struct TestConfigDir {
     _home: TempDir,
     home_path: PathBuf,
     prev_home: Option<OsString>,
+    // See H4 warning at the top of the module.
+    _env_guard: MutexGuard<'static, ()>,
 }
 
 impl TestConfigDir {
     /// Fresh tempdir, `$HOME` repointed at it, `~/.config/usagio`
     /// pre-created so callers can seed a state.json without extra ceremony.
     pub fn new() -> Self {
+        let _env_guard = env_lock();
         let home = tempfile::tempdir().expect("tempdir for TestConfigDir");
         let home_path = home.path().to_path_buf();
         let prev_home = std::env::var_os("HOME");
@@ -130,6 +163,7 @@ impl TestConfigDir {
             _home: home,
             home_path,
             prev_home,
+            _env_guard,
         }
     }
 

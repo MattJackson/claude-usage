@@ -50,13 +50,25 @@ pub fn compute_display(usage: &AccountUsage, now: DateTime<Utc>) -> DisplayState
         (Some(s), Some(w)) => {
             // Both blocking — pick the sooner reset. Sooner = smaller DateTime.
             if s <= w {
-                DisplayState::Locked { until: s, window: BlockingWindow::Session }
+                DisplayState::Locked {
+                    until: s,
+                    window: BlockingWindow::Session,
+                }
             } else {
-                DisplayState::Locked { until: w, window: BlockingWindow::Weekly }
+                DisplayState::Locked {
+                    until: w,
+                    window: BlockingWindow::Weekly,
+                }
             }
         }
-        (Some(s), None) => DisplayState::Locked { until: s, window: BlockingWindow::Session },
-        (None, Some(w)) => DisplayState::Locked { until: w, window: BlockingWindow::Weekly },
+        (Some(s), None) => DisplayState::Locked {
+            until: s,
+            window: BlockingWindow::Session,
+        },
+        (None, Some(w)) => DisplayState::Locked {
+            until: w,
+            window: BlockingWindow::Weekly,
+        },
         (None, None) => DisplayState::Usage {
             session_pct: usage.session_pct,
             weekly_pct: usage.weekly_pct,
@@ -64,7 +76,11 @@ pub fn compute_display(usage: &AccountUsage, now: DateTime<Utc>) -> DisplayState
     }
 }
 
-fn is_blocking(pct: Option<f64>, reset: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+fn is_blocking(
+    pct: Option<f64>,
+    reset: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
     let pct = pct?;
     let reset = reset?;
     if pct >= LOCKED_THRESHOLD_PCT && reset > now {
@@ -206,7 +222,10 @@ mod tests {
         let u = usage(Some(42.0), Some(2000), Some(61.0), Some(5000));
         assert_eq!(
             compute_display(&u, t(1000)),
-            DisplayState::Usage { session_pct: Some(42.0), weekly_pct: Some(61.0) }
+            DisplayState::Usage {
+                session_pct: Some(42.0),
+                weekly_pct: Some(61.0)
+            }
         );
     }
 
@@ -215,7 +234,10 @@ mod tests {
         let u = usage(Some(100.0), Some(2000), Some(61.0), Some(5000));
         assert_eq!(
             compute_display(&u, t(1000)),
-            DisplayState::Locked { until: t(2000), window: BlockingWindow::Session }
+            DisplayState::Locked {
+                until: t(2000),
+                window: BlockingWindow::Session
+            }
         );
     }
 
@@ -224,7 +246,10 @@ mod tests {
         let u = usage(Some(42.0), Some(2000), Some(100.0), Some(5000));
         assert_eq!(
             compute_display(&u, t(1000)),
-            DisplayState::Locked { until: t(5000), window: BlockingWindow::Weekly }
+            DisplayState::Locked {
+                until: t(5000),
+                window: BlockingWindow::Weekly
+            }
         );
     }
 
@@ -233,7 +258,10 @@ mod tests {
         let u = usage(Some(100.0), Some(2000), Some(100.0), Some(5000));
         assert_eq!(
             compute_display(&u, t(1000)),
-            DisplayState::Locked { until: t(2000), window: BlockingWindow::Session }
+            DisplayState::Locked {
+                until: t(2000),
+                window: BlockingWindow::Session
+            }
         );
     }
 
@@ -242,7 +270,10 @@ mod tests {
         let u = usage(Some(100.0), Some(5000), Some(100.0), Some(2000));
         assert_eq!(
             compute_display(&u, t(1000)),
-            DisplayState::Locked { until: t(2000), window: BlockingWindow::Weekly }
+            DisplayState::Locked {
+                until: t(2000),
+                window: BlockingWindow::Weekly
+            }
         );
     }
 
@@ -252,7 +283,10 @@ mod tests {
         let u = usage(Some(100.0), Some(3000), Some(100.0), Some(3000));
         assert_eq!(
             compute_display(&u, t(1000)),
-            DisplayState::Locked { until: t(3000), window: BlockingWindow::Session }
+            DisplayState::Locked {
+                until: t(3000),
+                window: BlockingWindow::Session
+            }
         );
     }
 
@@ -262,7 +296,10 @@ mod tests {
         let u = usage(Some(100.0), Some(500), Some(50.0), Some(5000));
         assert_eq!(
             compute_display(&u, t(1000)),
-            DisplayState::Usage { session_pct: Some(100.0), weekly_pct: Some(50.0) }
+            DisplayState::Usage {
+                session_pct: Some(100.0),
+                weekly_pct: Some(50.0)
+            }
         );
     }
 
@@ -271,7 +308,10 @@ mod tests {
         let u = usage(Some(99.5), Some(2000), None, None);
         assert_eq!(
             compute_display(&u, t(1000)),
-            DisplayState::Locked { until: t(2000), window: BlockingWindow::Session }
+            DisplayState::Locked {
+                until: t(2000),
+                window: BlockingWindow::Session
+            }
         );
     }
 
@@ -280,7 +320,10 @@ mod tests {
         let u = usage(Some(99.4), Some(2000), None, None);
         assert_eq!(
             compute_display(&u, t(1000)),
-            DisplayState::Usage { session_pct: Some(99.4), weekly_pct: None }
+            DisplayState::Usage {
+                session_pct: Some(99.4),
+                weekly_pct: None
+            }
         );
     }
 
@@ -290,7 +333,10 @@ mod tests {
         let u = usage(Some(100.0), None, None, None);
         assert_eq!(
             compute_display(&u, t(1000)),
-            DisplayState::Usage { session_pct: Some(100.0), weekly_pct: None }
+            DisplayState::Usage {
+                session_pct: Some(100.0),
+                weekly_pct: None
+            }
         );
     }
 
@@ -299,7 +345,10 @@ mod tests {
         let u = usage(None, Some(2000), None, Some(5000));
         assert_eq!(
             compute_display(&u, t(1000)),
-            DisplayState::Usage { session_pct: None, weekly_pct: None }
+            DisplayState::Usage {
+                session_pct: None,
+                weekly_pct: None
+            }
         );
     }
 }

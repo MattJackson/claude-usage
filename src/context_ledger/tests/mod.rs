@@ -75,7 +75,10 @@ fn claude_project_md_counted() {
         let proj = tempdir().unwrap();
         fs::write(proj.path().join("CLAUDE.md"), "project instructions").unwrap();
         let l = build_ledger("claude", Some(proj.path())).unwrap();
-        assert!(l.items.iter().any(|i| i.kind == ItemKind::ProjectInstructions));
+        assert!(l
+            .items
+            .iter()
+            .any(|i| i.kind == ItemKind::ProjectInstructions));
     });
 }
 

@@ -8,15 +8,37 @@
 //! Serialize the tools response to JSON and count its tokens — that's
 //! approximately what enters the model's context per turn.
 //!
-//! Timeout: 3s per server. Missing binaries / crashes surface as errors and
-//! the caller skips that row.
+//! Timeout: best-effort ~3s per server (a blocking `read_line` between polls
+//! may exceed it if the child stops emitting bytes). Missing binaries /
+//! crashes surface as errors and the caller skips that row.
 
 use super::tokenize;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// RAII guard that kills + reaps a spawned MCP child on drop. Ensures every
+/// `?` early return between spawn and cleanup — spawn failure, write failure,
+/// timeout, malformed response — reaps the child rather than leaking it as a
+/// zombie. See H5 in the round-1 codeaudit findings.
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn new(c: Child) -> Self {
+        Self(Some(c))
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -42,8 +64,8 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
     if config.get("url").is_some() {
         return Err("http transport not yet supported".into());
     }
-    let cfg: StdioConfig = serde_json::from_value(config.clone())
-        .map_err(|e| format!("bad stdio config: {}", e))?;
+    let cfg: StdioConfig =
+        serde_json::from_value(config.clone()).map_err(|e| format!("bad stdio config: {}", e))?;
 
     let start = Instant::now();
     let mut child = Command::new(&cfg.command)
@@ -55,9 +77,14 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
         .spawn()
         .map_err(|e| format!("spawn: {}", e))?;
 
-    let stdin = child.stdin.as_mut().ok_or("no stdin")?;
+    // Pull the stdio handles out BEFORE handing the child to ChildGuard so the
+    // guard doesn't need to be re-borrowed for each I/O op (avoids a two-mut
+    // borrow through `guard.as_mut()`). ChildGuard now owns kill+reap on any
+    // early return between here and the happy-path drop at fn end.
+    let mut stdin = child.stdin.take().ok_or("no stdin")?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let mut reader = BufReader::new(stdout);
+    let _guard = ChildGuard::new(child);
 
     // Initialize request
     let init = json!({
@@ -70,17 +97,24 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
             "clientInfo": {"name": "usagio-ledger", "version": "0.1"}
         }
     });
-    writeln!(stdin, "{}", init).map_err(|e| format!("write init: {}", e))?;
+    writeln!(&mut stdin, "{}", init).map_err(|e| format!("write init: {}", e))?;
 
-    // Wait for initialize response
-    let _init_response = read_line_with_timeout(&mut reader, start)?;
+    // Wait for initialize response; if the server rejected our handshake
+    // (JSON-RPC error object at top level), surface it now instead of
+    // proceeding into a `tools/list` that would fail the same way.
+    let init_response = read_line_with_timeout(&mut reader, start)?;
+    if let Ok(parsed) = serde_json::from_str::<Value>(&init_response) {
+        if let Some(err) = parsed.get("error") {
+            return Err(format!("initialize failed: {}", err));
+        }
+    }
 
     // Send initialized notification (no id — no response expected)
     let initialized = json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     });
-    writeln!(stdin, "{}", initialized).map_err(|e| format!("write initialized: {}", e))?;
+    writeln!(&mut stdin, "{}", initialized).map_err(|e| format!("write initialized: {}", e))?;
 
     // tools/list
     let tools_req = json!({
@@ -89,7 +123,7 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
         "method": "tools/list",
         "params": {}
     });
-    writeln!(stdin, "{}", tools_req).map_err(|e| format!("write tools/list: {}", e))?;
+    writeln!(&mut stdin, "{}", tools_req).map_err(|e| format!("write tools/list: {}", e))?;
 
     let tools_response = read_line_with_timeout(&mut reader, start)?;
     let parsed: Value =
@@ -101,10 +135,7 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
         .ok_or("tools/list missing result.tools")?
         .clone();
 
-    // Best-effort cleanup — kill child, don't block on it exiting.
-    let _ = child.kill();
-    let _ = child.wait();
-
+    // Happy path: ChildGuard::Drop at end-of-scope will kill+reap the child.
     let serialized = serde_json::to_string(&tools).unwrap_or_default();
     let token_count = tokenize::count_tokens(&serialized, tokenize::TokenizerHint::Anthropic);
     Ok(McpSummary {

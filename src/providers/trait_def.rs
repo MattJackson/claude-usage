@@ -240,7 +240,10 @@ impl CredentialFreshness {
     /// `Expired` is deliberately not usable — we want to hand out fresh
     /// access tokens only.
     pub fn is_usable(&self) -> bool {
-        matches!(self, CredentialFreshness::Fresh | CredentialFreshness::ExpiresIn(_))
+        matches!(
+            self,
+            CredentialFreshness::Fresh | CredentialFreshness::ExpiresIn(_)
+        )
     }
 }
 
@@ -329,11 +332,7 @@ pub trait Provider: Send + Sync + 'static {
 
     /// Persist `blob` as the active login for this provider and update any
     /// identity-adjacent files the vendor CLI expects to read.
-    fn write_active_account(
-        &self,
-        blob: &str,
-        identity: &IdentitySnapshot,
-    ) -> PResult<()> {
+    fn write_active_account(&self, blob: &str, identity: &IdentitySnapshot) -> PResult<()> {
         let _ = (blob, identity);
         Err(ProviderError::Unsupported)
     }
@@ -451,11 +450,7 @@ mod tests {
         fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
             Err(ProviderError::Unsupported)
         }
-        fn patch_stored_blob(
-            &self,
-            _blob: &str,
-            _grant: &TokenGrant,
-        ) -> PResult<String> {
+        fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
             Err(ProviderError::Unsupported)
         }
     }

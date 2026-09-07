@@ -267,35 +267,54 @@ fn save_state_safe_refuses_dropping_account_without_remove() {
 }
 
 #[test]
-fn save_state_safe_dumps_rejected_state_to_tmp() {
+fn save_state_safe_dumps_rejected_state_redacted_into_backups() {
+    // H2 (round-1 codeaudit): the rejected-state dump used to go to
+    // /tmp/usagio-state-rejected-<ts>.json (shared, default umask,
+    // world-readable) and carried plaintext OAuth tokens. It now lives under
+    // config_dir/backups/rejected-<ts>.json (0600), with tokens redacted.
     let _g = ScopedConfigDir::new();
     make_state_with(&["a@e.com", "b@e.com"]).save().unwrap();
     let mut bad = State::default();
     bad.accounts.push(acct("a@e.com"));
-    let before = std::time::SystemTime::now();
     let _ = bad.save().unwrap_err();
-    // Find the most recent /tmp/usagio-state-rejected-*.json created after `before`.
+
+    let backups_dir = config_dir().unwrap().join("backups");
     let mut found = None;
-    for entry in std::fs::read_dir("/tmp").unwrap().flatten() {
+    for entry in std::fs::read_dir(&backups_dir).unwrap().flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy().to_string();
-        if !name.starts_with("usagio-state-rejected-") || !name.ends_with(".json") {
-            continue;
-        }
-        if let Ok(m) = entry.metadata().and_then(|m| m.modified()) {
-            if m >= before {
-                found = Some(entry.path());
-                break;
-            }
+        if name.starts_with("state-rejected-") && name.ends_with(".json") {
+            found = Some(entry.path());
+            break;
         }
     }
-    let dump = found.expect("rejected state.json was dumped to /tmp");
+    let dump = found.expect("rejected state was dumped into config_dir/backups/");
     let contents = std::fs::read_to_string(&dump).unwrap();
     assert!(
         contents.contains("a@e.com"),
-        "dump contains new-state contents: {contents}"
+        "dump preserves account keys: {contents}"
     );
-    let _ = std::fs::remove_file(&dump);
+    // Tokens must NOT leak — the tempdir-backed acct() blob uses "acc"/"ref"
+    // as its access/refresh tokens; the redacted dump replaces them.
+    assert!(
+        !contents.contains("\"acc\""),
+        "access token must not appear verbatim in dump: {contents}"
+    );
+    assert!(
+        !contents.contains("\"ref\""),
+        "refresh token must not appear verbatim in dump: {contents}"
+    );
+    assert!(
+        contents.contains("<redacted>"),
+        "dump uses redaction placeholder: {contents}"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dump).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rejected dump must be owner-only");
+    }
 }
 
 #[test]
@@ -497,10 +516,7 @@ fn reconciler_never_persists_silent_account_drop() {
         .save()
         .expect_err("silent shrink must be refused by save_state_safe");
     let msg = format!("{err:#}");
-    assert!(
-        msg.contains("REFUSED save_state"),
-        "refusal is loud: {msg}"
-    );
+    assert!(msg.contains("REFUSED save_state"), "refusal is loud: {msg}");
     assert!(
         msg.contains("b@e.com"),
         "refusal names the vanished account: {msg}"

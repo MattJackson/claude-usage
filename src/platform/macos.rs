@@ -24,6 +24,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub struct MacOsPlatform {
+    // Reachable through the `MenuBackend` trait method below; the compiler's
+    // dead-code analysis doesn't see the vtable dispatch. The concrete impl
+    // stays a placeholder (see comments below) until the trait-based rewrite
+    // in v0.5.0.
+    #[allow(dead_code)]
     menu: MacOsMenu,
     secrets: MacOsSecrets,
     autostart: MacOsAutostart,
@@ -92,12 +97,29 @@ pub struct MacOsSecrets;
 
 impl SecretStore for MacOsSecrets {
     fn get(&self, service: &str, account: &str) -> Result<Option<String>> {
+        // Only exit code 44 ("SecItem not found" per <Security/SecBase.h> /
+        // `security(1)` conventions) is a genuine "not present". Any other
+        // non-zero — keychain locked, permission denied, IPC failure —
+        // surfaces as Err so callers like `sync_active_from_keychain` treat
+        // it as "don't touch anything" rather than "assume gone" (which
+        // would let a subsequent switch overwrite a still-valid token).
+        // See H7 in the round-1 codeaudit findings.
         let out = Command::new("security")
             .args(["find-generic-password", "-s", service, "-a", account, "-w"])
             .output()
             .context("running `security find-generic-password`")?;
         if !out.status.success() {
-            return Ok(None);
+            match out.status.code() {
+                Some(44) => return Ok(None),
+                other => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    bail!(
+                        "`security find-generic-password` failed \
+                         (exit {other:?}) for service={service} account={account}: {}",
+                        stderr.trim(),
+                    );
+                }
+            }
         }
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if s.is_empty() {
@@ -108,6 +130,13 @@ impl SecretStore for MacOsSecrets {
     }
 
     fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
+        // L5 (round-1 codeaudit): passing the secret via argv (`-w <secret>`)
+        // briefly exposes it in `ps(1)` output. Acknowledged limitation of
+        // `security(1)` — its stdin variant does not exist for
+        // add-generic-password. Alternative (Security.framework FFI) triggers
+        // "always allow?" keychain prompts on every launch of an unsigned
+        // brew-installed binary (see header comment at the top of this file).
+        // Kept as-is; documented as SEC-2 in security posture notes.
         let status = Command::new("security")
             .args([
                 "add-generic-password",
@@ -128,13 +157,26 @@ impl SecretStore for MacOsSecrets {
     }
 
     fn delete(&self, service: &str, account: &str) -> Result<()> {
-        let status = Command::new("security")
+        // Same class as H7 (round-1 codeaudit): distinguish "item not found"
+        // (exit 44, benign) from every other failure. Collapsing all non-zero
+        // to Ok(()) masked keychain-locked / permission errors, which then
+        // let callers assume the delete "succeeded" and move on.
+        let out = Command::new("security")
             .args(["delete-generic-password", "-s", service, "-a", account])
-            .status()
+            .output()
             .context("running `security delete-generic-password`")?;
-        if !status.success() {
-            // Not-found is not an error for our callers.
-            return Ok(());
+        if !out.status.success() {
+            match out.status.code() {
+                Some(44) => return Ok(()),
+                other => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    bail!(
+                        "`security delete-generic-password` failed \
+                         (exit {other:?}) for service={service} account={account}: {}",
+                        stderr.trim(),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -161,18 +203,39 @@ impl MacOsAutostart {
     }
 }
 
+/// XML-escape the five reserved chars so a label / path / arg containing
+/// `&`, `<`, `>`, `"`, or `'` can't corrupt the plist. L2 (round-1 codeaudit).
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 impl Autostart for MacOsAutostart {
     fn install(&self, label: &str, binary: &Path, args: &[&str]) -> Result<()> {
-        let mut prog_args = format!("    <string>{}</string>\n", binary.display());
+        let mut prog_args = format!(
+            "    <string>{}</string>\n",
+            xml_escape(&binary.display().to_string())
+        );
         for a in args {
-            prog_args.push_str(&format!("    <string>{a}</string>\n"));
+            prog_args.push_str(&format!("    <string>{}</string>\n", xml_escape(a)));
         }
+        let label_esc = xml_escape(label);
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>{label}</string>
+  <key>Label</key><string>{label_esc}</string>
   <key>ProgramArguments</key>
   <array>
 {prog_args}  </array>
@@ -294,10 +357,7 @@ mod tests {
     #[test]
     #[ignore = "touches the real login keychain; run with --ignored"]
     fn secret_store_roundtrip() {
-        let service = format!(
-            "usagio-platform-test-{}",
-            std::process::id()
-        );
+        let service = format!("usagio-platform-test-{}", std::process::id());
         let account = "roundtrip";
         let secret = "hunter2";
         let ss = MacOsSecrets;

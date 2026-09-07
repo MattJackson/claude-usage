@@ -12,8 +12,7 @@ use crate::pricing::{self, Pricing};
 use crate::providers::trait_def::Window;
 use crate::usage_log::{self, AccountKey};
 
-pub const DISCLAIMER: &str =
-    "Estimate: derived from % consumed × plan cap × published pricing. \
+pub const DISCLAIMER: &str = "Estimate: derived from % consumed × plan cap × published pricing. \
      Providers don't expose raw token counts; treat as ballpark, not billing.";
 
 /// Approximate per-cycle token cap by (provider_id, plan_slug).  Sources embedded
@@ -22,14 +21,26 @@ pub const DISCLAIMER: &str =
 ///
 /// All values in *total* tokens per cycle (input+output combined at typical 60/40
 /// ratio unless otherwise noted).  Adjust as vendors publish real numbers.
-pub const CLAUDE_MAX_100_WEEKLY_TOKENS: u64 = 15_000_000;   // ~ from community traces
-pub const CLAUDE_MAX_200_WEEKLY_TOKENS: u64 = 45_000_000;   // 3x the $100 tier
-pub const CLAUDE_MAX_300_WEEKLY_TOKENS: u64 = 90_000_000;   // 6x the $100 tier
-pub const CODEX_PLUS_WEEKLY_TOKENS:     u64 = 8_000_000;
-pub const CODEX_PRO_WEEKLY_TOKENS:      u64 = 35_000_000;
+pub const CLAUDE_MAX_100_WEEKLY_TOKENS: u64 = 15_000_000; // ~ from community traces
+                                                          // The remaining four are referenced by tier-selection logic that lands in
+                                                          // v0.5.0 (plan-detection off account metadata). Kept here + #[allow(dead_code)]
+                                                          // so the numbers stay reviewed alongside the $100 tier — a scattered set of
+                                                          // magic numbers three months later is how a plan-cap drifts unnoticed.
+#[allow(dead_code)]
+pub const CLAUDE_MAX_200_WEEKLY_TOKENS: u64 = 45_000_000; // 3x the $100 tier
+#[allow(dead_code)]
+pub const CLAUDE_MAX_300_WEEKLY_TOKENS: u64 = 90_000_000; // 6x the $100 tier
+#[allow(dead_code)]
+pub const CODEX_PLUS_WEEKLY_TOKENS: u64 = 8_000_000;
+#[allow(dead_code)]
+pub const CODEX_PRO_WEEKLY_TOKENS: u64 = 35_000_000;
 /// I/O split used when we don't have observed breakdown per account.
 pub const IO_SPLIT_INPUT_PCT: f64 = 0.65;
 
+// Fields consumed by upcoming v0.5.0 detail panel (cycle breakdown per
+// account); today only `estimated_usd` renders in the menu row. Kept present
+// so the type doesn't need a breaking change when the panel lands.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct CycleCost {
     pub account: AccountKey,
@@ -40,10 +51,7 @@ pub struct CycleCost {
     pub disclaimer: &'static str,
 }
 
-pub fn estimate_cycle_cost(
-    account: &AccountKey,
-    plan_cap_tokens: u64,
-) -> Option<CycleCost> {
+pub fn estimate_cycle_cost(account: &AccountKey, plan_cap_tokens: u64) -> Option<CycleCost> {
     // Pull most-recent snapshot for this account from the log to get pct consumed.
     let snaps = usage_log::last_n_days(account, 8);
     let latest = snaps.iter().max_by_key(|s| s.ts)?;
@@ -87,13 +95,34 @@ fn price_tokens(input: u64, output: u64, p: &Pricing) -> f64 {
 /// providers where we can't even ballpark (openrouter/synthetic passthrough).
 fn provider_default_price(provider_id: &str, input: u64, output: u64) -> f64 {
     let defaults = match provider_id {
-        "claude"     => Pricing { input_per_million: 3.00, output_per_million: 15.00 },  // Sonnet-tier
-        "codex"      => Pricing { input_per_million: 2.00, output_per_million: 8.00 },   // GPT-4.1-tier
-        "gemini-cli" | "vertex-ai" => Pricing { input_per_million: 1.25, output_per_million: 10.00 }, // 2.5-pro
-        "qwen-code"  => Pricing { input_per_million: 0.40, output_per_million: 1.20 },
-        "deepseek"   => Pricing { input_per_million: 0.28, output_per_million: 1.12 },
-        "fireworks"  => Pricing { input_per_million: 0.90, output_per_million: 0.90 },
-        "zai"        => Pricing { input_per_million: 0.60, output_per_million: 2.20 },
+        "claude" => Pricing {
+            input_per_million: 3.00,
+            output_per_million: 15.00,
+        }, // Sonnet-tier
+        "codex" => Pricing {
+            input_per_million: 2.00,
+            output_per_million: 8.00,
+        }, // GPT-4.1-tier
+        "gemini-cli" | "vertex-ai" => Pricing {
+            input_per_million: 1.25,
+            output_per_million: 10.00,
+        }, // 2.5-pro
+        "qwen-code" => Pricing {
+            input_per_million: 0.40,
+            output_per_million: 1.20,
+        },
+        "deepseek" => Pricing {
+            input_per_million: 0.28,
+            output_per_million: 1.12,
+        },
+        "fireworks" => Pricing {
+            input_per_million: 0.90,
+            output_per_million: 0.90,
+        },
+        "zai" => Pricing {
+            input_per_million: 0.60,
+            output_per_million: 2.20,
+        },
         _ => return 0.0,
     };
     price_tokens(input, output, &defaults)
@@ -102,8 +131,15 @@ fn provider_default_price(provider_id: &str, input: u64, output: u64) -> f64 {
 // ─── subscription verdict ────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub enum Verdict { Cancel, Downgrade, Keep, Upgrade }
+pub enum Verdict {
+    Cancel,
+    Downgrade,
+    Keep,
+    Upgrade,
+}
 
+// See CycleCost above — the verdict panel wiring lands in v0.5.0.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct SubscriptionVerdict {
     pub verdict: Verdict,
@@ -116,19 +152,26 @@ pub struct SubscriptionVerdict {
     pub recoverable_dollars: f64,
 }
 
+#[allow(dead_code)] // wired into v0.5.0 recommendations panel
 pub fn subscription_verdict(
     account: &AccountKey,
     cycles_to_analyze: usize,
 ) -> Option<SubscriptionVerdict> {
-    if cycles_to_analyze == 0 { return None; }
+    if cycles_to_analyze == 0 {
+        return None;
+    }
     // Weekly cycle ~= 7 days.  Look back cycles_to_analyze * 7 days of samples.
     let samples = usage_log::last_n_days(account, (cycles_to_analyze * 7) as u32);
-    if samples.is_empty() { return None; }
+    if samples.is_empty() {
+        return None;
+    }
 
     // Extract weekly pct per sample; take max per bucketed calendar week for peak,
     // and mean of all weekly_pct samples for avg.
     let weekly: Vec<f32> = samples.iter().filter_map(|s| s.weekly_pct).collect();
-    if weekly.is_empty() { return None; }
+    if weekly.is_empty() {
+        return None;
+    }
 
     let peak = weekly.iter().cloned().fold(0.0f32, f32::max);
     let avg = weekly.iter().sum::<f32>() / (weekly.len() as f32);
@@ -154,10 +197,10 @@ pub fn subscription_verdict(
         f64::INFINITY
     };
     let recoverable = match verdict {
-        Verdict::Cancel    => monthly_spend,
+        Verdict::Cancel => monthly_spend,
         Verdict::Downgrade => monthly_spend * 0.5,
-        Verdict::Keep      => 0.0,
-        Verdict::Upgrade   => 0.0,
+        Verdict::Keep => 0.0,
+        Verdict::Upgrade => 0.0,
     };
 
     Some(SubscriptionVerdict {
@@ -176,10 +219,15 @@ mod tests {
 
     fn v(peak: f32, avg: f32) -> Verdict {
         // Reconstruct just the classification bit for boundary tests.
-        if avg < 10.0 && peak < 20.0 { Verdict::Cancel }
-        else if avg < 30.0 && peak < 50.0 { Verdict::Downgrade }
-        else if avg < 80.0 { Verdict::Keep }
-        else { Verdict::Upgrade }
+        if avg < 10.0 && peak < 20.0 {
+            Verdict::Cancel
+        } else if avg < 30.0 && peak < 50.0 {
+            Verdict::Downgrade
+        } else if avg < 80.0 {
+            Verdict::Keep
+        } else {
+            Verdict::Upgrade
+        }
     }
 
     #[test]
@@ -208,7 +256,10 @@ mod tests {
 
     #[test]
     fn price_tokens_math() {
-        let p = Pricing { input_per_million: 3.00, output_per_million: 15.00 };
+        let p = Pricing {
+            input_per_million: 3.00,
+            output_per_million: 15.00,
+        };
         // 1M in, 1M out → $3 + $15 = $18
         assert!((price_tokens(1_000_000, 1_000_000, &p) - 18.00).abs() < 1e-9);
         // Half-and-half of half a million each: $0.75 + $3.75 = $4.50
@@ -217,15 +268,27 @@ mod tests {
 
     #[test]
     fn provider_default_price_zero_for_passthrough() {
-        assert_eq!(provider_default_price("openrouter", 1_000_000, 1_000_000), 0.0);
-        assert_eq!(provider_default_price("synthetic",  1_000_000, 1_000_000), 0.0);
+        assert_eq!(
+            provider_default_price("openrouter", 1_000_000, 1_000_000),
+            0.0
+        );
+        assert_eq!(
+            provider_default_price("synthetic", 1_000_000, 1_000_000),
+            0.0
+        );
     }
 
     #[test]
     fn plan_caps_sane_order() {
-        assert!(CLAUDE_MAX_100_WEEKLY_TOKENS < CLAUDE_MAX_200_WEEKLY_TOKENS);
-        assert!(CLAUDE_MAX_200_WEEKLY_TOKENS < CLAUDE_MAX_300_WEEKLY_TOKENS);
-        assert!(CODEX_PLUS_WEEKLY_TOKENS < CODEX_PRO_WEEKLY_TOKENS);
+        // These are const assertions; the ordering catches an operator
+        // mistake at edit time. `const { assert!(...) }` would be nicer once
+        // MSRV rises, but the runtime `assert!` here is trivially cheap.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(CLAUDE_MAX_100_WEEKLY_TOKENS < CLAUDE_MAX_200_WEEKLY_TOKENS);
+            assert!(CLAUDE_MAX_200_WEEKLY_TOKENS < CLAUDE_MAX_300_WEEKLY_TOKENS);
+            assert!(CODEX_PLUS_WEEKLY_TOKENS < CODEX_PRO_WEEKLY_TOKENS);
+        }
     }
 
     // Fixture-based full estimate — requires usage_log fixture harness; wired in

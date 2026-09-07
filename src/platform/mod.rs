@@ -11,6 +11,13 @@
 //! Linux, Win32 dispatch on Windows), it should use `block_on` inside the impl
 //! rather than infecting the trait surface.
 
+// Trait / MenuTree / MenuItem / MenuBackend / list / delete / etc. are
+// v0.5.0 scaffolding for Linux (ksni) + Windows (Win32) menu backends —
+// wired when those platforms land. macOS still drives the NSMenu path
+// directly through `crate::menubar`. File-level allow so the shape stays
+// reviewed as a whole rather than being pruned one method at a time.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 
 pub type Result<T> = anyhow::Result<T>;
@@ -146,10 +153,10 @@ pub trait Paths: Send + Sync {
 
 // ---------- current() -----------------------------------------------------
 
-#[cfg(target_os = "macos")]
-mod macos;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 

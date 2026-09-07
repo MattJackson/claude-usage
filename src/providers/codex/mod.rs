@@ -269,7 +269,11 @@ impl Provider for CodexProvider {
     /// id_token JWT and reading the `email` claim.
     fn identify_credential(&self, blob: &str) -> Option<AccountKey> {
         let parsed: AuthDotJson = serde_json::from_str(blob).ok()?;
-        let claims = parsed.tokens.id_token.as_deref().and_then(jwt_payload_claims)?;
+        let claims = parsed
+            .tokens
+            .id_token
+            .as_deref()
+            .and_then(jwt_payload_claims)?;
         let email = claims
             .get("email")
             .and_then(|x| x.as_str())
@@ -288,7 +292,12 @@ impl Provider for CodexProvider {
         let Ok(parsed) = serde_json::from_str::<AuthDotJson>(blob) else {
             return CredentialFreshness::Invalid;
         };
-        let Some(claims) = parsed.tokens.id_token.as_deref().and_then(jwt_payload_claims) else {
+        let Some(claims) = parsed
+            .tokens
+            .id_token
+            .as_deref()
+            .and_then(jwt_payload_claims)
+        else {
             return CredentialFreshness::Invalid;
         };
         let Some(exp) = claims.get("exp").and_then(|x| x.as_i64()) else {
@@ -372,7 +381,9 @@ fn jwt_payload_claims(jwt: &str) -> Option<serde_json::Map<String, Value>> {
         .ok()
         .or_else(|| {
             // Some producers pad; try the padded variant too.
-            base64::engine::general_purpose::URL_SAFE.decode(payload).ok()
+            base64::engine::general_purpose::URL_SAFE
+                .decode(payload)
+                .ok()
         })?;
     let v: Value = serde_json::from_slice(&bytes).ok()?;
     match v {

@@ -155,10 +155,7 @@ impl Provider for ClaudeProvider {
             })?;
         let now_ms = Utc::now().timestamp_millis();
         let expires_at = now_ms.saturating_add(grant.expires_in_secs.saturating_mul(1000));
-        obj.insert(
-            "accessToken".into(),
-            Value::String(grant.access.clone()),
-        );
+        obj.insert("accessToken".into(), Value::String(grant.access.clone()));
         // Preserve the existing refresh token if the server didn't rotate a
         // fresh one — mirrors `oauth::refresh`'s RFC 6749 §6 behaviour.
         if let Some(rt) = grant.refresh.as_ref() {
@@ -207,10 +204,7 @@ impl Provider for ClaudeProvider {
             access: tok.access_token,
             // RFC 6749 §6: keep the caller-supplied refresh token if the
             // server didn't rotate one.
-            refresh: Some(
-                tok.refresh_token
-                    .unwrap_or_else(|| refresh.to_string()),
-            ),
+            refresh: Some(tok.refresh_token.unwrap_or_else(|| refresh.to_string())),
             expires_in_secs: tok.expires_in,
         })
     }
@@ -237,11 +231,7 @@ impl Provider for ClaudeProvider {
 
     // --- Switching ----------------------------------------------------------
 
-    fn write_active_account(
-        &self,
-        blob: &str,
-        identity: &IdentitySnapshot,
-    ) -> PResult<()> {
+    fn write_active_account(&self, blob: &str, identity: &IdentitySnapshot) -> PResult<()> {
         // Sanity: refuse a non-Claude blob rather than corrupt the keychain.
         parse_claude_blob(blob)?;
 
@@ -324,7 +314,9 @@ impl Provider for ClaudeProvider {
         };
         vec![
             PathBuf::from(&home).join(".claude.json"),
-            PathBuf::from(&home).join(".claude").join(".credentials.json"),
+            PathBuf::from(&home)
+                .join(".claude")
+                .join(".credentials.json"),
         ]
     }
 
@@ -461,10 +453,7 @@ fn claude_window(id: &'static str, label: &'static str, w: &usage::Window) -> Us
         id: id.to_string(),
         label: label.to_string(),
         utilization: w.utilization,
-        resets_at: w
-            .resets_at
-            .as_deref()
-            .and_then(parse_rfc3339_utc),
+        resets_at: w.resets_at.as_deref().and_then(parse_rfc3339_utc),
     }
 }
 
@@ -561,16 +550,11 @@ fn claude_json_mode(_path: &std::path::Path) -> u32 {
 }
 
 fn restore_claude_json_raw(bytes: &[u8], mode: u32) -> PResult<()> {
-    let path = claude_json_path()
-        .ok_or_else(|| ProviderError::Other("HOME is not set".into()))?;
+    let path = claude_json_path().ok_or_else(|| ProviderError::Other("HOME is not set".into()))?;
     write_bytes_atomic_mode(&path, bytes, mode)
 }
 
-fn write_bytes_atomic_mode(
-    path: &std::path::Path,
-    bytes: &[u8],
-    mode: u32,
-) -> PResult<()> {
+fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> PResult<()> {
     let tmp = path.with_extension("json.usagio.tmp");
     if let Err(e) = crate::store::write_private(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
@@ -591,8 +575,7 @@ fn write_bytes_atomic_mode(
 }
 
 fn write_claude_identity(oauth_account: &Value, user_id: Option<&str>) -> PResult<()> {
-    let path = claude_json_path()
-        .ok_or_else(|| ProviderError::Other("HOME is not set".into()))?;
+    let path = claude_json_path().ok_or_else(|| ProviderError::Other("HOME is not set".into()))?;
     let bytes = std::fs::read(&path).map_err(ProviderError::Io)?;
     let mut v: Value = serde_json::from_slice(&bytes)
         .map_err(|e| ProviderError::Other(format!("parsing ~/.claude.json: {e}")))?;

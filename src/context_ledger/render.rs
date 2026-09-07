@@ -67,11 +67,7 @@ pub fn terminal(ledger: &Ledger) -> String {
         }
     }
 
-    out.push_str(&format!(
-        "  {:-<width$}\n",
-        "",
-        width = name_col + 20
-    ));
+    out.push_str(&format!("  {:-<width$}\n", "", width = name_col + 20));
     out.push_str(&format!(
         "  {:name_col$}   {:>10} tok\n",
         "Total baseline per turn",

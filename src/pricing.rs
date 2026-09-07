@@ -42,80 +42,296 @@ static TABLE: LazyLock<BTreeMap<&'static str, ProviderPricing>> = LazyLock::new(
     // begins 2026-09-01 — table below reflects the standard rate.
     let mut claude = BTreeMap::new();
     // Fable 5 — flagship reasoning model, published rate (unconfirmed exact).
-    claude.insert("claude-fable-5-1", Pricing { input_per_million: 8.00, output_per_million: 40.00 });
+    claude.insert(
+        "claude-fable-5-1",
+        Pricing {
+            input_per_million: 8.00,
+            output_per_million: 40.00,
+        },
+    );
     // Opus family
-    claude.insert("claude-opus-5",   Pricing { input_per_million: 5.00, output_per_million: 25.00 });
-    claude.insert("claude-opus-4-8", Pricing { input_per_million: 5.00, output_per_million: 25.00 });
+    claude.insert(
+        "claude-opus-5",
+        Pricing {
+            input_per_million: 5.00,
+            output_per_million: 25.00,
+        },
+    );
+    claude.insert(
+        "claude-opus-4-8",
+        Pricing {
+            input_per_million: 5.00,
+            output_per_million: 25.00,
+        },
+    );
     // Older Opus 4.x — 3x more expensive per Anthropic's own migration note
-    claude.insert("claude-opus-4-1", Pricing { input_per_million: 15.00, output_per_million: 75.00 });
-    claude.insert("claude-opus-4",   Pricing { input_per_million: 15.00, output_per_million: 75.00 });
+    claude.insert(
+        "claude-opus-4-1",
+        Pricing {
+            input_per_million: 15.00,
+            output_per_million: 75.00,
+        },
+    );
+    claude.insert(
+        "claude-opus-4",
+        Pricing {
+            input_per_million: 15.00,
+            output_per_million: 75.00,
+        },
+    );
     // Sonnet family
-    claude.insert("claude-sonnet-5",   Pricing { input_per_million: 3.00, output_per_million: 15.00 });
-    claude.insert("claude-sonnet-4-6", Pricing { input_per_million: 3.00, output_per_million: 15.00 });
-    claude.insert("claude-sonnet-4-5", Pricing { input_per_million: 3.00, output_per_million: 15.00 });
-    claude.insert("claude-sonnet-4",   Pricing { input_per_million: 3.00, output_per_million: 15.00 });
+    claude.insert(
+        "claude-sonnet-5",
+        Pricing {
+            input_per_million: 3.00,
+            output_per_million: 15.00,
+        },
+    );
+    claude.insert(
+        "claude-sonnet-4-6",
+        Pricing {
+            input_per_million: 3.00,
+            output_per_million: 15.00,
+        },
+    );
+    claude.insert(
+        "claude-sonnet-4-5",
+        Pricing {
+            input_per_million: 3.00,
+            output_per_million: 15.00,
+        },
+    );
+    claude.insert(
+        "claude-sonnet-4",
+        Pricing {
+            input_per_million: 3.00,
+            output_per_million: 15.00,
+        },
+    );
     // Haiku family
-    claude.insert("claude-haiku-4-5", Pricing { input_per_million: 1.00, output_per_million: 5.00 });
+    claude.insert(
+        "claude-haiku-4-5",
+        Pricing {
+            input_per_million: 1.00,
+            output_per_million: 5.00,
+        },
+    );
     t.insert("claude", ProviderPricing { models: claude });
 
     // ─── OpenAI (Codex CLI, ChatGPT/API-key) ──────────────────────────────
     let mut openai = BTreeMap::new();
     // GPT-6 Astra — flagship as of 2026-09-03
-    openai.insert("gpt-6-astra",  Pricing { input_per_million: 10.00, output_per_million: 50.00 });
-    openai.insert("gpt-5-6-sol",  Pricing { input_per_million: 5.00,  output_per_million: 30.00 });
-    openai.insert("gpt-5-6-luna", Pricing { input_per_million: 0.20,  output_per_million: 1.20 });
+    openai.insert(
+        "gpt-6-astra",
+        Pricing {
+            input_per_million: 10.00,
+            output_per_million: 50.00,
+        },
+    );
+    openai.insert(
+        "gpt-5-6-sol",
+        Pricing {
+            input_per_million: 5.00,
+            output_per_million: 30.00,
+        },
+    );
+    openai.insert(
+        "gpt-5-6-luna",
+        Pricing {
+            input_per_million: 0.20,
+            output_per_million: 1.20,
+        },
+    );
     // GPT-5 core
-    openai.insert("gpt-5",        Pricing { input_per_million: 1.25,  output_per_million: 10.00 });
+    openai.insert(
+        "gpt-5",
+        Pricing {
+            input_per_million: 1.25,
+            output_per_million: 10.00,
+        },
+    );
     // GPT-4.1
-    openai.insert("gpt-4-1",      Pricing { input_per_million: 2.00,  output_per_million: 8.00 });
+    openai.insert(
+        "gpt-4-1",
+        Pricing {
+            input_per_million: 2.00,
+            output_per_million: 8.00,
+        },
+    );
     // o-series (reasoning)
-    openai.insert("o3",           Pricing { input_per_million: 2.00,  output_per_million: 8.00 });
+    openai.insert(
+        "o3",
+        Pricing {
+            input_per_million: 2.00,
+            output_per_million: 8.00,
+        },
+    );
     // Codex CLI's default model — normalised name; alias handled in `lookup`.
-    openai.insert("codex-default",Pricing { input_per_million: 2.00,  output_per_million: 8.00 });
+    openai.insert(
+        "codex-default",
+        Pricing {
+            input_per_million: 2.00,
+            output_per_million: 8.00,
+        },
+    );
     t.insert("codex", ProviderPricing { models: openai });
 
     // ─── Google Gemini ────────────────────────────────────────────────────
     let mut gemini = BTreeMap::new();
-    gemini.insert("gemini-2-5-pro",         Pricing { input_per_million: 1.25, output_per_million: 10.00 });
-    gemini.insert("gemini-2-5-flash",       Pricing { input_per_million: 0.15, output_per_million: 1.25 });
-    gemini.insert("gemini-2-5-flash-lite",  Pricing { input_per_million: 0.05, output_per_million: 0.20 });
+    gemini.insert(
+        "gemini-2-5-pro",
+        Pricing {
+            input_per_million: 1.25,
+            output_per_million: 10.00,
+        },
+    );
+    gemini.insert(
+        "gemini-2-5-flash",
+        Pricing {
+            input_per_million: 0.15,
+            output_per_million: 1.25,
+        },
+    );
+    gemini.insert(
+        "gemini-2-5-flash-lite",
+        Pricing {
+            input_per_million: 0.05,
+            output_per_million: 0.20,
+        },
+    );
     // Older, still-served
-    gemini.insert("gemini-2-0-flash", Pricing { input_per_million: 0.075, output_per_million: 0.30 });
-    gemini.insert("gemini-1-5-pro",   Pricing { input_per_million: 1.25,  output_per_million: 5.00 });
+    gemini.insert(
+        "gemini-2-0-flash",
+        Pricing {
+            input_per_million: 0.075,
+            output_per_million: 0.30,
+        },
+    );
+    gemini.insert(
+        "gemini-1-5-pro",
+        Pricing {
+            input_per_million: 1.25,
+            output_per_million: 5.00,
+        },
+    );
     t.insert("gemini-cli", ProviderPricing { models: gemini });
 
     // ─── DeepSeek ─────────────────────────────────────────────────────────
     // DeepSeek V4 replaced chat/coder/reasoner endpoints; older names still
     // route on the API for backwards compat.
     let mut deepseek = BTreeMap::new();
-    deepseek.insert("deepseek-v4",       Pricing { input_per_million: 0.28, output_per_million: 1.12 });
-    deepseek.insert("deepseek-chat",     Pricing { input_per_million: 0.28, output_per_million: 1.12 });
-    deepseek.insert("deepseek-coder",    Pricing { input_per_million: 0.28, output_per_million: 1.12 });
-    deepseek.insert("deepseek-reasoner", Pricing { input_per_million: 0.55, output_per_million: 2.19 });
+    deepseek.insert(
+        "deepseek-v4",
+        Pricing {
+            input_per_million: 0.28,
+            output_per_million: 1.12,
+        },
+    );
+    deepseek.insert(
+        "deepseek-chat",
+        Pricing {
+            input_per_million: 0.28,
+            output_per_million: 1.12,
+        },
+    );
+    deepseek.insert(
+        "deepseek-coder",
+        Pricing {
+            input_per_million: 0.28,
+            output_per_million: 1.12,
+        },
+    );
+    deepseek.insert(
+        "deepseek-reasoner",
+        Pricing {
+            input_per_million: 0.55,
+            output_per_million: 2.19,
+        },
+    );
     t.insert("deepseek", ProviderPricing { models: deepseek });
 
     // ─── Fireworks (unconfirmed exact numbers — using published open-model
     // rates from Fireworks pricing page; llama-3.3 70B ~ $0.90/M, llama-4
     // scout ~ $0.75/M, etc.  Marked unconfirmed in READMEs downstream.) ──
     let mut fireworks = BTreeMap::new();
-    fireworks.insert("llama-3-3-70b", Pricing { input_per_million: 0.90, output_per_million: 0.90 });
-    fireworks.insert("llama-4-scout", Pricing { input_per_million: 0.75, output_per_million: 0.75 });
-    fireworks.insert("llama-4-maverick", Pricing { input_per_million: 1.50, output_per_million: 1.50 });
+    fireworks.insert(
+        "llama-3-3-70b",
+        Pricing {
+            input_per_million: 0.90,
+            output_per_million: 0.90,
+        },
+    );
+    fireworks.insert(
+        "llama-4-scout",
+        Pricing {
+            input_per_million: 0.75,
+            output_per_million: 0.75,
+        },
+    );
+    fireworks.insert(
+        "llama-4-maverick",
+        Pricing {
+            input_per_million: 1.50,
+            output_per_million: 1.50,
+        },
+    );
     t.insert("fireworks", ProviderPricing { models: fireworks });
 
     // ─── Alibaba Qwen ─────────────────────────────────────────────────────
     let mut qwen = BTreeMap::new();
-    qwen.insert("qwen-max",   Pricing { input_per_million: 1.60,  output_per_million: 6.40 });
-    qwen.insert("qwen-plus",  Pricing { input_per_million: 0.40,  output_per_million: 1.20 });
-    qwen.insert("qwen-turbo", Pricing { input_per_million: 0.05,  output_per_million: 0.20 });
-    qwen.insert("qwen-coder-3", Pricing { input_per_million: 0.30, output_per_million: 1.20 });
+    qwen.insert(
+        "qwen-max",
+        Pricing {
+            input_per_million: 1.60,
+            output_per_million: 6.40,
+        },
+    );
+    qwen.insert(
+        "qwen-plus",
+        Pricing {
+            input_per_million: 0.40,
+            output_per_million: 1.20,
+        },
+    );
+    qwen.insert(
+        "qwen-turbo",
+        Pricing {
+            input_per_million: 0.05,
+            output_per_million: 0.20,
+        },
+    );
+    qwen.insert(
+        "qwen-coder-3",
+        Pricing {
+            input_per_million: 0.30,
+            output_per_million: 1.20,
+        },
+    );
     t.insert("qwen-code", ProviderPricing { models: qwen });
 
     // ─── Zhipu GLM (z.ai) ─────────────────────────────────────────────────
     let mut glm = BTreeMap::new();
-    glm.insert("glm-4-5",    Pricing { input_per_million: 0.60, output_per_million: 2.20 });
-    glm.insert("glm-4-air",  Pricing { input_per_million: 0.20, output_per_million: 0.60 });
-    glm.insert("glm-4-plus", Pricing { input_per_million: 1.50, output_per_million: 4.50 });
+    glm.insert(
+        "glm-4-5",
+        Pricing {
+            input_per_million: 0.60,
+            output_per_million: 2.20,
+        },
+    );
+    glm.insert(
+        "glm-4-air",
+        Pricing {
+            input_per_million: 0.20,
+            output_per_million: 0.60,
+        },
+    );
+    glm.insert(
+        "glm-4-plus",
+        Pricing {
+            input_per_million: 1.50,
+            output_per_million: 4.50,
+        },
+    );
     t.insert("zai", ProviderPricing { models: glm });
 
     // ─── OpenRouter — passthrough only ───────────────────────────────────
@@ -125,16 +341,31 @@ static TABLE: LazyLock<BTreeMap<&'static str, ProviderPricing>> = LazyLock::new(
     // OpenRouter account queries their `/api/v1/generation` endpoint per-request
     // to pull actual charges rather than estimating.  Table stays empty; `lookup`
     // handles this branch.
-    t.insert("openrouter", ProviderPricing { models: BTreeMap::new() });
+    t.insert(
+        "openrouter",
+        ProviderPricing {
+            models: BTreeMap::new(),
+        },
+    );
 
     // ─── Synthetic ────────────────────────────────────────────────────────
     // Synthetic pricing is not publicly documented per our recon; leave empty.
-    t.insert("synthetic", ProviderPricing { models: BTreeMap::new() });
+    t.insert(
+        "synthetic",
+        ProviderPricing {
+            models: BTreeMap::new(),
+        },
+    );
 
     // ─── Vertex AI ─────────────────────────────────────────────────────────
     // Same models as Gemini API but under a different provider slug and (usually)
     // identical per-token pricing.  Alias to gemini table entries in `lookup`.
-    t.insert("vertex-ai", ProviderPricing { models: BTreeMap::new() });
+    t.insert(
+        "vertex-ai",
+        ProviderPricing {
+            models: BTreeMap::new(),
+        },
+    );
 
     t
 });
@@ -144,7 +375,11 @@ pub fn lookup(provider_id: &str, model: &str) -> Option<&'static Pricing> {
     let normalized = model.to_lowercase().replace('.', "-");
 
     // Vertex AI passes through Gemini pricing.
-    let effective_provider = if provider_id == "vertex-ai" { "gemini-cli" } else { provider_id };
+    let effective_provider = if provider_id == "vertex-ai" {
+        "gemini-cli"
+    } else {
+        provider_id
+    };
 
     let provider_table = TABLE.get(effective_provider)?;
     if let Some(p) = provider_table.models.get(normalized.as_str()) {

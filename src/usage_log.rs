@@ -15,14 +15,18 @@
 //! never fail because history logging failed. Errors bubble up so callers can
 //! log them, but the surrounding `refresh_usage_cache` swallows them.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Utc};
+#[cfg(test)]
+use chrono::TimeZone;
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::store;
@@ -73,6 +77,7 @@ impl AccountKey {
 pub struct PaceEstimate {
     pub slope_pct_per_hour: f64,
     pub confidence: f64,
+    #[allow(dead_code)] // rendered by v0.5.0 pace/burn detail row
     pub sample_count: usize,
 }
 
@@ -137,6 +142,7 @@ pub fn append(snap: &Snapshot) -> Result<()> {
 /// Explicit rotation entry point: prune history files older than
 /// `RETAIN_DAYS` and mark this process as having rotated. Cheap; safe to call
 /// repeatedly. `now` is threaded through so tests can pin a moment in time.
+#[allow(dead_code)] // wired into daily maintenance loop in v0.5.0
 pub fn rotate_if_needed(now: DateTime<Utc>) -> Result<()> {
     let dir = log_dir()?;
     std::fs::create_dir_all(&dir).context("creating history dir")?;
@@ -148,12 +154,131 @@ pub fn rotate_if_needed(now: DateTime<Utc>) -> Result<()> {
 /// Snapshots for `account` within the last `days` days (UTC-anchored), sorted
 /// ascending by timestamp. Reads only the month files that could overlap the
 /// window, so a long history stays cheap to sample.
+///
+/// H9 (round-1 codeaudit): each menu rebuild called this twice per account
+/// (burn_rate + cost_tracking), each doing a full ndjson parse. Now backed
+/// by a process-wide mtime-keyed cache: month files whose mtime is unchanged
+/// since the last read are served from memory. Cache is invalidated as soon
+/// as any tracked month file's mtime advances.
 pub fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
     let Ok(dir) = log_dir() else {
         return Vec::new();
     };
     let now = Utc::now();
-    read_range(&dir, account, now - Duration::days(days as i64), now)
+    let from = now - Duration::days(days as i64);
+    read_range_cached(&dir, account, from, now)
+}
+
+// ---------------------------------------------------------------------------
+// mtime-keyed cache (H9)
+// ---------------------------------------------------------------------------
+
+/// Per-month cached full parse. Keyed by (year, month) so the whole cache
+/// invalidates a month at a time. Only month files that read_range would
+/// have opened anyway are cached — no proactive scan.
+#[derive(Default)]
+struct MonthCache {
+    /// Key: (year, month). Value: (mtime at parse time, all snapshots).
+    months: HashMap<(i32, u32), (SystemTime, Vec<Snapshot>)>,
+}
+
+static MONTH_CACHE: OnceLock<Mutex<MonthCache>> = OnceLock::new();
+
+fn month_cache() -> &'static Mutex<MonthCache> {
+    MONTH_CACHE.get_or_init(|| Mutex::new(MonthCache::default()))
+}
+
+/// Cache-aware variant of read_range. Loads each month file once per mtime,
+/// then applies account + range filtering in memory on subsequent calls.
+fn read_range_cached(
+    dir: &Path,
+    account: &AccountKey,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Vec<Snapshot> {
+    let mut out = Vec::new();
+    let mut y = from.year();
+    let mut m = from.month();
+    let end = (to.year(), to.month());
+    loop {
+        let path = month_path_ym(dir, y, m);
+        let all = load_month_cached(&path, y, m);
+        for snap in all {
+            if snap.ts >= from && snap.ts <= to && account.matches(&snap) {
+                out.push(snap);
+            }
+        }
+        if (y, m) == end {
+            break;
+        }
+        if m == 12 {
+            y += 1;
+            m = 1;
+        } else {
+            m += 1;
+        }
+        if y > end.0 || (y == end.0 && m > end.1) {
+            break;
+        }
+    }
+    out.sort_by_key(|s| s.ts);
+    out
+}
+
+/// Return all snapshots in month file `path`, using the cached copy when its
+/// mtime matches. Missing file yields an empty vec (cached as UNIX_EPOCH so
+/// a later create-and-write invalidates it).
+fn load_month_cached(path: &Path, year: i32, month: u32) -> Vec<Snapshot> {
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    if let Ok(mut cache) = month_cache().lock() {
+        if let Some((stamp, snaps)) = cache.months.get(&(year, month)) {
+            if *stamp == mtime {
+                return snaps.clone();
+            }
+        }
+        // Cache miss / stale — parse and store.
+        let parsed = parse_month(path);
+        cache.months.insert((year, month), (mtime, parsed.clone()));
+        return parsed;
+    }
+    // Fallback if lock is poisoned: skip cache.
+    parse_month(path)
+}
+
+fn parse_month(path: &Path) -> Vec<Snapshot> {
+    let mut out = Vec::new();
+    let Ok(f) = File::open(path) else {
+        return out;
+    };
+    let rdr = BufReader::new(f);
+    // See the note in `read_range` for why filter_map (not map_while): one
+    // corrupt / non-UTF8 line must not halt the iterator and silently drop
+    // every valid snapshot after it.
+    #[allow(clippy::lines_filter_map_ok)]
+    for line in rdr.lines().filter_map(|r| r.ok()) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(snap) = serde_json::from_str::<Snapshot>(&line) {
+            out.push(snap);
+        }
+    }
+    out
+}
+
+/// Invalidate the entire cache. Currently unused at runtime — the mtime
+/// check in `load_month_cached` invalidates a single month lazily. Kept
+/// exposed to tests so a follow-up cache-behaviour test can pin state
+/// without waiting for an mtime tick.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn invalidate_cache() {
+    if let Ok(mut c) = month_cache().lock() {
+        c.months.clear();
+    }
 }
 
 /// Most recent snapshot for `account` in the current + previous month's
@@ -170,6 +295,7 @@ pub fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
 /// Seven-character sparkline of the last seven local days' peak weekly usage
 /// for `account`, oldest bucket on the left. Missing day = `·`. Cutoffs at
 /// 0/20/40/60/80 map to ▁▂▄▇█.
+#[allow(dead_code)] // wired into v0.5.0 sparkline row
 pub fn sparkline_7d(account: &AccountKey) -> String {
     let snaps = last_n_days(account, 7);
     sparkline_from_snaps(&snaps, Local::now().date_naive())
@@ -281,6 +407,7 @@ fn read_range(
             // partial/interleaved write or a crash mid-line would otherwise
             // make `last_snapshot`/`sparkline_7d`/`pace` return stale prefixes
             // with zero indication that data was truncated.
+            #[allow(clippy::lines_filter_map_ok)]
             for line in rdr.lines().filter_map(|r| r.ok()) {
                 if line.trim().is_empty() {
                     continue;
@@ -313,6 +440,7 @@ fn read_range(
 
 /// Pure: bucket `snaps` into the seven local days ending on `today_local` and
 /// emit a 7-char sparkline (oldest on the left). Missing day = `·`.
+#[allow(dead_code)] // reached from sparkline_7d (also allow'd until v0.5.0 wiring)
 fn sparkline_from_snaps(snaps: &[Snapshot], today_local: NaiveDate) -> String {
     // Peak weekly_pct per bucket (index 0 = 6 days ago, index 6 = today).
     let mut buckets: [Option<f32>; 7] = [None; 7];
@@ -561,13 +689,13 @@ mod tests {
             )
         };
         let snaps = vec![
-            mk(6, 5.0),   // ▁
-            mk(5, 25.0),  // ▂
-            mk(4, 45.0),  // ▄
-            mk(3, 65.0),  // ▇
-            mk(2, 85.0),  // █
+            mk(6, 5.0),  // ▁
+            mk(5, 25.0), // ▂
+            mk(4, 45.0), // ▄
+            mk(3, 65.0), // ▇
+            mk(2, 85.0), // █
             mk(1, 100.0), // █
-                          // day 0 missing -> ·
+                         // day 0 missing -> ·
         ];
         let out = sparkline_from_snaps(&snaps, today);
         assert_eq!(out, "▁▂▄▇██·");
@@ -609,8 +737,7 @@ mod tests {
         let mut snaps = Vec::new();
         for days_ago in 0..7 {
             let day = today - Duration::days(days_ago);
-            let dt =
-                NaiveDateTime::new(day, chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap());
+            let dt = NaiveDateTime::new(day, chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap());
             // Explicit fixed offset (UTC-5) avoids depending on the host TZ.
             let ts = FixedOffset::west_opt(5 * 3600)
                 .unwrap()

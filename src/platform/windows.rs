@@ -51,7 +51,9 @@ pub struct WindowsMenu;
 
 impl MenuBackend for WindowsMenu {
     fn create_status_item(&self, _title: &str, _icon: &[u8]) -> Result<Box<dyn MenuHandle>> {
-        unimplemented!("WindowsMenu::create_status_item — tray-icon + muda impl lands in a follow-up")
+        unimplemented!(
+            "WindowsMenu::create_status_item — tray-icon + muda impl lands in a follow-up"
+        )
     }
     fn on_click(&self, _cb: Box<dyn Fn(&str) + Send + Sync + 'static>) -> Result<()> {
         unimplemented!("WindowsMenu::on_click")

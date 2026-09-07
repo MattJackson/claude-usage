@@ -58,6 +58,17 @@ thread_local! {
     static STATE_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
+/// RAII guard that decrements `STATE_LOCK_DEPTH` on drop. L1 (round-1
+/// codeaudit): with the raw Cell mutation, an unwind between increment and
+/// decrement would leave depth stuck at 1+, and every subsequent
+/// `with_state_lock` on this thread would silently skip the actual OS lock.
+struct DepthGuard;
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        STATE_LOCK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Run `f` holding the shared exclusive advisory lock on the state file.
 /// Serialises state read-modify-write across processes; reentrant within a
 /// single thread so callers can nest without self-deadlocking.
@@ -67,9 +78,8 @@ pub fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     // run the closure. The outer frame will unlock when it unwinds.
     if STATE_LOCK_DEPTH.with(|d| d.get()) > 0 {
         STATE_LOCK_DEPTH.with(|d| d.set(d.get() + 1));
-        let r = f();
-        STATE_LOCK_DEPTH.with(|d| d.set(d.get() - 1));
-        return r;
+        let _g = DepthGuard;
+        return f();
     }
     let dir = store::config_dir()?;
     std::fs::create_dir_all(&dir).context("creating ~/.config/usagio")?;
@@ -82,8 +92,8 @@ pub fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
         .context("opening state lock")?;
     file.lock_exclusive().context("acquiring state lock")?;
     STATE_LOCK_DEPTH.with(|d| d.set(1));
+    let _g = DepthGuard;
     let r = f();
-    STATE_LOCK_DEPTH.with(|d| d.set(0));
     // Fully-qualified to fs2's trait: std 1.89 added an inherent unlock() that
     // would otherwise shadow it and break the 1.88 MSRV.
     let _ = fs2::FileExt::unlock(&file);
@@ -249,6 +259,12 @@ pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> boo
             continue;
         };
         let Some(key) = provider.identify_credential(&blob) else {
+            // L6 (round-1 codeaudit): log unrecognised blobs so a mismatched
+            // rotation shape (e.g. vendor CLI schema change) is visible.
+            crate::logging::log(&format!(
+                "credentials: last_chance_fallback: unrecognised blob at {}",
+                path.display()
+            ));
             continue;
         };
         let freshness = provider.credential_freshness(&blob);
@@ -263,12 +279,26 @@ pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> boo
             }
         } else if freshness.is_usable() {
             // Free sync for other tracked accounts we happened to see.
-            let _ = provider.absorb_credential(&key, &blob);
+            // M3 (round-1 codeaudit): don't silently drop the Err — log at
+            // least the account key + error so a persistent write failure
+            // is visible in the daemon log.
+            if let Err(e) = provider.absorb_credential(&key, &blob) {
+                crate::logging::log(&format!(
+                    "credentials: free-sync absorb of {}:{} failed: {e}",
+                    key.provider, key.key
+                ));
+            }
         }
     }
     match best_for_target {
         Some((blob, f)) if f.is_usable() => {
-            let _ = provider.absorb_credential(target, &blob);
+            if let Err(e) = provider.absorb_credential(target, &blob) {
+                crate::logging::log(&format!(
+                    "credentials: last_chance_fallback commit for {}:{} failed: {e}",
+                    target.provider, target.key
+                ));
+                return false;
+            }
             true
         }
         _ => false,
@@ -331,10 +361,8 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &parent,
-                        std::fs::Permissions::from_mode(0o700),
-                    );
+                    let _ =
+                        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700));
                 }
             }
             if watcher.watch(&parent, RecursiveMode::NonRecursive).is_ok() {
@@ -353,10 +381,7 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
             // Debounce: coalesce a burst of writes (atomic rename fires
             // multiple events) into one absorb pass.
             let debounce = Duration::from_millis(250);
-            loop {
-                let Ok(_first) = rx.recv() else {
-                    break;
-                };
+            while rx.recv().is_ok() {
                 while rx.recv_timeout(debounce).is_ok() {}
                 for p in &providers_static {
                     let _ = absorb_all_lagging(*p);

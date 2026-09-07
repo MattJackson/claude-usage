@@ -46,7 +46,10 @@ mod tests {
         assert!(png16_for("claude").is_some(), "claude bundled");
         assert!(png16_for("codex").is_some(), "codex bundled");
         assert!(png16_for("grok").is_some(), "grok bundled");
-        assert!(png16_for("synthetic").is_some(), "synthetic placeholder bundled");
+        assert!(
+            png16_for("synthetic").is_some(),
+            "synthetic placeholder bundled"
+        );
     }
 
     #[test]
@@ -70,9 +73,22 @@ mod tests {
         // Guards against forgetting a slug when the icon set is extended.
         // (`vertex-ai` deliberately excluded — no icon shipped.)
         for slug in [
-            "claude", "codex", "opencode", "gemini-cli", "qwen-code", "copilot-cli",
-            "cursor-agent", "amazon-q", "cline", "grok", "kimi", "openrouter",
-            "deepseek", "zai", "fireworks", "synthetic",
+            "claude",
+            "codex",
+            "opencode",
+            "gemini-cli",
+            "qwen-code",
+            "copilot-cli",
+            "cursor-agent",
+            "amazon-q",
+            "cline",
+            "grok",
+            "kimi",
+            "openrouter",
+            "deepseek",
+            "zai",
+            "fireworks",
+            "synthetic",
         ] {
             assert!(
                 png16_for(slug).is_some(),

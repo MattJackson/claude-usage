@@ -42,7 +42,11 @@ pub(crate) fn home_override() -> Option<PathBuf> {
 }
 
 /// Install (or clear) the current thread's `HOME_OVERRIDE`. Public within the
-/// crate so tests in any module can build their own guard on top of it.
+/// crate so tests in any module can build their own guard on top of it —
+/// `ScopedConfigDir` (in `store_tests`) is currently the only caller, but
+/// keeping the helper `pub(crate)` avoids a new caller having to duplicate
+/// the thread-local API on top of it.
+#[allow(dead_code)]
 pub(crate) fn set_home_override(p: Option<PathBuf>) {
     HOME_OVERRIDE.with(|c| *c.borrow_mut() = p);
 }
@@ -501,14 +505,22 @@ pub fn save_state_safe(state: &State) -> Result<()> {
                 .filter(|k| !new_keys.contains(k) && !state.pending_removals.contains(k))
                 .collect();
             if !unauthorized.is_empty() {
+                // Dump a REDACTED diagnostic (account keys/emails only, no
+                // tokens) into config_dir/backups/ with owner-only permissions.
+                // The old path wrote plaintext OAuth tokens to /tmp (shared,
+                // default umask, world-readable on macOS multi-user systems).
+                // See H2 in the round-1 codeaudit findings.
                 let ts = chrono::Utc::now().timestamp();
-                let dump_path = PathBuf::from(format!("/tmp/usagio-state-rejected-{ts}.json"));
-                let dump_bytes = serde_json::to_vec_pretty(state).unwrap_or_default();
-                let _ = std::fs::write(&dump_path, dump_bytes);
+                let backups_dir = dir.join("backups");
+                let _ = ensure_dir_0700(&backups_dir);
+                let dump_path = backups_dir.join(format!("state-rejected-{ts}.json"));
+                let redacted = redact_state_for_dump(state);
+                let dump_bytes = serde_json::to_vec_pretty(&redacted).unwrap_or_default();
+                let _ = write_private(&dump_path, &dump_bytes);
                 let msg = format!(
                     "REFUSED save_state: would drop {} account(s) without an explicit \
-                     remove(): {:?}. Rejected in-memory state dumped to {}. On-disk \
-                     state.json is UNCHANGED.",
+                     remove(): {:?}. Redacted (token-free) diagnostic written to {}. \
+                     On-disk state.json is UNCHANGED.",
                     unauthorized.len(),
                     unauthorized,
                     dump_path.display(),
@@ -539,6 +551,36 @@ pub fn save_state_safe(state: &State) -> Result<()> {
         return Err(e).context("renaming state.json");
     }
     Ok(())
+}
+
+/// Build a token-free serialisation of `state` suitable for a diagnostic
+/// dump when `save_state_safe` refuses a write. Preserves account keys,
+/// emails, `active`, and `pending_removals` so the developer can reason
+/// about what was rejected — replaces every secret string with "<redacted>".
+fn redact_state_for_dump(state: &State) -> serde_json::Value {
+    let accounts: Vec<serde_json::Value> = state
+        .accounts
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "email": a.email,
+                "expires_at": a.expires_at,
+                "access_token": "<redacted>",
+                "refresh_token": "<redacted>",
+                "keychain_blob": "<redacted>",
+                "user_id": a.user_id,
+                "oauth_account": a.oauth_account,
+                "needs_relogin": a.needs_relogin,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "accounts": accounts,
+        "active": state.active,
+        "autoswap_disabled": state.autoswap_disabled,
+        "trigger_pct": state.trigger_pct,
+        "pending_removals": state.pending_removals.iter().collect::<Vec<_>>(),
+    })
 }
 
 /// Copy the bytes we just read for `state_path` into a timestamped file under
@@ -607,13 +649,19 @@ pub fn list_backups() -> Result<Vec<(PathBuf, std::time::SystemTime)>> {
         if !name.starts_with("state-") || !name.ends_with(".json") {
             continue;
         }
+        // Redacted diagnostic dumps live alongside rolling backups but must
+        // NOT appear as a restore candidate — restoring one would clobber the
+        // live state with `<redacted>` tokens.
+        if name.starts_with("state-rejected-") {
+            continue;
+        }
         let mtime = e
             .metadata()
             .and_then(|m| m.modified())
             .unwrap_or(std::time::UNIX_EPOCH);
         out.push((e.path(), mtime));
     }
-    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out.sort_by_key(|(_, mt)| std::cmp::Reverse(*mt));
     Ok(out)
 }
 

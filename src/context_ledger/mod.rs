@@ -61,8 +61,6 @@ pub enum LedgerError {
     UnknownProvider(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("mcp: {0}")]
-    Mcp(String),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -95,13 +93,19 @@ pub fn render_terminal(ledger: &Ledger) -> String {
 
 /// Returns true if any tracked file's on-disk mtime is newer than captured_at.
 /// Missing files are ignored (returns false for that item).
+///
+/// M5 (round-1 codeaudit): the previous impl called `metadata()` twice per
+/// item (once to check the difference, again to compare) — both TOCTOU-race
+/// windows and a `.unwrap()` on the second call would panic if the file
+/// disappeared between them. Single-call form: read mtime once, compare
+/// directly.
+#[allow(dead_code)] // wired in v0.5.0 menu panel (context ledger UI)
 pub fn is_stale(ledger: &Ledger) -> bool {
     ledger.items.iter().any(|item| {
         std::fs::metadata(&item.path)
             .and_then(|m| m.modified())
             .ok()
-            .and_then(|mt| DateTime::<Utc>::from(mt).signed_duration_since(ledger.captured_at).num_milliseconds().checked_abs())
-            .map(|diff_ms| diff_ms > 0 && DateTime::<Utc>::from(std::fs::metadata(&item.path).unwrap().modified().unwrap()) > ledger.captured_at)
+            .map(|mt| DateTime::<Utc>::from(mt) > ledger.captured_at)
             .unwrap_or(false)
     })
 }
@@ -110,9 +114,9 @@ pub fn is_stale(ledger: &Ledger) -> bool {
 /// as a default; real per-model math lives in a future pricing module.
 fn estimate_cost(provider: &str, total_tokens: usize) -> Option<f64> {
     let per_million_usd = match provider {
-        "claude" | "claude-code" => 3.0,   // Sonnet input, USD per 1M tokens
-        "codex" => 5.0,                    // GPT-4.1 input ballpark
-        "opencode" => 3.0,                 // typically Anthropic-backed
+        "claude" | "claude-code" => 3.0, // Sonnet input, USD per 1M tokens
+        "codex" => 5.0,                  // GPT-4.1 input ballpark
+        "opencode" => 3.0,               // typically Anthropic-backed
         _ => return None,
     };
     Some((total_tokens as f64) * per_million_usd / 1_000_000.0)

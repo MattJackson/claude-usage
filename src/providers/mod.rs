@@ -27,23 +27,40 @@ use std::sync::OnceLock;
 // creates the file. The Cargo `[features]` table already lists every slug so
 // the gates line up when the modules land.
 //
-#[cfg(feature = "claude")]        pub mod claude;
-#[cfg(feature = "codex")]         pub mod codex;
-#[cfg(feature = "opencode")]      pub mod opencode;
-#[cfg(feature = "gemini-cli")]    pub mod gemini_cli;
-#[cfg(feature = "qwen-code")]     pub mod qwen_code;
-#[cfg(feature = "copilot-cli")]   pub mod copilot_cli;
-#[cfg(feature = "cursor-agent")]  pub mod cursor_agent;
-#[cfg(feature = "amazon-q")]      pub mod amazon_q;
-#[cfg(feature = "cline")]         pub mod cline;
-#[cfg(feature = "grok")]          pub mod grok;
-#[cfg(feature = "kimi")]          pub mod kimi;
-#[cfg(feature = "openrouter")]    pub mod openrouter;
-#[cfg(feature = "deepseek")]      pub mod deepseek;
-#[cfg(feature = "zai")]           pub mod zai;
-#[cfg(feature = "fireworks")]     pub mod fireworks;
-#[cfg(feature = "synthetic")]     pub mod synthetic;
-#[cfg(feature = "vertex-ai")]     pub mod vertex_ai;
+#[cfg(feature = "amazon-q")]
+pub mod amazon_q;
+#[cfg(feature = "claude")]
+pub mod claude;
+#[cfg(feature = "cline")]
+pub mod cline;
+#[cfg(feature = "codex")]
+pub mod codex;
+#[cfg(feature = "copilot-cli")]
+pub mod copilot_cli;
+#[cfg(feature = "cursor-agent")]
+pub mod cursor_agent;
+#[cfg(feature = "deepseek")]
+pub mod deepseek;
+#[cfg(feature = "fireworks")]
+pub mod fireworks;
+#[cfg(feature = "gemini-cli")]
+pub mod gemini_cli;
+#[cfg(feature = "grok")]
+pub mod grok;
+#[cfg(feature = "kimi")]
+pub mod kimi;
+#[cfg(feature = "opencode")]
+pub mod opencode;
+#[cfg(feature = "openrouter")]
+pub mod openrouter;
+#[cfg(feature = "qwen-code")]
+pub mod qwen_code;
+#[cfg(feature = "synthetic")]
+pub mod synthetic;
+#[cfg(feature = "vertex-ai")]
+pub mod vertex_ai;
+#[cfg(feature = "zai")]
+pub mod zai;
 
 static REGISTRY: OnceLock<Vec<Box<dyn Provider>>> = OnceLock::new();
 
@@ -89,23 +106,40 @@ fn build() -> Vec<Box<dyn Provider>> {
     #[allow(unused_mut)]
     let mut v: Vec<Box<dyn Provider>> = Vec::new();
 
-    #[cfg(feature = "claude")]        v.push(claude::new());
-    #[cfg(feature = "codex")]         v.push(codex::new());
-    #[cfg(feature = "opencode")]      v.push(opencode::new());
-    #[cfg(feature = "gemini-cli")]    v.push(gemini_cli::new());
-    #[cfg(feature = "qwen-code")]     v.push(qwen_code::new());
-    #[cfg(feature = "copilot-cli")]   v.push(copilot_cli::new());
-    #[cfg(feature = "cursor-agent")]  v.push(cursor_agent::new());
-    #[cfg(feature = "amazon-q")]      v.push(amazon_q::new());
-    #[cfg(feature = "cline")]         v.push(cline::new());
-    #[cfg(feature = "grok")]          v.push(grok::new());
-    #[cfg(feature = "kimi")]          v.push(kimi::new());
-    #[cfg(feature = "openrouter")]    v.push(openrouter::new());
-    #[cfg(feature = "deepseek")]      v.push(deepseek::new());
-    #[cfg(feature = "zai")]           v.push(zai::new());
-    #[cfg(feature = "fireworks")]     v.push(fireworks::new());
-    #[cfg(feature = "synthetic")]     v.push(synthetic::new());
-    #[cfg(feature = "vertex-ai")]     v.push(vertex_ai::new());
+    #[cfg(feature = "claude")]
+    v.push(claude::new());
+    #[cfg(feature = "codex")]
+    v.push(codex::new());
+    #[cfg(feature = "opencode")]
+    v.push(opencode::new());
+    #[cfg(feature = "gemini-cli")]
+    v.push(gemini_cli::new());
+    #[cfg(feature = "qwen-code")]
+    v.push(qwen_code::new());
+    #[cfg(feature = "copilot-cli")]
+    v.push(copilot_cli::new());
+    #[cfg(feature = "cursor-agent")]
+    v.push(cursor_agent::new());
+    #[cfg(feature = "amazon-q")]
+    v.push(amazon_q::new());
+    #[cfg(feature = "cline")]
+    v.push(cline::new());
+    #[cfg(feature = "grok")]
+    v.push(grok::new());
+    #[cfg(feature = "kimi")]
+    v.push(kimi::new());
+    #[cfg(feature = "openrouter")]
+    v.push(openrouter::new());
+    #[cfg(feature = "deepseek")]
+    v.push(deepseek::new());
+    #[cfg(feature = "zai")]
+    v.push(zai::new());
+    #[cfg(feature = "fireworks")]
+    v.push(fireworks::new());
+    #[cfg(feature = "synthetic")]
+    v.push(synthetic::new());
+    #[cfg(feature = "vertex-ai")]
+    v.push(vertex_ai::new());
 
     v
 }

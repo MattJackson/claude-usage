@@ -28,6 +28,11 @@ pub enum MigrationResult {
     BothExisted { new: PathBuf, old: PathBuf },
 }
 
+// The inner payloads of these variants are consumed via the `Debug` impl in
+// `main.rs`'s eprintln! ("migration skipped ({e:?})") and, for
+// `OldRemovalFailed`, by pattern-match in the H6/M1 dispatch that treats the
+// new tree as populated. Suppress the "field never read" lint file-locally.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum MigrationError {
     /// Neither `$XDG_CONFIG_HOME` nor `$HOME` resolved to a usable base dir.
@@ -46,9 +51,15 @@ pub enum MigrationError {
 }
 
 /// Default entry point — uses `~/.config/claude-usage` and `~/.config/usagio`.
+/// L9 (round-1 codeaudit): the two slug names come from the module-level
+/// constants in `main.rs` (`LEGACY_APP_SLUG` and `APP_SLUG`) so renaming the
+/// app is a single-point edit.
 pub fn migrate_config_dir_if_needed() -> Result<MigrationResult, MigrationError> {
     let base = config_base()?;
-    migrate_between(&base.join("claude-usage"), &base.join("usagio"))
+    migrate_between(
+        &base.join(crate::LEGACY_APP_SLUG),
+        &base.join(crate::APP_SLUG),
+    )
 }
 
 /// Test-friendly form: caller supplies the exact old and new paths.
@@ -76,7 +87,8 @@ pub fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, Migrat
             // Ensure the parent exists before renaming into it.
             if let Some(parent) = new.parent() {
                 if !parent.exists() {
-                    std::fs::create_dir_all(parent).map_err(MigrationError::ParentCreationFailed)?;
+                    std::fs::create_dir_all(parent)
+                        .map_err(MigrationError::ParentCreationFailed)?;
                 }
             }
 

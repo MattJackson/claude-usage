@@ -60,7 +60,7 @@ pub fn estimate(
     };
     let mut samples = usage_log::last_n_days(account, lookback_days);
     // Keep only the ones whose target-window pct is Some, ordered by ts asc.
-    samples.retain(|s| pct_for(&s, window).is_some());
+    samples.retain(|s| pct_for(s, window).is_some());
     samples.sort_by_key(|s| s.ts);
 
     // Apply the per-window horizon filter.
@@ -83,10 +83,7 @@ pub fn estimate(
     // Empty-at projection: solve intercept + slope*t = 100 (t is hours from `now`).
     let (empty_at, margin) = if slope_per_hour <= FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR {
         // Flat: cap far in the future, no margin.
-        (
-            now + Duration::hours(MAX_EMPTY_IN_HOURS),
-            None,
-        )
+        (now + Duration::hours(MAX_EMPTY_IN_HOURS), None)
     } else {
         // hours_from_now = (100 - current_pct) / slope
         let hours_to_empty = ((100.0 - current_pct) / slope_per_hour).max(0.0) as i64;
@@ -242,7 +239,11 @@ fn weighted_linear_fit(
 fn format_short_duration(d: Duration) -> String {
     let secs = d.num_seconds().max(0);
     if secs < 60 {
-        return if secs > 0 { "<1m".to_string() } else { "0m".to_string() };
+        return if secs > 0 {
+            "<1m".to_string()
+        } else {
+            "0m".to_string()
+        };
     }
     let mins_total = secs / 60;
     let hours_total = mins_total / 60;
@@ -300,11 +301,11 @@ mod tests {
             })
             .collect();
         let (slope, _intercept, r2) = weighted_linear_fit(&samples, Window::Weekly, now).unwrap();
+        assert!((slope - 10.0).abs() < 1.5, "slope ~10 pct/hr, got {slope}");
         assert!(
-            (slope - 10.0).abs() < 1.5,
-            "slope ~10 pct/hr, got {slope}"
+            r2 > 0.95,
+            "R² should be near 1 for a linear ascent, got {r2}"
         );
-        assert!(r2 > 0.95, "R² should be near 1 for a linear ascent, got {r2}");
     }
 
     #[test]
@@ -350,7 +351,10 @@ mod tests {
             margin: Some(Duration::hours(7) + Duration::minutes(45)),
         };
         let s = format_menu_row(&est);
-        assert!(s.contains("empty in ~2h") && s.contains("safe for this cycle"), "{s}");
+        assert!(
+            s.contains("empty in ~2h") && s.contains("safe for this cycle"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -365,7 +369,10 @@ mod tests {
             margin: None,
         };
         let s = format_menu_row(&est);
-        assert!(s.contains("empty in ~40m") && s.contains("before reset"), "{s}");
+        assert!(
+            s.contains("empty in ~40m") && s.contains("before reset"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -376,9 +383,15 @@ mod tests {
         assert_eq!(format_short_duration(Duration::minutes(59)), "59m");
         assert_eq!(format_short_duration(Duration::minutes(60)), "1h 0m");
         assert_eq!(format_short_duration(Duration::minutes(60 + 23)), "1h 23m");
-        assert_eq!(format_short_duration(Duration::hours(23) + Duration::minutes(59)), "23h 59m");
+        assert_eq!(
+            format_short_duration(Duration::hours(23) + Duration::minutes(59)),
+            "23h 59m"
+        );
         assert_eq!(format_short_duration(Duration::hours(24)), "1d 0h");
-        assert_eq!(format_short_duration(Duration::days(1) + Duration::hours(23)), "1d 23h");
+        assert_eq!(
+            format_short_duration(Duration::days(1) + Duration::hours(23)),
+            "1d 23h"
+        );
     }
 
     // Ignored by default — this hits the live usage_log crate function, which panics

@@ -59,7 +59,9 @@ fn refresh_with_empty_refresh_token_returns_invalid_grant_without_network() {
 fn refresh_error_display_carries_variant() {
     // Callers log these; make sure the InvalidGrant string is stable enough
     // to be recognized (the fix hinges on catching invalid_grant explicitly).
-    assert!(RefreshError::InvalidGrant.to_string().contains("invalid_grant"));
+    assert!(RefreshError::InvalidGrant
+        .to_string()
+        .contains("invalid_grant"));
     assert!(RefreshError::RateLimited.to_string().contains("429"));
     let s = RefreshError::Transient("boom".into()).to_string();
     assert!(s.contains("boom"));

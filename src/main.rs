@@ -131,8 +131,30 @@ fn run() -> Result<()> {
             );
         }
         Ok(_) => {}
+        Err(paths::MigrationError::OldRemovalFailed { new, source }) => {
+            // The NEW tree is populated and mode-correct — proceed as if the
+            // migration succeeded. Log the leftover so the user can inspect.
+            // See H6 in the round-1 codeaudit findings and M1 for the variant.
+            eprintln!(
+                "usagio: migrated config to {}; old tree left in place ({source})",
+                new.display()
+            );
+        }
         Err(e) => {
-            eprintln!("usagio: config-dir migration skipped ({e:?})");
+            // Any other migration failure means the new tree is NOT populated.
+            // Falling straight through to State::default (an ENOENT from
+            // State::load) would look like a fresh install and prompt every
+            // user to re-login. Fire a menu-bar notification AND log loudly.
+            // We still proceed (State::default), but the user is at least
+            // told and can retry.
+            let msg = format!(
+                "usagio: config migration FAILED — accounts may appear missing. \
+                 See ~/.config/usagio/logs; try again or copy the old dir manually. \
+                 Details: {e:?}"
+            );
+            eprintln!("{msg}");
+            logging::log(&msg);
+            notify(&msg);
         }
     }
 
@@ -460,8 +482,7 @@ where
         }
     }
     let prev = ENV_OVERRIDE_TEST_HOOK.with(|h| h.borrow().clone());
-    let set: std::collections::HashSet<String> =
-        overrides.iter().map(|s| s.to_string()).collect();
+    let set: std::collections::HashSet<String> = overrides.iter().map(|s| s.to_string()).collect();
     ENV_OVERRIDE_TEST_HOOK.with(|h| *h.borrow_mut() = Some(set));
     let _g = Guard(prev);
     f()
@@ -489,7 +510,14 @@ fn switch_to_if_still_active(
     expect_active: &str,
 ) -> Result<Option<String>> {
     let (acct, identity, backfilled) = prepare_switch(provider, email)?;
-    switch_to_guarded(provider, email, &acct, &identity, backfilled, Some(expect_active))
+    switch_to_guarded(
+        provider,
+        email,
+        &acct,
+        &identity,
+        backfilled,
+        Some(expect_active),
+    )
 }
 
 /// Phase 1 of a switch (no lock): refresh the token and resolve the identity
@@ -564,13 +592,20 @@ fn ensure_fresh_with_fallback(
 /// re-observes the invalid_grant and sets it again — callers that need
 /// certainty already surface a distinct error to the user.
 fn flag_needs_relogin(email: &str) {
-    let _ = with_state_lock(|| {
+    // L7 (round-1 codeaudit): the previous `let _ =` swallowed save errors
+    // silently, so a persistent state.json write failure would never be
+    // visible in the log. The next `refresh_usage_cache` tick re-sets the
+    // flag from the invalid_grant observation, so we still make progress,
+    // but the failure should be noisy.
+    if let Err(e) = with_state_lock(|| {
         let mut st = State::load()?;
         if let Some(a) = st.find_mut(email) {
             a.needs_relogin = true;
         }
         st.save()
-    });
+    }) {
+        logging::log(&format!("flag_needs_relogin({email}): save failed: {e:#}"));
+    }
 }
 
 /// The locked phase of a switch, optionally guarded by `expect_active`: if given
@@ -606,6 +641,13 @@ fn switch_to_guarded(
         // account's blob. sync_active_from_keychain only handles the Claude
         // legacy path; this catches every configured credential file.
         credentials::absorb_before_switch(provider);
+        // absorb_before_switch reaches back through the reentrant state lock
+        // and rewrites state.json with any freshly-absorbed rotations. Our
+        // in-memory `st` snapshot from a few lines above is now stale; reload
+        // it here or our final `st.save()` will clobber the absorbed changes
+        // (reintroducing the never-re-login regression). See H1 in the
+        // round-1 codeaudit findings.
+        st = State::load()?;
         // A concurrent poll may have rotated this account's token after our
         // phase-1 snapshot; use whichever tokens are fresher so we never write a
         // stale (possibly already-superseded) refresh token to the keychain.
@@ -1265,8 +1307,12 @@ fn refresh_usage_cache() -> RefreshOutcome {
     let mut rate_limited = false;
     // (email, refreshed account after ensure_fresh, new cached usage or None,
     // updated notif state or None)
-    let mut updates: Vec<(String, Account, Option<CachedUsage>, Option<notifications::NotifState>)> =
-        Vec::new();
+    let mut updates: Vec<(
+        String,
+        Account,
+        Option<CachedUsage>,
+        Option<notifications::NotifState>,
+    )> = Vec::new();
     let emails: Vec<String> = state.accounts.iter().map(|a| a.key().to_string()).collect();
     let notif_cfg = notifications::NotificationConfig::default();
     for email in &emails {
@@ -1289,15 +1335,13 @@ fn refresh_usage_cache() -> RefreshOutcome {
                 // — so re-scan credential paths for this account and retry
                 // once with the freshly-adopted grant before flagging. This
                 // closes the mid-loop race the pre-cycle absorb can't cover.
-                let key = crate::providers::trait_def::AccountKey::new(
-                    CLAUDE_SLUG, email,
-                );
+                let key = crate::providers::trait_def::AccountKey::new(CLAUDE_SLUG, email);
                 let adopted = credentials::last_chance_fallback(provider, &key);
                 let recovered = if adopted {
                     match State::load().ok().and_then(|s| s.find(email).cloned()) {
                         Some(fresh) => {
                             acct = fresh;
-                            matches!(oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS), Ok(_))
+                            oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS).is_ok()
                         }
                         None => false,
                     }
@@ -1357,22 +1401,14 @@ fn refresh_usage_cache() -> RefreshOutcome {
             if let Some(prev) = prev_snap {
                 let mut ns = acct.notif_state.clone();
                 let raw = notifications::evaluate(&prev, &curr_snap, &notif_cfg);
-                let mut kept =
-                    notifications::dedup_and_apply(&mut ns, &prev, &curr_snap, raw);
+                let mut kept = notifications::dedup_and_apply(&mut ns, &prev, &curr_snap, raw);
                 // Pace check (default off) — feeds through the same dedup path.
                 let pace = usage_log::pace(&account_key);
-                if let Some(pt) = notifications::evaluate_pace(
-                    pace.as_ref(),
-                    &curr_snap,
-                    &notif_cfg,
-                    Utc::now(),
-                ) {
-                    let extra = notifications::dedup_and_apply(
-                        &mut ns,
-                        &prev,
-                        &curr_snap,
-                        vec![pt],
-                    );
+                if let Some(pt) =
+                    notifications::evaluate_pace(pace.as_ref(), &curr_snap, &notif_cfg, Utc::now())
+                {
+                    let extra =
+                        notifications::dedup_and_apply(&mut ns, &prev, &curr_snap, vec![pt]);
                     kept.extend(extra);
                 }
                 for trig in &kept {
@@ -1441,9 +1477,7 @@ fn cmd_watch(args: &[String]) -> Result<()> {
         }
     }
 
-    eprintln!(
-        "usagio watch: every {interval}s, swap at {trigger:.0}%, target <= {ceiling:.0}%"
-    );
+    eprintln!("usagio watch: every {interval}s, swap at {trigger:.0}%, target <= {ceiling:.0}%");
 
     let base = interval;
     let mut current = base;
@@ -1822,11 +1856,7 @@ fn parse_context_args(args: &[String]) -> Result<(Option<String>, Option<std::pa
     while let Some(a) = it.next() {
         match a.as_str() {
             "--provider" => {
-                provider = Some(
-                    it.next()
-                        .cloned()
-                        .context("--provider requires a value")?,
-                );
+                provider = Some(it.next().cloned().context("--provider requires a value")?);
             }
             "--project" => {
                 project = Some(std::path::PathBuf::from(
@@ -1998,16 +2028,36 @@ fn cmd_report_pricing() -> Result<()> {
         ),
         (
             "codex",
-            &["gpt-6-astra", "gpt-5-6-sol", "gpt-5-6-luna", "gpt-5", "gpt-4-1", "o3"],
+            &[
+                "gpt-6-astra",
+                "gpt-5-6-sol",
+                "gpt-5-6-luna",
+                "gpt-5",
+                "gpt-4-1",
+                "o3",
+            ],
         ),
         (
             "gemini-cli",
-            &["gemini-2-5-pro", "gemini-2-5-flash", "gemini-2-5-flash-lite"],
+            &[
+                "gemini-2-5-pro",
+                "gemini-2-5-flash",
+                "gemini-2-5-flash-lite",
+            ],
         ),
-        ("deepseek", &["deepseek-v4", "deepseek-chat", "deepseek-reasoner"]),
-        ("qwen-code", &["qwen-max", "qwen-plus", "qwen-turbo", "qwen-coder-3"]),
+        (
+            "deepseek",
+            &["deepseek-v4", "deepseek-chat", "deepseek-reasoner"],
+        ),
+        (
+            "qwen-code",
+            &["qwen-max", "qwen-plus", "qwen-turbo", "qwen-coder-3"],
+        ),
         ("zai", &["glm-4-5", "glm-4-air", "glm-4-plus"]),
-        ("fireworks", &["llama-3-3-70b", "llama-4-scout", "llama-4-maverick"]),
+        (
+            "fireworks",
+            &["llama-3-3-70b", "llama-4-scout", "llama-4-maverick"],
+        ),
     ];
     for (provider, models) in probes {
         println!("  {provider}");
@@ -2021,9 +2071,7 @@ fn cmd_report_pricing() -> Result<()> {
         }
         println!();
     }
-    println!(
-        "  Passthrough providers (billed per-request against the vendor's API):"
-    );
+    println!("  Passthrough providers (billed per-request against the vendor's API):");
     for p in ["openrouter", "synthetic"] {
         if crate::pricing::is_passthrough(p) {
             println!("    {p} — cost pulled live from the underlying model");

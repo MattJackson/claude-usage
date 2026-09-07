@@ -22,8 +22,16 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
 
     // Global AGENTS.md / instructions.md — whichever exists
     for (fname, kind, display) in [
-        ("AGENTS.md", ItemKind::GlobalInstructions, "Global AGENTS.md"),
-        ("instructions.md", ItemKind::GlobalInstructions, "Global instructions.md"),
+        (
+            "AGENTS.md",
+            ItemKind::GlobalInstructions,
+            "Global AGENTS.md",
+        ),
+        (
+            "instructions.md",
+            ItemKind::GlobalInstructions,
+            "Global instructions.md",
+        ),
     ] {
         push_file_if_exists(&mut items, codex_dir.join(fname), kind, display);
     }

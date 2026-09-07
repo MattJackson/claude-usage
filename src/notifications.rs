@@ -112,11 +112,7 @@ const THRESHOLDS: [u8; 2] = [70, 90];
 /// A field that's `None` on either side of the pair produces no trigger for
 /// that window — first-boot after a capture shouldn't blast the user with
 /// "you crossed 70" for percentages that were simply unknown before.
-pub fn evaluate(
-    prev: &Snapshot,
-    curr: &Snapshot,
-    cfg: &NotificationConfig,
-) -> Vec<Trigger> {
+pub fn evaluate(prev: &Snapshot, curr: &Snapshot, cfg: &NotificationConfig) -> Vec<Trigger> {
     let mut out = Vec::new();
     let pairs = [
         (Window::Session, prev.session_pct, curr.session_pct),
@@ -440,24 +436,14 @@ mod tests {
         let curr = snap(Some(75.0), None);
         let cfg = NotificationConfig::default();
 
-        let first = dedup_and_apply(
-            &mut state,
-            &prev,
-            &curr,
-            evaluate(&prev, &curr, &cfg),
-        );
+        let first = dedup_and_apply(&mut state, &prev, &curr, evaluate(&prev, &curr, &cfg));
         assert_eq!(first.len(), 1, "first crossing must fire");
 
         // A follow-up tick that stays above 70 without crossing again — the
         // pair itself produces no new Threshold from `evaluate`, and even if
         // it did, `state.crossings` would suppress it.
         let curr2 = snap(Some(80.0), None);
-        let second = dedup_and_apply(
-            &mut state,
-            &curr,
-            &curr2,
-            evaluate(&curr, &curr2, &cfg),
-        );
+        let second = dedup_and_apply(&mut state, &curr, &curr2, evaluate(&curr, &curr2, &cfg));
         assert!(second.is_empty(), "same threshold must not re-fire");
         assert!(state.crossings.contains(&(Window::Session, 70)));
     }
@@ -471,23 +457,13 @@ mod tests {
         // 1st tick: cross 70.
         let prev = snap(Some(50.0), None);
         let curr = snap(Some(75.0), None);
-        let _ = dedup_and_apply(
-            &mut state,
-            &prev,
-            &curr,
-            evaluate(&prev, &curr, &cfg),
-        );
+        let _ = dedup_and_apply(&mut state, &prev, &curr, evaluate(&prev, &curr, &cfg));
         assert!(state.crossings.contains(&(Window::Session, 70)));
 
         // 2nd tick: session resets (drop from 75 to 5) → crossings clear +
         // a ResetBack fires.
         let reset = snap(Some(5.0), None);
-        let fired = dedup_and_apply(
-            &mut state,
-            &curr,
-            &reset,
-            evaluate(&curr, &reset, &cfg),
-        );
+        let fired = dedup_and_apply(&mut state, &curr, &reset, evaluate(&curr, &reset, &cfg));
         assert_eq!(
             fired,
             vec![Trigger::ResetBack {
@@ -519,19 +495,16 @@ mod tests {
     #[test]
     fn weekly_reset_clears_pace_fired_this_window() {
         let mut state = NotifState {
-            crossings: [(Window::Weekly, 70), (Window::Weekly, 90)].into_iter().collect(),
+            crossings: [(Window::Weekly, 70), (Window::Weekly, 90)]
+                .into_iter()
+                .collect(),
             pace_fired_this_window: true,
         };
         // A weekly reset happens; `dedup_and_apply` must clear both.
         let prev = snap(None, Some(85.0));
         let curr = snap(None, Some(3.0));
         let cfg = NotificationConfig::default();
-        let _ = dedup_and_apply(
-            &mut state,
-            &prev,
-            &curr,
-            evaluate(&prev, &curr, &cfg),
-        );
+        let _ = dedup_and_apply(&mut state, &prev, &curr, evaluate(&prev, &curr, &cfg));
         assert!(state.crossings.is_empty());
         assert!(!state.pace_fired_this_window);
     }
@@ -547,12 +520,7 @@ mod tests {
         let prev = snap(Some(85.0), None);
         let curr = snap(Some(3.0), None);
         let cfg = NotificationConfig::default();
-        let _ = dedup_and_apply(
-            &mut state,
-            &prev,
-            &curr,
-            evaluate(&prev, &curr, &cfg),
-        );
+        let _ = dedup_and_apply(&mut state, &prev, &curr, evaluate(&prev, &curr, &cfg));
         assert!(
             state.pace_fired_this_window,
             "session reset must not touch weekly pace state"
@@ -579,8 +547,7 @@ mod tests {
         let t = evaluate_pace(Some(&pace), &curr, &cfg, now).expect("pace should fire");
         let mut state = NotifState::default();
         let prev = snap(None, Some(48.0));
-        let kept =
-            dedup_and_apply(&mut state, &prev, &curr, vec![t]);
+        let kept = dedup_and_apply(&mut state, &prev, &curr, vec![t]);
         assert_eq!(kept.len(), 1);
         assert!(state.pace_fired_this_window);
 
@@ -592,12 +559,7 @@ mod tests {
 
         // 3rd tick: weekly resets — pace_fired clears; pace fires again.
         let reset = snap(None, Some(3.0));
-        let _ = dedup_and_apply(
-            &mut state,
-            &curr2,
-            &reset,
-            evaluate(&curr2, &reset, &cfg),
-        );
+        let _ = dedup_and_apply(&mut state, &curr2, &reset, evaluate(&curr2, &reset, &cfg));
         assert!(!state.pace_fired_this_window);
         let t = evaluate_pace(Some(&pace), &reset, &cfg, now).expect("pace re-arms after reset");
         let kept = dedup_and_apply(&mut state, &reset, &reset, vec![t]);
