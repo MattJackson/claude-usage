@@ -1,8 +1,13 @@
-//! claude-usage — usage/limits across multiple Claude accounts, keyed by the
-//! account email, and account switching by writing the shared keychain login
-//! plus the `~/.claude.json` identity Claude Code reads. New `claude` sessions
-//! use the switched account; already-running sessions keep theirs until
-//! restarted.
+//! usagio — usage/limits across multiple Claude / Codex accounts (and every
+//! AI-coding CLI we grow support for), keyed by the account email, and
+//! account switching by writing the shared keychain login plus the
+//! `~/.claude.json` identity Claude Code reads. New `claude` sessions use the
+//! switched account; already-running sessions keep theirs until restarted.
+//!
+//! Renamed from `claude-usage` in v0.4.0. Config dir, launchd label, and
+//! Login Items entry migrate transparently on first run; the macOS Keychain
+//! service string is intentionally frozen at "claude-usage" to preserve
+//! existing tokens (see `providers/state.rs`).
 
 mod burn_rate;
 mod context_ledger;
@@ -15,6 +20,7 @@ mod logging;
 #[cfg(target_os = "macos")]
 mod menubar;
 mod notifications;
+mod paths;
 mod platform;
 mod pricing;
 mod providers;
@@ -37,10 +43,16 @@ const CLAUDE_SLUG: &str = "claude";
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// App slug used everywhere we ask the platform for a per-app directory
-/// (`~/.config/claude-usage` on macOS, `$XDG_CONFIG_HOME/claude-usage` on
-/// Linux, `%APPDATA%\claude-usage` on Windows). Kept as a single const so a
-/// future rename (usagio) is one line.
-pub(crate) const APP_SLUG: &str = "claude-usage";
+/// (`~/.config/usagio` on macOS, `$XDG_CONFIG_HOME/usagio` on Linux,
+/// `%APPDATA%\usagio` on Windows). The one-shot rename from `claude-usage`
+/// → `usagio` migrates the on-disk directory transparently at first run
+/// (see `paths::migrate_config_dir_if_needed`).
+pub(crate) const APP_SLUG: &str = "usagio";
+/// Previous slug (pre-v0.4.0). Referenced only by the one-shot migration
+/// in `paths::migrate_config_dir_if_needed` — do not use for any live
+/// path construction.
+#[allow(dead_code)]
+pub(crate) const LEGACY_APP_SLUG: &str = "claude-usage";
 /// Refresh a token if it expires within this many seconds. Sourced from the
 /// credential-sync module so the reactive (switch / cmd_token / poll) path
 /// and the proactive (fsnotify + inactive-refresh) path can never drift.
@@ -69,7 +81,11 @@ const PROACTIVE_HEADROOM_MARGIN: f64 = 10.0;
 /// app at login). Reused across install / uninstall on every platform: it's
 /// the launchd Label on macOS, the .desktop filename on Linux, and the
 /// registry value name on Windows.
-pub(crate) const AUTOSTART_LABEL: &str = "com.claude-usage.menubar";
+pub(crate) const AUTOSTART_LABEL: &str = "com.mattjackson.usagio.menubar";
+/// Previous launchd label (pre-v0.4.0). Referenced only by the one-shot
+/// migration in `cmd_install` — unload + remove the old plist before
+/// registering the new label so upgraded users don't run two agents.
+pub(crate) const LEGACY_AUTOSTART_LABEL: &str = "com.claude-usage.menubar";
 
 /// Process-global handle to the platform impl. `platform::current()` builds
 /// once at first use; every host-OS call (keychain, autostart, paths) routes
@@ -90,6 +106,34 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // One-shot rename migration: if `~/.config/claude-usage/` still exists
+    // and `~/.config/usagio/` doesn't, atomically move it (with a
+    // cross-device copy+delete fallback). Idempotent and safe to run on
+    // every subsequent boot. Must run BEFORE the first state-load or
+    // logging init so the new dir is populated before anyone reads it.
+    match paths::migrate_config_dir_if_needed() {
+        Ok(paths::MigrationResult::Migrated { from, to }) => {
+            eprintln!(
+                "usagio: migrated config directory {} -> {}",
+                from.display(),
+                to.display()
+            );
+        }
+        Ok(paths::MigrationResult::BothExisted { new, old }) => {
+            eprintln!(
+                "usagio: both {} and {} exist; using {} and leaving the old one \
+                 in place for inspection",
+                old.display(),
+                new.display(),
+                new.display()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("usagio: config-dir migration skipped ({e:?})");
+        }
+    }
+
     // Populate the provider registry once, before any command handler runs.
     // Cheap (a `Vec::push` per feature-gated provider) and idempotent, so
     // handlers that never touch the registry (today: all of them) pay
@@ -137,7 +181,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some("-V") | Some("--version") | Some("version") => {
-            println!("claude-usage {}", env!("CARGO_PKG_VERSION"));
+            println!("usagio {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some(other) => {
@@ -150,33 +194,33 @@ fn run() -> Result<()> {
 
 fn print_help() {
     println!(
-        "claude-usage — usage & instant account switching for Claude\n\n\
+        "usagio — usage & instant account switching for Claude\n\n\
          Accounts are identified by their email; commands accept a full email or a\n\
          unique prefix (e.g. `dev` for dev@example.com).\n\n\
          USAGE:\n  \
-         claude-usage                   Show cached usage for every account (default)\n  \
-         claude-usage list --refresh    Fetch usage now, then show it\n  \
-         claude-usage capture           Save the account you're currently logged into\n  \
-         claude-usage switch [email]    Make <email> the active login (no launch)\n  \
-         claude-usage start [email]     Switch, then launch a fresh `claude`\n  \
-         claude-usage continue [email]  Switch, then launch `claude --continue`\n  \
-         claude-usage token [email]     Print a fresh access token\n  \
-         claude-usage watch             Auto-swap at 95%, keep working (foreground)\n  \
-         claude-usage menubar           Run the macOS menu-bar app (usage + auto-swap)\n  \
-         claude-usage install           Run the menu-bar app at every login (via launchd)\n  \
-         claude-usage uninstall         Stop running the menu-bar app at login\n  \
-         claude-usage report            Usage patterns by weekday / hour / account\n  \
-         claude-usage report --pace     Per-account burn-rate forecast (empty-in ETA)\n  \
-         claude-usage report --pricing  Model → USD-per-1M-tokens lookup table\n  \
-         claude-usage report --verdict  Cancel/downgrade/keep/upgrade classifier\n  \
-         claude-usage context [OPTS]    Audit CLI auto-injected context (per turn)\n  \
+         usagio                   Show cached usage for every account (default)\n  \
+         usagio list --refresh    Fetch usage now, then show it\n  \
+         usagio capture           Save the account you're currently logged into\n  \
+         usagio switch [email]    Make <email> the active login (no launch)\n  \
+         usagio start [email]     Switch, then launch a fresh `claude`\n  \
+         usagio continue [email]  Switch, then launch `claude --continue`\n  \
+         usagio token [email]     Print a fresh access token\n  \
+         usagio watch             Auto-swap at 95%, keep working (foreground)\n  \
+         usagio menubar           Run the macOS menu-bar app (usage + auto-swap)\n  \
+         usagio install           Run the menu-bar app at every login (via launchd)\n  \
+         usagio uninstall         Stop running the menu-bar app at login\n  \
+         usagio report            Usage patterns by weekday / hour / account\n  \
+         usagio report --pace     Per-account burn-rate forecast (empty-in ETA)\n  \
+         usagio report --pricing  Model → USD-per-1M-tokens lookup table\n  \
+         usagio report --verdict  Cancel/downgrade/keep/upgrade classifier\n  \
+         usagio context [OPTS]    Audit CLI auto-injected context (per turn)\n  \
                                         --provider <slug>  claude|codex|opencode\n  \
                                         --project  <path>  scope in-tree instructions to this project\n  \
-         claude-usage rm <email>        Forget an account\n\n\
+         usagio rm <email>        Forget an account\n\n\
          With no [email], switch/start/continue auto-pick the account that has room\n  \
          and whose weekly limit resets soonest (use it before the quota resets).\n\n\
          Onboarding: log into an account with `claude` as usual, then\n  \
-         `claude-usage capture`. Repeat once per account.\n"
+         `usagio capture`. Repeat once per account.\n"
     );
 }
 
@@ -276,7 +320,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
     }
     let state = State::load()?;
     if state.accounts.is_empty() {
-        println!("No accounts yet. Log into one with `claude`, then: claude-usage capture");
+        println!("No accounts yet. Log into one with `claude`, then: usagio capture");
         return Ok(());
     }
     let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
@@ -291,7 +335,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
 fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
     let state = State::load()?;
     if state.accounts.is_empty() {
-        bail!("no accounts yet; capture one with: claude-usage capture");
+        bail!("no accounts yet; capture one with: usagio capture");
     }
     let email = select_email(&state, selector)?;
     let label = switch_to(&email)?;
@@ -620,7 +664,7 @@ fn resolve_identity(
     built.map(|v| (v, true)).ok_or_else(|| {
         anyhow!(
             "could not resolve this account's identity (offline?) — \
-             run `claude-usage capture` for it while logged in"
+             run `usagio capture` for it while logged in"
         )
     })
 }
@@ -648,7 +692,7 @@ fn apply_account(
                 return Err(e).context(format!(
                     "writing the account into the keychain, and rolling back \
                      ~/.claude.json failed too ({re:#}); it may now point at the new \
-                     account while the keychain holds the old — run `claude-usage \
+                     account while the keychain holds the old — run `usagio \
                      switch` again to reconcile"
                 ));
             }
@@ -743,7 +787,7 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
         Some(sel) => state.resolve(sel)?,
         None => match state.accounts.as_slice() {
             [only] => only.key().to_string(),
-            [] => bail!("no accounts; capture one with: claude-usage capture"),
+            [] => bail!("no accounts; capture one with: usagio capture"),
             _ => bail!("multiple accounts; specify one by email or prefix"),
         },
     };
@@ -787,7 +831,7 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
             // persist it, say so — the stored refresh token is now stale.
             st.save().context(
                 "the token was refreshed but recording the rotation in state.json \
-                 failed; if refreshes start failing, run `claude-usage capture` for \
+                 failed; if refreshes start failing, run `usagio capture` for \
                  this account",
             )
         })?;
@@ -801,7 +845,7 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_rm(selector: Option<&str>) -> Result<()> {
-    let selector = selector.context("usage: claude-usage rm <email>")?;
+    let selector = selector.context("usage: usagio rm <email>")?;
     let state = State::load()?;
     let email = state.resolve(selector)?;
     remove_account(&email)?;
@@ -943,7 +987,7 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
 fn auto_pick(rows: &[Row]) -> Result<String> {
     if !rows.iter().any(|r| r.has_data()) {
         bail!(
-            "no usage data yet — let the menu-bar app or `claude-usage watch` \
+            "no usage data yet — let the menu-bar app or `usagio watch` \
              populate it, or pass an explicit account email"
         );
     }
@@ -1026,7 +1070,7 @@ fn cell_from_parts(pct: Option<f64>, reset: Option<&str>) -> Cell {
 // Cross-process state lock
 // ---------------------------------------------------------------------------
 
-/// Run `f` holding an exclusive advisory lock on ~/.config/claude-usage/lock,
+/// Run `f` holding an exclusive advisory lock on ~/.config/usagio/lock,
 /// serializing state read-modify-write across processes (the daemon poll and
 /// concurrent CLI/menu commands). The lock is fd-scoped, so the kernel releases
 /// it if the holder dies. Reentrant on the current thread, so provider-
@@ -1126,7 +1170,7 @@ fn restore_claude_json_raw(bytes: &[u8], mode: u32) -> Result<()> {
 /// these files carry OAuth tokens; `mode` is then applied before the rename.
 /// Shared by the `~/.claude.json` identity write and rollback, and unit-tested.
 fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let tmp = path.with_extension("json.claude-usage.tmp");
+    let tmp = path.with_extension("json.usagio.tmp");
     if let Err(e) = store::write_private(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).context("writing temp file");
@@ -1396,7 +1440,7 @@ fn cmd_watch(args: &[String]) -> Result<()> {
     }
 
     eprintln!(
-        "claude-usage watch: every {interval}s, swap at {trigger:.0}%, target <= {ceiling:.0}%"
+        "usagio watch: every {interval}s, swap at {trigger:.0}%, target <= {ceiling:.0}%"
     );
 
     let base = interval;
@@ -1537,7 +1581,7 @@ fn choose_swap_target(
 
 /// Poll usage for every account (the only network path), record history, and
 /// auto-swap away from the active account if it has reached `trigger` and a
-/// healthy target exists. Shared by `claude-usage watch` and the menu-bar poller.
+/// healthy target exists. Shared by `usagio watch` and the menu-bar poller.
 fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<CycleOutcome> {
     // Pre-cycle: absorb any on-disk credential rotations the vendor CLI made
     // behind our back (fsnotify may not fire on remote/network volumes, and
@@ -1667,7 +1711,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
 
 /// Fire a native macOS notification (best effort).
 fn notify(msg: &str) {
-    let script = format!("display notification {msg:?} with title \"claude-usage\"");
+    let script = format!("display notification {msg:?} with title \"usagio\"");
     let _ = std::process::Command::new("osascript")
         .arg("-e")
         .arg(script)
@@ -1758,7 +1802,7 @@ fn consumption_deltas(active: &[&Sample]) -> Vec<(i64, f64)> {
 // context — Context Ledger
 // ---------------------------------------------------------------------------
 
-/// `claude-usage context [--provider SLUG] [--project PATH]` — audit what a
+/// `usagio context [--provider SLUG] [--project PATH]` — audit what a
 /// CLI auto-injects into the model context per turn, with token cost per item.
 /// Delegates parsing (positional-agnostic) to a pure helper so the arg parsing
 /// stays unit-testable without a subprocess.
@@ -1814,7 +1858,7 @@ fn cmd_report(args: &[String]) -> Result<()> {
 
     let path = history_path()?;
     let data = std::fs::read_to_string(&path)
-        .context("no history yet — run `claude-usage watch` (or `install`) to collect it")?;
+        .context("no history yet — run `usagio watch` (or `install`) to collect it")?;
     let samples: Vec<Sample> = data
         .lines()
         .filter_map(|l| serde_json::from_str::<Sample>(l).ok())
@@ -1910,7 +1954,7 @@ fn cmd_report_pace() -> Result<()> {
     use crate::usage_log::AccountKey;
     let state = State::load()?;
     if state.accounts.is_empty() {
-        println!("No accounts captured yet — run `claude-usage capture` first.");
+        println!("No accounts captured yet — run `usagio capture` first.");
         return Ok(());
     }
     println!("\nBurn-rate forecast");
@@ -1996,7 +2040,7 @@ fn cmd_report_verdict() -> Result<()> {
     use crate::usage_log::AccountKey;
     let state = State::load()?;
     if state.accounts.is_empty() {
-        println!("No accounts captured yet — run `claude-usage capture` first.");
+        println!("No accounts captured yet — run `usagio capture` first.");
         return Ok(());
     }
     println!("\nSubscription verdict");
@@ -2045,13 +2089,13 @@ fn print_bars(labels: &[String], values: &[f64]) {
 /// Path to invoke for the login item and for a post-upgrade relaunch, chosen to
 /// survive `brew upgrade`. `current_exe()` resolves symlinks to the versioned
 /// Homebrew Cellar path, which an upgrade deletes; map that back to the stable
-/// `<prefix>/bin/claude-usage` symlink brew keeps repointing. For a from-source
+/// `<prefix>/bin/usagio` symlink brew keeps repointing. For a from-source
 /// install the resolved path is already stable.
 pub(crate) fn stable_exe_path() -> std::path::PathBuf {
     let exe = std::env::current_exe().unwrap_or_default();
     let s = exe.to_string_lossy();
-    if let Some(idx) = s.find("/Cellar/claude-usage/") {
-        let stable = std::path::PathBuf::from(format!("{}/bin/claude-usage", &s[..idx]));
+    if let Some(idx) = s.find("/Cellar/usagio/") {
+        let stable = std::path::PathBuf::from(format!("{}/bin/usagio", &s[..idx]));
         if stable.exists() {
             return stable;
         }
@@ -2060,22 +2104,66 @@ pub(crate) fn stable_exe_path() -> std::path::PathBuf {
 }
 
 fn cmd_install() -> Result<()> {
+    // One-shot launchd migration: unload + remove the pre-v0.4.0 plist so
+    // an upgrading user doesn't end up with two agents fighting for the
+    // menu bar. Best-effort — a failed unload (e.g. label not loaded)
+    // is fine; only the file-remove failure is worth surfacing.
+    migrate_launchd_if_needed();
+
     let exe = stable_exe_path();
     platform()
         .autostart()
         .install(AUTOSTART_LABEL, &exe, &["menubar"])?;
-    println!("Installed and started the claude-usage menu bar app — it now runs at every login.");
+    println!("Installed and started the usagio menu bar app — it now runs at every login.");
     println!(
         "Logs: {}",
-        store::config_dir()?.join("claude-usage.log").display()
+        store::config_dir()?.join("usagio.log").display()
     );
     Ok(())
 }
 
 fn cmd_uninstall() -> Result<()> {
     platform().autostart().uninstall(AUTOSTART_LABEL)?;
+    // Also clean up the pre-v0.4.0 plist if the user last installed under
+    // the `claude-usage` name.
+    migrate_launchd_if_needed();
     println!("Uninstalled — the menu-bar app will no longer start at login.");
     Ok(())
+}
+
+/// One-shot launchd label migration. If a pre-v0.4.0 plist named
+/// `com.claude-usage.menubar.plist` still exists in `~/Library/LaunchAgents/`,
+/// unload it (best-effort) and remove the file so it doesn't run in parallel
+/// with the new `com.mattjackson.usagio.menubar` agent.
+fn migrate_launchd_if_needed() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let old_plist = std::path::PathBuf::from(home)
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LEGACY_AUTOSTART_LABEL}.plist"));
+    if !old_plist.exists() {
+        return;
+    }
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", &old_plist.to_string_lossy()])
+        .status();
+    match std::fs::remove_file(&old_plist) {
+        Ok(()) => {
+            eprintln!(
+                "usagio: removed legacy launchd plist {}",
+                old_plist.display()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "usagio: could not remove legacy launchd plist {}: {}",
+                old_plist.display(),
+                e
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2105,7 +2193,7 @@ fn render_table(rows: &[Row], active: Option<&str>) {
         };
         if !r.has_data() {
             println!(
-                "{marker}  {:<28} no data yet (run the menu-bar app or `claude-usage watch`)",
+                "{marker}  {:<28} no data yet (run the menu-bar app or `usagio watch`)",
                 truncate(&r.email, 28),
             );
             continue;
@@ -2135,8 +2223,8 @@ fn render_table(rows: &[Row], active: Option<&str>) {
         println!("(no active account tracked yet — `capture` the one you're on)");
     }
     println!(
-        "Usage updates on a schedule (menu-bar app / `claude-usage watch`). \
-         Run `claude-usage list --refresh` to fetch now.\n"
+        "Usage updates on a schedule (menu-bar app / `usagio watch`). \
+         Run `usagio list --refresh` to fetch now.\n"
     );
 }
 

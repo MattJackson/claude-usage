@@ -72,7 +72,7 @@ pub fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
         return r;
     }
     let dir = store::config_dir()?;
-    std::fs::create_dir_all(&dir).context("creating ~/.config/claude-usage")?;
+    std::fs::create_dir_all(&dir).context("creating ~/.config/usagio")?;
     let lock_path = dir.join("lock");
     let file = std::fs::OpenOptions::new()
         .create(true)

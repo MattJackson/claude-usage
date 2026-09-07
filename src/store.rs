@@ -32,7 +32,7 @@ thread_local! {
     ///    in-crate, or `TestConfigDir` in `tests/common/mod.rs`). When
     ///    compiled with `cfg(test)`, `config_dir()` panics if no override
     ///    is set, so a stray test that forgets the guard can never write
-    ///    to the developer's real `~/.config/claude-usage/state.json`.
+    ///    to the developer's real `~/.config/usagio/state.json`.
     static HOME_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
@@ -222,15 +222,15 @@ pub struct State {
 }
 
 /// Per-app config directory. Delegates to the platform Paths backend so the
-/// path resolves to the OS-appropriate location (`~/.config/claude-usage` on
-/// macOS, XDG on Linux, `%APPDATA%\claude-usage` on Windows). Kept as a
+/// path resolves to the OS-appropriate location (`~/.config/usagio` on
+/// macOS, XDG on Linux, `%APPDATA%\usagio` on Windows). Kept as a
 /// `Result` for callsite stability; the underlying trait call is infallible
 /// today.
 pub fn config_dir() -> Result<PathBuf> {
     // Test-only tripwire: every unit test that lands here MUST have installed
     // a `ScopedConfigDir` / `TestConfigDir` first. Without one, a stray
     // `State::load()` or `state.save()` inside a test would resolve to the
-    // developer's real `~/.config/claude-usage`. That's how one prior test
+    // developer's real `~/.config/usagio`. That's how one prior test
     // wiped a live account list. Panic loudly instead of silently corrupting
     // real data.
     #[cfg(test)]
@@ -367,7 +367,7 @@ impl State {
         }
     }
 
-    /// Persist this state to `~/.config/claude-usage/state.json`.
+    /// Persist this state to `~/.config/usagio/state.json`.
     ///
     /// Delegates to [`save_state_safe`], which:
     /// * refuses to write if the new state DROPS any account not marked in
@@ -482,7 +482,7 @@ pub(crate) const BACKUP_KEEP_COUNT: usize = 20;
 ///    a 0700 dir), then prunes so at most [`BACKUP_KEEP_COUNT`] survive.
 pub fn save_state_safe(state: &State) -> Result<()> {
     let dir = config_dir()?;
-    std::fs::create_dir_all(&dir).context("creating ~/.config/claude-usage")?;
+    std::fs::create_dir_all(&dir).context("creating ~/.config/usagio")?;
     let path = state_path()?;
 
     // (1) Overwrite protection.

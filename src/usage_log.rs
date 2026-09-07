@@ -3,7 +3,7 @@
 //! sparkline and pace estimator, and is the substrate for future burn-rate /
 //! cost-tracking features.
 //!
-//! Path layout: `~/.config/claude-usage/history.YYYY-MM.ndjson`. One JSON
+//! Path layout: `~/.config/usagio/history.YYYY-MM.ndjson`. One JSON
 //! object per line, keyed by (`provider`, `account`), always in UTC.
 //!
 //! The append path is O_APPEND-atomic per line (single small `writeln!`), so
@@ -98,7 +98,7 @@ fn appender_slot() -> &'static Mutex<Option<Appender>> {
     APPENDER.get_or_init(|| Mutex::new(None))
 }
 
-/// The default log directory: `~/.config/claude-usage`. All public entry
+/// The default log directory: `~/.config/usagio`. All public entry
 /// points route through here so a single place decides where history lives.
 fn log_dir() -> Result<PathBuf> {
     store::config_dir()

@@ -324,7 +324,7 @@ fn save_state_safe_writes_rolling_backup_before_overwrite() {
     // Second save overwrites → prior state.json must be copied to backups/.
     make_state_with(&["a@e.com", "b@e.com"]).save().unwrap();
 
-    let backups_dir = g.home().join(".config/claude-usage/backups");
+    let backups_dir = g.home().join(".config/usagio/backups");
     assert!(
         backups_dir.exists(),
         "backups dir must be created on first overwrite"
@@ -349,7 +349,7 @@ fn save_state_safe_prunes_backups_to_cap() {
     let g = ScopedConfigDir::new();
     // Seed 25 pre-existing backup files with staggered mtimes so pruning has
     // an unambiguous order.
-    let backups_dir = g.home().join(".config/claude-usage/backups");
+    let backups_dir = g.home().join(".config/usagio/backups");
     std::fs::create_dir_all(&backups_dir).unwrap();
     for i in 0..25u32 {
         let p = backups_dir.join(format!(
@@ -386,7 +386,7 @@ fn save_state_safe_no_backup_when_no_prior_state() {
     let g = ScopedConfigDir::new();
     // First save ever — no state.json on disk, so nothing to back up.
     make_state_with(&["a@e.com"]).save().unwrap();
-    let backups_dir = g.home().join(".config/claude-usage/backups");
+    let backups_dir = g.home().join(".config/usagio/backups");
     assert!(
         !backups_dir.exists(),
         "no backup written on first-ever save"
@@ -401,7 +401,7 @@ fn save_state_safe_backup_dir_is_0700_and_file_is_0600() {
     make_state_with(&["a@e.com"]).save().unwrap();
     make_state_with(&["a@e.com", "b@e.com"]).save().unwrap();
 
-    let backups_dir = g.home().join(".config/claude-usage/backups");
+    let backups_dir = g.home().join(".config/usagio/backups");
     let dir_mode = std::fs::metadata(&backups_dir)
         .unwrap()
         .permissions()

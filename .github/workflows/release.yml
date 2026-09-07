@@ -15,7 +15,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BIN: claude-usage
+  BIN: usagio
 
 jobs:
   release:
@@ -75,7 +75,7 @@ jobs:
 
       - name: Attest build provenance
         # Cryptographically attests these artifacts were built by this workflow.
-        # Verify with: gh attestation verify <file> --repo MattJackson/claude-usage
+        # Verify with: gh attestation verify <file> --repo MattJackson/usagio
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: 'dist/*.tar.gz'
@@ -105,7 +105,7 @@ jobs:
 
           git clone git@github.com:MattJackson/homebrew-tap.git tap
           f="tap/Formula/${BIN}.rb"
-          url="https://github.com/MattJackson/claude-usage/releases/download/${version}/${BIN}-${version}-universal-apple-darwin.tar.gz"
+          url="https://github.com/MattJackson/usagio/releases/download/${version}/${BIN}-${version}-universal-apple-darwin.tar.gz"
           sed -i '' -E "s|^  url .*|  url \"${url}\"|" "$f"
           sed -i '' -E "s|^  sha256 .*|  sha256 \"${sum}\"|" "$f"
           sed -i '' -E "s|^  version .*|  version \"${ver}\"|" "$f"

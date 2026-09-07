@@ -96,8 +96,9 @@ pub trait MenuBackend: Send + Sync {
 // ---------- SecretStore ---------------------------------------------------
 
 /// Per-item secret storage keyed by `(service, account)`. Service is a stable
-/// namespace string (e.g. `"claude-usage"`); account is a per-user
-/// identifier (e.g. `"matt@example.com"` or `$USER`).
+/// namespace string (e.g. `"claude-usage"` — kept frozen post-rename to
+/// preserve existing tokens); account is a per-user identifier (e.g.
+/// `"matt@example.com"` or `$USER`).
 ///
 /// Kept CLI-shape (String in/out) so macOS keeps its `security(1)` subprocess
 /// contract without a Rust FFI dep, and Linux / Windows can layer their
@@ -116,7 +117,7 @@ pub trait SecretStore: Send + Sync {
 // ---------- Autostart -----------------------------------------------------
 
 /// Login-time launch registration. `label` is a reverse-DNS identifier
-/// (`com.mattjackson.claude-usage`) reused across install / uninstall.
+/// (`com.mattjackson.usagio.menubar`) reused across install / uninstall.
 pub trait Autostart: Send + Sync {
     fn install(&self, label: &str, binary: &Path, args: &[&str]) -> Result<()>;
     fn uninstall(&self, label: &str) -> Result<()>;
@@ -132,8 +133,10 @@ pub trait Autostart: Send + Sync {
 /// Canonical directories for the app's mutable state. Callers should use
 /// these, never `~/.config/...` string literals.
 ///
-/// Naming convention: pass the app slug (`"claude-usage"`, later `"usagio"`)
-/// as `app` so the rename doesn't ripple through every callsite.
+/// Naming convention: pass the app slug (`"usagio"`) as `app` so the rename
+/// doesn't ripple through every callsite. Legacy code paths that still
+/// resolve the old `"claude-usage"` directory live in
+/// `crate::paths::migrate_config_dir_if_needed`.
 pub trait Paths: Send + Sync {
     fn config_dir(&self, app: &str) -> PathBuf;
     fn data_dir(&self, app: &str) -> PathBuf;

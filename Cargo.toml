@@ -1,12 +1,18 @@
 [package]
-name = "claude-usage"
-version = "0.3.1"
+name = "usagio"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Check usage / limits across multiple Claude Max accounts, and switch between them."
+description = "Track usage / limits across every AI coding CLI you use, and switch between accounts."
+homepage = "https://usagio.dev"
+repository = "https://github.com/MattJackson/claude-usage"
+license = "MIT"
+readme = "README.md"
+categories = ["command-line-utilities"]
+keywords = ["claude", "codex", "usage", "menubar", "macos"]
 
 [[bin]]
-name = "claude-usage"
+name = "usagio"
 path = "src/main.rs"
 
 [features]

@@ -1,6 +1,6 @@
 //! Tests for the credential-sync layer. State-touching helpers redirect HOME
 //! to a per-test tempdir so `store::config_dir()` writes stay in-fixture and
-//! parallel test runs don't collide on the real ~/.config/claude-usage.
+//! parallel test runs don't collide on the real ~/.config/usagio.
 
 use super::*;
 use crate::providers::trait_def::{

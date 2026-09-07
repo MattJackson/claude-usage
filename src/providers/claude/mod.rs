@@ -571,7 +571,7 @@ fn write_bytes_atomic_mode(
     bytes: &[u8],
     mode: u32,
 ) -> PResult<()> {
-    let tmp = path.with_extension("json.claude-usage.tmp");
+    let tmp = path.with_extension("json.usagio.tmp");
     if let Err(e) = crate::store::write_private(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
         return Err(ProviderError::Io(e));
