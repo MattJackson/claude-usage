@@ -118,12 +118,41 @@ block2 = "0.6"
 libc = "0.2" # getuid() for the launchctl kickstart restart target
 
 # Linux platform impl deps. Only pulled in when building for Linux — cargo
-# skips these on macOS/Windows targets. Real impls land in a follow-up commit;
-# the stubs in src/platform/linux.rs don't reference the crates yet, so having
-# them declared costs nothing on cross-compile until the real code lands.
+# skips these on macOS/Windows targets. See src/platform/linux.rs for the
+# real impls (tray + GTK loop, Secret Service + file fallback, XDG autostart,
+# XDG paths).
 [target.'cfg(target_os = "linux")'.dependencies]
-ksni = "0.3"                     # KDE StatusNotifierItem (works on GNOME + KDE + tiling WMs)
-secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
+# `tray-icon` (top-level dep, shared with macOS/Windows) is backed on Linux by
+# `libappindicator`/`libayatana-appindicator3`, itself a GTK status-icon
+# wrapper — an actual GTK main loop has to run on the thread that created the
+# tray icon. `gtk`/`glib` are pulled in only to drive that loop; tray-icon
+# owns the appindicator plumbing itself. Version pinned to what tray-icon
+# 0.24's own examples build against.
+gtk = "0.18"
+# Per-account secret storage: prefers the Secret Service D-Bus daemon (GNOME
+# Keyring / KWallet) via keyring's pure-Rust `async-secret-service` backend
+# (zbus-based — no libdbus C dependency to cross-compile, and no
+# tokio-on-the-main-thread deadlock risk the crate's own docs warn about for
+# the `tokio` runtime feature). Falls back to an on-disk file when no daemon
+# is reachable (headless servers) — see `LinuxSecrets` below.
+keyring = { version = "3", default-features = false, features = ["async-secret-service", "async-io"] }
+# `keyring`'s `async-secret-service` feature pulls in `secret-service` without
+# picking one of its required `rt-*` runtime+crypto features (it's a compile
+# error otherwise: "Please enable a feature to pick a runtime for the
+# secret-service crate"). We never call `secret-service` directly — this
+# entry exists purely so Cargo's feature unification hands keyring's copy of
+# the crate the `async-io` runtime (matching `keyring`'s own `async-io`
+# feature above) and a pure-Rust crypto backend (`crypto-rust`, no system
+# OpenSSL needed to cross-compile).
+secret-service = { version = "4", default-features = false, features = ["rt-async-io-crypto-rust"] }
+# Decodes the bundled 16x16 provider PNGs into the raw RGBA tray-icon needs.
+# Pure Rust, no system libpng dependency.
+png = "0.18"
+# File dialogs (Backups Save/Restore in the tray menu) via the
+# xdg-desktop-portal — works across GNOME/KDE/Sway. The portal round-trip
+# uses rfd's own dlopen'd libdbus binding (no link-time C dep); "wayland" is
+# left off since the portal path doesn't need direct Wayland surface access.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 # Windows platform impl deps. Same story as the Linux block — only fetched
 # when the target is Windows.
