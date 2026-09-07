@@ -26,8 +26,10 @@ interrupts your work.
 ## Install
 
 ```sh
-brew install MattJackson/tap/usagio
-usagio install     # menu-bar app + auto-swap, now and at every login
+brew tap mattjackson/tap
+brew tap --trust mattjackson/tap        # third-party tap — approve once
+brew install mattjackson/tap/usagio
+usagio install                          # menu-bar app + auto-swap, now and at every login
 ```
 
 Upgrades come through Homebrew: `brew upgrade usagio` — a running menu-bar app
