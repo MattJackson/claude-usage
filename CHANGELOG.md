@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-07
+
+Hotfix for a file-descriptor leak that could exhaust the macOS default
+NOFILE cap (256) within hours of running the menu-bar app, causing every
+subsequent state.json read, DNS lookup, and Keychain call to fail with
+`Too many open files`. Symptom the user sees: `capture failed`, blank
+usage cells, `usagio switch` refusing to run.
+
+### Fixed
+- **fsnotify watcher no longer watches `$HOME`.** `Provider::credential_paths`
+  for Claude returns `~/.claude.json` whose parent directory is the user's
+  home. Registering a watcher on that parent turned the NonRecursive-on-macOS
+  emulation into a file-descriptor firehose — every log file under
+  `~/.config/gcloud/logs/`, image caches, etc. got tracked. `spawn_watchers`
+  now skips parents equal to `$HOME` or `/`; the periodic `absorb_all_lagging`
+  poll picks up `~/.claude.json` writes within one watch cycle (~30s worst
+  case vs. ~2s under fsnotify).
+- **RLIMIT_NOFILE raised at startup** from macOS's stock 256 to 4096 (or the
+  hard cap, whichever is smaller) as belt-and-suspenders — a menu-bar that
+  keeps fsnotify watchers open, opens state.json on every poll, does DNS,
+  and talks to the Keychain has no business running under 256.
+- **`usagio install`** no longer prints two near-identical warnings about
+  a co-existing `~/.config/claude-usage/` and `~/.config/usagio/`.
+- **`usagio install`** no longer prints `Unload failed: 5: Input/output error`
+  when the legacy launchd plist is already unloaded (typical after reboot).
+
+### Tap
+- `Formula/usagio.rb`: dropped the `oldnames "claude-usage"` DSL call
+  (removed in Homebrew 6.x); rename is now handled by `tap_migrations.json`
+  at the tap root.
+
 ## [0.4.0] - 2026-09-06
 
 Big-bang release. Rebrand from **claude-usage** to **usagio**. Refactored into

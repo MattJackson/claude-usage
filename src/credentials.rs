@@ -360,7 +360,20 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
         }
     };
 
+    // Refuse to register a watcher on a directory this broad — it turns the
+    // NonRecursive-on-macOS-emulated watch into a file-descriptor firehose
+    // (~/.config/gcloud/logs/*, image caches, etc. all get FDs held open),
+    // maxing out RLIMIT_NOFILE (256 on stock macOS) within days. Any
+    // credential file whose parent lands here (e.g. `~/.claude.json` under
+    // `$HOME`) is picked up by the periodic `absorb_all_lagging` poll every
+    // watch cycle instead. Latency goes from ~2s to ~30s for that one file;
+    // capture still works.
+    let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let root_dir = std::path::PathBuf::from("/");
+
     let mut any_watched = false;
+    let mut watched_parents: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
     for p in &providers {
         for path in p.credential_paths() {
             // Watch the parent directory (notify's file-level watching is
@@ -370,6 +383,21 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
                 Some(par) if !par.as_os_str().is_empty() => par.to_path_buf(),
                 _ => continue,
             };
+            // Skip $HOME and /: too broad, would blow past RLIMIT_NOFILE.
+            // Skip duplicate parents so `~/.claude/.credentials.json` and any
+            // sibling credential file only register one watch each.
+            if Some(&parent) == home_dir.as_ref() || parent == root_dir {
+                crate::logging::log(&format!(
+                    "credentials: skipping fsnotify watch on {} (too broad); \
+                     relying on periodic absorb_all_lagging poll for {}",
+                    parent.display(),
+                    path.display()
+                ));
+                continue;
+            }
+            if !watched_parents.insert(parent.clone()) {
+                continue;
+            }
             // Fresh install: ~/.claude may not exist yet at daemon startup.
             // Create it (0700 on Unix) BEFORE registering the watcher so the
             // vendor CLI's first write lands under an inode we're already

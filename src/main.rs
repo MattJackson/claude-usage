@@ -157,6 +157,15 @@ fn run() -> Result<()> {
         }
     }
 
+    // Raise RLIMIT_NOFILE from macOS's stock 256 to something a long-lived
+    // menubar can actually survive. Under 256, an fsnotify watcher whose
+    // parent lands on a big directory (see spawn_watchers) plus normal state
+    // reads exhaust FDs within a day, and every subsequent open — state.json,
+    // DNS resolution, keychain lookups — starts failing with EMFILE. Best
+    // effort; ignored on non-Unix or if the shell's hard cap is lower.
+    #[cfg(unix)]
+    raise_nofile_limit();
+
     // Populate the provider registry once, before any command handler runs.
     // Cheap (a `Vec::push` per feature-gated provider) and idempotent, so
     // handlers that never touch the registry (today: all of them) pay
@@ -2193,6 +2202,44 @@ fn cmd_uninstall() -> Result<()> {
     migrate_launchd_if_needed();
     println!("Uninstalled — the menu-bar app will no longer start at login.");
     Ok(())
+}
+
+/// Bump the soft `RLIMIT_NOFILE` up to the hard cap (or 4096, whichever is
+/// smaller). macOS ships every process with a soft cap of 256 files, which
+/// is fine for a CLI one-shot but crippling for a menubar that keeps
+/// fsnotify watchers open, opens state.json on every poll, does DNS, and
+/// talks to the keychain. libc getrlimit/setrlimit are always available on
+/// Unix; failure is logged and swallowed (we still run, just with the
+/// stock cap).
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    // SAFETY: getrlimit/setrlimit take a valid resource id and a writable
+    // rlimit struct; both preconditions are trivially met here.
+    unsafe {
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            crate::logging::log("credentials: getrlimit(NOFILE) failed; leaving stock cap");
+            return;
+        }
+        let target = rl.rlim_max.min(4096);
+        if rl.rlim_cur >= target {
+            return;
+        }
+        let new = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: rl.rlim_max,
+        };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &new) != 0 {
+            crate::logging::log(&format!(
+                "credentials: setrlimit(NOFILE, {target}) failed; \
+                 leaving soft cap at {}",
+                rl.rlim_cur
+            ));
+        }
+    }
 }
 
 /// One-shot launchd label migration. If a pre-v0.4.0 plist named
