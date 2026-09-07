@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-07
+
+Menu declutter — removes a broken row and consolidates the footer.
+
+### Removed
+- **Context Ledger submenu.** Clicks shelled out to a new Terminal window via
+  osascript, which silently failed for anyone who hadn't granted macOS
+  Automation permission — a broken menu row is worse than no menu row. The
+  CLI (`usagio context [--provider slug]`) is unchanged and remains the
+  supported entry point. Related dead code + tests removed.
+
+### Changed
+- **Quit row now shows the version inline** (`Quit  ·  usagio v0.4.2`), so
+  the version no longer eats its own disabled row above Quit. macOS NSMenu
+  doesn't support arbitrary right-alignment for a submenu item, so it reads
+  left-to-right rather than hard-right-aligned.
+
 ## [0.4.1] - 2026-09-07
 
 Hotfix for a file-descriptor leak that could exhaust the macOS default
