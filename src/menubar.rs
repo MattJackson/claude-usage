@@ -2722,6 +2722,10 @@ mod tests {
 
     #[test]
     fn try_start_refresh_dedupes_rapid_clicks() {
+        // try_start_refresh reaches logging::log → store::config_dir(), which
+        // panics in tests without a HOME_OVERRIDE. Wrap in ScopedConfigDir so
+        // the tripwire (added post-hermeticity merge) doesn't fire here.
+        let _g = crate::store::ScopedConfigDir::new();
         // Reset in case a prior test in this binary left it set (best-effort
         // — tests run with --test-threads=1 so no other test races us here).
         REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -3895,7 +3899,10 @@ mod tests {
         let stash = stash_pre_restore(&dir)
             .unwrap()
             .expect("live state existed");
+        // Strong positive assertion: the stash MUST be inside the scoped tempdir's
+        // config backups dir. On Linux CI the tempdir itself lives under /tmp/xyz/,
+        // so a `!starts_with("/tmp")` guard would false-positive — the positive
+        // form here catches the real regression (stash landing outside backups/).
         assert!(stash.starts_with(g.home().join(".config/usagio/backups")));
-        assert!(!stash.starts_with("/tmp"));
     }
 }
