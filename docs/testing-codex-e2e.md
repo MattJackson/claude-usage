@@ -4,14 +4,14 @@ Audience: Matthew, running this by hand on macOS. Companion to
 `docs/testing-0.5.0.md` (Claude's contract tests) and
 `docs/architecture-0.5.0.md`.
 
-## Read this first — what changed (codex-switch-e2e, closes the v0.5.0 BLOCKER)
+## Read this first — what changed (codex-switch-e2e, closed the v0.5.0 BLOCKER)
 
 The 2026-09-07 audit of `src/providers/codex/**`, `src/main.rs`, and
 `src/menubar.rs` found that Codex's credential-lifecycle primitives were
 complete and unit-tested, but nothing in the live app called them for
-switching or active-token refresh. The `codex-switch-e2e` branch closes that
-gap by giving `state.json` a real "state v2" multi-account slot for
-non-Claude providers and wiring every dispatch point through it:
+switching or active-token refresh. The `codex-switch-e2e` work (now merged to
+`dev`) closed that gap by giving `state.json` a real "state v2" multi-account
+slot for non-Claude providers and wiring every dispatch point through it:
 
 - **`state.json` schema v2** (`src/store.rs`): a new `providers` map
   (`HashMap<String, ProviderAccounts>`) holds every captured account for a
