@@ -67,11 +67,13 @@ jobs:
         # `cfg(target_os = ...)` as example text — false positives).
         run: cargo test --tests --all-features -- --test-threads=1
 
-      # Windows-only: exercises the #[ignore]d tests with REAL side effects
-      # — the registry-write autostart test writes a HKCU\...\Run value and
-      # cleans up in a Drop guard. Safe: windows-latest runners are
+      # Windows-only: real side-effect tests — Credential Manager round-trip
+      # (M4 fix, WindowsSecrets) + HKCU Run key round-trip (autostart) are
+      # `#[ignore]`d in the default run so `cargo test` stays hermetic on
+      # every OS/dev machine. Run them for real here, on the one OS that has
+      # a Credential Manager / registry. Safe: windows-latest runners are
       # disposable per-job VMs. Closes gap 3 of the v0.5.0 CI matrix.
-      - name: cargo test --ignored (real HKCU registry write)
+      - name: cargo test --ignored (Windows-only side-effect tests)
         if: matrix.os == 'windows-latest'
         run: cargo test --all-features -- --ignored --test-threads=1
 
@@ -109,11 +111,8 @@ jobs:
 
       # H4 (v0.5.0 codeaudit): release.yml's macOS build job calls
       # packaging/macos/generate-icns.sh, which shells out to `rsvg-convert`
-      # (from librsvg) and dies loudly if missing. release.yml didn't
-      # install it, so the FIRST v0.5.0 tag push would have failed after
-      # the build/package steps already ran — aborting the whole release
-      # (no artifacts, no tap bump). Running the script here on every
-      # push catches that class of regression immediately.
+      # (from librsvg) and dies loudly if missing. Verify locally on every
+      # push so a missing dep doesn't only surface at release-tag time.
       - name: Install librsvg for icon generation
         if: matrix.os == 'macos-latest'
         run: brew install librsvg
@@ -122,10 +121,6 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: packaging/macos/generate-icns.sh
 
-      # (Redundant shell strict-cfg lint step removed — the Rust test
-      # `tests/strict_cfg.rs` covers this with a proper allowlist and
-      # comment-skipping logic; the shell grep version tripped on doc
-      # comments naming cfg(target_os = ...) as example text.)
 
   # Full lane — release build, only on the qa and main branches.
   build:

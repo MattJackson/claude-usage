@@ -109,11 +109,23 @@ enum UiCmd {
     SetMenu(MenuTree),
 }
 
+/// Doc string for the threading invariant `TrayState`'s `unsafe impl Send`
+/// depends on. Factored into a constant (rather than only living in prose
+/// comments) so `run_event_loop`'s panic message and a unit test both quote
+/// the exact same wording — see `MenuBackend` in `platform/mod.rs` for the
+/// cross-backend version of this contract.
+const SAME_THREAD_INVARIANT: &str =
+    "create_status_item and run_event_loop MUST be called on the same thread.";
+
 /// Wraps the thread-confined `TrayIcon` (see module doc). Never touched
 /// outside `run_event_loop`, which the `MenuBackend` contract requires to
 /// run on the same (main) thread `create_status_item` was called from.
+/// `creation_thread` records which thread created it so `run_event_loop` can
+/// assert the invariant at runtime instead of relying on caller discipline
+/// alone.
 struct TrayState {
     tray: TrayIcon,
+    creation_thread: std::thread::ThreadId,
 }
 
 // SAFETY: `TrayState` holds a `tray_icon::TrayIcon`, which is `!Send`
@@ -125,6 +137,8 @@ struct TrayState {
 // `TrayState` — is documented (see `MenuBackend::create_status_item`) as
 // being called once at startup on that same main thread. Every other
 // thread only ever sends plain owned data through the `UiCmd` channel.
+// `run_event_loop` additionally asserts `creation_thread` matches at entry,
+// so a violation panics loudly instead of producing UB.
 unsafe impl Send for TrayState {}
 
 /// Type alias for the click-handler callback slot — factored out so the
@@ -297,7 +311,10 @@ impl MenuBackend for WindowsMenu {
             .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
 
         let (tx, rx) = mpsc::channel::<UiCmd>();
-        *self.tray_state.lock().unwrap() = Some(TrayState { tray });
+        *self.tray_state.lock().unwrap() = Some(TrayState {
+            tray,
+            creation_thread: std::thread::current().id(),
+        });
         *self.cmd_rx.lock().unwrap() = Some(rx);
         *self.cmd_tx.lock().unwrap() = Some(tx.clone());
 
@@ -310,6 +327,15 @@ impl MenuBackend for WindowsMenu {
     }
 
     fn run_event_loop(&self) -> Result<()> {
+        // If `request_quit()` was called before this call started (e.g. the
+        // caller tore down and quit during startup, possibly even before
+        // `create_status_item`), `quit` is already `true` here. Honor it
+        // immediately, before touching `cmd_rx`/`tray_state` at all — do NOT
+        // reset it to `false`, which would silently drop the earlier
+        // request and pump a loop the caller already asked to stop.
+        if self.quit.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let rx = self
             .cmd_rx
             .lock()
@@ -321,8 +347,18 @@ impl MenuBackend for WindowsMenu {
             .as_mut()
             .context("run_event_loop called before create_status_item")?;
 
+        // `TrayState`'s `unsafe impl Send` is only sound if create_status_item
+        // and run_event_loop share a thread (see the SAFETY comment on
+        // `TrayState`). Nothing else enforces that at compile time, so check
+        // it here and fail loudly rather than let a violation manifest as UB
+        // deep inside `tray-icon`/Win32.
+        assert_eq!(
+            state.creation_thread,
+            std::thread::current().id(),
+            "{SAME_THREAD_INVARIANT}"
+        );
+
         let menu_rx = MenuEvent::receiver();
-        self.quit.store(false, Ordering::SeqCst);
         loop {
             if self.quit.load(Ordering::SeqCst) {
                 break;
@@ -780,5 +816,61 @@ mod tests {
 
         autostart.uninstall(&label).unwrap();
         assert!(!autostart.is_installed(&label).unwrap());
+    }
+
+    /// Round-trip against the real Credential Manager. `#[ignore]`d by
+    /// default — same rationale as `windows_autostart_writes_registry_key`:
+    /// a real side effect on the machine running it. Run explicitly on
+    /// Windows with `cargo test -- --ignored windows_secrets_set_get_roundtrip`.
+    #[test]
+    #[ignore = "writes to the real Credential Manager; run with --ignored on Windows"]
+    fn windows_secrets_set_get_roundtrip() {
+        let service = format!("usagio-ci-test-{}", std::process::id());
+        let account = "ci-test-account";
+        let secrets = WindowsSecrets;
+
+        // Start from a clean slate in case a previous run was interrupted.
+        let _ = secrets.delete(&service, account);
+        assert_eq!(secrets.get(&service, account).unwrap(), None);
+
+        secrets.set(&service, account, "s3cr3t-value").unwrap();
+        assert_eq!(
+            secrets.get(&service, account).unwrap(),
+            Some("s3cr3t-value".to_string())
+        );
+
+        secrets.delete(&service, account).unwrap();
+        assert_eq!(
+            secrets.get(&service, account).unwrap(),
+            None,
+            "delete-then-get must return the documented NoEntry sentinel (None)"
+        );
+
+        // Deleting again must stay Ok (idempotent) rather than erroring.
+        secrets.delete(&service, account).unwrap();
+    }
+
+    // --- M10: TrayState's same-thread invariant is documented + checkable --
+
+    #[test]
+    fn same_thread_invariant_message_names_both_methods() {
+        assert!(SAME_THREAD_INVARIANT.contains("create_status_item"));
+        assert!(SAME_THREAD_INVARIANT.contains("run_event_loop"));
+        assert!(SAME_THREAD_INVARIANT.contains("same thread"));
+    }
+
+    // --- M7: request_quit() before run_event_loop() must not be a no-op ----
+
+    #[test]
+    fn request_quit_before_run_event_loop_returns_immediately() {
+        let menu = WindowsMenu::default();
+        // No create_status_item call — cmd_rx/tray_state are still None.
+        // A naive implementation that resets `quit` to `false` on entry, or
+        // that checks the flag only after unwrapping cmd_rx/tray_state,
+        // would either drop this request or return the wrong error.
+        menu.request_quit();
+
+        menu.run_event_loop()
+            .expect("an early quit request must make run_event_loop return Ok immediately");
     }
 }

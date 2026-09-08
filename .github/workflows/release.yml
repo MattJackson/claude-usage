@@ -175,6 +175,22 @@ jobs:
             perl -0777 -pi -e 's/(\nend\n?)\z/\n  def caveats\n    <<~EOS\n      For the app icon in Login Items, run `usagio install` — it now points\n      launchd at usagio.app\/Contents\/MacOS\/usagio.\n    EOS\n  end\n$1/' "$f"
           fi
 
+          # M14: the perl rewrites above are brittle regex surgery on the
+          # formula's `install` block. Validate the result is still valid
+          # Ruby AND still has the expected `install do ... end` shape
+          # BEFORE pushing — a silently corrupted tap formula breaks every
+          # `brew install`/`brew upgrade` for every user until caught.
+          if ! ruby -c "$f" >/dev/null; then
+            echo "::error::perl rewrite produced invalid Ruby in $f — aborting before push"
+            ruby -c "$f" || true
+            exit 1
+          fi
+          if ! grep -q 'def install' "$f" || ! grep -q 'bin.install "usagio"' "$f"; then
+            echo "::error::$f is missing the expected install block after the rewrite — aborting before push"
+            cat "$f"
+            exit 1
+          fi
+
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -236,7 +252,12 @@ jobs:
       - name: Publish GitHub Release asset
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          generate_release_notes: true
+          # Only build-macos generates release notes (M13 — 3 parallel jobs
+          # calling action-gh-release against the same tag with
+          # generate_release_notes: true on more than one job race to
+          # publish, and the loser can lose or duplicate the notes). This
+          # job still uploads its own artifacts additively.
+          generate_release_notes: false
           files: |
             dist/*.tar.gz
             dist/*.sha256
@@ -289,7 +310,9 @@ jobs:
       - name: Publish GitHub Release asset
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          generate_release_notes: true
+          # See the matching comment in build-linux — only build-macos
+          # generates release notes (M13).
+          generate_release_notes: false
           files: |
             dist/*.zip
             dist/*.sha256

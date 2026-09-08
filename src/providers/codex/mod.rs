@@ -437,6 +437,16 @@ fn auth_json_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".codex").join("auth.json"))
 }
 
+/// Map a filesystem `io::Result` into `PResult`, naming the operation and
+/// path on failure. A bare `?` on `create_dir_all` / `set_permissions` /
+/// `write` / `rename` collapses into `ProviderError::Io`, which `Display`s as
+/// just `"io: <message>"` — no indication of which of the 4 operations, or
+/// which path, actually failed. `ProviderError::Other` carries the full
+/// annotated string instead.
+fn fs_ctx<T>(r: std::io::Result<T>, op: &str, path: &std::path::Path) -> PResult<T> {
+    r.map_err(|e| ProviderError::Other(format!("while {op} on {}: {e}", path.display())))
+}
+
 /// Write `contents` to `path` atomically (tmp file in the same directory +
 /// rename), matching the permissions the `codex` CLI itself uses: parent
 /// directory `0700` (created if missing), file `0600`. Rename is atomic on
@@ -461,8 +471,12 @@ fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult
     let dir = path
         .parent()
         .ok_or_else(|| ProviderError::Other("auth.json path has no parent directory".into()))?;
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    fs_ctx(std::fs::create_dir_all(dir), "create_dir_all", dir)?;
+    fs_ctx(
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)),
+        "set_permissions",
+        dir,
+    )?;
 
     // Tmp file lives in the same directory as the target so the rename below
     // is guaranteed to be on the same filesystem (atomic).
@@ -472,7 +486,14 @@ fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult
         Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
 
-    let write_result = (|| -> std::io::Result<()> {
+    // H1 (security codeaudit) + M9 (errors codeaudit) combined: create the
+    // tmp file with mode 0600 via `OpenOptions::create_new(true).mode(0o600)`
+    // in one syscall so no TOCTOU window exposes tokens to other local
+    // users, and wrap the fs ops with `fs_ctx` so a failure reports which
+    // operation on which path (not just "io: <msg>"). Clean up the tmp
+    // file on any failure so a partial write doesn't leave a
+    // secret-bearing orphan.
+    let create_and_write = (|| -> std::io::Result<()> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -480,13 +501,13 @@ fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult
             .open(&tmp_path)?;
         f.write_all(contents.as_bytes())
     })();
-    if let Err(e) = write_result {
+    if let Err(e) = fs_ctx(create_and_write, "open/write", &tmp_path) {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(ProviderError::Io(e));
+        return Err(e);
     }
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
+    if let Err(e) = fs_ctx(std::fs::rename(&tmp_path, path), "rename", &tmp_path) {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(ProviderError::Io(e));
+        return Err(e);
     }
     Ok(())
 }
@@ -496,14 +517,14 @@ fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult
     let dir = path
         .parent()
         .ok_or_else(|| ProviderError::Other("auth.json path has no parent directory".into()))?;
-    std::fs::create_dir_all(dir)?;
+    fs_ctx(std::fs::create_dir_all(dir), "create_dir_all", dir)?;
     let tmp_path = dir.join(format!(
         ".auth.json.tmp.{}.{}",
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
-    std::fs::write(&tmp_path, contents)?;
-    std::fs::rename(&tmp_path, path)?;
+    fs_ctx(std::fs::write(&tmp_path, contents), "write", &tmp_path)?;
+    fs_ctx(std::fs::rename(&tmp_path, path), "rename", &tmp_path)?;
     Ok(())
 }
 
@@ -614,6 +635,43 @@ mod tests {
                 assert_eq!(dir_mode & 0o777, 0o700);
             }
         });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_auth_json_atomically_names_the_failing_operation() {
+        // Skip under root (e.g. some CI containers): root ignores the 0o000
+        // permission bit this test relies on to force create_dir_all to fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, permission bits are not enforced");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let readonly = base.path().join("readonly-parent");
+        std::fs::create_dir(&readonly).unwrap();
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // `dir` (readonly-parent/subdir) doesn't exist yet, and its parent
+        // has no write permission, so `create_dir_all` must fail here.
+        let target = readonly.join("subdir").join("auth.json");
+        let err = write_auth_json_atomically(&target, "{}")
+            .expect_err("create_dir_all under a read-only parent must fail");
+        let msg = err.to_string();
+
+        // Restore permissions so the tempdir can be cleaned up regardless of
+        // the assertion outcome below.
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            msg.contains("create_dir_all"),
+            "error should name the failing operation: {msg}"
+        );
+        assert!(
+            msg.contains("subdir"),
+            "error should include the failing path: {msg}"
+        );
     }
 
     #[test]

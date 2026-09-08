@@ -1758,7 +1758,11 @@ fn handle_backup_save_with(dialog: &dyn crate::platform::FileDialog) {
 /// `config_dir()/backups/` (owner-only permissions), and the whole
 /// read-confirm-write sequence runs under `with_state_lock` with the actual
 /// write routed through `store::save_state_restore` (a thin, explicitly-
-/// authorized wrapper around `save_state_safe`).
+/// authorized wrapper around `save_state_safe`). Note: the M2 concern
+/// (`State::load()` failure silently becoming "0 accounts") is subsumed by
+/// this restructure — `accounts_dropped_by(&new_state)?` bubbles the load
+/// error up out of `with_state_lock`, and the `Err(e) => notify(...)` arm
+/// below surfaces it, so the drop-warning path can't be silently skipped.
 fn handle_backup_restore_dialog() {
     handle_backup_restore_dialog_with(crate::platform().file_dialog());
 }
@@ -1793,7 +1797,7 @@ fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
             return;
         }
     };
-    if value.get("accounts").and_then(|a| a.as_array()).is_none() {
+    if value.get("accounts").is_none() {
         notify("Restore failed: not a usagio state file (missing 'accounts')");
         return;
     }
@@ -1825,19 +1829,51 @@ fn restore_drop_confirmation(dropped: &[String]) -> String {
     format!("Restoring will drop {}. Continue?", dropped.join(", "))
 }
 
+/// Guards against piling up blocked threads when "Refresh usage now" is
+/// clicked repeatedly: a stalled network call (see `run_cycle`) means each
+/// new click would otherwise stack up its own throwaway `SwapGuard` and
+/// thread. `false` = no refresh in flight; CAS to `true` before spawning,
+/// reset to `false` when the spawned thread's cycle completes.
+static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// "Refresh usage now" click (Settings ▸ Advanced ▸). Runs one poll +
 /// auto-swap cycle on a background thread — same `run_cycle` the poll loop
 /// calls every `WATCH_INTERVAL_SECS` — so the menu never blocks on network
 /// I/O. The main-thread timer picks up the refreshed cache on its next tick.
+///
+/// De-duplicated via `REFRESH_IN_FLIGHT`: a second click while a refresh is
+/// still running notifies instead of spawning another thread. See
+/// `try_start_refresh` for the testable core.
 fn handle_refresh_now() {
-    std::thread::spawn(|| {
-        let mut guard = SwapGuard::default();
-        if run_cycle(&mut guard) {
-            notify("Refresh: rate limited, backing off");
-        } else {
-            notify("Usage refreshed");
-        }
-    });
+    try_start_refresh(|| {
+        std::thread::spawn(|| {
+            let mut guard = SwapGuard::default();
+            let rate_limited = run_cycle(&mut guard);
+            REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            if rate_limited {
+                notify("Refresh: rate limited, backing off");
+            } else {
+                notify("Usage refreshed");
+            }
+        });
+    })
+}
+
+/// CAS `REFRESH_IN_FLIGHT` from `false` to `true`; if it was already `true`
+/// (a refresh is still running), notify and return without calling `spawn`.
+/// Factored out from `handle_refresh_now` so a test can inject a counting
+/// closure in place of a real `std::thread::spawn` and assert the second of
+/// two rapid calls never invokes it.
+fn try_start_refresh(spawn: impl FnOnce()) {
+    use std::sync::atomic::Ordering;
+    if REFRESH_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        notify("Refresh already running");
+        return;
+    }
+    spawn();
 }
 
 /// Capture the current login for `slug`. For Claude, use the full v1 flow
@@ -2021,9 +2057,24 @@ fn set_autoswap(enabled: bool) {
 /// on-disk state currently says, rather than assuming a fixed target — so a
 /// stale menu (built just before an external `usagio` CLI toggle) can't
 /// un-toggle a setting it never actually observed.
+///
+/// Read-modify-write happens entirely INSIDE `with_state_lock`, atomic with
+/// respect to other in-process AND cross-process writers (the CLI `usagio`
+/// binary and the menu-bar app both take the same advisory file lock — see
+/// `with_state_lock`). A previous version read the current value with a
+/// separate `State::load()` call *outside* the lock, decided the new bool
+/// from that stale read, and only entered the lock to write it — a
+/// concurrent writer between the read and the write could have its own
+/// toggle silently lost ("toggle lost" under contention).
 fn toggle_autoswap() {
-    let currently_enabled = !State::load().unwrap_or_default().autoswap_disabled;
-    set_autoswap(!currently_enabled);
+    let r = with_state_lock(|| {
+        let mut st = State::load()?;
+        st.autoswap_disabled = !st.autoswap_disabled;
+        st.save()
+    });
+    if let Err(e) = r {
+        notify(&format!("Could not save auto-swap setting: {e}"));
+    }
 }
 
 /// Flip one Settings ▸ Notifications ▸ per-trigger checkbox. `trigger` is one
@@ -2176,6 +2227,89 @@ mod tests {
             notification_config: crate::notifications::NotificationConfig::default(),
         }
     }
+
+    #[test]
+    fn try_start_refresh_dedupes_rapid_clicks() {
+        // Reset in case a prior test in this binary left it set (best-effort
+        // — tests run with --test-threads=1 so no other test races us here).
+        REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let spawn_count = std::rc::Rc::new(StdCell::new(0u32));
+        let c1 = spawn_count.clone();
+        try_start_refresh(move || {
+            c1.set(c1.get() + 1);
+            // Deliberately do NOT reset REFRESH_IN_FLIGHT here — this stands
+            // in for "the background thread is still running" so the second
+            // click below is the one under test.
+        });
+        assert_eq!(spawn_count.get(), 1, "first click must spawn");
+
+        let c2 = spawn_count.clone();
+        try_start_refresh(move || {
+            c2.set(c2.get() + 1);
+        });
+        assert_eq!(
+            spawn_count.get(),
+            1,
+            "second rapid click must NOT spawn a second refresh"
+        );
+
+        // Clean up so later tests in this binary see the flag cleared.
+        REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn toggle_autoswap_read_modify_write_is_atomic_under_contention() {
+        let g = crate::store::ScopedConfigDir::new();
+        let home = g.home();
+
+        State::default().save().expect("seed initial state");
+        let initial = State::load().unwrap().autoswap_disabled;
+
+        const ITERATIONS: usize = 100;
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let home = home.clone();
+                std::thread::spawn(move || {
+                    // HOME_OVERRIDE is thread-local (see store::ScopedConfigDir);
+                    // each worker thread must repoint it at the same tempdir
+                    // the parent test set up.
+                    crate::store::set_home_override(Some(home));
+                    for _ in 0..ITERATIONS {
+                        toggle_autoswap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let total_toggles = 2 * ITERATIONS;
+        let expected = if total_toggles % 2 == 1 {
+            !initial
+        } else {
+            initial
+        };
+        let final_state = State::load().unwrap();
+        assert_eq!(
+            final_state.autoswap_disabled, expected,
+            "final parity must match initial XOR (total_toggles % 2 == 1); a lost \
+             toggle under contention would flip this"
+        );
+
+        drop(g);
+    }
+
+    // NOTE: M2's `restore_old_account_count` helper + its two tests were
+    // deleted at aggregation time. The M2 concern (State::load failure
+    // silently becoming "0 accounts" and skipping the drop-warning prompt)
+    // is fully subsumed by H2's restructure: the new Restore flow runs
+    // under `with_state_lock`, delegates the drop-detection to
+    // `crate::store::accounts_dropped_by(&new_state)` (which propagates
+    // load errors via `?`), and the outer `Err(e) => notify(...)` arm
+    // surfaces the abort message to the user. Tests for the H2 path live
+    // in store_tests.rs and menubar's Restore… test block above.
 
     #[test]
     fn severity_bands_defaults() {

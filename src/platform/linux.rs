@@ -477,6 +477,12 @@ pub struct LinuxMenu {
     click_cb: Arc<Mutex<Option<ClickCb>>>,
     main_loop: Arc<Mutex<Option<gtk::glib::MainLoop>>>,
     gtk_init: OnceLock<Result<(), String>>,
+    /// Set by `request_quit` when it's called before `run_event_loop` has
+    /// populated `main_loop` — otherwise that quit request would be silently
+    /// discarded (there's no `glib::MainLoop` yet to call `.quit()` on).
+    /// `run_event_loop` checks this on entry and returns immediately if set,
+    /// so a quit requested during startup is still honored.
+    should_quit_early: std::sync::atomic::AtomicBool,
 }
 
 impl LinuxMenu {
@@ -485,6 +491,7 @@ impl LinuxMenu {
             click_cb: Arc::new(Mutex::new(None)),
             main_loop: Arc::new(Mutex::new(None)),
             gtk_init: OnceLock::new(),
+            should_quit_early: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -730,6 +737,17 @@ impl MenuBackend for LinuxMenu {
     }
 
     fn run_event_loop(&self) -> Result<()> {
+        // A `request_quit()` that arrived before this call (main_loop was
+        // still None, so request_quit had nowhere to route the quit) set
+        // this flag instead of silently discarding the request. Honor it now
+        // by returning immediately, without pumping a GTK loop the caller
+        // already wants stopped.
+        if self
+            .should_quit_early
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
         self.ensure_gtk_init()?;
         let main_loop = gtk::glib::MainLoop::new(None, false);
         *self.main_loop.lock().unwrap() = Some(main_loop.clone());
@@ -762,6 +780,12 @@ impl MenuBackend for LinuxMenu {
     fn request_quit(&self) {
         if let Some(ml) = self.main_loop.lock().unwrap().as_ref() {
             ml.quit();
+        } else {
+            // run_event_loop hasn't populated main_loop yet — remember the
+            // request so run_event_loop can honor it on entry instead of
+            // this call being a silent no-op.
+            self.should_quit_early
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -1043,5 +1067,31 @@ mod tests {
     fn linux_terminal_probe_returns_none_when_nothing_found() {
         let exists = |_: &str| false;
         assert_eq!(find_terminal_with(None, exists), None);
+    }
+
+    // --- M8: request_quit() before run_event_loop() must not be a no-op ----
+
+    #[test]
+    fn request_quit_before_run_event_loop_is_honored() {
+        let menu = LinuxMenu::new();
+        // No main_loop exists yet — a naive request_quit would have nowhere
+        // to route this and would silently discard it.
+        menu.request_quit();
+        assert!(
+            menu.should_quit_early
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "request_quit before run_event_loop must set should_quit_early"
+        );
+
+        // run_event_loop must see the flag and return immediately, without
+        // touching GTK (which would need a display in CI).
+        menu.run_event_loop()
+            .expect("an early quit request must make run_event_loop return Ok immediately");
+        assert!(
+            !menu
+                .should_quit_early
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the flag must be consumed, not left set for a future real run"
+        );
     }
 }

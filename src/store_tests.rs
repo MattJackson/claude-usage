@@ -674,3 +674,42 @@ fn stash_pre_restore_is_noop_when_no_live_state() {
     let dir = config_dir().unwrap();
     assert!(stash_pre_restore(&dir).unwrap().is_none());
 }
+
+// ---------------------------------------------------------------------------
+// M1 — notification_config parse failures must not be silent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn corrupt_notification_config_falls_back_to_default_and_logs() {
+    let g = ScopedConfigDir::new();
+
+    // Seed state.json with a notification_config shape that can never
+    // deserialize (a string where an object/array is expected).
+    let dir = config_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = serde_json::json!({
+        "accounts": {},
+        "active": null,
+        "notification_config": "this-is-not-a-valid-config-shape",
+    });
+    std::fs::write(dir.join("state.json"), serde_json::to_vec(&bad).unwrap()).unwrap();
+
+    // Loading must still succeed with defaulted notification_config.
+    let loaded = State::load().expect("load must succeed despite corrupt field");
+    assert_eq!(loaded.notification_config, Default::default());
+
+    // A discoverable log line must exist mentioning the failure.
+    let log_path = dir.join("usagio.log");
+    let contents = std::fs::read_to_string(&log_path)
+        .expect("log file should exist after a logged parse failure");
+    assert!(
+        contents.contains("notification_config"),
+        "log should mention notification_config: {contents}"
+    );
+    assert!(
+        contents.to_lowercase().contains("parse"),
+        "log should mention parse failure: {contents}"
+    );
+
+    drop(g);
+}

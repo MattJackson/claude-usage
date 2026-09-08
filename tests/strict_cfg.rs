@@ -46,7 +46,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // src/main.rs — the `menubar` CLI subcommand arm dispatches into the
     // macOS-only menubar module; must be cfg-gated to the same OS to
     // avoid a link-time symbol miss on other platforms.
-    ("src/main.rs", 213),
+    ("src/main.rs", 239),
 ];
 
 fn src_root() -> PathBuf {
