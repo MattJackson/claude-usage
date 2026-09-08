@@ -300,7 +300,12 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
     let label = format!("{provider_display:<PROVIDER_COL$}{}", a.display);
     let base = u16len(&label) + 1; // + '\t'
     if let Some((cd, _win)) = locked_countdown_for(a, now_utc()) {
-        let trailing = format!("locked · {cd}");
+        // UX (v0.5.0): drop the "locked · " prefix — the trailing run is
+        // rendered in red (visually implying locked) and the payload is a
+        // time-until-reset instead of a percentage (structurally implying
+        // locked, since a healthy row shows "S n%  W n%"). The old
+        // "locked · Xh Ym" wording repeated the same fact three ways.
+        let trailing = cd.clone();
         let plain = format!("{label}\t{trailing}");
         // A "locked" account is by definition red — no need to consult bands.
         let colors = vec![(base, u16len(&trailing), Severity::Red)];
@@ -2752,15 +2757,17 @@ mod tests {
                 None,
             );
             let r = main_row("Claude", &a, bands());
-            assert_eq!(r.plain, "Claude    matt@example.com\tlocked · 1h 30m");
+            // v0.5.0 UX: no "locked · " prefix — red color + a time (not a
+            // percent) is the affordance. See main_row's locked-branch comment.
+            assert_eq!(r.plain, "Claude    matt@example.com\t1h 30m");
             assert!(r.bold, "active locked row is still bold");
             assert!(r.checkmark, "active row gets a leading checkmark");
-            // Exactly one colored span, red-tinted, covering the "locked · …" run.
+            // Exactly one colored span, red-tinted, covering the countdown run.
             assert_eq!(r.colors.len(), 1);
             let (off, len, sev) = r.colors[0];
             assert_eq!(sev, Severity::Red);
             let picked: String = r.plain.chars().skip(off).take(len).collect();
-            assert_eq!(picked, "locked · 1h 30m");
+            assert_eq!(picked, "1h 30m");
         });
     }
 
@@ -3104,7 +3111,9 @@ mod tests {
             let r = main_row("Claude", &a, bands());
             let (label, trailing) = r.plain.split_once('\t').expect("tab preserved");
             assert_eq!(label, "Claude    matt@example.com");
-            assert_eq!(trailing, "locked · 23h 52m");
+            // No "locked · " prefix — red color + a time (not a percent) is
+            // the affordance now. See main_row's locked-branch comment.
+            assert_eq!(trailing, "23h 52m");
             assert_eq!(r.tab_x, Some(TAB_X), "right-align tab-stop preserved");
         });
     }
