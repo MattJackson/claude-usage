@@ -28,6 +28,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::providers::trait_def::{
@@ -40,6 +41,28 @@ use crate::providers::trait_def::{
 /// `main.rs` so this module has no dependency on the legacy CLI internals;
 /// the two constants MUST stay in lock-step until the legacy path is deleted.
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// Serializes access to the shared active-identity keychain/file slot
+/// (`mirror_rotated_token` writes, `read_active_slot` reads) across threads
+/// in this process.
+///
+/// concurrency-01 (v0.5.1 audit): nothing previously stopped the periodic
+/// poll thread's `run_cycle` and a user-triggered "Refresh usage now"
+/// `run_cycle` from both landing in `main.rs::mirror_inactive_rotation` for
+/// the same inactive account at the same time, when that account's email
+/// happens to match Claude Code's own active identity. Without a lock here,
+/// two `security delete-generic-password` + `add-generic-password` pairs (or
+/// two atomic file writes, off-macOS) interleave on the exact same
+/// (service, account) slot: the last `add` wins non-deterministically and
+/// can clobber a still-valid grant with one already invalidated by the
+/// loser's own refresh POST, and a third reader can transiently observe the
+/// slot empty in the delete-to-add gap. Taking this mutex around every
+/// write AND read of that slot closes the window for in-process races
+/// (multiple usagio threads); it cannot exclude a genuinely separate
+/// process (the real `claude` CLI) from writing the same slot concurrently —
+/// that residual race is accepted and documented the same way the Codex
+/// `auth.json` CAS gap is (see `codex::oauth::active_refresh_cas`).
+static ACTIVE_SLOT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Constructor called from `providers::build()` behind the `claude` feature.
 pub fn new() -> Box<dyn Provider> {
@@ -341,6 +364,14 @@ impl Provider for ClaudeProvider {
     /// rotated token must NOT touch identity at all, only the token bytes.
     fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
         parse_claude_blob(blob)?;
+        // concurrency-01: serialize against every other in-process reader/
+        // writer of this same slot (see `ACTIVE_SLOT_LOCK`'s doc comment).
+        // Poisoning here would mean a prior holder panicked mid-write; still
+        // proceed rather than deadlock the whole credential path forever —
+        // recovering the guard is safe since the lock only protects
+        // interleaving of independent read/write syscalls, not any shared
+        // in-memory invariant.
+        let _guard = ACTIVE_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let to = if crate::platform::current().os_display_name() == "macOS" {
             "keychain:Claude Code-credentials"
         } else {
@@ -375,6 +406,10 @@ impl Provider for ClaudeProvider {
     /// the exact same slot `mirror_rotated_token` writes: macOS keychain, or
     /// the plaintext credentials file on Linux/Windows.
     fn read_active_slot(&self) -> PResult<Option<String>> {
+        // concurrency-01: same lock `mirror_rotated_token` takes, so an
+        // in-process reader can never observe the transient delete-then-add
+        // gap opened by an in-process writer.
+        let _guard = ACTIVE_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // On macOS `keychain_read` routes through `Platform::secrets().get()`
         // (`MacOsSecrets::get`), which already emits the structured
         // `event=keychain_read` line — no need to duplicate it here.
@@ -947,6 +982,77 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
             assert!(ClaudeProvider.mirror_rotated_token("{}").is_err());
+        });
+    }
+
+    /// concurrency-01 (v0.5.1 audit): two threads racing `mirror_rotated_token`
+    /// against the same slot must never panic, deadlock, or leave a
+    /// half-written / unparseable blob behind — `ACTIVE_SLOT_LOCK` serializes
+    /// every writer so the slot always ends up holding exactly one of the two
+    /// complete blobs, never a torn mix of both. This exercises the
+    /// off-macOS (plaintext file) path, which is what CI actually runs; the
+    /// same lock also guards the macOS keychain branch, just not exercised
+    /// here since headless CI has no Security.framework session (see the
+    /// sibling test above).
+    #[test]
+    fn mirror_rotated_token_survives_concurrent_writers_without_corruption() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let dir = _cfg.home();
+        crate::env_lock::scoped_env_var("HOME", Some(dir.to_str().unwrap()), || {
+            if crate::platform::current().os_display_name() == "macOS" {
+                // Keychain writes in a headless CI sandbox are unreliable
+                // for reasons unrelated to this lock; skip there, the
+                // off-macOS branch below still exercises the same lock.
+                return;
+            }
+            let blob_a = serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "at-a",
+                    "refreshToken": "rt-a",
+                    "expiresAt": Utc::now().timestamp_millis() + 3_600_000,
+                }
+            })
+            .to_string();
+            let blob_b = serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "at-b",
+                    "refreshToken": "rt-b",
+                    "expiresAt": Utc::now().timestamp_millis() + 3_600_000,
+                }
+            })
+            .to_string();
+
+            // `$HOME` is already set process-wide by the enclosing
+            // `scoped_env_var` call above and spawned threads inherit the
+            // process environment, so the threads below must NOT call
+            // `scoped_env_var` themselves — nesting it across threads while
+            // the outer call still holds `ENV_LOCK` (waiting on `join()`)
+            // would deadlock, per that helper's own non-reentrancy doc.
+            let ba = blob_a.clone();
+            let bb = blob_b.clone();
+            let t1 = std::thread::spawn(move || {
+                for _ in 0..20 {
+                    let _ = ClaudeProvider.mirror_rotated_token(&ba);
+                }
+            });
+            let t2 = std::thread::spawn(move || {
+                for _ in 0..20 {
+                    let _ = ClaudeProvider.mirror_rotated_token(&bb);
+                }
+            });
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            let path = dir.join(".claude").join(".credentials.json");
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            // Must be exactly one of the two complete, valid blobs — never a
+            // torn interleaving of both writers' bytes.
+            assert!(
+                on_disk == blob_a || on_disk == blob_b,
+                "final slot content was neither writer's complete blob: {on_disk}"
+            );
+            // And it must still parse as a valid Claude credential.
+            ClaudeProvider.parse_stored_blob(&on_disk).unwrap();
         });
     }
 }

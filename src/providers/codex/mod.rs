@@ -606,6 +606,15 @@ pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str)
     Ok(())
 }
 
+/// robustness-02 (v0.5.1 audit): a rename failure on Windows commonly means
+/// another process (the real `codex` CLI, opened without `FILE_SHARE_DELETE`)
+/// briefly holds `path` open — transient, so retry a few times with a short
+/// backoff before giving up.
+#[cfg(not(unix))]
+const WINDOWS_RENAME_RETRIES: u32 = 3;
+#[cfg(not(unix))]
+const WINDOWS_RENAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
 #[cfg(not(unix))]
 pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
     let dir = path
@@ -617,9 +626,30 @@ pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str)
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
-    fs_ctx(std::fs::write(&tmp_path, contents), "write", &tmp_path)?;
-    fs_ctx(std::fs::rename(&tmp_path, path), "rename", &tmp_path)?;
-    Ok(())
+    // robustness-02: clean up the tmp file (which holds the plaintext OAuth
+    // blob being switched in) on ANY failure between creating it and
+    // completing the rename, mirroring the unix impl above — previously a
+    // write or rename failure here left a secret-bearing orphan on disk
+    // forever.
+    if let Err(e) = fs_ctx(std::fs::write(&tmp_path, contents), "write", &tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    let mut attempt = 0;
+    loop {
+        match fs_ctx(std::fs::rename(&tmp_path, path), "rename", &tmp_path) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < WINDOWS_RENAME_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(WINDOWS_RENAME_RETRY_DELAY);
+                let _ = e; // retrying; only the final failure is surfaced
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        }
+    }
 }
 
 /// Decode a JWT and return its payload claims as a JSON map. Signature is not
@@ -869,6 +899,62 @@ mod tests {
             leftovers.is_empty(),
             "orphaned tmp file(s) left behind: {leftovers:?}"
         );
+    }
+
+    /// robustness-02 (v0.5.1 audit), Windows path: a rename failure must not
+    /// leak the secret-bearing tmp file, mirroring the unix test above.
+    /// Windows-only because the `#[cfg(not(unix))]` impl this exercises only
+    /// compiles there; CI runs this on the Windows runner.
+    #[test]
+    #[cfg(not(unix))]
+    fn write_auth_json_cleans_up_tmp_file_on_rename_failure_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        // Make the rename destination itself a non-empty directory so
+        // std::fs::rename(file -> dir) fails on every retry attempt too.
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keepme"), b"x").unwrap();
+
+        let result = write_auth_json_atomically(&target, r#"{"tokens":{"access_token":"at"}}"#);
+        assert!(result.is_err());
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".auth.json.tmp.")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "orphaned tmp file(s) left behind: {leftovers:?}"
+        );
+    }
+
+    /// robustness-02, Windows path: a transient rename failure that clears up
+    /// on its own (mirroring a vendor CLI briefly holding the file open)
+    /// must succeed via the retry loop rather than failing immediately.
+    #[test]
+    #[cfg(not(unix))]
+    fn write_auth_json_retries_transient_rename_failure_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        // Occupy the destination with a directory so the FIRST rename
+        // attempt fails, then remove it from a background thread shortly
+        // after so a later retry attempt succeeds.
+        std::fs::create_dir(&target).unwrap();
+        let target_clone = target.clone();
+        let remover = std::thread::spawn(move || {
+            std::thread::sleep(WINDOWS_RENAME_RETRY_DELAY);
+            let _ = std::fs::remove_dir(&target_clone);
+        });
+        let result = write_auth_json_atomically(&target, r#"{"tokens":{"access_token":"at"}}"#);
+        remover.join().unwrap();
+        assert!(result.is_ok(), "expected the retry to eventually succeed");
+        let on_disk = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(on_disk, r#"{"tokens":{"access_token":"at"}}"#);
     }
 
     #[test]

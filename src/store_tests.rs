@@ -883,3 +883,92 @@ fn save_state_safe_allows_explicit_provider_account_removal() {
         .find_provider_account("codex", "a@example.com")
         .is_none());
 }
+
+// --- robustness-05: v1 state.json duplicate-email dedup on load ------------
+
+#[test]
+fn from_value_dedups_duplicate_emails_keeping_the_newer_grant() {
+    let _g = ScopedConfigDir::new();
+    let v = serde_json::json!({
+        "accounts": [
+            {
+                "email": "dup@example.com",
+                "access_token": "old-at",
+                "refresh_token": "old-rt",
+                "expires_at": 1_000i64,
+                "keychain_blob": "{}",
+            },
+            {
+                "email": "dup@example.com",
+                "access_token": "new-at",
+                "refresh_token": "new-rt",
+                "expires_at": 2_000i64,
+                "keychain_blob": "{}",
+            },
+        ],
+    });
+    let s = State::from_value(&v);
+    assert_eq!(
+        s.accounts.len(),
+        1,
+        "the duplicate must be dropped, not kept"
+    );
+    let acct = s.find("dup@example.com").unwrap();
+    assert_eq!(acct.access_token, "new-at");
+    assert_eq!(acct.expires_at, 2_000);
+}
+
+#[test]
+fn from_value_dedup_is_case_insensitive_and_order_independent() {
+    let _g = ScopedConfigDir::new();
+    // Newer entry listed FIRST this time — dedup must not assume ordering.
+    let v = serde_json::json!({
+        "accounts": [
+            {
+                "email": "Dup@Example.com",
+                "access_token": "new-at",
+                "refresh_token": "new-rt",
+                "expires_at": 5_000i64,
+                "keychain_blob": "{}",
+            },
+            {
+                "email": "dup@example.com",
+                "access_token": "old-at",
+                "refresh_token": "old-rt",
+                "expires_at": 1_000i64,
+                "keychain_blob": "{}",
+            },
+        ],
+    });
+    let s = State::from_value(&v);
+    assert_eq!(s.accounts.len(), 1);
+    let acct = s.find("dup@example.com").unwrap();
+    assert_eq!(acct.access_token, "new-at");
+}
+
+#[test]
+fn from_value_keeps_distinct_accounts_untouched() {
+    let _g = ScopedConfigDir::new();
+    let v = serde_json::json!({
+        "accounts": [
+            {
+                "email": "a@example.com",
+                "access_token": "a-at",
+                "refresh_token": "a-rt",
+                "expires_at": 1_000i64,
+                "keychain_blob": "{}",
+            },
+            {
+                "email": "b@example.com",
+                "access_token": "b-at",
+                "refresh_token": "b-rt",
+                "expires_at": 1_000i64,
+                "keychain_blob": "{}",
+            },
+        ],
+    });
+    let s = State::from_value(&v);
+    assert_eq!(s.accounts.len(), 2);
+    assert!(s.find("a@example.com").is_some());
+    assert!(s.find("b@example.com").is_some());
+}
