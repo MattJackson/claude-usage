@@ -468,8 +468,13 @@ impl SecretStore for LinuxSecrets {
 /// - `glib::MainLoop` (used for `request_quit`) genuinely is `Send + Sync` —
 ///   GLib documents `g_main_loop_quit` as callable from any thread — so it's
 ///   stored directly as an `Arc<Mutex<Option<glib::MainLoop>>>` field.
+// ClickCb: factored-out signature for the tray's click-handler callback
+// slot. Keeps `LinuxMenu::click_cb` under clippy's type-complexity
+// threshold; mirror of `WindowsMenu`'s `ClickCb`.
+type ClickCb = Box<dyn Fn(&str) + Send + Sync + 'static>;
+
 pub struct LinuxMenu {
-    click_cb: Arc<Mutex<Option<Box<dyn Fn(&str) + Send + Sync + 'static>>>>,
+    click_cb: Arc<Mutex<Option<ClickCb>>>,
     main_loop: Arc<Mutex<Option<gtk::glib::MainLoop>>>,
     gtk_init: OnceLock<Result<(), String>>,
 }
@@ -494,6 +499,10 @@ impl LinuxMenu {
     }
 }
 
+/// The `Set*` naming is deliberate — each variant is a setter operation
+/// on the tray. Renaming to drop the shared prefix would only obscure
+/// the intent for clippy's benefit (mirror of `WindowsMenu`'s `UiCmd`).
+#[allow(clippy::enum_variant_names)]
 enum HandleMsg {
     SetIcon(Vec<u8>),
     SetTitle(String),
@@ -530,10 +539,16 @@ fn decode_png_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
     let bytes = &buf[..info.buffer_size()];
     let rgba = match info.color_type {
         png::ColorType::Rgba => bytes.to_vec(),
-        png::ColorType::Rgb => bytes
-            .chunks_exact(3)
-            .flat_map(|c| [c[0], c[1], c[2], 255])
-            .collect(),
+        png::ColorType::Rgb => {
+            // as_chunks::<3>() is what clippy prefers over chunks_exact(3);
+            // it returns a slice of fixed-size arrays so the compiler can
+            // elide the bounds check inside the closure below.
+            let (chunks, _rem) = bytes.as_chunks::<3>();
+            chunks
+                .iter()
+                .flat_map(|c| [c[0], c[1], c[2], 255])
+                .collect()
+        }
         other => {
             bail!("unsupported PNG color type for a tray/menu icon: {other:?} (need RGB or RGBA)")
         }

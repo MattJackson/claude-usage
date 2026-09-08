@@ -79,6 +79,16 @@ pub(crate) struct ProviderSection {
     provider_id: &'static str,
     display_name: &'static str,
     supports_switching: bool,
+    /// Gates the "Launch client" row (H3, v0.5.0 codeaudit). Independent of
+    /// `supports_switching` — a provider can have one wired without the
+    /// other; the row must not appear (and error on click) for a provider
+    /// whose `launch_client` is still the `Unsupported` trait default.
+    supports_launch: bool,
+    /// Gates the "Remove…" row (H3, v0.5.0 codeaudit). Defaults `true` for
+    /// every current provider — removing a captured account is a generic
+    /// state.json operation — but stays explicit so a provider needing extra
+    /// cleanup can opt out until that's wired.
+    supports_remove: bool,
     supports_usage: bool,
     severity_bands: SeverityBands,
     /// True when the provider's OAuth env-override is set on this process's
@@ -706,6 +716,8 @@ fn build_snapshot() -> Snapshot {
             provider_id: slug,
             display_name: provider.display_name(),
             supports_switching: caps.supports_switching,
+            supports_launch: caps.supports_launch,
+            supports_remove: caps.supports_remove,
             supports_usage: caps.supports_usage,
             severity_bands: provider.severity_bands(),
             env_override_active: env_override_for(slug),
@@ -1133,6 +1145,32 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     rows
 }
 
+/// Which optional rows `build_account_submenu` should append for `sec`'s
+/// account `a`. Pure over `ProviderSection`/`AcctView` fields, with no
+/// `muda`/`tray_icon` types involved, so this decision is unit-testable
+/// without a live main-thread `NSApplication` (a bare `muda::Menu` can only
+/// be constructed on the main thread, which `cargo test`'s worker threads
+/// aren't). H3, v0.5.0 codeaudit: `supports_switching` used to be the only
+/// gate consulted, for BOTH the Switch and Launch rows, and Remove had no
+/// gate at all.
+#[derive(Debug, PartialEq, Eq)]
+struct AccountSubmenuRows {
+    /// `Some(true)` → render "✓ Active" (this account is the active one).
+    /// `Some(false)` → render a clickable "Switch to this account" row.
+    /// `None` → the provider doesn't support switching; render neither.
+    switch_row: Option<bool>,
+    launch_row: bool,
+    remove_row: bool,
+}
+
+fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRows {
+    AccountSubmenuRows {
+        switch_row: sec.supports_switching.then_some(a.active),
+        launch_row: sec.supports_launch,
+        remove_row: sec.supports_remove,
+    }
+}
+
 /// Build one account's submenu inside a provider section. Splits Switch /
 /// reset-info / Launch / Remove; the pieces vary by capability so a
 /// reporting-only provider drops the Switch item and a no-usage provider
@@ -1140,10 +1178,12 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
 fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
     let head = main_row(sec.display_name, a, sec.severity_bands).plain;
     let sub = Submenu::with_id(format!("sub:{}:{}", sec.provider_id, a.key), head, true);
-    if sec.supports_switching {
-        if a.active {
+    let rows = account_submenu_rows(sec, a);
+    match rows.switch_row {
+        Some(true) => {
             let _ = sub.append(&MenuItem::with_id("noop", "✓ Active", false, None));
-        } else {
+        }
+        Some(false) => {
             let _ = sub.append(&MenuItem::with_id(
                 format!("switch:{}:{}", sec.provider_id, a.key),
                 "Switch to this account",
@@ -1151,6 +1191,7 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
                 None,
             ));
         }
+        None => {}
     }
     let _ = sub.append(&PredefinedMenuItem::separator());
     // v0.5.0 (item 3): these rows are informational, not disabled — enabled:
@@ -1201,11 +1242,14 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
         ));
     }
     let _ = sub.append(&PredefinedMenuItem::separator());
-    // "Launch" only exposed for providers that both switch and know how to
-    // spawn their client. The trait's default `launch_client` returns
-    // `Unsupported`, so a click on this for a stub provider surfaces a
-    // real error rather than doing nothing.
-    if sec.supports_switching {
+    // "Launch" is gated on `supports_launch`, NOT `supports_switching` (H3,
+    // v0.5.0 codeaudit): the two are independent — a provider can have
+    // `write_active_account` wired (switching) without `launch_client` wired
+    // (spawning the vendor CLI), and vice versa. Building this row off
+    // `supports_switching` used to expose a "Launch client" row for any
+    // switching-capable provider even when its `launch_client` was still the
+    // `Unsupported` trait default, so every click errored.
+    if rows.launch_row {
         let _ = sub.append(&MenuItem::with_id(
             format!("launch:{}:{}", sec.provider_id, a.key),
             "Launch client",
@@ -1213,12 +1257,20 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
             None,
         ));
     }
-    let _ = sub.append(&MenuItem::with_id(
-        format!("remove:{}:{}", sec.provider_id, a.key),
-        "Remove…",
-        true,
-        None,
-    ));
+    // "Remove…" is gated on `supports_remove` (H3, v0.5.0 codeaudit): the
+    // row used to be built unconditionally regardless of what the provider
+    // actually supports. Every current provider sets `supports_remove:
+    // true`, so this is not a behavior change today, but it stops a future
+    // provider that needs `supports_remove: false` from getting a row that
+    // silently does nothing useful.
+    if rows.remove_row {
+        let _ = sub.append(&MenuItem::with_id(
+            format!("remove:{}:{}", sec.provider_id, a.key),
+            "Remove…",
+            true,
+            None,
+        ));
+    }
     let _ = menu.append(&sub);
 }
 
@@ -1688,13 +1740,25 @@ fn handle_backup_save_with(dialog: &dyn crate::platform::FileDialog) {
 
 /// "Restore…" click: opens a native OPEN panel (via
 /// `Platform::file_dialog().pick_file(...)`) defaulting to the automatic
-/// rolling-backups directory, validates the
-/// chosen file is state-shaped, warns before a restore would drop accounts
-/// (a "downgrade"), then atomically replaces `state.json`. The rolling
-/// backups already snapshot the pre-restore state on every ordinary save, but
-/// we ALSO stash the live file to a `/tmp` sidecar right before overwriting
-/// it, so the restore itself is reversible even if the user picked a very old
-/// backup.
+/// rolling-backups directory, validates the chosen file is state-shaped,
+/// warns — by NAME, not just count — before a restore would drop accounts,
+/// then replaces `state.json` through the same `save_state_safe`
+/// drop-protection every other write goes through. The rolling backups
+/// already snapshot the pre-restore state on every ordinary save, but we
+/// ALSO stash the live file to `<config_dir>/backups/` right before
+/// overwriting it, so the restore itself is reversible even if the user
+/// picked a very old backup.
+///
+/// H2 (v0.5.0 codeaudit): this used to (1) stash the live state — full OAuth
+/// tokens, non-redacted — to a `/tmp` sidecar, a world-writable shared
+/// directory, and (2) bypass `save_state_safe`'s drop-protection guard and
+/// the cross-process state lock entirely, gating the write on nothing but an
+/// account *count* comparison (same-count-different-accounts sailed through
+/// with zero confirmation). Both are fixed here: the stash moves under
+/// `config_dir()/backups/` (owner-only permissions), and the whole
+/// read-confirm-write sequence runs under `with_state_lock` with the actual
+/// write routed through `store::save_state_restore` (a thin, explicitly-
+/// authorized wrapper around `save_state_safe`).
 fn handle_backup_restore_dialog() {
     handle_backup_restore_dialog_with(crate::platform().file_dialog());
 }
@@ -1729,48 +1793,36 @@ fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
             return;
         }
     };
-    let Some(new_accounts) = value.get("accounts").and_then(|a| a.as_array()) else {
+    if value.get("accounts").and_then(|a| a.as_array()).is_none() {
         notify("Restore failed: not a usagio state file (missing 'accounts')");
         return;
-    };
-    let new_count = new_accounts.len();
-    let old_count = State::load().unwrap_or_default().accounts.len();
-    if new_count < old_count {
-        let question = format!(
-            "Selected file has {new_count} account(s); current state has {old_count}. \
-             Restoring will drop {} account(s). Continue?",
-            old_count - new_count
-        );
-        if !confirm(&question) {
-            return;
+    }
+    let new_state = State::from_value(&value);
+
+    let outcome = with_state_lock(|| -> Result<bool> {
+        let dropped = crate::store::accounts_dropped_by(&new_state)?;
+        if !dropped.is_empty() && !confirm(&restore_drop_confirmation(&dropped)) {
+            return Ok(false); // user declined; not an error
         }
+        let dir = crate::store::config_dir()?;
+        crate::store::stash_pre_restore(&dir)?;
+        crate::store::save_state_restore(new_state.clone())?;
+        Ok(true)
+    });
+
+    match outcome {
+        Ok(true) => notify(&format!("Restored state from {}", path.display())),
+        Ok(false) => {} // user declined the drop confirmation; no-op
+        Err(e) => notify(&format!("Restore failed: {e}")),
     }
-    if let Err(e) = atomic_replace_state_bytes(&bytes) {
-        notify(&format!("Restore failed: {e}"));
-        return;
-    }
-    notify(&format!("Restored state from {}", path.display()));
 }
 
-/// Move the live `state.json` to a `pre-restore` sidecar under `/tmp` (best
-/// effort — a missing live file is not an error, there's simply nothing to
-/// preserve), then write `new_bytes` into place with mode 0600. Bypasses
-/// `State::save`'s overwrite-protection guard deliberately: THIS is the
-/// user-confirmed, explicit "replace everything" path that guard exists to
-/// gate everywhere else.
-fn atomic_replace_state_bytes(new_bytes: &[u8]) -> Result<(), String> {
-    let live = crate::store::state_json_path().map_err(|e| e.to_string())?;
-    if live.exists() {
-        let ts = chrono::Utc::now().timestamp();
-        let pre_restore =
-            std::path::PathBuf::from(format!("/tmp/usagio-state-pre-restore-{ts}.json"));
-        if std::fs::rename(&live, &pre_restore).is_err() {
-            std::fs::copy(&live, &pre_restore)
-                .and_then(|_| std::fs::remove_file(&live))
-                .map_err(|e| format!("while moving current state: {e}"))?;
-        }
-    }
-    crate::store::write_private(&live, new_bytes).map_err(|e| e.to_string())
+/// Build the confirmation question shown before a restore that would drop
+/// accounts. Names the specific dropped emails (H2, v0.5.0 codeaudit — the
+/// prior wording was "will drop 2 account(s)", which told the user nothing
+/// about *which* accounts they were about to lose).
+fn restore_drop_confirmation(dropped: &[String]) -> String {
+    format!("Restoring will drop {}. Continue?", dropped.join(", "))
 }
 
 /// "Refresh usage now" click (Settings ▸ Advanced ▸). Runs one poll +
@@ -1843,7 +1895,13 @@ fn switch_target_lock_countdown(st: &State, slug: &str, key: &str) -> Option<Str
 fn handle_switch(slug: &str, key: &str) {
     // v1 state only knows Claude accounts; a switch on any other slug can't
     // be persisted yet, so gate on Claude and route to the shared free
-    // function that already knows the v1 identity/keychain dance.
+    // function that already knows the v1 identity/keychain dance. This is
+    // belt-and-suspenders with `capabilities().supports_switching` (which
+    // already keeps the "Switch to this account" row from being built for a
+    // non-switching provider — see `build_account_submenu`, H3 in the
+    // v0.5.0 codeaudit): the click-id dispatch table is a single flat match
+    // in `handle_click`, so nothing stops a stray/future id shaped like
+    // `switch:<other-slug>:<key>` from reaching this function directly.
     if slug != CLAUDE_SLUG {
         notify(&format!("Switching is not yet supported for {slug}"));
         return;
@@ -2100,6 +2158,8 @@ mod tests {
                 display_name: "Claude",
                 supports_switching: true,
                 supports_usage: true,
+                supports_launch: true,
+                supports_remove: true,
                 severity_bands: bands(),
                 env_override_active: false,
                 accounts: vec![a],
@@ -2214,6 +2274,8 @@ mod tests {
             display_name: "Claude",
             supports_switching: true,
             supports_usage: true,
+            supports_launch: true,
+            supports_remove: true,
             severity_bands: bands(),
             env_override_active: false,
             accounts: vec![],
@@ -2367,6 +2429,8 @@ mod tests {
                     display_name: "Claude",
                     supports_switching: true,
                     supports_usage: true,
+                    supports_launch: true,
+                    supports_remove: true,
                     severity_bands: bands(),
                     env_override_active: false,
                     accounts: vec![a],
@@ -2376,6 +2440,8 @@ mod tests {
                     display_name: "Codex",
                     supports_switching: true,
                     supports_usage: true,
+                    supports_launch: true,
+                    supports_remove: true,
                     severity_bands: bands(),
                     env_override_active: false,
                     accounts: vec![b],
@@ -2415,6 +2481,8 @@ mod tests {
             providers::Capabilities {
                 supports_usage: self.supports_usage,
                 supports_switching: false,
+                supports_launch: false,
+                supports_remove: true,
                 supports_email_capture: false,
                 secret_backend: providers::SecretBackend::File,
                 capture_mode: self.capture_mode,
@@ -2674,6 +2742,8 @@ mod tests {
                 display_name: "Claude",
                 supports_switching: true,
                 supports_usage: true,
+                supports_launch: true,
+                supports_remove: true,
                 severity_bands: bands(),
                 env_override_active: false,
                 accounts: vec![active, inactive],
@@ -2717,6 +2787,111 @@ mod tests {
             snap.sections.is_empty(),
             "empty snapshot has no sections — a provider with zero rows must never emit one",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // H3 (v0.5.0 codeaudit) — capability-gated menu rows. `supports_switching`
+    // used to be the sole gate for BOTH the "Switch to this account" row AND
+    // the "Launch client" row, and "Remove…" had no gate at all. A provider
+    // like Codex (usage-only, no switching, no launch wired) would still get
+    // a "Launch client" row that always errored on click.
+    // -----------------------------------------------------------------------
+
+    fn section_with_caps(
+        supports_switching: bool,
+        supports_launch: bool,
+        supports_remove: bool,
+    ) -> ProviderSection {
+        ProviderSection {
+            provider_id: "codex",
+            display_name: "Codex",
+            supports_switching,
+            supports_launch,
+            supports_remove,
+            supports_usage: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![],
+        }
+    }
+
+    #[test]
+    fn submenu_rows_omit_launch_when_supports_launch_is_false() {
+        // Codex today: supports_switching == false AND supports_launch ==
+        // false. Neither the Switch nor the Launch row may appear.
+        let sec = section_with_caps(false, false, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        let rows = account_submenu_rows(&sec, &a);
+        assert_eq!(rows.switch_row, None, "no switch row: {rows:?}");
+        assert!(!rows.launch_row, "no launch row: {rows:?}");
+    }
+
+    #[test]
+    fn submenu_rows_can_omit_launch_even_when_switching_is_supported() {
+        // The two capabilities are independent: a provider could (in
+        // principle) support switching without a wired client launcher.
+        // supports_launch alone must gate the Launch row.
+        let sec = section_with_caps(true, false, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        let rows = account_submenu_rows(&sec, &a);
+        assert_eq!(
+            rows.switch_row,
+            Some(false),
+            "clickable switch row present: {rows:?}"
+        );
+        assert!(
+            !rows.launch_row,
+            "launch row absent even though switching is supported: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn submenu_rows_include_launch_when_supports_launch_is_true() {
+        let sec = section_with_caps(true, true, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        assert!(account_submenu_rows(&sec, &a).launch_row);
+    }
+
+    #[test]
+    fn submenu_rows_marks_active_account_instead_of_a_clickable_switch_row() {
+        let sec = section_with_caps(true, true, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), true);
+        assert_eq!(account_submenu_rows(&sec, &a).switch_row, Some(true));
+    }
+
+    #[test]
+    fn submenu_rows_omit_remove_when_supports_remove_is_false() {
+        let sec = section_with_caps(false, false, false);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        assert!(!account_submenu_rows(&sec, &a).remove_row);
+    }
+
+    #[test]
+    fn submenu_rows_include_remove_when_supports_remove_is_true() {
+        let sec = section_with_caps(false, false, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        assert!(account_submenu_rows(&sec, &a).remove_row);
+    }
+
+    #[test]
+    fn codex_capabilities_do_not_advertise_switching_or_launch() {
+        // Locks in the H3 downgrade at the real provider boundary (not just
+        // the ProviderSection fixture above): CodexProvider's actual
+        // capabilities() must not claim switching or launch support until
+        // state v2 gives it somewhere to persist a second account.
+        let caps = crate::providers::codex::CodexProvider.capabilities();
+        assert!(!caps.supports_switching);
+        assert!(!caps.supports_launch);
+        assert!(caps.supports_remove);
+    }
+
+    #[test]
+    fn claude_capabilities_advertise_launch_support() {
+        // Claude is the only provider with a wired `launch_client`.
+        let caps = crate::providers::claude::ClaudeProvider.capabilities();
+        assert!(caps.supports_switching);
+        assert!(caps.supports_launch);
+        assert!(caps.supports_remove);
     }
 
     #[test]
@@ -2974,23 +3149,103 @@ mod tests {
             default_name.starts_with("usagio-state-") && default_name.ends_with(".json"),
             "unexpected default file name: {default_name}"
         );
-        // default_dir mirrors dirs::download_dir() on this machine — just
-        // assert the call *passed through* whatever that returned, rather
-        // than hardcoding a path that doesn't exist in CI.
         assert_eq!(default_dir.as_deref(), dirs::download_dir().as_deref());
     }
 
     #[test]
     fn backup_restore_click_calls_file_dialog_pick_file_once() {
-        // handle_backup_restore_dialog_with probes state_json_path() (via
-        // crate::store::config_dir()) to default the panel to the backups
-        // dir if it exists — needs a ScopedConfigDir so that probe resolves
-        // to a tempdir instead of panicking on a missing HOME_OVERRIDE.
         let _g = crate::store::ScopedConfigDir::new();
         let dialog = crate::platform::MockFileDialog::default();
         handle_backup_restore_dialog_with(&dialog);
 
         let calls = dialog.pick_file_calls.borrow();
         assert_eq!(calls.len(), 1, "expected exactly one pick_file() call");
+    }
+
+    // -----------------------------------------------------------------------
+    // H2 (v0.5.0 codeaudit) — Restore… drop-confirmation wording + store-level
+    // wiring. `handle_backup_restore_dialog` itself opens a native file panel
+    // and shells out to osascript for confirmation, neither of which is
+    // unit-testable; these tests cover the pure logic it's built from.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn restore_drop_confirmation_names_dropped_emails_not_just_a_count() {
+        let msg = super::restore_drop_confirmation(&[
+            "dev@getbusbar.com".to_string(),
+            "matthew@pq.io".to_string(),
+        ]);
+        assert_eq!(
+            msg,
+            "Restoring will drop dev@getbusbar.com, matthew@pq.io. Continue?"
+        );
+    }
+
+    /// Minimal restore-test account.
+    fn restore_test_acct(email: &str) -> crate::store::Account {
+        let blob = serde_json::json!({
+            "claudeAiOauth": { "accessToken": "at", "refreshToken": "rt", "expiresAt": 0 }
+        })
+        .to_string();
+        let mut a = crate::store::Account::from_keychain_blob(&blob).unwrap();
+        a.email = Some(email.to_string());
+        a
+    }
+
+    #[test]
+    fn restore_that_only_adds_an_account_reports_no_drops() {
+        use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
+        let _g = ScopedConfigDir::new();
+        let mut current = State::default();
+        current.accounts.push(restore_test_acct("a@e.com"));
+        current.save().unwrap();
+
+        let mut restore_target = State::load().unwrap();
+        restore_target.accounts.push(restore_test_acct("b@e.com"));
+
+        let dropped = accounts_dropped_by(&restore_target).unwrap();
+        assert!(
+            dropped.is_empty(),
+            "adding an account must not be reported as a drop"
+        );
+    }
+
+    #[test]
+    fn restore_that_drops_an_account_reports_exactly_that_email() {
+        use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
+        let _g = ScopedConfigDir::new();
+        let mut current = State::default();
+        for email in ["dev@getbusbar.com", "matthew@pq.io"] {
+            current.accounts.push(restore_test_acct(email));
+        }
+        current.save().unwrap();
+
+        let mut restore_target = State::default();
+        restore_target
+            .accounts
+            .push(restore_test_acct("dev@getbusbar.com"));
+
+        let dropped = accounts_dropped_by(&restore_target).unwrap();
+        assert_eq!(dropped, vec!["matthew@pq.io".to_string()]);
+        assert_eq!(
+            restore_drop_confirmation(&dropped),
+            "Restoring will drop matthew@pq.io. Continue?"
+        );
+    }
+
+    #[test]
+    fn pre_restore_stash_lands_under_config_backups_not_tmp() {
+        use crate::store::{config_dir, stash_pre_restore, ScopedConfigDir, State};
+        let g = ScopedConfigDir::new();
+        let mut current = State::default();
+        current.accounts.push(restore_test_acct("a@e.com"));
+        current.save().unwrap();
+
+        let dir = config_dir().unwrap();
+        let stash = stash_pre_restore(&dir)
+            .unwrap()
+            .expect("live state existed");
+        assert!(stash.starts_with(g.home().join(".config/usagio/backups")));
+        assert!(!stash.starts_with("/tmp"));
     }
 }

@@ -877,6 +877,10 @@ fn mock_cellar_bundle_layout(
     (dir, bare_exe, bundle_exe)
 }
 
+// macOS-only: exercises the .app bundle path-resolution helper (Homebrew
+// Cellar layout) — no such concept on Linux/Windows. Uses cfg(unix)
+// which the strict-cfg guard leaves alone.
+#[cfg(unix)]
 #[test]
 fn sibling_app_bundle_exe_finds_bundle_next_to_bin_dir() {
     let (dir, bare_exe, bundle_exe) = mock_cellar_bundle_layout("usagio-bundle-test");
@@ -887,6 +891,7 @@ fn sibling_app_bundle_exe_finds_bundle_next_to_bin_dir() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn sibling_app_bundle_exe_none_when_bundle_absent() {
     let dir = std::env::temp_dir().join(format!(
@@ -914,6 +919,7 @@ fn sibling_app_bundle_exe_none_when_bundle_absent() {
 /// asserts the written LaunchAgent plist's `ProgramArguments` points at the
 /// bundle's `Contents/MacOS/usagio`, not the bare binary. This is what makes
 /// Login Items show the app icon instead of the generic "exec" glyph.
+#[cfg(unix)]
 #[test]
 fn usagio_install_prefers_app_bundle_path_when_available() {
     let (dir, bare_exe, bundle_exe) = mock_cellar_bundle_layout("usagio-install-bundle-test");

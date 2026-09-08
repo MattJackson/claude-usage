@@ -59,25 +59,26 @@ jobs:
         # --test-threads=1 required: several tests mutate process-global $HOME
         # to point at a tempdir via env_lock::scoped_env_var. Parallel runs
         # would race the lock across binaries. See M7 in the round-1 codeaudit.
+        #
+        # Includes `tests/strict_cfg.rs`, which enforces the "no scattered
+        # `#[cfg(target_os)]` outside src/platform/*" rule with a proper
+        # allowlist and comment-skipping logic (the previous naive shell
+        # `grep` version tripped on doc comments that mention the string
+        # `cfg(target_os = ...)` as example text — false positives).
         run: cargo test --tests --all-features -- --test-threads=1
 
-      # Windows-only: exercises the one #[ignore]d test with a REAL side
-      # effect — windows_autostart_writes_registry_key round-trips an actual
-      # HKCU\...\Run key (writes a usagio-platform-test-<pid> value, reads it
-      # back, then deletes it in the test body). Safe here because
-      # windows-latest runners are disposable per-job VMs. Closes the
-      # "compile-only" gap on the real registry-write path (gap 3 of the
-      # v0.5.0 CI matrix).
+      # Windows-only: exercises the #[ignore]d tests with REAL side effects
+      # — the registry-write autostart test writes a HKCU\...\Run value and
+      # cleans up in a Drop guard. Safe: windows-latest runners are
+      # disposable per-job VMs. Closes gap 3 of the v0.5.0 CI matrix.
       - name: cargo test --ignored (real HKCU registry write)
         if: matrix.os == 'windows-latest'
         run: cargo test --all-features -- --ignored --test-threads=1
 
       # Ubuntu-only GUI smoke test: proves the real tray backend actually
-      # initializes at runtime (GTK starts, libayatana-appindicator3 links
-      # and a tray_icon::TrayIcon can be built/mutated/dropped) rather than
-      # only compiling. xvfb-run supplies a virtual X server so this can run
-      # headless on the runner. See tests/integration_tray.rs for exactly
-      # what this does and doesn't prove.
+      # initializes at runtime (GTK starts, libayatana-appindicator3 links,
+      # tray_icon::TrayIcon can be built/mutated/dropped) — not just
+      # compiles. xvfb-run supplies a virtual X server for headless CI.
       - name: Install xvfb
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get install -y xvfb
@@ -87,12 +88,10 @@ jobs:
         run: xvfb-run --auto-servernum cargo test --test integration_tray --all-features -- --ignored --test-threads=1
 
       # Ubuntu-only: proves the Secret Service D-Bus path in LinuxSecrets
-      # actually works against a real daemon, not just the offline-file
-      # fallback every unit test exercises. `dbus-run-session` spins up a
-      # throwaway session bus and runs the wrapped command inside it;
-      # `gnome-keyring-daemon --unlock` with an empty stdin password creates
-      # an unlocked default keyring so the Secret Service calls succeed with
-      # no interactive prompt. See tests/integration_linux_secrets.rs.
+      # actually works against a real daemon (not just the offline-file
+      # fallback every unit test exercises). dbus-run-session spins up a
+      # throwaway session bus; gnome-keyring-daemon --unlock with an empty
+      # stdin password creates an unlocked default keyring.
       - name: Install Secret Service daemon deps
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get install -y gnome-keyring dbus-x11
@@ -108,20 +107,25 @@ jobs:
             cargo test --test integration_linux_secrets --all-features -- --ignored --test-threads=1
           '
 
-      # Cheap, Ubuntu-only lint: every `#[cfg(target_os = ...)]` (or the
-      # `cfg!(...)` macro form) outside src/platform/* is a scattered
-      # platform check that should instead be routed through the `Platform`
-      # trait (see src/platform/mod.rs). Runs once, not per-OS, since it's a
-      # text scan of the checked-out source and doesn't depend on the runner.
-      - name: strict-cfg lint (no scattered target_os checks)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          BAD=$(grep -rn 'cfg(target_os' src/ | grep -v '^src/platform/' || true)
-          if [ -n "$BAD" ]; then
-            echo "FAIL: cfg(target_os) found outside src/platform/. Route through the Platform trait."
-            echo "$BAD"
-            exit 1
-          fi
+      # H4 (v0.5.0 codeaudit): release.yml's macOS build job calls
+      # packaging/macos/generate-icns.sh, which shells out to `rsvg-convert`
+      # (from librsvg) and dies loudly if missing. release.yml didn't
+      # install it, so the FIRST v0.5.0 tag push would have failed after
+      # the build/package steps already ran — aborting the whole release
+      # (no artifacts, no tap bump). Running the script here on every
+      # push catches that class of regression immediately.
+      - name: Install librsvg for icon generation
+        if: matrix.os == 'macos-latest'
+        run: brew install librsvg
+
+      - name: Verify packaging/macos/generate-icns.sh runs end-to-end
+        if: matrix.os == 'macos-latest'
+        run: packaging/macos/generate-icns.sh
+
+      # (Redundant shell strict-cfg lint step removed — the Rust test
+      # `tests/strict_cfg.rs` covers this with a proper allowlist and
+      # comment-skipping logic; the shell grep version tripped on doc
+      # comments naming cfg(target_os = ...) as example text.)
 
   # Full lane — release build, only on the qa and main branches.
   build:

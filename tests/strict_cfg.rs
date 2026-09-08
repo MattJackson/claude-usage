@@ -37,16 +37,16 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // src/main.rs — icons module is macOS-only (bundled provider PNGs are
     // baked into the objc-driven menu; Linux/Windows use tray-icon's own
     // image path when their menubar wiring lands).
-    ("src/main.rs", 19),
+    ("src/main.rs", 28),
     // src/main.rs — menubar module is macOS-only until Linux/Windows
     // menubar wiring lands (v0.5.x). Their `Platform` impls exist; the
     // menu-render code paths still call macOS-native NSMenu attributedTitle
     // helpers straight-lined here rather than through the trait.
-    ("src/main.rs", 22),
+    ("src/main.rs", 31),
     // src/main.rs — the `menubar` CLI subcommand arm dispatches into the
     // macOS-only menubar module; must be cfg-gated to the same OS to
     // avoid a link-time symbol miss on other platforms.
-    ("src/main.rs", 204),
+    ("src/main.rs", 213),
 ];
 
 fn src_root() -> PathBuf {

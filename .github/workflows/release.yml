@@ -62,6 +62,16 @@ jobs:
             "target/aarch64-apple-darwin/release/${BIN}" \
             "target/x86_64-apple-darwin/release/${BIN}"
 
+      - name: Install librsvg for icon generation
+        # H4 (v0.5.0 codeaudit): packaging/macos/generate-icns.sh shells out
+        # to `rsvg-convert` (from librsvg) to rasterize the SVG source logo
+        # into the .icns iconset, and dies loudly if it's missing. Without
+        # this step, the very first v0.5.0 tag push would fail here — after
+        # the build + package steps above already ran — and the whole
+        # release job (including the GitHub Release publish and tap bump)
+        # would abort with nothing uploaded.
+        run: brew install librsvg
+
       - name: Build usagio.app bundle (for Login Items icon)
         # Wraps the universal binary from the previous step in a minimal
         # .app bundle so macOS's Login Items UI (System Settings > General >

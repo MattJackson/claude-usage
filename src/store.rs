@@ -576,6 +576,99 @@ pub fn save_state_safe(state: &State) -> Result<()> {
     Ok(())
 }
 
+/// Compute the account emails present in the on-disk `state.json` but absent
+/// from `new_state` — i.e. exactly what a restore to `new_state` would drop.
+/// Used by the Restore… dialog (`menubar::handle_backup_restore_dialog`) to
+/// build a confirmation that names the accounts, rather than just a bare
+/// count (H2, v0.5.0 codeaudit — "will drop 2 account(s)" told the user
+/// nothing about *which* two).
+pub fn accounts_dropped_by(new_state: &State) -> Result<Vec<String>> {
+    let path = state_path()?;
+    let old_bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).context("reading state.json"),
+    };
+    let v: serde_json::Value =
+        serde_json::from_slice(&old_bytes).context("state.json is corrupt")?;
+    let old = State::from_value(&v);
+    let new_keys: HashSet<String> = new_state
+        .accounts
+        .iter()
+        .map(|a| a.key().to_lowercase())
+        .collect();
+    Ok(old
+        .accounts
+        .iter()
+        .filter(|a| !new_keys.contains(&a.key().to_lowercase()))
+        .map(|a| a.key().to_string())
+        .collect())
+}
+
+/// Restore `state.json` from `new_state`, explicitly authorising any account
+/// drops relative to the current on-disk state before delegating to
+/// [`save_state_safe`]. The caller (the Restore… dialog) MUST already have
+/// confirmed those drops with the user — see [`accounts_dropped_by`] — this
+/// function's job is only to carry that authorization through the same
+/// drop-protection guard every other write goes through, rather than
+/// bypassing it. Callers MUST hold `credentials::with_state_lock` around
+/// this call (H2, v0.5.0 codeaudit: the prior restore path took no lock at
+/// all, racing the daemon poll / a concurrent CLI command).
+pub fn save_state_restore(mut new_state: State) -> Result<()> {
+    let dropped = accounts_dropped_by(&new_state).unwrap_or_default();
+    for email in dropped {
+        new_state.pending_removals.insert(email.to_lowercase());
+    }
+    save_state_safe(&new_state)
+}
+
+/// Stash the live `state.json` (if any) to
+/// `<config_dir>/backups/pre-restore-<unix_ts>.json` (owner-only: `0700` dir,
+/// `0600` file) ahead of a Restore… overwrite. Returns the stash path, or
+/// `None` if there was no live file to preserve.
+///
+/// H2 (v0.5.0 codeaudit): the prior implementation stashed to
+/// `/tmp/usagio-state-pre-restore-<ts>.json` — a world-writable shared
+/// directory with a default umask — which briefly exposed the full,
+/// non-redacted OAuth tokens (access/refresh/id_token) to any other local
+/// user. This mirrors the fix already applied to the "REFUSED save" dump
+/// path (see `save_state_safe`'s doc comment) but had not been applied here
+/// because this restore flow was written fresh for v0.5.0's "Restore…"
+/// dialog.
+pub fn stash_pre_restore(config_dir: &Path) -> Result<Option<PathBuf>> {
+    let live = state_path()?;
+    if !live.exists() {
+        return Ok(None);
+    }
+    let backups_dir = config_dir.join("backups");
+    ensure_dir_0700(&backups_dir).context("preparing backups directory")?;
+    let ts = chrono::Utc::now().timestamp();
+    let mut dst = backups_dir.join(format!("pre-restore-{ts}.json"));
+    let mut n: u32 = 1;
+    while dst.exists() {
+        dst = backups_dir.join(format!("pre-restore-{ts}-{n}.json"));
+        n += 1;
+    }
+    if std::fs::rename(&live, &dst).is_err() {
+        // Cross-filesystem rename (e.g. state.json and backups/ on different
+        // mounts): fall back to owner-only copy + remove-original.
+        let bytes =
+            std::fs::read(&live).context("reading live state.json for pre-restore stash")?;
+        write_private(&dst, &bytes).context("writing pre-restore stash")?;
+        std::fs::remove_file(&live).context("removing live state.json after stash")?;
+    } else {
+        // rename() preserves the source file's mode, which is already 0600
+        // (state.json is always written via write_private), but enforce it
+        // explicitly so this stash is never weaker than that guarantee.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(Some(dst))
+}
+
 /// Build a token-free serialisation of `state` suitable for a diagnostic
 /// dump when `save_state_safe` refuses a write. Preserves account keys,
 /// emails, `active`, and `pending_removals` so the developer can reason
@@ -732,7 +825,7 @@ pub fn state_json_path() -> Result<PathBuf> {
     state_path()
 }
 
-fn ensure_dir_0700(p: &Path) -> Result<()> {
+pub(crate) fn ensure_dir_0700(p: &Path) -> Result<()> {
     std::fs::create_dir_all(p).context("creating dir")?;
     // Best-effort, matching the prior `#[cfg(unix)]` behavior: a chmod
     // failure here shouldn't fail the caller, only the mkdir above should.

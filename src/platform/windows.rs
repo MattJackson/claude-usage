@@ -98,6 +98,11 @@ impl Platform for WindowsPlatform {
 /// Commands applied to the live `TrayIcon` from inside `run_event_loop`'s
 /// pump, on the thread that owns it. See the module doc for why this exists
 /// instead of touching `TrayIcon` directly from `MenuHandle` methods.
+///
+/// The `Set*` naming is deliberate — each variant is a setter operation on
+/// the tray. Renaming to drop the shared prefix would only obscure the
+/// intent for clippy's benefit.
+#[allow(clippy::enum_variant_names)]
 enum UiCmd {
     SetIcon(Vec<u8>),
     SetTitle(String),
@@ -122,11 +127,16 @@ struct TrayState {
 // thread only ever sends plain owned data through the `UiCmd` channel.
 unsafe impl Send for TrayState {}
 
+/// Type alias for the click-handler callback slot — factored out so the
+/// field type below stays under clippy's type-complexity threshold and
+/// so any future ClickCb-typed variable inherits the same signature.
+type ClickCb = Box<dyn Fn(&str) + Send + Sync + 'static>;
+
 pub struct WindowsMenu {
     tray_state: Mutex<Option<TrayState>>,
     cmd_rx: Mutex<Option<mpsc::Receiver<UiCmd>>>,
     cmd_tx: Mutex<Option<mpsc::Sender<UiCmd>>>,
-    click_cb: Arc<Mutex<Option<Box<dyn Fn(&str) + Send + Sync + 'static>>>>,
+    click_cb: Arc<Mutex<Option<ClickCb>>>,
     quit: Arc<AtomicBool>,
 }
 
@@ -236,7 +246,7 @@ fn build_native_menu(tree: &MenuTree) -> Result<Menu> {
 /// clicks / menu commands on the notification icon to turn into
 /// `TrayIconEvent`/`MenuEvent` channel entries at all.
 fn pump_windows_messages() {
-    use windows::Win32::UI::WindowsAndMessaging::{
+    use ::windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
     };
     let mut msg = MSG::default();
