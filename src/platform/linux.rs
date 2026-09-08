@@ -173,6 +173,57 @@ fn desktop_exec_quote(s: &str) -> String {
     out
 }
 
+/// Inverse of `desktop_exec_quote`: split a freedesktop `Exec=` value back
+/// into its whitespace-separated tokens, honoring double-quoted spans (and
+/// their `\"`, `\\`, `` \` ``, `\$` escapes) the way `install()` wrote them —
+/// so a path with a space (e.g. `"/home/user/My Apps/usagio"`) round-trips as
+/// ONE token instead of splitting on the internal space (platform-01, v0.5.2
+/// audit). Whitespace outside quotes always separates tokens; quoted spans
+/// may appear mid-token (`foo"bar baz"qux` -> `foobar bazqux`) though
+/// `desktop_exec_quote` itself never produces that shape — this just doesn't
+/// assume otherwise.
+fn desktop_exec_split(line: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut tok = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() {
+                break;
+            }
+            if c == '"' {
+                chars.next(); // consume opening quote
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(next) if matches!(next, '"' | '\\' | '`' | '$') => tok.push(next),
+                            Some(next) => {
+                                tok.push('\\');
+                                tok.push(next);
+                            }
+                            None => bail!("unterminated escape in Exec= line: {line:?}"),
+                        },
+                        Some(other) => tok.push(other),
+                        None => bail!("unterminated quote in Exec= line: {line:?}"),
+                    }
+                }
+            } else {
+                chars.next();
+                tok.push(c);
+            }
+        }
+        tokens.push(tok);
+    }
+    Ok(tokens)
+}
+
 impl Autostart for LinuxAutostart {
     fn install(&self, label: &str, binary: &Path, args: &[&str]) -> Result<()> {
         let _ = label; // filename is fixed — see AUTOSTART_DESKTOP_FILE.
@@ -237,19 +288,24 @@ impl Autostart for LinuxAutostart {
             .lines()
             .find_map(|l| l.strip_prefix("Exec="))
             .context("usagio.desktop has no Exec= line")?;
-        let mut parts = exec_line.split_whitespace();
+        // platform-01 (v0.5.2 audit): quote-aware split, matching the
+        // quote-aware writer (`desktop_exec_quote`) `install()` used to
+        // produce this line. `split_whitespace()` used to break a quoted
+        // path containing a space (e.g. `"/home/user/My Apps/usagio"`) into
+        // two bogus tokens.
+        let mut parts = desktop_exec_split(exec_line)?.into_iter();
         let bin = parts.next().context("Exec= line is empty")?;
-        let rest: Vec<&str> = parts.collect();
+        let rest: Vec<String> = parts.collect();
 
-        let bin_name = Path::new(bin)
+        let bin_name = Path::new(&bin)
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or(bin);
+            .unwrap_or(&bin);
         // Best-effort: absence of `pkill`, or nothing running, is fine.
         let _ = Command::new("pkill").args(["-f", bin_name]).status();
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        Command::new(bin)
+        Command::new(&bin)
             .args(&rest)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -966,6 +1022,62 @@ mod tests {
             "\"/path with spaces/usagio\""
         );
         assert_eq!(desktop_exec_quote("has\"quote"), "\"has\\\"quote\"");
+    }
+
+    // --- Exec= quote-aware split (platform-01, v0.5.2 audit) --------------
+
+    #[test]
+    fn desktop_exec_split_round_trips_path_with_spaces() {
+        let line = format!(
+            "{} menubar",
+            desktop_exec_quote("/home/user/My Apps/usagio")
+        );
+        let tokens = desktop_exec_split(&line).unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                "/home/user/My Apps/usagio".to_string(),
+                "menubar".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn desktop_exec_split_handles_plain_unquoted_line() {
+        let tokens = desktop_exec_split("/usr/local/bin/usagio menubar").unwrap();
+        assert_eq!(
+            tokens,
+            vec!["/usr/local/bin/usagio".to_string(), "menubar".to_string()]
+        );
+    }
+
+    #[test]
+    fn desktop_exec_split_unescapes_quoted_special_chars() {
+        let quoted = desktop_exec_quote("has\"quote");
+        let tokens = desktop_exec_split(&quoted).unwrap();
+        assert_eq!(tokens, vec!["has\"quote".to_string()]);
+    }
+
+    #[test]
+    fn desktop_exec_split_install_write_round_trips_through_restart_parse() {
+        // End-to-end: whatever `install()` would write for a spacey binary
+        // path + args, `desktop_exec_split` must parse back into the exact
+        // (bin, args) pair `restart()` needs.
+        let mut exec = desktop_exec_quote("/home/user/My Apps/usagio");
+        for a in ["menubar"] {
+            exec.push(' ');
+            exec.push_str(&desktop_exec_quote(a));
+        }
+        let mut tokens = desktop_exec_split(&exec).unwrap().into_iter();
+        let bin = tokens.next().unwrap();
+        let rest: Vec<String> = tokens.collect();
+        assert_eq!(bin, "/home/user/My Apps/usagio");
+        assert_eq!(rest, vec!["menubar".to_string()]);
+    }
+
+    #[test]
+    fn desktop_exec_split_errors_on_unterminated_quote() {
+        assert!(desktop_exec_split("\"/no/closing/quote menubar").is_err());
     }
 
     // --- Secrets: offline fallback ---------------------------------------
