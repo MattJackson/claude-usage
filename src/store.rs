@@ -201,13 +201,132 @@ impl Account {
     }
 }
 
+/// One captured account for a non-Claude provider (currently just Codex).
+/// Unlike [`Account`] (Claude's keychain-shaped record with its dedicated
+/// `~/.claude.json` identity fields), this is the generic shape every future
+/// `CredsOnDisk` provider can reuse without a parallel struct: `secret_blob`
+/// is the provider's *entire* on-disk credential blob verbatim (Codex's full
+/// `auth.json` contents), so writing it back via
+/// `Provider::write_active_account` always reproduces exactly what a real
+/// login would have produced. `access_token`/`refresh_token`/`expires_at`
+/// mirror the blob's tokens for refresh math, exactly like `Account` does for
+/// Claude.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAccount {
+    /// The provider's own identifier for this account (email, or a UUID/hash
+    /// fallback — see `Provider::account_identifier`).
+    pub key: String,
+    /// Verbatim provider credential blob (e.g. Codex's `auth.json` bytes).
+    pub secret_blob: String,
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: String,
+    /// Unix epoch SECONDS when the access token expires. (Note: `Account`
+    /// above uses epoch MILLIS for Claude's keychain shape — this field uses
+    /// SECONDS, matching `TokenGrant::expires_in_secs` math used to compute
+    /// it. Callers must not mix the two units across account types.)
+    #[serde(default)]
+    pub expires_at: i64,
+    #[serde(default)]
+    pub identity_email: Option<String>,
+    #[serde(default)]
+    pub identity_uuid: Option<String>,
+    #[serde(default)]
+    pub identity_display_name: Option<String>,
+    #[serde(default)]
+    pub identity_native_blob: serde_json::Value,
+    #[serde(default)]
+    pub cached_usage: Option<CachedUsage>,
+    #[serde(default)]
+    pub notif_state: crate::notifications::NotifState,
+    #[serde(default)]
+    pub needs_relogin: bool,
+}
+
+impl ProviderAccount {
+    /// Rebuild the `IdentitySnapshot` this account was captured with, for
+    /// callers that need to hand it back to `Provider::write_active_account`.
+    pub fn identity_snapshot(&self) -> crate::providers::trait_def::IdentitySnapshot {
+        crate::providers::trait_def::IdentitySnapshot {
+            email: self.identity_email.clone(),
+            uuid: self.identity_uuid.clone(),
+            display_name: self.identity_display_name.clone(),
+            native_blob: self.identity_native_blob.clone(),
+        }
+    }
+}
+
+/// One non-Claude provider's multi-account slot: every captured account plus
+/// which one is currently written to the provider's on-disk credential file.
+/// This is state v2's answer to the gap documented in `providers::codex::mod`'s
+/// module doc (H3, v0.5.0 codeaudit) — before this, v1 `State` had nowhere to
+/// persist a *second* Codex account to switch to.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ProviderAccounts {
+    #[serde(default)]
+    pub accounts: Vec<ProviderAccount>,
+    /// Key of the account currently written to this provider's active
+    /// credential slot, if known.
+    #[serde(default)]
+    pub active: Option<String>,
+}
+
+impl ProviderAccounts {
+    pub fn find(&self, key: &str) -> Option<&ProviderAccount> {
+        self.accounts
+            .iter()
+            .find(|a| a.key.eq_ignore_ascii_case(key))
+    }
+
+    pub fn find_mut(&mut self, key: &str) -> Option<&mut ProviderAccount> {
+        self.accounts
+            .iter_mut()
+            .find(|a| a.key.eq_ignore_ascii_case(key))
+    }
+
+    pub fn upsert(&mut self, acct: ProviderAccount) {
+        if let Some(existing) = self.find_mut(&acct.key) {
+            *existing = acct;
+        } else {
+            self.accounts.push(acct);
+        }
+    }
+}
+
+/// Current on-disk `state.json` schema version. Bumped to 2 for the
+/// per-provider multi-account slot (`State::providers`) added alongside
+/// Codex switching. `State::from_value` accepts any version at or below this
+/// (an absent/older `schema_version` is v1 — the flat Claude-only shape) and
+/// always upgrades the in-memory result to this version. No on-disk migration
+/// step is required beyond that: every v2 field is `#[serde(default)]` and
+/// purely additive, so a v1 file loads as-is with an empty `providers` map,
+/// and the next `save()` simply starts writing `schema_version: 2` and (once
+/// populated) `providers`, alongside the unchanged `accounts`/`active`
+/// fields. Existing v1 `state.json` files therefore continue to load with
+/// nothing lost — see `store_tests::v1_state_json_loads_and_upgrades_to_v2`
+/// for the fixture that pins this contract.
+pub const STATE_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct State {
+    /// Schema version this in-memory `State` represents. Always
+    /// [`STATE_SCHEMA_VERSION`] once loaded via `State::load`/`from_value` —
+    /// see that constant's doc for the v1→v2 migration story.
+    #[serde(default)]
+    pub schema_version: u32,
     #[serde(default)]
     pub accounts: Vec<Account>,
     /// Email of the account currently written to the keychain, if known.
     #[serde(default)]
     pub active: Option<String>,
+    /// Per-provider multi-account slots for every non-Claude provider that
+    /// supports switching (currently just `codex`), keyed by
+    /// `Provider::provider_id`. Claude keeps its dedicated `accounts`/`active`
+    /// fields above (unchanged) rather than moving into this map, so a v1
+    /// `state.json` needs no data migration at all — this map is simply empty
+    /// until a non-Claude account is captured.
+    #[serde(default)]
+    pub providers: std::collections::HashMap<String, ProviderAccounts>,
     /// Menu-bar: auto-swap is on unless this is set (defaults to enabled).
     #[serde(default)]
     pub autoswap_disabled: bool,
@@ -229,6 +348,12 @@ pub struct State {
     /// being in this set) causes the save to be refused.
     #[serde(skip)]
     pub(crate) pending_removals: HashSet<String>,
+    /// Like `pending_removals`, but for provider-account keys: `(provider
+    /// slug lowercased, account key lowercased)`. Authorises
+    /// `remove_provider_account`'s drops the same way `pending_removals`
+    /// authorises `remove`'s.
+    #[serde(skip)]
+    pub(crate) pending_provider_removals: HashSet<(String, String)>,
 }
 
 /// Per-app config directory. Delegates to the platform Paths backend so the
@@ -365,9 +490,42 @@ impl State {
             }
         });
 
+        // v1→v2 migration: a missing/absent `schema_version` means this file
+        // predates `State::providers` entirely. Nothing to move — Claude
+        // accounts already live in `accounts` above, unchanged — so the
+        // "migration" is simply defaulting `providers` to empty and always
+        // reporting the in-memory result as the current schema version (see
+        // `STATE_SCHEMA_VERSION`'s doc). Deliberately no logging here:
+        // `from_value` is a pure parsing function called from contexts (e.g.
+        // `providers::state`'s own v1 migration tests) that never set up a
+        // `HOME_OVERRIDE`, and `logging::log` resolves `config_dir()`, which
+        // panics under `cfg(test)` without one.
+        let providers: std::collections::HashMap<String, ProviderAccounts> = v
+            .get("providers")
+            .and_then(|p| p.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(slug, val)| {
+                        match serde_json::from_value::<ProviderAccounts>(val.clone()) {
+                            Ok(pa) => Some((slug.clone(), pa)),
+                            Err(e) => {
+                                crate::logging::log(&format!(
+                                    "warn: failed to parse providers.{slug} in state.json, \
+                                     dropping that provider's accounts: {e}"
+                                ));
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         State {
+            schema_version: STATE_SCHEMA_VERSION,
             accounts,
             active,
+            providers,
             autoswap_disabled: v
                 .get("autoswap_disabled")
                 .and_then(|x| x.as_bool())
@@ -386,6 +544,7 @@ impl State {
                 })
                 .unwrap_or_default(),
             pending_removals: HashSet::new(),
+            pending_provider_removals: HashSet::new(),
         }
     }
 
@@ -478,6 +637,65 @@ impl State {
         }
         changed
     }
+
+    // -----------------------------------------------------------------
+    // Per-provider (non-Claude) account slots — state v2.
+    // -----------------------------------------------------------------
+
+    /// Read-only view of `slug`'s multi-account slot, or `None` if nothing has
+    /// ever been captured for that provider.
+    pub fn provider_accounts(&self, slug: &str) -> Option<&ProviderAccounts> {
+        self.providers.get(slug)
+    }
+
+    /// Mutable view of `slug`'s multi-account slot, creating an empty one if
+    /// this is the first account ever captured for that provider.
+    pub fn provider_accounts_mut(&mut self, slug: &str) -> &mut ProviderAccounts {
+        self.providers.entry(slug.to_string()).or_default()
+    }
+
+    /// Look up one account within `slug`'s slot by key (case-insensitive).
+    pub fn find_provider_account(&self, slug: &str, key: &str) -> Option<&ProviderAccount> {
+        self.providers.get(slug)?.find(key)
+    }
+
+    pub fn find_provider_account_mut(
+        &mut self,
+        slug: &str,
+        key: &str,
+    ) -> Option<&mut ProviderAccount> {
+        self.providers.get_mut(slug)?.find_mut(key)
+    }
+
+    /// Insert or replace an account within `slug`'s slot, keyed on
+    /// `acct.key`.
+    pub fn upsert_provider_account(&mut self, slug: &str, acct: ProviderAccount) {
+        self.provider_accounts_mut(slug).upsert(acct);
+    }
+
+    /// Drop `key` from `slug`'s slot AND authorise the drop for the next
+    /// `save()` (mirrors `remove()`'s `pending_removals` contract, scoped to
+    /// provider accounts).
+    pub fn remove_provider_account(&mut self, slug: &str, key: &str) -> bool {
+        let Some(pa) = self.providers.get_mut(slug) else {
+            return false;
+        };
+        let before = pa.accounts.len();
+        pa.accounts.retain(|a| !a.key.eq_ignore_ascii_case(key));
+        let changed = pa.accounts.len() != before;
+        if changed {
+            if pa
+                .active
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(key))
+            {
+                pa.active = None;
+            }
+            self.pending_provider_removals
+                .insert((slug.to_lowercase(), key.to_lowercase()));
+        }
+        changed
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -522,7 +740,32 @@ pub fn save_state_safe(state: &State) -> Result<()> {
                 .map(|a| a.key().to_lowercase())
                 .filter(|k| !new_keys.contains(k) && !state.pending_removals.contains(k))
                 .collect();
-            if !unauthorized.is_empty() {
+            // Same guard, scoped to each non-Claude provider's slot: a
+            // provider-account key present on disk but missing from the
+            // in-memory state (without an explicit `remove_provider_account`
+            // authorization) is refused for the same reason a Claude account
+            // drop is — a stale/blank load must never silently wipe a
+            // captured account.
+            let mut unauthorized_provider: Vec<String> = Vec::new();
+            for (slug, old_pa) in &old.providers {
+                let new_keys_for_slug: HashSet<String> = state
+                    .providers
+                    .get(slug)
+                    .map(|pa| pa.accounts.iter().map(|a| a.key.to_lowercase()).collect())
+                    .unwrap_or_default();
+                for a in &old_pa.accounts {
+                    let k = a.key.to_lowercase();
+                    let slug_lc = slug.to_lowercase();
+                    if !new_keys_for_slug.contains(&k)
+                        && !state
+                            .pending_provider_removals
+                            .contains(&(slug_lc.clone(), k.clone()))
+                    {
+                        unauthorized_provider.push(format!("{slug}:{}", a.key));
+                    }
+                }
+            }
+            if !unauthorized.is_empty() || !unauthorized_provider.is_empty() {
                 // Dump a REDACTED diagnostic (account keys/emails only, no
                 // tokens) into config_dir/backups/ with owner-only permissions.
                 // The old path wrote plaintext OAuth tokens to /tmp (shared,
@@ -549,11 +792,14 @@ pub fn save_state_safe(state: &State) -> Result<()> {
                 // (prune_backups matches both `state-*` prefixes).
                 let _ = prune_rejected_dumps(&backups_dir, BACKUP_KEEP_COUNT);
                 let msg = format!(
-                    "REFUSED save_state: would drop {} account(s) without an explicit \
-                     remove(): {:?}. Redacted (token-free) diagnostic written to {}. \
-                     On-disk state.json is UNCHANGED.",
+                    "REFUSED save_state: would drop {} claude account(s) without an explicit \
+                     remove(): {:?}, and {} provider account(s) without an explicit \
+                     remove_provider_account(): {:?}. Redacted (token-free) diagnostic written \
+                     to {}. On-disk state.json is UNCHANGED.",
                     unauthorized.len(),
                     unauthorized,
+                    unauthorized_provider.len(),
+                    unauthorized_provider,
                     dump_path.display(),
                 );
                 crate::logging::log(&msg);
@@ -605,12 +851,27 @@ pub fn accounts_dropped_by(new_state: &State) -> Result<Vec<String>> {
         .iter()
         .map(|a| a.key().to_lowercase())
         .collect();
-    Ok(old
+    let mut dropped: Vec<String> = old
         .accounts
         .iter()
         .filter(|a| !new_keys.contains(&a.key().to_lowercase()))
         .map(|a| a.key().to_string())
-        .collect())
+        .collect();
+    // Provider-account drops are reported as "<slug>:<key>" so the caller can
+    // distinguish them from Claude emails in the confirmation dialog.
+    for (slug, old_pa) in &old.providers {
+        let new_keys_for_slug: HashSet<String> = new_state
+            .providers
+            .get(slug)
+            .map(|pa| pa.accounts.iter().map(|a| a.key.to_lowercase()).collect())
+            .unwrap_or_default();
+        for a in &old_pa.accounts {
+            if !new_keys_for_slug.contains(&a.key.to_lowercase()) {
+                dropped.push(format!("{slug}:{}", a.key));
+            }
+        }
+    }
+    Ok(dropped)
 }
 
 /// Restore `state.json` from `new_state`, explicitly authorising any account
@@ -624,8 +885,21 @@ pub fn accounts_dropped_by(new_state: &State) -> Result<Vec<String>> {
 /// all, racing the daemon poll / a concurrent CLI command).
 pub fn save_state_restore(mut new_state: State) -> Result<()> {
     let dropped = accounts_dropped_by(&new_state).unwrap_or_default();
-    for email in dropped {
-        new_state.pending_removals.insert(email.to_lowercase());
+    for entry in dropped {
+        // `accounts_dropped_by` reports provider-account drops as
+        // "<slug>:<key>" (see its doc) — route those into
+        // `pending_provider_removals` instead of `pending_removals` so both
+        // guards in `save_state_safe` see their matching authorization.
+        match entry.split_once(':') {
+            Some((slug, key)) if new_state.providers.contains_key(slug) => {
+                new_state
+                    .pending_provider_removals
+                    .insert((slug.to_lowercase(), key.to_lowercase()));
+            }
+            _ => {
+                new_state.pending_removals.insert(entry.to_lowercase());
+            }
+        }
     }
     save_state_safe(&new_state)
 }
@@ -698,12 +972,44 @@ pub(crate) fn redact_state_for_dump(state: &State) -> serde_json::Value {
             })
         })
         .collect();
+    let providers: serde_json::Value = state
+        .providers
+        .iter()
+        .map(|(slug, pa)| {
+            let accts: Vec<serde_json::Value> = pa
+                .accounts
+                .iter()
+                .map(|a| {
+                    serde_json::json!({
+                        "key": a.key,
+                        "expires_at": a.expires_at,
+                        "secret_blob": "<redacted>",
+                        "access_token": "<redacted>",
+                        "refresh_token": "<redacted>",
+                        "identity_email": a.identity_email,
+                        "needs_relogin": a.needs_relogin,
+                    })
+                })
+                .collect();
+            (
+                slug.clone(),
+                serde_json::json!({ "accounts": accts, "active": pa.active }),
+            )
+        })
+        .collect();
     serde_json::json!({
+        "schema_version": state.schema_version,
         "accounts": accounts,
         "active": state.active,
+        "providers": providers,
         "autoswap_disabled": state.autoswap_disabled,
         "trigger_pct": state.trigger_pct,
         "pending_removals": state.pending_removals.iter().collect::<Vec<_>>(),
+        "pending_provider_removals": state
+            .pending_provider_removals
+            .iter()
+            .map(|(s, k)| format!("{s}:{k}"))
+            .collect::<Vec<_>>(),
     })
 }
 

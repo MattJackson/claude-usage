@@ -1430,6 +1430,264 @@ fn spawn_mock_token_server() -> (String, std::sync::Arc<std::sync::atomic::Atomi
     (format!("http://{addr}"), hits)
 }
 
+// ---------------------------------------------------------------------------
+// codex-switch-e2e: generic (non-Claude) capture / switch / CAS dispatch.
+// Every test below uses `ScopedConfigDir` (state.json → tempdir) and
+// `env_lock::scoped_env_var("CODEX_HOME", ...)` (auth.json → tempdir), so
+// none of them ever touch a real `~/.codex/auth.json` or the real OS
+// keychain — consistent with the crate-wide test-hermeticity contract.
+// ---------------------------------------------------------------------------
+
+fn codex_id_token(email: &str, exp: i64) -> String {
+    use base64::Engine;
+    let hdr = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::json!({ "email": email, "exp": exp })
+            .to_string()
+            .as_bytes(),
+    );
+    format!("{hdr}.{payload}.sig")
+}
+
+/// A full Codex `auth.json` blob for `email`, expiring at `exp` (unix
+/// seconds). Mirrors `providers::codex::mod::tests::make_blob`, duplicated
+/// here rather than imported since it's `#[cfg(test)]`-private to that
+/// module and this file's edit scope doesn't include changing that.
+fn codex_auth_json(email: &str, exp: i64, access: &str, refresh: &str) -> String {
+    let id_token = codex_id_token(email, exp);
+    serde_json::json!({
+        "tokens": {
+            "id_token": id_token,
+            "access_token": access,
+            "refresh_token": refresh,
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn capture_current_generic_persists_a_codex_account_into_state_v2() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let blob = codex_auth_json("codex-user@example.com", 4_000_000_000, "at1", "rt1");
+        std::fs::write(dir.path().join("auth.json"), &blob).unwrap();
+
+        let (key, existed) = capture_current_generic("codex").expect("capture must succeed");
+        assert_eq!(key, "codex-user@example.com");
+        assert!(
+            !existed,
+            "first capture of this account must report existed=false"
+        );
+
+        let state = State::load().unwrap();
+        let acct = state
+            .find_provider_account("codex", "codex-user@example.com")
+            .expect("captured account must be persisted");
+        assert_eq!(acct.access_token, "at1");
+        assert_eq!(acct.refresh_token, "rt1");
+        assert_eq!(acct.secret_blob, blob);
+        assert_eq!(
+            state.provider_accounts("codex").unwrap().active.as_deref(),
+            Some("codex-user@example.com"),
+            "capture must also become the active account for its provider"
+        );
+
+        // Re-capturing the same account (same auth.json) reports existed=true
+        // and doesn't lose the identity.
+        let (key2, existed2) = capture_current_generic("codex").unwrap();
+        assert_eq!(key2, "codex-user@example.com");
+        assert!(existed2);
+    });
+}
+
+#[test]
+fn switch_to_provider_account_writes_auth_json_and_updates_active() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        // Capture two accounts (A then B) so B ends up active, then switch
+        // back to A and confirm auth.json + state.providers["codex"].active
+        // both flip.
+        let blob_a = codex_auth_json("a@example.com", 4_000_000_000, "at-a", "rt-a");
+        std::fs::write(dir.path().join("auth.json"), &blob_a).unwrap();
+        capture_current_generic("codex").unwrap();
+
+        let blob_b = codex_auth_json("b@example.com", 4_000_000_000, "at-b", "rt-b");
+        std::fs::write(dir.path().join("auth.json"), &blob_b).unwrap();
+        capture_current_generic("codex").unwrap();
+
+        let label = switch_to_provider_account("codex", "a@example.com").unwrap();
+        assert_eq!(label, "a@example.com");
+
+        let on_disk = std::fs::read_to_string(dir.path().join("auth.json")).unwrap();
+        assert_eq!(on_disk, blob_a, "auth.json must now hold account A's blob");
+
+        let state = State::load().unwrap();
+        assert_eq!(
+            state.provider_accounts("codex").unwrap().active.as_deref(),
+            Some("a@example.com")
+        );
+        // Both accounts are still there — switching must not drop B.
+        assert!(state
+            .find_provider_account("codex", "b@example.com")
+            .is_some());
+    });
+}
+
+#[test]
+fn switch_to_provider_account_errors_for_unknown_key() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let err = switch_to_provider_account("codex", "nobody@example.com").unwrap_err();
+        assert!(format!("{err}").contains("no codex account matches"));
+    });
+}
+
+#[test]
+fn resolve_provider_selector_matches_exact_and_unique_prefix() {
+    let mut state = State::default();
+    state.upsert_provider_account(
+        "codex",
+        crate::store::ProviderAccount {
+            key: "dev@example.com".into(),
+            secret_blob: "{}".into(),
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            expires_at: 0,
+            identity_email: Some("dev@example.com".into()),
+            identity_uuid: None,
+            identity_display_name: None,
+            identity_native_blob: serde_json::Value::Null,
+            cached_usage: None,
+            notif_state: Default::default(),
+            needs_relogin: false,
+        },
+    );
+
+    assert_eq!(
+        resolve_provider_selector(&state, "dev@example.com"),
+        Some(("codex".to_string(), "dev@example.com".to_string()))
+    );
+    assert_eq!(
+        resolve_provider_selector(&state, "dev"),
+        Some(("codex".to_string(), "dev@example.com".to_string()))
+    );
+    assert_eq!(resolve_provider_selector(&state, "nobody"), None);
+}
+
+#[test]
+fn refresh_provider_active_account_noop_when_provider_does_not_support_active_refresh() {
+    // `opencode` is registered but doesn't override `supports_active_refresh`
+    // (defaults `false`) — the gate this test pins must stop
+    // `refresh_provider_active_account` before it ever looks at
+    // `state.providers["opencode"]`, let alone tries a network call.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let seed = crate::store::ProviderAccount {
+        key: "x@example.com".into(),
+        secret_blob: "untouched".into(),
+        access_token: "untouched-at".into(),
+        refresh_token: "untouched-rt".into(),
+        expires_at: 1,
+        identity_email: Some("x@example.com".into()),
+        identity_uuid: None,
+        identity_display_name: None,
+        identity_native_blob: serde_json::Value::Null,
+        cached_usage: None,
+        notif_state: Default::default(),
+        needs_relogin: false,
+    };
+    with_state_lock(|| {
+        let mut st = State::load()?;
+        st.upsert_provider_account("opencode", seed);
+        st.provider_accounts_mut("opencode").active = Some("x@example.com".to_string());
+        st.save()
+    })
+    .unwrap();
+
+    refresh_provider_active_account("opencode");
+
+    let after = State::load().unwrap();
+    let acct = after
+        .find_provider_account("opencode", "x@example.com")
+        .unwrap();
+    assert_eq!(acct.secret_blob, "untouched");
+    assert_eq!(acct.access_token, "untouched-at");
+}
+
+#[test]
+fn refresh_provider_active_account_codex_fresh_token_is_a_noop() {
+    // The stored token is far from expiry and has no `last_refresh` at all,
+    // so `grant_needs_refresh` reports `Fresh` — no network call should even
+    // be attempted, and the account must be byte-for-byte unchanged.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let blob = codex_auth_json("fresh@example.com", 4_000_000_000, "fresh-at", "fresh-rt");
+        std::fs::write(dir.path().join("auth.json"), &blob).unwrap();
+        capture_current_generic("codex").unwrap();
+
+        refresh_provider_active_account("codex");
+
+        let state = State::load().unwrap();
+        let acct = state
+            .find_provider_account("codex", "fresh@example.com")
+            .unwrap();
+        assert_eq!(acct.access_token, "fresh-at");
+        assert_eq!(acct.secret_blob, blob);
+    });
+}
+
+#[test]
+fn refresh_provider_active_account_codex_refreshes_and_persists_new_grant() {
+    // End-to-end: an expired stored token triggers `codex_active_refresh`,
+    // which drives `providers::codex::oauth::active_refresh_cas` against a
+    // local mock token endpoint, wins the CAS (nothing else touches
+    // auth.json during the test), and the new grant lands back in
+    // `state.providers["codex"]` — this is gap-4 of codex-switch-e2e end to
+    // end, without touching the real network or `~/.codex/auth.json`.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    let codex_home = dir.path().to_str().unwrap().to_string();
+
+    // `scoped_env_var` isn't reentrant, so both env vars are set inside one
+    // call (mirrors `providers::codex::oauth_tests::with_codex_env`, which
+    // this file's edit scope doesn't extend to import from).
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(&codex_home), || {
+        let expired_blob = codex_auth_json("stale@example.com", 1, "stale-at", "stale-rt");
+        std::fs::write(dir.path().join("auth.json"), &expired_blob).unwrap();
+        capture_current_generic("codex").unwrap();
+
+        let (base_url, _hits) = spawn_mock_token_server();
+        #[allow(clippy::disallowed_methods)]
+        let prev_url = std::env::var_os("CODEX_REFRESH_TOKEN_URL_OVERRIDE");
+        #[allow(clippy::disallowed_methods)]
+        std::env::set_var(
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+            format!("{base_url}/v1/oauth/token"),
+        );
+
+        refresh_provider_active_account("codex");
+
+        #[allow(clippy::disallowed_methods)]
+        match prev_url {
+            Some(v) => std::env::set_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", v),
+            None => std::env::remove_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE"),
+        }
+
+        let state = State::load().unwrap();
+        let acct = state
+            .find_provider_account("codex", "stale@example.com")
+            .expect("account survives the refresh");
+        assert_eq!(acct.access_token, "mock-refreshed-access-token");
+        assert_ne!(acct.secret_blob, expired_blob);
+
+        let on_disk = std::fs::read_to_string(dir.path().join("auth.json")).unwrap();
+        assert!(on_disk.contains("mock-refreshed-access-token"));
+    });
+}
+
 // `refresh_usage_cache_does_not_touch_the_active_account` (735b762's "never
 // refresh the active account" test) is superseded by the CAS suite above:
 // usagio now DOES refresh the active account, via `active_refresh_cas`,
