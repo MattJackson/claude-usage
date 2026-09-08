@@ -95,90 +95,117 @@ impl MenuBackend for MacOsMenu {
 
 pub struct MacOsSecrets;
 
-impl SecretStore for MacOsSecrets {
-    fn get(&self, service: &str, account: &str) -> Result<Option<String>> {
-        // Only exit code 44 ("SecItem not found" per <Security/SecBase.h> /
-        // `security(1)` conventions) is a genuine "not present". Any other
-        // non-zero — keychain locked, permission denied, IPC failure —
-        // surfaces as Err so callers like `sync_active_from_keychain` treat
-        // it as "don't touch anything" rather than "assume gone" (which
-        // would let a subsequent switch overwrite a still-valid token).
-        // See H7 in the round-1 codeaudit findings.
-        let out = Command::new("security")
-            .args(["find-generic-password", "-s", service, "-a", account, "-w"])
-            .output()
-            .context("running `security find-generic-password`")?;
-        if !out.status.success() {
-            match out.status.code() {
-                Some(44) => return Ok(None),
-                other => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    bail!(
-                        "`security find-generic-password` failed \
-                         (exit {other:?}) for service={service} account={account}: {}",
-                        stderr.trim(),
-                    );
-                }
+// ---------------------------------------------------------------------------
+// Real (subprocess-backed) implementation. Lives in ordinary free functions —
+// not gated on `cfg(not(test))` themselves — so the one `#[ignore]`d test
+// below that deliberately exercises the real login keychain can still call
+// them directly by name. Only the `SecretStore for MacOsSecrets` *trait impl*
+// is compiled differently between test and non-test builds (see below); that
+// split is what keeps `cargo test` from ever invoking `security(1)` through
+// the trait-dispatched path every other caller in the crate uses
+// (`platform().secrets()`).
+// ---------------------------------------------------------------------------
+
+fn real_get(service: &str, account: &str) -> Result<Option<String>> {
+    // Only exit code 44 ("SecItem not found" per <Security/SecBase.h> /
+    // `security(1)` conventions) is a genuine "not present". Any other
+    // non-zero — keychain locked, permission denied, IPC failure —
+    // surfaces as Err so callers like `sync_active_from_keychain` treat
+    // it as "don't touch anything" rather than "assume gone" (which
+    // would let a subsequent switch overwrite a still-valid token).
+    // See H7 in the round-1 codeaudit findings.
+    let out = Command::new("security")
+        .args(["find-generic-password", "-s", service, "-a", account, "-w"])
+        .output()
+        .context("running `security find-generic-password`")?;
+    if !out.status.success() {
+        match out.status.code() {
+            Some(44) => return Ok(None),
+            other => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                bail!(
+                    "`security find-generic-password` failed \
+                     (exit {other:?}) for service={service} account={account}: {}",
+                    stderr.trim(),
+                );
             }
         }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(s))
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(s))
+    }
+}
+
+fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
+    // L5 (round-1 codeaudit): passing the secret via argv (`-w <secret>`)
+    // briefly exposes it in `ps(1)` output. Acknowledged limitation of
+    // `security(1)` — its stdin variant does not exist for
+    // add-generic-password. Alternative (Security.framework FFI) triggers
+    // "always allow?" keychain prompts on every launch of an unsigned
+    // brew-installed binary (see header comment at the top of this file).
+    // Kept as-is; documented as SEC-2 in security posture notes.
+    let status = Command::new("security")
+        .args([
+            "add-generic-password",
+            "-U",
+            "-s",
+            service,
+            "-a",
+            account,
+            "-w",
+            secret,
+        ])
+        .status()
+        .context("running `security add-generic-password`")?;
+    if !status.success() {
+        bail!("`security add-generic-password` failed for service={service} account={account}");
+    }
+    Ok(())
+}
+
+fn real_delete(service: &str, account: &str) -> Result<()> {
+    // Same class as H7 (round-1 codeaudit): distinguish "item not found"
+    // (exit 44, benign) from every other failure. Collapsing all non-zero
+    // to Ok(()) masked keychain-locked / permission errors, which then
+    // let callers assume the delete "succeeded" and move on.
+    let out = Command::new("security")
+        .args(["delete-generic-password", "-s", service, "-a", account])
+        .output()
+        .context("running `security delete-generic-password`")?;
+    if !out.status.success() {
+        match out.status.code() {
+            Some(44) => return Ok(()),
+            other => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                bail!(
+                    "`security delete-generic-password` failed \
+                     (exit {other:?}) for service={service} account={account}: {}",
+                    stderr.trim(),
+                );
+            }
         }
+    }
+    Ok(())
+}
+
+/// Production `SecretStore` impl: shells out to `security(1)`. Compiled only
+/// for non-test builds so `cargo test` can never reach the real login
+/// keychain through `platform().secrets()` — see the `cfg(test)` impl below.
+#[cfg(not(test))]
+impl SecretStore for MacOsSecrets {
+    fn get(&self, service: &str, account: &str) -> Result<Option<String>> {
+        real_get(service, account)
     }
 
     fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
-        // L5 (round-1 codeaudit): passing the secret via argv (`-w <secret>`)
-        // briefly exposes it in `ps(1)` output. Acknowledged limitation of
-        // `security(1)` — its stdin variant does not exist for
-        // add-generic-password. Alternative (Security.framework FFI) triggers
-        // "always allow?" keychain prompts on every launch of an unsigned
-        // brew-installed binary (see header comment at the top of this file).
-        // Kept as-is; documented as SEC-2 in security posture notes.
-        let status = Command::new("security")
-            .args([
-                "add-generic-password",
-                "-U",
-                "-s",
-                service,
-                "-a",
-                account,
-                "-w",
-                secret,
-            ])
-            .status()
-            .context("running `security add-generic-password`")?;
-        if !status.success() {
-            bail!("`security add-generic-password` failed for service={service} account={account}");
-        }
-        Ok(())
+        real_set(service, account, secret)
     }
 
     fn delete(&self, service: &str, account: &str) -> Result<()> {
-        // Same class as H7 (round-1 codeaudit): distinguish "item not found"
-        // (exit 44, benign) from every other failure. Collapsing all non-zero
-        // to Ok(()) masked keychain-locked / permission errors, which then
-        // let callers assume the delete "succeeded" and move on.
-        let out = Command::new("security")
-            .args(["delete-generic-password", "-s", service, "-a", account])
-            .output()
-            .context("running `security delete-generic-password`")?;
-        if !out.status.success() {
-            match out.status.code() {
-                Some(44) => return Ok(()),
-                other => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    bail!(
-                        "`security delete-generic-password` failed \
-                         (exit {other:?}) for service={service} account={account}: {}",
-                        stderr.trim(),
-                    );
-                }
-            }
-        }
-        Ok(())
+        real_delete(service, account)
     }
 
     fn list(&self, _service: &str) -> Result<Vec<String>> {
@@ -186,6 +213,72 @@ impl SecretStore for MacOsSecrets {
         // Callers today track accounts via state.json; this stays empty
         // until a real caller needs it.
         Ok(Vec::new())
+    }
+}
+
+/// Test-only `SecretStore` impl: a process-local in-memory map, never a
+/// subprocess. Every unit / integration test that reaches `MacOsSecrets`
+/// through the `SecretStore` trait (e.g. via `platform().secrets()`) lands
+/// here instead of touching the developer's real login keychain — the crash
+/// this module exists to fix (SecurityAgent prompts + keychain writes fired
+/// by `cargo test`). The `#[ignore]`d `secret_store_roundtrip` test below
+/// deliberately bypasses this impl (calling `real_get`/`real_set`/
+/// `real_delete` directly) because its entire point is to exercise the real
+/// keychain, on demand, under `--ignored`.
+#[cfg(test)]
+impl SecretStore for MacOsSecrets {
+    fn get(&self, service: &str, account: &str) -> Result<Option<String>> {
+        Ok(in_memory::get(service, account))
+    }
+
+    fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
+        in_memory::set(service, account, secret);
+        Ok(())
+    }
+
+    fn delete(&self, service: &str, account: &str) -> Result<()> {
+        in_memory::delete(service, account);
+        Ok(())
+    }
+
+    fn list(&self, _service: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Backing store for the `cfg(test)` `SecretStore` impl above. A plain
+/// `Mutex<HashMap>` keyed by `(service, account)` — process-local, cleared
+/// only on process exit, which is exactly right for `cargo test` where each
+/// test binary is its own process and tests within it may legitimately want
+/// to observe state written by an earlier `set` in the same run (mirroring
+/// how the real keychain persists across calls within a process).
+#[cfg(test)]
+mod in_memory {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static STORE: Mutex<Option<HashMap<(String, String), String>>> = Mutex::new(None);
+
+    fn with_store<T>(f: impl FnOnce(&mut HashMap<(String, String), String>) -> T) -> T {
+        let mut guard = STORE.lock().unwrap_or_else(|e| e.into_inner());
+        f(guard.get_or_insert_with(HashMap::new))
+    }
+
+    pub(super) fn get(service: &str, account: &str) -> Option<String> {
+        with_store(|m| m.get(&(service.to_string(), account.to_string())).cloned())
+    }
+
+    pub(super) fn set(service: &str, account: &str, secret: &str) {
+        with_store(|m| {
+            m.insert(
+                (service.to_string(), account.to_string()),
+                secret.to_string(),
+            )
+        });
+    }
+
+    pub(super) fn delete(service: &str, account: &str) {
+        with_store(|m| m.remove(&(service.to_string(), account.to_string())));
     }
 }
 
@@ -354,23 +447,28 @@ mod tests {
     /// explicitly with `cargo test -- --ignored secret_store_roundtrip`.
     /// Uses a per-run unique service name and cleans up on both success and
     /// failure paths.
+    ///
+    /// Calls `real_get`/`real_set`/`real_delete` directly rather than going
+    /// through `MacOsSecrets`'s `SecretStore` impl: under `cfg(test)` that
+    /// impl is the in-memory mock (see above), so dispatching through the
+    /// trait here would silently test the mock instead of the real
+    /// `security(1)` subprocess path this test exists to exercise.
     #[test]
     #[ignore = "touches the real login keychain; run with --ignored"]
     fn secret_store_roundtrip() {
         let service = format!("usagio-platform-test-{}", std::process::id());
         let account = "roundtrip";
         let secret = "hunter2";
-        let ss = MacOsSecrets;
 
         // Ensure a clean starting point.
-        let _ = ss.delete(&service, account);
+        let _ = real_delete(&service, account);
 
-        ss.set(&service, account, secret).expect("set");
-        let got = ss.get(&service, account).expect("get");
+        real_set(&service, account, secret).expect("set");
+        let got = real_get(&service, account).expect("get");
         assert_eq!(got.as_deref(), Some(secret));
 
-        ss.delete(&service, account).expect("delete");
-        let after = ss.get(&service, account).expect("get after delete");
+        real_delete(&service, account).expect("delete");
+        let after = real_get(&service, account).expect("get after delete");
         assert!(after.is_none(), "secret still present after delete");
     }
 }
