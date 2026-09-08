@@ -55,33 +55,33 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("src/menubar.rs", 28),
     // src/menubar.rs — `pub fn run()`, non-macOS branch: dispatches to
     // `cross_platform::run` (the `platform::MenuBackend`-based renderer).
-    ("src/menubar.rs", 418),
+    ("src/menubar.rs", 420),
     // src/menubar.rs — `pub fn run()`, macOS branch: the native
     // `NSApplication` run loop.
-    ("src/menubar.rs", 423),
+    ("src/menubar.rs", 425),
     // src/menubar.rs — `build_menu`: builds a native `tray_icon::menu::Menu`
     // for the macOS `apply_menu_styles` NSMenu walk to mutate in place.
     // Linux/Windows build the equivalent `platform::MenuTree` via
     // `cross_platform::menu_tree_from_snapshot`.
-    ("src/menubar.rs", 960),
+    ("src/menubar.rs", 977),
     // src/menubar.rs — `build_account_submenu`: macOS-only counterpart to
     // `cross_platform::build_account_submenu_items`.
-    ("src/menubar.rs", 1248),
+    ("src/menubar.rs", 1265),
     // src/menubar.rs — `mod mac_style`: the NSMenu attributedTitle styling
     // walk (`install_menu`/`color_for`/`attributed`/`apply_menu_styles`) plus
     // the `objc2*` imports it needs. Grouped into one module so this whole
     // cluster needs exactly one cfg site instead of one per function.
-    ("src/menubar.rs", 1355),
+    ("src/menubar.rs", 1372),
     // src/menubar.rs — `add`: `build_menu`/`build_account_submenu` helper
     // (native `tray_icon::menu::Menu::append`).
-    ("src/menubar.rs", 1677),
+    ("src/menubar.rs", 1694),
     // src/menubar.rs — `mod cross_platform`: the Linux/Windows renderer
     // (`platform::MenuBackend`-based). Never compiled alongside `mac_style`.
-    ("src/menubar.rs", 2246),
+    ("src/menubar.rs", 2274),
     // src/menubar.rs — `tests::mac_style_tests`: exercises
     // `mac_style::attributed` (NSAttributedString attribute inspection)
     // directly; needs the same `objc2*` crates as `mac_style` itself.
-    ("src/menubar.rs", 3692),
+    ("src/menubar.rs", 3722),
 ];
 
 fn src_root() -> PathBuf {

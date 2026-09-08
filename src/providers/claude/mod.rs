@@ -76,6 +76,18 @@ impl Provider for ClaudeProvider {
         &["session", "weekly", "opus"]
     }
 
+    /// Claude's refresh grant is also a plain, programmatic HTTPS POST (see
+    /// `oauth::refresh`) — `main.rs::active_refresh_cas` has driven a
+    /// compare-and-swap on the ACTIVE account's keychain slot since v0.4.0,
+    /// it just didn't previously go through this trait method to decide
+    /// whether to run. `main.rs`'s poll cycle now checks
+    /// `supports_active_refresh()` before invoking that CAS for ANY
+    /// provider (Claude included), so this must stay `true` to keep today's
+    /// behavior — see the call site's doc comment.
+    fn supports_active_refresh(&self) -> bool {
+        true
+    }
+
     // --- Capture / listing --------------------------------------------------
 
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {

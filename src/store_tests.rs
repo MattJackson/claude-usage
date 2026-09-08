@@ -726,3 +726,160 @@ fn corrupt_notification_config_falls_back_to_default_and_logs() {
 
     drop(g);
 }
+
+// ---------------------------------------------------------------------------
+// State v2 — per-provider multi-account slot (codex-switch-e2e)
+// ---------------------------------------------------------------------------
+
+fn provider_account(key: &str) -> ProviderAccount {
+    ProviderAccount {
+        key: key.to_string(),
+        secret_blob: format!("{{\"tokens\":{{\"access_token\":\"at-{key}\"}}}}"),
+        access_token: format!("at-{key}"),
+        refresh_token: format!("rt-{key}"),
+        expires_at: 1_000,
+        identity_email: Some(key.to_string()),
+        identity_uuid: None,
+        identity_display_name: None,
+        identity_native_blob: serde_json::Value::Null,
+        cached_usage: None,
+        notif_state: Default::default(),
+        needs_relogin: false,
+    }
+}
+
+#[test]
+fn v1_state_json_loads_and_upgrades_to_v2() {
+    // A real (well, hand-built but shape-accurate) v1 state.json: flat
+    // `accounts` list, no `schema_version`, no `providers` map at all. This
+    // is the exact fixture `STATE_SCHEMA_VERSION`'s doc comment promises
+    // loads with nothing lost.
+    let v1 = serde_json::json!({
+        "accounts": [
+            {
+                "email": "dev@getbusbar.com",
+                "access_token": "a1",
+                "refresh_token": "r1",
+                "expires_at": 1_700_000_000_000i64,
+                "keychain_blob": "{}",
+                "cached_usage": {
+                    "session_pct": 42.0,
+                    "fetched_at": 1_757_000_000i64
+                }
+            }
+        ],
+        "active": "dev@getbusbar.com",
+        "autoswap_disabled": true,
+        "trigger_pct": 90.0
+    });
+    let s = State::from_value(&v1);
+
+    // Nothing lost: the Claude account, its tokens, its cached usage, and
+    // the policy bits all survive untouched.
+    assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
+    assert_eq!(s.accounts.len(), 1);
+    let acct = s.find("dev@getbusbar.com").unwrap();
+    assert_eq!(acct.access_token, "a1");
+    assert_eq!(acct.cached_usage.as_ref().unwrap().session_pct, Some(42.0));
+    assert_eq!(s.active.as_deref(), Some("dev@getbusbar.com"));
+    assert!(s.autoswap_disabled);
+    assert_eq!(s.trigger_pct, Some(90.0));
+    // The new v2 bucket is simply empty — no non-Claude accounts existed to
+    // migrate.
+    assert!(s.providers.is_empty());
+}
+
+#[test]
+fn v2_state_json_round_trips_provider_accounts() {
+    let mut s = State::default();
+    s.upsert_provider_account("codex", provider_account("a@example.com"));
+    s.upsert_provider_account("codex", provider_account("b@example.com"));
+    s.provider_accounts_mut("codex").active = Some("a@example.com".to_string());
+
+    let bytes = serde_json::to_vec(&s).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let reloaded = State::from_value(&v);
+
+    assert_eq!(reloaded.schema_version, STATE_SCHEMA_VERSION);
+    let pa = reloaded.provider_accounts("codex").unwrap();
+    assert_eq!(pa.accounts.len(), 2);
+    assert_eq!(pa.active.as_deref(), Some("a@example.com"));
+    assert_eq!(
+        reloaded
+            .find_provider_account("codex", "b@example.com")
+            .unwrap()
+            .access_token,
+        "at-b@example.com"
+    );
+}
+
+#[test]
+fn upsert_provider_account_replaces_by_key() {
+    let mut s = State::default();
+    s.upsert_provider_account("codex", provider_account("a@example.com"));
+    let mut updated = provider_account("a@example.com");
+    updated.access_token = "rotated".to_string();
+    s.upsert_provider_account("codex", updated);
+
+    let pa = s.provider_accounts("codex").unwrap();
+    assert_eq!(pa.accounts.len(), 1);
+    assert_eq!(pa.accounts[0].access_token, "rotated");
+}
+
+#[test]
+fn remove_provider_account_clears_active_and_authorizes_the_drop() {
+    let mut s = State::default();
+    s.upsert_provider_account("codex", provider_account("a@example.com"));
+    s.provider_accounts_mut("codex").active = Some("a@example.com".to_string());
+
+    assert!(s.remove_provider_account("codex", "a@example.com"));
+    assert!(s.provider_accounts("codex").unwrap().accounts.is_empty());
+    assert!(s.provider_accounts("codex").unwrap().active.is_none());
+    assert!(s
+        .pending_provider_removals
+        .contains(&("codex".to_string(), "a@example.com".to_string())));
+}
+
+#[test]
+fn save_state_safe_refuses_dropping_provider_account_without_remove() {
+    let _g = ScopedConfigDir::new();
+    let mut seed = State::default();
+    seed.upsert_provider_account("codex", provider_account("a@example.com"));
+    seed.save().expect("seed save");
+
+    // Reload, then silently drop the codex account without calling
+    // `remove_provider_account` (no authorization recorded) — must be
+    // refused exactly like an unauthorized Claude account drop.
+    let mut reloaded = State::load().unwrap();
+    reloaded
+        .providers
+        .get_mut("codex")
+        .unwrap()
+        .accounts
+        .clear();
+    let err = reloaded.save().unwrap_err();
+    assert!(format!("{err}").contains("provider account"));
+
+    // On-disk state is unchanged.
+    let still_there = State::load().unwrap();
+    assert!(still_there
+        .find_provider_account("codex", "a@example.com")
+        .is_some());
+}
+
+#[test]
+fn save_state_safe_allows_explicit_provider_account_removal() {
+    let _g = ScopedConfigDir::new();
+    let mut seed = State::default();
+    seed.upsert_provider_account("codex", provider_account("a@example.com"));
+    seed.save().expect("seed save");
+
+    let mut reloaded = State::load().unwrap();
+    assert!(reloaded.remove_provider_account("codex", "a@example.com"));
+    reloaded.save().expect("authorized drop must succeed");
+
+    let after = State::load().unwrap();
+    assert!(after
+        .find_provider_account("codex", "a@example.com")
+        .is_none());
+}

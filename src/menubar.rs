@@ -39,9 +39,11 @@ use crate::countdown::{self, AccountUsage, BlockingWindow, DisplayState};
 use crate::providers::{self, CaptureMode, Provider, SeverityBands};
 use crate::store::State;
 use crate::{
-    age_str, capture_current, env_override_active, menu_order, next_interval, notify, optimize_now,
-    remove_account, row_from_account, switch_to, watch_cycle, with_state_lock, Row, SwapGuard,
-    CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
+    age_str, capture_current, capture_current_generic, env_override_active, menu_order,
+    next_interval, notify, optimize_now, remove_account, remove_provider_account_generic,
+    row_from_account, row_from_provider_account, switch_to, switch_to_provider_account,
+    watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT,
+    WATCH_INTERVAL_SECS,
 };
 
 /// Exact title of the disabled section row inserted when a provider's env
@@ -742,25 +744,40 @@ fn build_snapshot() -> Snapshot {
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     let active = st.active.clone();
 
-    // v1 state only has Claude accounts. Group by provider slug so once state
-    // v2 lands (each account tagged with its provider), this loop generalises
-    // with a one-line change (filter by account's slug instead of hardcoded
-    // CLAUDE_SLUG).
+    // Claude's accounts live in `st.accounts` (its own dedicated slot); every
+    // other provider's captured accounts live in `st.providers[slug]` (state
+    // v2 — see `store.rs`'s `State` doc). Build one flat `Row` list tagged by
+    // `provider_id` from both, same as before this changed from "always
+    // Claude" to "Claude + whichever providers have captured accounts".
     let mut rows: Vec<Row> = st.accounts.iter().map(row_from_account).collect();
+    for (slug, pa) in &st.providers {
+        rows.extend(
+            pa.accounts
+                .iter()
+                .map(|a| row_from_provider_account(slug, a)),
+        );
+    }
     rows.sort_by(menu_order);
 
     let mut sections: Vec<ProviderSection> = Vec::new();
     for provider in providers::all() {
         let slug = provider.provider_id();
-        // In v1 every stored row is a Claude account. Once state carries a
-        // per-account slug this becomes `rows.iter().filter(|r| r.provider_id == slug)`.
         let provider_rows: Vec<&Row> = rows.iter().filter(|r| r.provider_id == slug).collect();
         if provider_rows.is_empty() {
             continue; // no captured accounts → no section (no header, no rows).
         }
+        // Claude's "active" selection is `st.active`; every other provider
+        // tracks its own active key in `st.providers[slug].active` (state
+        // v2), since a provider's captured accounts are independent of
+        // Claude's.
+        let active_for_slug = if slug == CLAUDE_SLUG {
+            active.clone()
+        } else {
+            st.providers.get(slug).and_then(|p| p.active.clone())
+        };
         let mut accounts: Vec<AcctView> = provider_rows
             .into_iter()
-            .map(|r| acctview_from_row(r, &active, slug, provider.window_order()))
+            .map(|r| acctview_from_row(r, &active_for_slug, slug, provider.window_order()))
             .collect();
         // Primary sort: soonest-to-expire first, using the weekly-reset instant
         // as the "expiration" signal (accounts with no data yet sort last).
@@ -1989,12 +2006,15 @@ fn handle_capture(slug: &str) {
         ));
         return;
     };
-    match provider.capture_current_login() {
-        Ok(Some(_)) => notify(&format!(
-            "Captured {} account (persistence lands in a later phase)",
+    // State v2 (codex-switch-e2e): every non-Claude provider now has a real
+    // multi-account slot (`State::providers[slug]`) to persist into, closing
+    // the gap this used to leave as "persistence lands in a later phase".
+    match capture_current_generic(slug) {
+        Ok((key, existed)) => notify(&format!(
+            "{} {} {key}",
+            if existed { "Refreshed" } else { "Captured" },
             provider.display_name()
         )),
-        Ok(None) => notify(&format!("{} — nothing to capture", provider.display_name())),
         Err(e) => notify(&format!("Capture failed: {e}")),
     }
 }
@@ -2021,23 +2041,14 @@ fn switch_target_lock_countdown(st: &State, slug: &str, key: &str) -> Option<Str
 }
 
 fn handle_switch(slug: &str, key: &str) {
-    // v1 state only knows Claude accounts; a switch on any other slug can't
-    // be persisted yet, so gate on Claude and route to the shared free
-    // function that already knows the v1 identity/keychain dance. This is
-    // belt-and-suspenders with `capabilities().supports_switching` (which
-    // already keeps the "Switch to this account" row from being built for a
-    // non-switching provider — see `build_account_submenu`, H3 in the
-    // v0.5.0 codeaudit): the click-id dispatch table is a single flat match
-    // in `handle_click`, so nothing stops a stray/future id shaped like
-    // `switch:<other-slug>:<key>` from reaching this function directly.
-    if slug != CLAUDE_SLUG {
-        notify(&format!("Switching is not yet supported for {slug}"));
-        return;
-    }
     // Item 8 of the v0.5.0 redesign: refuse a switch into an account still
     // under its own rate-limit wall — auto-swap will pick it back up the
     // moment it resets, and switching now would just leave the user on a
-    // 0%-headroom account.
+    // 0%-headroom account. Only meaningful for Claude today —
+    // `switch_target_lock_countdown` reads `st.accounts`, which state v2
+    // keeps Claude-only (see `store.rs`); non-Claude providers have no
+    // persisted usage signal to gate on yet, so the check is a no-op for
+    // them rather than a false negative.
     if let Ok(st) = State::load() {
         if let Some(cd) = switch_target_lock_countdown(&st, slug, key) {
             notify(&format!(
@@ -2047,7 +2058,19 @@ fn handle_switch(slug: &str, key: &str) {
             return;
         }
     }
-    match switch_to(key) {
+    // State v2 (codex-switch-e2e): dispatch by provider slug instead of
+    // hard-gating on Claude — `capabilities().supports_switching` already
+    // keeps the "Switch to this account" row from being built for a
+    // non-switching provider (`build_account_submenu`, H3 in the v0.5.0
+    // codeaudit), and `switch_to_provider_account` itself re-checks that
+    // capability as belt-and-suspenders against a stray/future click id
+    // shaped like `switch:<slug>:<key>` reaching this function directly.
+    let result = if slug == CLAUDE_SLUG {
+        switch_to(key)
+    } else {
+        switch_to_provider_account(slug, key)
+    };
+    match result {
         Ok(label) => notify(&format!("Switched to {label}")),
         Err(e) => notify(&format!("Switch failed: {e}")),
     }
@@ -2087,14 +2110,19 @@ fn handle_apikey_capture(slug: &str) {
 }
 
 fn handle_remove(slug: &str, key: &str) {
-    if slug != CLAUDE_SLUG {
-        notify(&format!("Remove is not yet supported for {slug}"));
-        return;
-    }
     if !confirm(&format!("Remove account {key}? This cannot be undone.")) {
         return;
     }
-    match remove_account(key) {
+    // State v2 (codex-switch-e2e): a non-Claude provider's accounts can now
+    // actually render a "Remove…" row (see `build_snapshot`), so route it to
+    // the matching state.json bucket instead of the old blanket
+    // "not yet supported" refusal.
+    let result = if slug == CLAUDE_SLUG {
+        remove_account(key)
+    } else {
+        remove_provider_account_generic(slug, key)
+    };
+    match result {
         Ok(_) => notify(&format!("Removed {key}")),
         Err(e) => notify(&format!("Remove failed: {e}")),
     }
@@ -3469,13 +3497,15 @@ mod tests {
     }
 
     #[test]
-    fn codex_capabilities_do_not_advertise_switching_or_launch() {
-        // Locks in the H3 downgrade at the real provider boundary (not just
-        // the ProviderSection fixture above): CodexProvider's actual
-        // capabilities() must not claim switching or launch support until
-        // state v2 gives it somewhere to persist a second account.
+    fn codex_capabilities_advertise_switching_but_not_launch() {
+        // H3 (v0.5.0 codeaudit) is now closed: state v2 (`State::providers`)
+        // gives Codex somewhere to persist a second account, and
+        // `main.rs`/`menubar.rs` dispatch a switch by provider slug, so
+        // `write_active_account` is reachable from the live app —
+        // `supports_switching` is `true`. `launch_client` is still
+        // unimplemented for Codex, so `supports_launch` stays `false`.
         let caps = crate::providers::codex::CodexProvider.capabilities();
-        assert!(!caps.supports_switching);
+        assert!(caps.supports_switching);
         assert!(!caps.supports_launch);
         assert!(caps.supports_remove);
     }
