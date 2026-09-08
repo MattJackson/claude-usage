@@ -73,9 +73,13 @@ jobs:
       # every OS/dev machine. Run them for real here, on the one OS that has
       # a Credential Manager / registry. Safe: windows-latest runners are
       # disposable per-job VMs. Closes gap 3 of the v0.5.0 CI matrix.
+      #
+      # Scoped to platform::windows tests so we don't sweep up other `#[ignore]`d
+      # tests (e.g. burn_rate/cost_tracking public-API tests that need a
+      # fixture harness — they'd panic on the test-isolation guard on any OS).
       - name: cargo test --ignored (Windows-only side-effect tests)
         if: matrix.os == 'windows-latest'
-        run: cargo test --all-features -- --ignored --test-threads=1
+        run: cargo test --all-features platform::windows -- --ignored --test-threads=1
 
       # Ubuntu-only GUI smoke test: proves the real tray backend actually
       # initializes at runtime (GTK starts, libayatana-appindicator3 links,
