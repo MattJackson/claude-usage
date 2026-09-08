@@ -508,6 +508,82 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+/// Build the argv for `launchctl bootstrap gui/<uid>/ <plist_path>`. Split out
+/// so a hermetic test can pin the exact argv usagio's post-brew `install` path
+/// hands to launchd, without ever invoking `launchctl` for real (v0.5.3 P0 #2:
+/// after brew's `post_install` writes the plist, the LaunchAgent was never
+/// bootstrapped and the menu bar app didn't run until the next reboot).
+pub(crate) fn launchctl_bootstrap_argv(uid: u32, plist_path: &Path) -> Vec<String> {
+    vec![
+        "bootstrap".to_string(),
+        format!("gui/{uid}"),
+        plist_path.to_string_lossy().into_owned(),
+    ]
+}
+
+/// Build the argv for `launchctl bootout gui/<uid>/<label>` (the modern
+/// counterpart to `unload`). Symmetric with `launchctl_bootstrap_argv`.
+pub(crate) fn launchctl_bootout_argv(uid: u32, label: &str) -> Vec<String> {
+    vec!["bootout".to_string(), format!("gui/{uid}/{label}")]
+}
+
+/// Load a plist via `launchctl bootstrap` (modern macOS 10.10+ form), falling
+/// back to `launchctl load -w` on failure — some older macOS point releases
+/// still expect the legacy form, and the fallback is cheap. Emits a structured
+/// token-lifecycle log line for both success and failure paths so a broken
+/// post-brew autostart shows up in `usagio-log`.
+#[cfg(unix)]
+fn launchctl_bootstrap(plist_path: &Path) -> Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let argv = launchctl_bootstrap_argv(uid, plist_path);
+    let bootstrap = Command::new("launchctl").args(&argv).output();
+    match bootstrap {
+        Ok(o) if o.status.success() => {
+            crate::logging::log(&format!(
+                "event=launchagent_bootstrap result=ok uid={uid} plist={}",
+                plist_path.display(),
+            ));
+            return Ok(());
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            crate::logging::log(&format!(
+                "event=launchagent_bootstrap result=fallback_to_load uid={uid} plist={} \
+                 exit={:?} stderr={stderr:?}",
+                plist_path.display(),
+                o.status.code(),
+            ));
+        }
+        Err(e) => {
+            crate::logging::log(&format!(
+                "event=launchagent_bootstrap result=fallback_to_load uid={uid} plist={} err={e}",
+                plist_path.display(),
+            ));
+        }
+    }
+    // Legacy fallback.
+    let load = Command::new("launchctl")
+        .args(["load", "-w", &plist_path.to_string_lossy()])
+        .status()
+        .context("launchctl load -w (bootstrap fallback)")?;
+    if !load.success() {
+        crate::logging::log(&format!(
+            "event=launchagent_load result=err uid={uid} plist={} exit={:?}",
+            plist_path.display(),
+            load.code(),
+        ));
+        bail!(
+            "launchctl bootstrap AND launchctl load both failed for {}",
+            plist_path.display()
+        );
+    }
+    crate::logging::log(&format!(
+        "event=launchagent_load result=ok uid={uid} plist={}",
+        plist_path.display(),
+    ));
+    Ok(())
+}
+
 impl Autostart for MacOsAutostart {
     fn install(&self, label: &str, binary: &Path, args: &[&str]) -> Result<()> {
         let mut prog_args = format!(
@@ -552,22 +628,44 @@ impl Autostart for MacOsAutostart {
         // `install`.
         Self::register_with_launch_services(binary);
 
-        // Unload first to allow reload without a stale process holding the label.
-        let _ = Command::new("launchctl")
-            .args(["unload", &path.to_string_lossy()])
-            .status();
-        let status = Command::new("launchctl")
-            .args(["load", "-w", &path.to_string_lossy()])
-            .status()
-            .context("launchctl load")?;
-        if !status.success() {
-            bail!("launchctl load failed for {}", path.display());
+        // v0.5.3 P0 #2: after brew's `post_install` (or a manual `usagio
+        // install`) writes the plist, we MUST also load it — otherwise the
+        // menu bar app doesn't run until the next reboot. Bootout first to
+        // clear any stale entry holding the label, then bootstrap the fresh
+        // plist. `launchctl_bootstrap` falls back to `load -w` if bootstrap
+        // fails (some older macOS point releases still need the legacy form).
+        #[cfg(unix)]
+        {
+            let uid = unsafe { libc::getuid() };
+            let _ = Command::new("launchctl")
+                .args(launchctl_bootout_argv(uid, label))
+                .output();
+            // Also try the legacy `unload` form so a plist previously loaded
+            // via `load -w` is definitely gone before we bootstrap the fresh
+            // one — bootout won't find it if it was registered the old way.
+            let _ = Command::new("launchctl")
+                .args(["unload", &path.to_string_lossy()])
+                .status();
+            launchctl_bootstrap(&path)?;
         }
         Ok(())
     }
 
     fn uninstall(&self, label: &str) -> Result<()> {
         let path = Self::plist_path(label)?;
+        #[cfg(unix)]
+        {
+            let uid = unsafe { libc::getuid() };
+            // Bootout is the modern counterpart to `unload`. Best-effort:
+            // ignore exit status (the label may not be currently bootstrapped
+            // — a fresh install after a failed prior run — which is fine).
+            let _ = Command::new("launchctl")
+                .args(launchctl_bootout_argv(uid, label))
+                .output();
+        }
+        // Also drop any legacy `load`-registered entry before removing the
+        // file, so a switch from an older usagio that used the legacy form
+        // doesn't leave a stale live job behind.
         let _ = Command::new("launchctl")
             .args(["unload", &path.to_string_lossy()])
             .status();
@@ -705,6 +803,45 @@ mod tests {
                 "acct".to_string(),
                 "-w".to_string(),
             ]
+        );
+    }
+
+    /// v0.5.3 P0 #2: `launchctl_bootstrap_argv` MUST produce the exact
+    /// `["bootstrap", "gui/<uid>", "<plist>"]` argv brew's `post_install →
+    /// usagio install` path hands to `launchctl`. Regression-guards a merge
+    /// that could drop the bootstrap step (which is exactly what happened
+    /// between v0.4.x and v0.5.2 — the plist was being written but never
+    /// loaded, so the menu bar didn't come up until reboot).
+    #[test]
+    fn launchctl_bootstrap_argv_matches_expected_shape() {
+        let argv = super::launchctl_bootstrap_argv(
+            501,
+            std::path::Path::new(
+                "/Users/x/Library/LaunchAgents/com.mattjackson.usagio.menubar.plist",
+            ),
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "bootstrap".to_string(),
+                "gui/501".to_string(),
+                "/Users/x/Library/LaunchAgents/com.mattjackson.usagio.menubar.plist".to_string(),
+            ],
+        );
+    }
+
+    /// v0.5.3 P0 #2: `launchctl_bootout_argv` must be the symmetric shutdown
+    /// form — `["bootout", "gui/<uid>/<label>"]` — so `usagio uninstall`
+    /// tears down the running job before deleting the plist.
+    #[test]
+    fn launchctl_bootout_argv_matches_expected_shape() {
+        let argv = super::launchctl_bootout_argv(501, "com.mattjackson.usagio.menubar");
+        assert_eq!(
+            argv,
+            vec![
+                "bootout".to_string(),
+                "gui/501/com.mattjackson.usagio.menubar".to_string(),
+            ],
         );
     }
 
