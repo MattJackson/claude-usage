@@ -9,7 +9,9 @@
 //! gate maps to a slug listed in `Cargo.toml`'s `[features]` table. With zero
 //! features enabled this file still compiles: `init` registers an empty vector.
 
-pub mod state;
+// `providers::state` (a v2-schema scaffold) was superseded by
+// `crate::store::State`'s in-place `providers` HashMap. Deleted to keep the
+// codebase honest about which schema actually persists.
 pub mod trait_def;
 pub use trait_def::*;
 

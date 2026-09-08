@@ -497,7 +497,7 @@ impl State {
         // reporting the in-memory result as the current schema version (see
         // `STATE_SCHEMA_VERSION`'s doc). Deliberately no logging here:
         // `from_value` is a pure parsing function called from contexts (e.g.
-        // `providers::state`'s own v1 migration tests) that never set up a
+        // `internal from_value round-trip tests) that never set up a
         // `HOME_OVERRIDE`, and `logging::log` resolves `config_dir()`, which
         // panics under `cfg(test)` without one.
         let providers: std::collections::HashMap<String, ProviderAccounts> = v
@@ -890,13 +890,22 @@ pub fn save_state_restore(mut new_state: State) -> Result<()> {
         // "<slug>:<key>" (see its doc) — route those into
         // `pending_provider_removals` instead of `pending_removals` so both
         // guards in `save_state_safe` see their matching authorization.
+        // Route "<slug>:<key>" entries to `pending_provider_removals` even
+        // when the whole `providers[slug]` bucket has been dropped by the
+        // restore. The prior guard (`new_state.providers.contains_key(slug)`)
+        // meant a restore that dropped an entire provider silently fell
+        // through to the Claude-only `pending_removals` set, which
+        // `save_state_safe`'s guard then refused — surfacing as "restore
+        // failed to preserve auth" even though the drop was authorized.
+        // `accounts_dropped_by`'s "slug:" prefix is the authoritative source
+        // of truth here; if it says provider, we trust it.
         match entry.split_once(':') {
-            Some((slug, key)) if new_state.providers.contains_key(slug) => {
+            Some((slug, key)) => {
                 new_state
                     .pending_provider_removals
                     .insert((slug.to_lowercase(), key.to_lowercase()));
             }
-            _ => {
+            None => {
                 new_state.pending_removals.insert(entry.to_lowercase());
             }
         }

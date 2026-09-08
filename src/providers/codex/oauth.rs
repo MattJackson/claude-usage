@@ -56,7 +56,9 @@ pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// Public OAuth client id the `codex` CLI itself uses for the refresh grant.
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
+#[cfg(test)]
 const TOKEN_URL_OVERRIDE_ENV: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
+#[cfg(test)]
 const CLIENT_ID_OVERRIDE_ENV: &str = "CODEX_APP_SERVER_LOGIN_CLIENT_ID";
 
 /// Vendor's own proactive-refresh cadence: refresh if `last_refresh` in
@@ -64,10 +66,29 @@ const CLIENT_ID_OVERRIDE_ENV: &str = "CODEX_APP_SERVER_LOGIN_CLIENT_ID";
 /// close to expiry yet. See the module doc for the source.
 pub const SESSION_STALE_AFTER_DAYS: i64 = 8;
 
+// Prod: always hardcoded HTTPS endpoint + client id. The env-var overrides
+// (used by tests to point at a local mock server) are `#[cfg(test)]`-only —
+// mirroring Claude's oauth.rs pattern — so a compromised shell / LaunchAgent
+// env cannot redirect the refresh-token POST to an attacker-controlled URL.
+// (Codex's own CLI honors these env vars in prod, but usagio is a separate
+// binary; a user who genuinely needs an alternate auth server would rebuild
+// from source or file a request for a persistent config setting.)
+#[cfg(not(test))]
+fn token_url() -> String {
+    TOKEN_URL.to_string()
+}
+
+#[cfg(not(test))]
+fn oauth_client_id() -> String {
+    CLIENT_ID.to_string()
+}
+
+#[cfg(test)]
 fn token_url() -> String {
     std::env::var(TOKEN_URL_OVERRIDE_ENV).unwrap_or_else(|_| TOKEN_URL.to_string())
 }
 
+#[cfg(test)]
 fn oauth_client_id() -> String {
     std::env::var(CLIENT_ID_OVERRIDE_ENV)
         .ok()
@@ -166,6 +187,7 @@ pub fn refresh_token_grant(refresh_token: &str) -> Result<CodexRefreshGrant, Ref
             .map_err(|e| RefreshError::Transient(format!("parsing codex refresh response: {e}")))?,
         Err(ureq::Error::Status(400, _)) => return Err(RefreshError::InvalidGrant),
         Err(ureq::Error::Status(401, _)) => return Err(RefreshError::InvalidGrant),
+        Err(ureq::Error::Status(403, _)) => return Err(RefreshError::InvalidGrant),
         Err(ureq::Error::Status(429, _)) => return Err(RefreshError::RateLimited),
         Err(ureq::Error::Status(code, _)) => {
             return Err(RefreshError::Transient(format!(

@@ -413,9 +413,16 @@ impl Autostart for MacOsAutostart {
         // is gone — the exact bug that had usagio silently respawning
         // post-uninstall. Best-effort: osascript exits non-zero if the item
         // is already absent (the desired state), so all output is swallowed.
+        // Wrap in `timeout(1) 3` so a first-run TCC Automation dialog can't
+        // hang `brew uninstall` indefinitely — this login-item purge is
+        // best-effort defense-in-depth; if TCC prompts and the user doesn't
+        // dismiss it in 3 seconds, we move on (the plist deletion above is
+        // what actually stops autostart).
         for name in ["usagio", "claude-usage"] {
-            let _ = Command::new("osascript")
+            let _ = Command::new("timeout")
                 .args([
+                    "3",
+                    "osascript",
                     "-e",
                     &format!("tell application \"System Events\" to delete login item \"{name}\""),
                 ])

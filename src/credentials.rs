@@ -188,7 +188,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
         };
         match crate::providers::claude::oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
             Ok(true) => {
-                let _ = with_state_lock(|| {
+                let save_result = with_state_lock(|| {
                     let mut st = State::load()?;
                     // Belt-and-braces: don't clobber tokens for what is now
                     // the active account (a switch may have completed while
@@ -205,6 +205,16 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                     }
                     st.save()
                 });
+                // Surface persist failures (state.json write refused / lock
+                // poisoned / disk full). Same posture as the sibling
+                // InvalidGrant branch below — a silent `let _ =` here was
+                // exactly the pattern the earlier R2-EH-01 fix targeted.
+                if let Err(e) = save_result {
+                    crate::logging::log(&format!(
+                        "refresh_inactive_if_stale: post-refresh state save \
+                         failed for {email}: {e:#}"
+                    ));
+                }
             }
             Ok(false) => {}
             Err(crate::providers::claude::oauth::RefreshError::InvalidGrant) => {

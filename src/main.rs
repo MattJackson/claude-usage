@@ -1868,19 +1868,40 @@ fn refresh_provider_active_account(slug: &str) {
         if acct.needs_relogin {
             return Ok(());
         }
-        let Some((new_blob, grant)) = provider_active_refresh(slug, &acct) else {
-            return Ok(()); // fresh, or the refresh attempt itself failed (already logged)
-        };
-        if let Some(a) = state.find_provider_account_mut(slug, &active_key) {
-            a.secret_blob = new_blob;
-            a.access_token = grant.access.clone();
-            if let Some(r) = grant.refresh.clone() {
-                a.refresh_token = r;
+        let outcome = provider_active_refresh(slug, &acct);
+        match outcome {
+            ProviderRefreshOutcome::Nothing => return Ok(()),
+            ProviderRefreshOutcome::Refreshed(new_blob, grant) => {
+                if let Some(a) = state.find_provider_account_mut(slug, &active_key) {
+                    a.secret_blob = new_blob;
+                    a.access_token = grant.access.clone();
+                    if let Some(r) = grant.refresh.clone() {
+                        a.refresh_token = r;
+                    }
+                    a.expires_at = Utc::now().timestamp() + grant.expires_in_secs;
+                    a.needs_relogin = false;
+                }
+                state.save()?;
             }
-            a.expires_at = Utc::now().timestamp() + grant.expires_in_secs;
-            a.needs_relogin = false;
+            ProviderRefreshOutcome::InvalidGrant => {
+                // Vendor rejected our refresh_token — user must re-login. Flip
+                // the flag so the menu bar row surfaces "needs re-login" instead
+                // of silently retrying the same dead token every poll cycle.
+                if let Some(a) = state.find_provider_account_mut(slug, &active_key) {
+                    if !a.needs_relogin {
+                        logging::log(&format!(
+                            "event=needs_relogin_flipped provider={slug} \
+                             account={active_key} reason=invalid_grant"
+                        ));
+                        a.needs_relogin = true;
+                    }
+                }
+                state.save()?;
+            }
+            ProviderRefreshOutcome::Failed => {
+                // Already logged; leave state untouched, retry next cycle.
+            }
         }
-        state.save()?;
         Ok(())
     });
     if let Err(e) = result {
@@ -1890,16 +1911,32 @@ fn refresh_provider_active_account(slug: &str) {
     }
 }
 
+/// Outcome of a provider-specific active-account refresh cycle, so the caller
+/// can distinguish "vendor rejected the grant → flip needs_relogin" from
+/// "network hiccup → retry next cycle" from "nothing to do".
+enum ProviderRefreshOutcome {
+    /// Fresh enough already, or CAS lost / drift adopted (state was already
+    /// updated in-place by the CAS primitive); caller does nothing.
+    Nothing,
+    /// New blob + token grant to persist against the active account.
+    Refreshed(String, TokenGrant),
+    /// Vendor returned invalid_grant (RFC 6749 400/401). The refresh token
+    /// is dead — user must re-login. Caller flips `needs_relogin`.
+    InvalidGrant,
+    /// Anything else (network transient, 5xx, parse error, etc.) — already
+    /// logged. Leave state alone, retry next cycle.
+    Failed,
+}
+
 /// The provider-specific half of `refresh_provider_active_account`: drive
-/// whatever CAS primitive `slug` implements and normalize the outcome to
-/// "nothing changed" (`None`) or "here's the new blob + token grant to
-/// persist" (`Some`). Only Codex is wired today; a future provider adds an
-/// arm here rather than a parallel copy of the state-locking logic above.
-fn provider_active_refresh(slug: &str, acct: &ProviderAccount) -> Option<(String, TokenGrant)> {
+/// whatever CAS primitive `slug` implements and normalize the outcome. Only
+/// Codex is wired today; a future provider adds an arm here rather than a
+/// parallel copy of the state-locking logic above.
+fn provider_active_refresh(slug: &str, acct: &ProviderAccount) -> ProviderRefreshOutcome {
     match slug {
         #[cfg(feature = "codex")]
         "codex" => codex_active_refresh(acct),
-        _ => None,
+        _ => ProviderRefreshOutcome::Nothing,
     }
 }
 
@@ -1911,34 +1948,44 @@ fn provider_active_refresh(slug: &str, acct: &ProviderAccount) -> Option<(String
 /// hand-rolling a second blob->TokenGrant conversion here — so the result is
 /// guaranteed consistent with what a fresh capture would see.
 #[cfg(feature = "codex")]
-fn codex_active_refresh(acct: &ProviderAccount) -> Option<(String, TokenGrant)> {
-    use providers::codex::oauth::{active_refresh_cas, CasOutcome, SESSION_STALE_AFTER_DAYS};
+fn codex_active_refresh(acct: &ProviderAccount) -> ProviderRefreshOutcome {
+    use providers::codex::oauth::{
+        active_refresh_cas, CasOutcome, RefreshError, SESSION_STALE_AFTER_DAYS,
+    };
     let stale_after_secs = SESSION_STALE_AFTER_DAYS * 24 * 60 * 60;
     match active_refresh_cas(
         credentials::REFRESH_SKEW_SECS,
         stale_after_secs,
         Some(&acct.secret_blob),
     ) {
-        Ok(CasOutcome::Fresh) => None,
+        Ok(CasOutcome::Fresh) => ProviderRefreshOutcome::Nothing,
         Ok(CasOutcome::Refreshed) | Ok(CasOutcome::Adopted(_)) => {
-            let provider = providers::get("codex")?;
+            let Some(provider) = providers::get("codex") else {
+                return ProviderRefreshOutcome::Nothing;
+            };
             match provider.capture_current_login() {
-                Ok(Some(captured)) => Some((captured.secret_blob, captured.tokens)),
-                Ok(None) => None,
+                Ok(Some(captured)) => {
+                    ProviderRefreshOutcome::Refreshed(captured.secret_blob, captured.tokens)
+                }
+                Ok(None) => ProviderRefreshOutcome::Nothing,
                 Err(e) => {
                     logging::log(&format!(
                         "event=active_refresh_cas_failed provider=codex \
                          reason=post_cas_reread:{e}"
                     ));
-                    None
+                    ProviderRefreshOutcome::Failed
                 }
             }
+        }
+        Err(RefreshError::InvalidGrant) => {
+            logging::log("event=active_refresh_cas_failed provider=codex reason=invalid_grant");
+            ProviderRefreshOutcome::InvalidGrant
         }
         Err(e) => {
             logging::log(&format!(
                 "event=active_refresh_cas_failed provider=codex reason={e}"
             ));
-            None
+            ProviderRefreshOutcome::Failed
         }
     }
 }
@@ -2573,20 +2620,16 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
     })
 }
 
-/// Fire a native macOS notification (best effort).
+/// Fire a native "usagio: {msg}" notification (best effort, cross-platform).
+/// Delegates to `notifications::fire_plain`, which routes through notify-rust
+/// so macOS/Linux/Windows all get a real notification — the previous osascript
+/// path silently no-op'd on Linux and Windows. Best-effort: failures are
+/// logged (R2-EH-04) so H6's user-facing notification guarantee has
+/// diagnostic backing when the channel is unavailable (headless SSH, no
+/// notification daemon, denied permission, etc.).
 fn notify(msg: &str) {
-    let script = format!("display notification {msg:?} with title \"usagio\"");
-    // R2-EH-04: log osascript spawn/exit failures so H6's user-facing
-    // notification guarantee has diagnostic backing when the channel is
-    // silently unavailable (headless SSH, Automation permission denied).
-    match std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .status()
-    {
-        Ok(s) if s.success() => {}
-        Ok(s) => logging::log(&format!("notify: osascript exited {:?}", s.code())),
-        Err(e) => logging::log(&format!("notify: osascript spawn failed: {e}")),
+    if let Err(e) = notifications::fire_plain(msg) {
+        logging::log(&format!("notify: fire_plain failed: {e}"));
     }
 }
 
@@ -3014,12 +3057,47 @@ pub(crate) fn launch_agent_exe_path() -> std::path::PathBuf {
     sibling_app_bundle_exe(&stable).unwrap_or(stable)
 }
 
-/// Given a path to `.../<version>/bin/usagio` (or a symlink resolving to
-/// it), look for `.../<version>/usagio.app/Contents/MacOS/usagio` next to
-/// it. Checks both the path as given and its canonicalized form, so tests
-/// can point directly at a `bin/` directory without a real Homebrew symlink
-/// chain.
+/// Given a path to `.../bin/usagio` — typically the stable Homebrew symlink
+/// `<prefix>/bin/usagio` — resolve a **version-stable** path to the sibling
+/// `usagio.app/Contents/MacOS/usagio` that survives `brew upgrade`.
+///
+/// Homebrew keeps two stable roots per formula: `<prefix>/bin/<formula>`
+/// (symlink to the current Cellar bin), and `<prefix>/opt/<formula>/`
+/// (symlink to the current Cellar root — the whole version dir). Both point
+/// at the just-installed version and are updated atomically on `brew upgrade`.
+/// We MUST use one of those, not the canonicalized `<prefix>/Cellar/usagio/<version>/...`
+/// path, because Homebrew deletes the old version's Cellar directory on
+/// upgrade — pinning the LaunchAgent to the versioned path would silently
+/// break autostart on every user's next `brew upgrade`.
+///
+/// Resolution order:
+///   1. Given `<prefix>/bin/usagio`, derive `<prefix>` (bin's parent) and
+///      probe `<prefix>/opt/usagio/usagio.app/Contents/MacOS/usagio`. Homebrew
+///      creates that symlink whenever a formula ships a bundle. This is the
+///      preferred path — brew keeps it valid across upgrades.
+///   2. Given a non-brew layout (from-source install, custom deployment),
+///      look for `usagio.app` as a sibling of the binary's version dir
+///      (`../usagio.app/Contents/MacOS/usagio` from `bin/`). Not upgrade-
+///      stable for brew but doesn't apply to brew installs.
+///   3. Otherwise, `None` — callers fall back to the bare `stable_exe_path()`.
 fn sibling_app_bundle_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    // (1) Homebrew stable opt-path — the correct answer for a brew install.
+    if let Some(bin_dir) = exe.parent() {
+        if let Some(prefix) = bin_dir.parent() {
+            let opt_bundle = prefix
+                .join("opt")
+                .join("usagio")
+                .join("usagio.app")
+                .join("Contents")
+                .join("MacOS")
+                .join("usagio");
+            if opt_bundle.exists() {
+                return Some(opt_bundle);
+            }
+        }
+    }
+    // (2) Non-brew: sibling in the version dir. Match on canonicalized form
+    // too so a symlinked bin/usagio still finds a real sibling app.
     let mut candidates = vec![exe.to_path_buf()];
     if let Ok(resolved) = std::fs::canonicalize(exe) {
         candidates.push(resolved);

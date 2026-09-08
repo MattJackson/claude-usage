@@ -536,6 +536,24 @@ fn poll_loop() {
 /// -k`), which relaunches it in a fresh job context. A bare/from-source run has
 /// no such job, so there the orphaned self-spawn survives our exit as usual.
 fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
+    // Called from the macOS main-thread NSTimer tick (~0.75s). `canonicalize`
+    // is a real syscall that hits disk; skip it 90%+ of the time via a
+    // per-process last-check clock so the tray thread doesn't do blocking I/O
+    // on the hot path (R2-PERF audit finding). A stale check window of 10s
+    // is plenty — the brew upgrade + relaunch is best-effort and doesn't need
+    // sub-second detection.
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut g = LAST_CHECK.lock().unwrap();
+        let should_check = !matches!(*g, Some(t) if t.elapsed() < Duration::from_secs(10));
+        if !should_check {
+            return;
+        }
+        *g = Some(Instant::now());
+    }
+
     let stable = crate::stable_exe_path();
     let Ok(now) = std::fs::canonicalize(&stable) else {
         return;

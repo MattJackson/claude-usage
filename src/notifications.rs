@@ -300,6 +300,15 @@ fn null_notifier_or_real(_summary: &str, _body: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fire a plain "usagio: <msg>" notification, without going through the
+/// `Trigger`/`AccountKey` pipeline. Used for one-off diagnostics (auto-swap,
+/// stuck-account, migration failures) from `main::notify`. Cross-platform via
+/// notify-rust — replaces the older macOS-only `osascript display notification`
+/// path that silently no-op'd on Linux/Windows.
+pub fn fire_plain(msg: &str) -> Result<()> {
+    null_notifier_or_real("usagio", msg)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
