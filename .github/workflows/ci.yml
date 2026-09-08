@@ -67,6 +67,22 @@ jobs:
         # `cfg(target_os = ...)` as example text — false positives).
         run: cargo test --tests --all-features -- --test-threads=1
 
+      # H4 (v0.5.0 codeaudit): release.yml's macOS build job calls
+      # packaging/macos/generate-icns.sh, which shells out to `rsvg-convert`
+      # (from librsvg) and dies loudly if it's missing. release.yml didn't
+      # install it, so the FIRST v0.5.0 tag push would have failed here —
+      # after the build/package steps already ran — aborting the whole
+      # release (no artifacts, no tap bump). Running the script itself on
+      # every push (not just a release-tag push) catches that class of
+      # regression immediately instead of only at tag-push time.
+      - name: Install librsvg for icon generation
+        if: matrix.os == 'macos-latest'
+        run: brew install librsvg
+
+      - name: Verify packaging/macos/generate-icns.sh runs end-to-end
+        if: matrix.os == 'macos-latest'
+        run: packaging/macos/generate-icns.sh
+
   # Full lane — release build, only on the qa and main branches.
   build:
     name: release build
