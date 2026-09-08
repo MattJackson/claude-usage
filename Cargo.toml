@@ -1,6 +1,6 @@
 [package]
 name = "usagio"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 rust-version = "1.88"
 description = "Track usage / limits across every AI coding CLI you use, and switch between accounts."
