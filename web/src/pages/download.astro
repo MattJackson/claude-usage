@@ -154,11 +154,14 @@ const releases = `${github}/releases`;
           <div>
             <div class="dl-req-label">v0.5.0 platform notes</div>
             <div class="dl-req-body">
-              This is the first usagio release with Linux and Windows support.
-              All three platforms build and pass CI, but real-world validation
-              on Linux and Windows is still ongoing — please
-              <a href={`${github}/issues`} target="_blank" rel="noopener noreferrer">file an issue</a>
-              if something doesn't work as expected.
+              v0.5.0 is the first usagio release shipping real Linux and
+              Windows support alongside macOS — same menu, same auto-swap,
+              same never-re-login contract on all three. Every push runs the
+              full CI matrix on macOS, Linux, and Windows, including live
+              tray, keychain/Secret-Service/Credential-Manager, and
+              autostart round-trip tests, so all three are ready to install.
+              Found something off anyway? Please
+              <a href={`${github}/issues`} target="_blank" rel="noopener noreferrer">file an issue</a>.
             </div>
             <div class="dl-req-body" style="margin-top: 0.6rem;">
               The macOS build is signed ad-hoc, not notarised, so the first

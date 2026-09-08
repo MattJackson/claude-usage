@@ -1,0 +1,148 @@
+---
+// Scan-read summary of the 0.5.0 CHANGELOG entry. Not the full changelog —
+// links out to that on GitHub for the rest.
+import Base from '../layouts/Base.astro';
+
+const title = "What's new in usagio 0.5.0";
+const description =
+  'usagio 0.5.0 fixes the /login loop for good, adds real Linux and Windows support, Codex switching, a menu redesign, and adaptive poll cadence.';
+
+const github = 'https://github.com/MattJackson/usagio';
+const changelog = `${github}/blob/main/CHANGELOG.md`;
+---
+<Base title={title} description={description} path="/whats-new/">
+
+  <!-- ============ HERO ============ -->
+  <section class="wn-hero">
+    <div class="container container-narrow" style="text-align: center;">
+      <span class="eyebrow fade-up">v0.5.0 — the never-re-login release</span>
+      <h1 class="h-display fade-up" style="font-size: clamp(2.2rem, 5vw, 3.4rem); margin-top: 0.5rem;">What changed</h1>
+      <p class="lede fade-up" style="margin: 1rem auto 0;">
+        v0.4.x soak testing surfaced a real pattern: users getting prompted to
+        <code>/login</code> in Claude Code despite capturing the account
+        weeks earlier. Adversarial audits traced it to usagio refreshing the
+        active account's single-use OAuth token out from under Claude Code.
+        0.5.0 fixes that at the root, and ships real Linux + Windows support
+        alongside it.
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ FIXED ============ -->
+  <section class="wn-section">
+    <div class="container container-narrow">
+      <h2 class="h-section fade-up">Fixed — the north-star bug</h2>
+      <ul class="wn-list fade-up">
+        <li>
+          <strong>Never-re-login contract now holds.</strong> usagio no longer
+          refreshes the ACTIVE account's OAuth token — Claude Code owns that
+          slot and rotates it itself; usagio only reads it. Inactive accounts
+          still refresh automatically, and every rotation is mirrored back to
+          the vendor CLI's OS-native storage (Keychain on macOS, a plain file
+          on Linux and Windows).
+        </li>
+        <li>
+          <strong>No more clobbered fresh state.</strong> Syncing from the
+          keychain used to overwrite newer in-memory tokens with a stale
+          keychain blob. Now it only adopts keychain state when it's actually
+          newer, and auto-detects when Claude Code's own <code>/login</code>
+          switched you into a different captured account.
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============ ADDED ============ -->
+  <section class="wn-section section-soft">
+    <div class="container container-narrow">
+      <h2 class="h-section fade-up">Added</h2>
+      <ul class="wn-list fade-up">
+        <li><strong>Linux and Windows, for real.</strong> Native tray icon, OS-native credential storage (Secret Service / Credential Manager), and autostart on both — the same menu and auto-swap you get on macOS.</li>
+        <li><strong>Codex switching.</strong> Swap between OpenAI Codex accounts the same way, on all three OSes. <code>~/.codex/auth.json</code> is rewritten atomically under usagio's control.</li>
+        <li><strong>Menu redesign.</strong> A flatter main list (provider, email, session %, weekly %), cleaner account submenus, and a proper Settings ▸ tree for notifications, auto-swap threshold, and backups.</li>
+        <li><strong>macOS <code>.app</code> bundle.</strong> Login Items in System Settings now shows the usagio icon instead of a generic exec glyph.</li>
+        <li><strong>Adaptive poll cadence.</strong> Polling tightens as an account approaches its auto-swap trigger threshold, so a fast climb toward the wall gets caught sooner.</li>
+        <li><strong>Backups ▸ Save… / Restore…</strong> via native OS file dialogs, with automatic pre-restore snapshots.</li>
+        <li><strong>Settings ▸ Notifications ▸.</strong> Per-trigger toggles for threshold, reset-back, and weekly-pace alerts.</li>
+        <li><strong>Full CI matrix.</strong> Every push is built, linted, and tested on macOS, Linux, and Windows, including live tray, credential-store, and autostart round-trips.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============ REMOVED ============ -->
+  <section class="wn-section">
+    <div class="container container-narrow">
+      <h2 class="h-section fade-up">Removed</h2>
+      <ul class="wn-list fade-up">
+        <li><strong>The "Launch at login" menu checkbox.</strong> It re-prompted for macOS Automation permission on every <code>brew upgrade</code>. Autostart is CLI-only now: <code>usagio install</code> / <code>usagio uninstall</code>.</li>
+        <li><strong>~1,400 lines of over-engineered token-sync machinery.</strong> Collapsed to one refresher, one keychain reader, one mirror-back method — the design now has a single owner for each piece of state.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============ MIGRATION ============ -->
+  <section class="wn-section section-soft">
+    <div class="container container-narrow">
+      <h2 class="h-section fade-up">Upgrading</h2>
+      <p class="lede fade-up" style="margin-bottom: 1rem;">
+        Nothing to reconfigure. State and keychain items carry over unchanged;
+        first launch silently mirrors the active account's token back to the
+        keychain to close any pre-existing drift.
+      </p>
+      <ul class="wn-list fade-up">
+        <li><strong>macOS:</strong> <code>brew upgrade</code>.</li>
+        <li><strong>Linux:</strong> <code>brew upgrade</code> via linuxbrew, or download the new tarball from the releases page.</li>
+        <li><strong>Windows:</strong> download the new zip from the releases page.</li>
+      </ul>
+      <p class="wn-foot fade-up">
+        <a href={changelog} target="_blank" rel="noopener noreferrer">Full CHANGELOG on GitHub →</a>
+      </p>
+    </div>
+  </section>
+
+</Base>
+
+<style>
+  .wn-hero {
+    padding: clamp(3rem, 8vw, 5rem) 0 clamp(2rem, 5vw, 3rem);
+    background:
+      radial-gradient(70% 60% at 50% 0%, rgba(91,43,234,0.06), transparent 65%),
+      var(--bg);
+    border-bottom: var(--hairline);
+  }
+  .wn-hero code,
+  .wn-list code {
+    font-family: var(--font-mono);
+    font-size: 0.86em;
+    background: var(--accent-tint);
+    color: var(--accent);
+    padding: 0.05em 0.35em;
+    border-radius: 4px;
+  }
+  .wn-section { padding: clamp(2rem, 5vw, 3rem) 0; }
+  .wn-section .h-section { margin-bottom: 1.25rem; }
+  .wn-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: grid;
+    gap: 0.9rem;
+  }
+  .wn-list li {
+    color: var(--muted);
+    line-height: 1.65;
+    font-size: 0.98rem;
+    padding-left: 1.1rem;
+    position: relative;
+  }
+  .wn-list li::before {
+    content: "";
+    position: absolute; left: 0; top: 0.55em;
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+  }
+  .wn-list li strong { color: var(--ink); font-weight: 650; }
+  .wn-foot { margin-top: 1.5rem; font-size: var(--fs-sm); }
+  .wn-foot a { color: var(--accent); font-weight: 600; }
+  .wn-foot a:hover { color: var(--accent-hover); }
+</style>
