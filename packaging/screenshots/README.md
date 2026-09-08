@@ -22,25 +22,57 @@ state.
 
 ## CI flow
 
-`.github/workflows/screenshots.yml` runs on every push to `qa` (plus
-manual `workflow_dispatch`), builds `usagio` in release mode on a
-`[macos-latest, ubuntu-latest, windows-latest]` matrix, runs the matching
-capture script, and uploads the result as a workflow artifact
-(`hero-macos`, `hero-linux`, `hero-windows`).
+This is a fully automatic, end-to-end pipeline: **app updates -> push to
+`qa` or a release tag -> CI captures fresh screenshots -> website
+updated** — no manual download/copy step anywhere in the chain.
 
-**This workflow is artifact-only — it does not commit anything back to
-`qa` or into `web/public/`.** That's a deliberate choice, not a shortcut
-we forgot to finish: committing images into the website tree is a
-separate, visible change to a different concern, and (per the "reality
-check" below) not every OS reliably produces a menu-open screenshot in
-headless CI, so an unattended auto-commit risks silently overwriting a
-good hero image with a degraded fallback. To publish a screenshot:
+`.github/workflows/screenshots.yml` has two job stages:
 
-1. Go to the workflow run in the Actions tab.
-2. Download the `hero-<os>` artifact you want.
-3. Inspect it — confirm it shows the open dropdown, not just the icon.
-4. Copy it into `web/public/hero-<os>.png` and commit it yourself (the
-   website is out of scope for this automation).
+1. `capture` — runs on every push to `qa` and on every `vX.Y.Z` release
+   tag (plus manual `workflow_dispatch` for one-off test runs), builds
+   `usagio` in release mode on a `[macos-latest, ubuntu-latest,
+   windows-latest]` matrix, runs the matching capture script, and uploads
+   the result as a workflow artifact (`hero-macos`, `hero-linux`,
+   `hero-windows`).
+2. `commit-hero-images` — runs once all three `capture` legs finish, for
+   real push triggers only (a `qa` push or a release tag — not
+   `workflow_dispatch`, so poking the button in the Actions tab can't
+   accidentally redeploy the live site). Downloads all three artifacts,
+   copies the primary `hero-<os>.png` from each into
+   `web/public/hero-<os>.png`, and commits + pushes straight to **`main`**
+   as `github-actions[bot]`. `main` — not `qa` — because that's the branch
+   `.github/workflows/pages.yml`'s `deploy` job actually redeploys the
+   live site from; pushing there is what makes "website updated" the
+   final, automatic step. If the captured PNGs are byte-identical to what
+   `main` already has, the job skips the commit/push (logs "no image
+   change; skipping commit") instead of creating no-op noise commits.
+
+**One-time repo setup required:** the `commit-hero-images` job needs
+`contents: write` to push, which only works if this repo's **Settings >
+Actions > General > Workflow permissions** is set to **"Read and write
+permissions"** (GitHub defaults new repos to read-only). This is a
+one-time dashboard setting, not something the workflow file itself can
+grant — if it's still on the read-only default, `commit-hero-images` will
+fail on `git push` with a permission error and you'll need to flip that
+setting once.
+
+Because not every OS reliably produces a menu-open screenshot in headless
+CI (see "Reality check" below), an automatic run can legitimately refresh
+`web/public/hero-linux.png` with a tray-icon-only fallback image rather
+than an open dropdown. If you want a hand-curated, guaranteed-good hero
+image instead, capture it locally (see "Running locally" below) and
+commit it directly to `web/public/` on `main` yourself — a manual commit
+after the bot's auto-commit simply wins since it lands later in `main`'s
+history.
+
+**Deliberately no `[skip ci]` marker on the bot's commit.** GitHub's
+native skip-ci handling suppresses *every* push-triggered workflow run
+for a commit carrying that marker — including pages.yml's own
+push-to-`main` deploy trigger, which would silently break the "website
+updated" step this whole pipeline exists for. There's no loop to guard
+against by omitting it: this job only ever pushes to `main`, and neither
+this workflow nor pages.yml re-triggers `screenshots.yml` (which only
+listens for `qa` pushes and `vX.Y.Z` tags).
 
 ## Reality check: what CI can and can't capture
 

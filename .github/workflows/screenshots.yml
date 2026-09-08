@@ -5,17 +5,31 @@ name: Hero screenshots
 # 2 Claude accounts + 3 Codex accounts, fixed percentages) so the images
 # look the same regardless of the developer's real account state.
 #
-# Triggered on every push to `qa` (the pre-release staging branch), plus
-# manual dispatch for one-off re-renders. Does NOT run on `dev`/`main`
-# pushes or on pull requests — this is a release-asset job, not part of the
-# fast CI lane in ci.yml.
+# Triggered on every push to `qa` (the pre-release staging branch) and on
+# every `vX.Y.Z` release tag, plus manual dispatch for one-off re-renders
+# (which only run `capture`, not the auto-commit-to-main step — see
+# `commit-hero-images` below). Does NOT run on `dev` pushes or on pull
+# requests — this is a release-asset job, not part of the fast CI lane in
+# ci.yml.
 #
 # See packaging/screenshots/README.md for the full explanation of the
 # per-OS capture approach (menu-visible vs. full dropdown) and the honest
 # limitations of headless CI capture on each platform.
+#
+# Full pipeline: app updates -> push to qa (iteration) or a vX.Y.Z release
+# tag -> this workflow captures fresh hero screenshots -> `commit-hero-images`
+# pushes web/public/hero-<os>.png straight to `main` (the branch
+# .github/workflows/pages.yml actually deploys from — see that file's
+# `deploy` job condition) as github-actions[bot] -> pages.yml's own
+# push-to-main trigger picks that commit up and redeploys the site. No
+# manual download/copy step anywhere in this chain. Requires the repo's
+# Settings > Actions > General > Workflow permissions to be set to "Read
+# and write permissions" (one-time repo config, not a code change; see
+# packaging/screenshots/README.md).
 on:
   push:
     branches: [qa]
+    tags: ["v*.*.*"]
   workflow_dispatch: {}
 
 permissions:
@@ -96,10 +110,79 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # Artifact-only by design (no auto-commit back to `qa` or `web/`):
-      # a bot commit into the website tree is a meaningful, visible change
-      # to a separate concern (the website repo/tree is explicitly out of
-      # scope for this workflow — see packaging/screenshots/README.md).
-      # Download the artifact from this run and commit it manually once
-      # you've confirmed it actually looks right — headless capture quality
-      # varies a lot per OS (see README "Reality check").
+  # Runs once, after all three matrix legs of `capture` have finished
+  # (`needs: capture` on a matrix job waits for every leg, not just one),
+  # and only for real push triggers (qa iteration or a release tag) — not
+  # for a manual `workflow_dispatch` test run, so poking the button doesn't
+  # accidentally redeploy the live site. Downloads each OS's artifact,
+  # keeps only the primary hero-<os>.png (drops the *-menubar.png /
+  # *-taskbar.png fallback-diagnostic files — useful as workflow-artifact
+  # debugging aids, not as published hero images), and pushes straight to
+  # `main` as github-actions[bot] — the branch pages.yml's `deploy` job is
+  # gated on (`if: github.ref == 'refs/heads/main'`), so this push is what
+  # actually triggers the live site rebuild. Deliberately targets `main`
+  # rather than `qa`: pages.yml only *builds* (no deploy) on `feat/website`
+  # and does nothing at all for pushes to `qa`.
+  commit-hero-images:
+    name: commit hero screenshots to main
+    needs: capture
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - name: Download all hero artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: hero-*
+          path: /tmp/hero-artifacts
+          merge-multiple: false
+
+      - name: Place hero images into web/public
+        run: |
+          set -euo pipefail
+          mkdir -p web/public
+          for os in macos linux windows; do
+            src="/tmp/hero-artifacts/hero-${os}/hero-${os}.png"
+            if [[ ! -f "$src" ]]; then
+              echo "error: expected $src from the hero-${os} artifact but it's missing" >&2
+              exit 1
+            fi
+            cp "$src" "web/public/hero-${os}.png"
+          done
+
+      - name: Commit and push as github-actions[bot]
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add web/public/hero-macos.png web/public/hero-linux.png web/public/hero-windows.png
+
+          # Idempotence: skip the commit+push entirely if the captured PNGs
+          # are byte-identical to what's already on `main` (the fixture and
+          # capture are deterministic enough that this happens often). Keeps
+          # `main`'s history free of no-op noise commits while still
+          # leaving a normal "nothing to do" line in the Actions log for
+          # every run, so the pipeline stays visibly auditable.
+          if git diff --cached --quiet -- web/public/hero-macos.png web/public/hero-linux.png web/public/hero-windows.png; then
+            echo "no image change; skipping commit"
+            exit 0
+          fi
+
+          # Deliberately NOT using a "[skip ci]"/"[ci skip]" marker here:
+          # GitHub's native skip-ci handling suppresses *every* push-triggered
+          # workflow run for a commit carrying that marker, not just this
+          # one — which would also suppress pages.yml's own push-to-main
+          # deploy trigger and silently break the "website updated" leg of
+          # this pipeline. There's no infinite-loop risk to guard against
+          # either way: this job only ever pushes to `main`, and neither
+          # this workflow nor pages.yml re-triggers screenshots.yml (which
+          # only listens for qa pushes / vX.Y.Z tags).
+          git commit \
+            -m "chore(web): refresh hero screenshots from CI" \
+            -m "Auto-generated by .github/workflows/screenshots.yml from the demo-state.json fixture. See packaging/screenshots/README.md."
+          git push origin HEAD:main
