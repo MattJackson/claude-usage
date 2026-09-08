@@ -208,6 +208,8 @@ fn run() -> Result<()> {
         Some("install") => cmd_install(),
         Some("uninstall") => cmd_uninstall(),
         Some("rm") | Some("remove") => cmd_rm(args.get(1).map(String::as_str)),
+        // Internal, undocumented — see `cmd_secrets_selftest` doc comment.
+        Some("__secrets_selftest") => cmd_secrets_selftest(&args[1..]),
         Some("-h") | Some("--help") | Some("help") => {
             print_help();
             Ok(())
@@ -1169,6 +1171,53 @@ fn keychain_write(blob: &str) -> Result<()> {
     platform()
         .secrets()
         .set(KEYCHAIN_SERVICE, &keychain_account(), blob)
+}
+
+/// Internal, undocumented CLI hook used ONLY by
+/// `tests/integration_linux_secrets.rs` (and any equivalent test on other
+/// OSes) to round-trip `Platform::secrets()` against whatever the real
+/// backend is on this machine — the real D-Bus Secret Service daemon on
+/// Linux CI, Keychain on macOS, Credential Manager on Windows. This crate
+/// has no `[lib]` target, so an integration test can't call `LinuxSecrets`
+/// directly the way a unit test in `src/platform/linux.rs` can; this
+/// subcommand is the black-box seam (same shape as every other
+/// `tests/cli.rs` test driving the compiled binary as a subprocess).
+///
+/// Deliberately not listed in `print_help` — it exists purely as a test
+/// fixture, not a user-facing feature. Round-trips a caller-supplied
+/// `(service, account, secret)` through delete → get(None) → set →
+/// get(Some) → delete → get(None), printing `OK` and exiting 0 on success,
+/// or returning an `Err` (non-zero exit, message on stderr) describing
+/// exactly which step diverged.
+///
+/// Usage: `usagio __secrets_selftest <service> <account> <secret>`
+fn cmd_secrets_selftest(args: &[String]) -> Result<()> {
+    let (service, account, secret) = match args {
+        [service, account, secret] => (service.as_str(), account.as_str(), secret.as_str()),
+        _ => bail!("usage: usagio __secrets_selftest <service> <account> <secret>"),
+    };
+    let store = platform().secrets();
+
+    // Start from a clean slate in case a previous run crashed mid-round-trip
+    // and left a stale entry behind under this test-scoped service name.
+    let _ = store.delete(service, account);
+    if store.get(service, account)?.is_some() {
+        bail!("secrets_selftest: secret unexpectedly present before set()");
+    }
+
+    store.set(service, account, secret)?;
+    let got = store.get(service, account)?;
+    if got.as_deref() != Some(secret) {
+        bail!("secrets_selftest: get() after set() returned {got:?}, expected Some({secret:?})");
+    }
+
+    store.delete(service, account)?;
+    if store.get(service, account)?.is_some() {
+        bail!("secrets_selftest: secret still present after delete()");
+    }
+
+    println!("OK");
+    Ok(())
 }
 
 fn claude_json_path() -> Result<std::path::PathBuf> {

@@ -20,9 +20,10 @@
 //! - **File dialogs** (Backups Save/Restore in the tray menu) and
 //!   **notifications** need no Linux-specific code at all: `rfd`'s
 //!   `xdg-desktop-portal` backend and `notify_rust` (see
-//!   `crate::notifications::fire`) already work cross-platform. `rfd` is
-//!   still declared as a Linux-only Cargo dependency for now since nothing
-//!   outside Linux calls it yet.
+//!   `crate::notifications::fire`) already work cross-platform. File dialogs
+//!   are routed through `Platform::file_dialog()` /
+//!   `platform::RfdFileDialog` (src/platform/mod.rs), same as macOS and
+//!   Windows.
 //! - **Terminal launcher**: `usagio start` / `continue` want to run `claude`
 //!   in a fresh terminal window when invoked from the tray (the tray process
 //!   itself isn't attached to a terminal). `launch_claude_in_terminal` probes

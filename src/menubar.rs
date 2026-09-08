@@ -1638,8 +1638,9 @@ fn handle_click(id: &str) {
 // Settings ▸ Advanced ▸ Backups ▸ handlers (native Save…/Restore… panels)
 // ---------------------------------------------------------------------------
 
-/// "Save…" click: opens a native SAVE panel (`rfd::FileDialog::save_file`)
-/// defaulting to `~/Downloads/usagio-state-{timestamp}.json`, then writes a
+/// "Save…" click: opens a native SAVE panel (via
+/// `Platform::file_dialog().save_file(...)`) defaulting to
+/// `~/Downloads/usagio-state-{timestamp}.json`, then writes a
 /// REDACTED (token-free) dump of the current state to the chosen path with
 /// mode 0600. This is a portable diagnostics/config snapshot — the same
 /// shape `redact_state_for_dump` already produces for the "REFUSED save"
@@ -1648,15 +1649,19 @@ fn handle_click(id: &str) {
 /// real `state.json` save; see `write_rolling_backup`) are what "Restore…"
 /// below defaults its file panel to.
 fn handle_backup_save() {
+    handle_backup_save_with(crate::platform().file_dialog());
+}
+
+/// Testable core of the Save… click: takes the `FileDialog` as a parameter
+/// so `#[cfg(test)]` can pass a `platform::MockFileDialog` instead of
+/// popping a real native panel. See `platform::Platform::file_dialog`.
+fn handle_backup_save_with(dialog: &dyn crate::platform::FileDialog) {
     let default_name = format!(
         "usagio-state-{}.json",
         chrono::Utc::now().format("%Y%m%d-%H%M%S")
     );
-    let mut dialog = rfd::FileDialog::new().set_file_name(&default_name);
-    if let Some(dir) = dirs::download_dir() {
-        dialog = dialog.set_directory(dir);
-    }
-    let Some(path) = dialog.save_file() else {
+    let default_dir = dirs::download_dir();
+    let Some(path) = dialog.save_file(&default_name, default_dir.as_deref()) else {
         return; // user cancelled
     };
     let st = match State::load() {
@@ -1681,8 +1686,9 @@ fn handle_backup_save() {
     notify(&format!("Saved to {}", path.display()));
 }
 
-/// "Restore…" click: opens a native OPEN panel (`rfd::FileDialog::pick_file`)
-/// defaulting to the automatic rolling-backups directory, validates the
+/// "Restore…" click: opens a native OPEN panel (via
+/// `Platform::file_dialog().pick_file(...)`) defaulting to the automatic
+/// rolling-backups directory, validates the
 /// chosen file is state-shaped, warns before a restore would drop accounts
 /// (a "downgrade"), then atomically replaces `state.json`. The rolling
 /// backups already snapshot the pre-restore state on every ordinary save, but
@@ -1690,16 +1696,23 @@ fn handle_backup_save() {
 /// it, so the restore itself is reversible even if the user picked a very old
 /// backup.
 fn handle_backup_restore_dialog() {
-    let mut dialog = rfd::FileDialog::new().add_filter("usagio state (*.json)", &["json"]);
+    handle_backup_restore_dialog_with(crate::platform().file_dialog());
+}
+
+/// Testable core of the Restore… click: takes the `FileDialog` as a
+/// parameter so `#[cfg(test)]` can pass a `platform::MockFileDialog` instead
+/// of popping a real native panel. See `platform::Platform::file_dialog`.
+fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
+    let mut default_dir = None;
     if let Ok(p) = crate::store::state_json_path() {
         let backups_dir = p.parent().map(|d| d.join("backups"));
         if let Some(dir) = backups_dir {
             if dir.is_dir() {
-                dialog = dialog.set_directory(&dir);
+                default_dir = Some(dir);
             }
         }
     }
-    let Some(path) = dialog.pick_file() else {
+    let Some(path) = dialog.pick_file(default_dir.as_deref()) else {
         return; // user cancelled
     };
     let bytes = match std::fs::read(&path) {
@@ -2938,5 +2951,46 @@ mod tests {
             value.is_none(),
             "a plain row must not carry a forced foreground color",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Backups Save…/Restore… ▸ FileDialog trait routing
+    //
+    // These assert the click handlers call `FileDialog` with the expected
+    // arguments WITHOUT ever popping a real native panel — the mock's
+    // `save_file`/`pick_file` return `None` by default, so each handler
+    // returns right after recording the call (the "user cancelled" path).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn backup_save_click_calls_file_dialog_with_default_name_and_downloads_dir() {
+        let dialog = crate::platform::MockFileDialog::default();
+        handle_backup_save_with(&dialog);
+
+        let calls = dialog.save_file_calls.borrow();
+        assert_eq!(calls.len(), 1, "expected exactly one save_file() call");
+        let (default_name, default_dir) = &calls[0];
+        assert!(
+            default_name.starts_with("usagio-state-") && default_name.ends_with(".json"),
+            "unexpected default file name: {default_name}"
+        );
+        // default_dir mirrors dirs::download_dir() on this machine — just
+        // assert the call *passed through* whatever that returned, rather
+        // than hardcoding a path that doesn't exist in CI.
+        assert_eq!(default_dir.as_deref(), dirs::download_dir().as_deref());
+    }
+
+    #[test]
+    fn backup_restore_click_calls_file_dialog_pick_file_once() {
+        // handle_backup_restore_dialog_with probes state_json_path() (via
+        // crate::store::config_dir()) to default the panel to the backups
+        // dir if it exists — needs a ScopedConfigDir so that probe resolves
+        // to a tempdir instead of panicking on a missing HOME_OVERRIDE.
+        let _g = crate::store::ScopedConfigDir::new();
+        let dialog = crate::platform::MockFileDialog::default();
+        handle_backup_restore_dialog_with(&dialog);
+
+        let calls = dialog.pick_file_calls.borrow();
+        assert_eq!(calls.len(), 1, "expected exactly one pick_file() call");
     }
 }

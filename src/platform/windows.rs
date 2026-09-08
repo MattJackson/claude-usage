@@ -5,9 +5,11 @@
 //! probing) lives in this file. Nothing outside `src/platform/` should ever
 //! need `#[cfg(target_os = "windows")]` — callers go through the `Platform`
 //! trait (`platform::current()`), and the handful of Windows-only helpers
-//! below that aren't (yet) part of the trait surface — `pick_file`,
-//! `probe_terminal`, `launch_repl` — are `pub` only within this module tree
-//! so nothing outside it can reach for them by accident.
+//! below that aren't (yet) part of the trait surface — `probe_terminal`,
+//! `launch_repl` — are `pub` only within this module tree so nothing outside
+//! it can reach for them by accident. File dialogs go through
+//! `Platform::file_dialog()` (see `src/platform/mod.rs::RfdFileDialog`), not
+//! a Windows-only helper, since `rfd` is already cross-platform.
 //!
 //! ## Tray icon threading model
 //!
@@ -632,13 +634,10 @@ pub(crate) fn launch_repl(program: &str) -> Result<()> {
 //
 // `rfd` is cross-platform (Win32 IFileOpenDialog under the hood here) and
 // needs no Windows-specific wiring beyond being a dependency — see the note
-// in Cargo.toml. This wrapper exists to prove it's actually plumbed in and
-// give the future menu-redesign import/export flow a single call site.
-
-#[allow(dead_code)]
-pub(crate) fn pick_file(title: &str) -> Option<PathBuf> {
-    rfd::FileDialog::new().set_title(title).pick_file()
-}
+// in Cargo.toml. Routed through `Platform::file_dialog()` /
+// `platform::RfdFileDialog` (src/platform/mod.rs) rather than a Windows-only
+// free function, so `crate::menubar`'s Backups Save…/Restore… handlers call
+// one cross-platform trait method instead of reaching for `rfd::` directly.
 
 // ---- Tests ------------------------------------------------------------------
 
@@ -726,16 +725,38 @@ mod tests {
         );
     }
 
+    /// Drop guard that deletes `label` from the real `HKCU` Run key when it
+    /// goes out of scope — including on an early `panic!`/assertion failure
+    /// mid-test, so a red assertion never leaves a stray
+    /// `usagio-test-<pid>` value behind in CI's registry.
+    struct RunKeyCleanup<'a> {
+        autostart: &'a WindowsAutostart,
+        label: String,
+    }
+
+    impl Drop for RunKeyCleanup<'_> {
+        fn drop(&mut self) {
+            let _ = self.autostart.uninstall(&self.label);
+        }
+    }
+
     /// Registry round-trip against the real `HKCU` Run key. `#[ignore]`d by
     /// default — this is the one test in this module with a real side
     /// effect on the machine running it. Run explicitly on Windows with
-    /// `cargo test -- --ignored windows_autostart_writes_registry_key`.
+    /// `cargo test --all-features -- --ignored windows_autostart_writes_registry_key`,
+    /// or via CI's Windows-only "cargo test --ignored" step
+    /// (`.github/workflows/ci.yml`), which runs on every push since
+    /// `windows-latest` runners are disposable per-job VMs.
     #[test]
     #[ignore = "writes to the real HKCU Run key; run with --ignored on Windows"]
     fn windows_autostart_writes_registry_key() {
-        let label = format!("usagio-platform-test-{}", std::process::id());
+        let label = format!("usagio-test-{}", std::process::id());
         let autostart = WindowsAutostart;
         let binary = Path::new(r"C:\Path\To\usagio-test.exe");
+        let _cleanup = RunKeyCleanup {
+            autostart: &autostart,
+            label: label.clone(),
+        };
 
         let _ = autostart.uninstall(&label);
         assert!(!autostart.is_installed(&label).unwrap());

@@ -37,6 +37,20 @@ pub trait Platform: Send + Sync + 'static {
     /// user's NTFS ACL, so this is a documented no-op on that backend rather
     /// than a scattered `#[cfg(unix)]` at every call site. `path` must exist.
     fn secure_permissions(&self, path: &Path) -> Result<()>;
+    /// Native save/open panels for the "Advanced ▸ Backups ▸ Save…/Restore…"
+    /// menu flow. Default-implemented against `rfd` (Win32
+    /// IFileOpenDialog/IFileSaveDialog on Windows, NSOpenPanel/NSSavePanel on
+    /// macOS, xdg-desktop-portal on Linux) via the process-wide
+    /// [`RfdFileDialog`] — `rfd` already backs every target from one
+    /// cross-platform call, so there's no per-OS behavior to fork here the
+    /// way there is for menu/secrets/autostart/paths. Kept as a trait method
+    /// (rather than a bare free function `menubar.rs` calls directly) so
+    /// tests can substitute a capturing mock instead of popping a real
+    /// native dialog — see `handle_backup_save_with` /
+    /// `handle_backup_restore_dialog_with` in `crate::menubar`.
+    fn file_dialog(&self) -> &dyn FileDialog {
+        &RfdFileDialog
+    }
 }
 
 // ---------- MenuBackend ---------------------------------------------------
@@ -156,6 +170,81 @@ pub trait Paths: Send + Sync {
     fn data_dir(&self, app: &str) -> PathBuf;
     fn log_dir(&self, app: &str) -> PathBuf;
     fn cache_dir(&self, app: &str) -> PathBuf;
+}
+
+// ---------- FileDialog -----------------------------------------------------
+
+/// Native file-open/save panels. See `Platform::file_dialog` for why this
+/// isn't forked per-OS the way menu/secrets/autostart/paths are.
+///
+/// No `Send + Sync` supertrait bound (unlike the other backend traits): every
+/// production impl (`RfdFileDialog`) is a stateless unit struct held by value
+/// inside a `Platform` impl (never boxed as a trait object field), and the
+/// test mock (`MockFileDialog`) intentionally uses `RefCell` — a `Sync`
+/// requirement here would forbid that without buying anything, since nothing
+/// stores `Box<dyn FileDialog>` behind a shared reference across threads.
+pub trait FileDialog {
+    /// Open a SAVE panel defaulting to `default_name` inside `default_dir`
+    /// (falls back to the OS's normal default location if `None`). Returns
+    /// `None` if the user cancels.
+    fn save_file(&self, default_name: &str, default_dir: Option<&Path>) -> Option<PathBuf>;
+    /// Open an OPEN panel defaulting to `default_dir`, filtered to
+    /// `*.json` (the only caller today is the state-file restore flow).
+    /// Returns `None` if the user cancels.
+    fn pick_file(&self, default_dir: Option<&Path>) -> Option<PathBuf>;
+}
+
+/// `rfd`-backed `FileDialog`. Stateless — `rfd::FileDialog` is built fresh
+/// per call, so this is a zero-sized marker type wired into every `Platform`
+/// impl via the trait's default method.
+pub struct RfdFileDialog;
+
+impl FileDialog for RfdFileDialog {
+    fn save_file(&self, default_name: &str, default_dir: Option<&Path>) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new().set_file_name(default_name);
+        if let Some(dir) = default_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        dialog.save_file()
+    }
+
+    fn pick_file(&self, default_dir: Option<&Path>) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new().add_filter("usagio state (*.json)", &["json"]);
+        if let Some(dir) = default_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        dialog.pick_file()
+    }
+}
+
+/// Test-only capturing mock for [`FileDialog`], shared by any module that
+/// needs to assert "the Save…/Restore… click handler called `FileDialog`
+/// with X arguments" without popping a real native panel. `pub(crate)` so
+/// `crate::menubar`'s `#[cfg(test)]` module can reach it.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MockFileDialog {
+    pub save_file_calls: std::cell::RefCell<Vec<(String, Option<PathBuf>)>>,
+    pub save_file_returns: std::cell::RefCell<Option<PathBuf>>,
+    pub pick_file_calls: std::cell::RefCell<Vec<Option<PathBuf>>>,
+    pub pick_file_returns: std::cell::RefCell<Option<PathBuf>>,
+}
+
+#[cfg(test)]
+impl FileDialog for MockFileDialog {
+    fn save_file(&self, default_name: &str, default_dir: Option<&Path>) -> Option<PathBuf> {
+        self.save_file_calls
+            .borrow_mut()
+            .push((default_name.to_string(), default_dir.map(Path::to_path_buf)));
+        self.save_file_returns.borrow_mut().take()
+    }
+
+    fn pick_file(&self, default_dir: Option<&Path>) -> Option<PathBuf> {
+        self.pick_file_calls
+            .borrow_mut()
+            .push(default_dir.map(Path::to_path_buf));
+        self.pick_file_returns.borrow_mut().take()
+    }
 }
 
 // ---------- current() -----------------------------------------------------
