@@ -50,16 +50,29 @@ pub enum MigrationError {
     OldRemovalFailed { new: PathBuf, source: io::Error },
 }
 
-/// Default entry point — uses `~/.config/claude-usage` and `~/.config/usagio`.
-/// L9 (round-1 codeaudit): the two slug names come from the module-level
-/// constants in `main.rs` (`LEGACY_APP_SLUG` and `APP_SLUG`) so renaming the
-/// app is a single-point edit.
+/// Default entry point — attempts a `claude-usage` → `usagio` config-dir
+/// rename in whatever the Platform's Paths backend considers the config base
+/// (macOS: `~/.config`; Linux: `$XDG_CONFIG_HOME` or `~/.config`; Windows:
+/// `%APPDATA%`). L9 (round-1 codeaudit): the two slug names come from the
+/// module-level constants in `main.rs` (`LEGACY_APP_SLUG` and `APP_SLUG`) so
+/// renaming the app is a single-point edit.
+///
+/// Windows note: the legacy `claude-usage` binary never shipped on Windows,
+/// so `migrate_between` will observe `(false, ...)` for the old dir and
+/// return `FreshInstall` / `AlreadyMigrated`. No false "config migration
+/// FAILED" message can fire from a stock Windows install without `$HOME` set.
 pub fn migrate_config_dir_if_needed() -> Result<MigrationResult, MigrationError> {
-    let base = config_base()?;
-    migrate_between(
-        &base.join(crate::LEGACY_APP_SLUG),
-        &base.join(crate::APP_SLUG),
-    )
+    // Route through the Platform trait so each OS's real config dir is used —
+    // NOT a hardcoded `$HOME/.config`. Both dirs share the same parent (the
+    // `parent()` of the new-slug config dir is the base we'd have joined
+    // `LEGACY_APP_SLUG` onto), so we derive the base by trimming the app
+    // segment off `platform().paths().config_dir(APP_SLUG)`.
+    let new_dir = crate::platform().paths().config_dir(crate::APP_SLUG);
+    let base = new_dir
+        .parent()
+        .ok_or(MigrationError::NoConfigBase)?
+        .to_path_buf();
+    migrate_between(&base.join(crate::LEGACY_APP_SLUG), &new_dir)
 }
 
 /// Test-friendly form: caller supplies the exact old and new paths.
@@ -113,6 +126,10 @@ pub fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, Migrat
 // Internals
 // -------------------------------------------------------------------------
 
+// Retained for tests that pin the old XDG-first resolution shape; no prod
+// callers (see `migrate_config_dir_if_needed` above, which now routes through
+// `crate::platform().paths()` so Windows and any future OS work correctly).
+#[allow(dead_code)]
 fn config_base() -> Result<PathBuf, MigrationError> {
     if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
         let p = PathBuf::from(x);
@@ -158,16 +175,18 @@ fn copy_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     if file_type.is_symlink() {
         let target = std::fs::read_link(src)?;
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, dst)?;
+        {
+            std::os::unix::fs::symlink(&target, dst)?;
+            return Ok(());
+        }
         #[cfg(not(unix))]
         {
-            let _ = target;
+            let _ = (target, dst);
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "symlink copy not implemented on this platform",
             ));
         }
-        return Ok(());
     }
 
     if file_type.is_dir() {

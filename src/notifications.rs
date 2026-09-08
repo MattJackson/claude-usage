@@ -58,7 +58,7 @@ pub enum Trigger {
 /// Per-trigger enable flags. Thresholds and reset-back default on; pace is
 /// experimental and defaults off (the user opts in from Settings ▸
 /// Notifications).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationConfig {
     pub threshold_enabled: bool,
     pub reset_back_enabled: bool,
@@ -270,14 +270,43 @@ pub fn format_message(trigger: &Trigger, account: &AccountKey) -> (String, Strin
 /// perspective — the watch loop swallows the Err so a broken dbus connection
 /// can't stall the poll cycle. Runs synchronously; notify-rust's own thread
 /// model varies by backend and we don't need async here.
+///
+/// Under `cfg(test)` this is a no-op (`NullNotifier`, below) rather than the
+/// real `notify_rust` call: `cargo test` must never pop a real Notification
+/// Center banner. Every test that wants to assert on what *would* have been
+/// shown should assert against `format_message` directly instead — it's the
+/// pure half of this function and is exercised by the golden-message tests
+/// further down.
 pub fn fire(trigger: &Trigger, account: &AccountKey) -> Result<()> {
     let (summary, body) = format_message(trigger, account);
+    null_notifier_or_real(&summary, &body)
+}
+
+#[cfg(not(test))]
+fn null_notifier_or_real(summary: &str, body: &str) -> Result<()> {
     notify_rust::Notification::new()
-        .summary(&summary)
-        .body(&body)
+        .summary(summary)
+        .body(body)
         .show()
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("notify-rust show failed: {e}"))
+}
+
+/// `NullNotifier`: the `cfg(test)` stand-in for the real notify-rust call.
+/// Deliberately swallows `summary`/`body` rather than firing anything — see
+/// the doc comment on `fire` above.
+#[cfg(test)]
+fn null_notifier_or_real(_summary: &str, _body: &str) -> Result<()> {
+    Ok(())
+}
+
+/// Fire a plain "usagio: <msg>" notification, without going through the
+/// `Trigger`/`AccountKey` pipeline. Used for one-off diagnostics (auto-swap,
+/// stuck-account, migration failures) from `main::notify`. Cross-platform via
+/// notify-rust — replaces the older macOS-only `osascript display notification`
+/// path that silently no-op'd on Linux/Windows.
+pub fn fire_plain(msg: &str) -> Result<()> {
+    null_notifier_or_real("usagio", msg)
 }
 
 // ---------------------------------------------------------------------------

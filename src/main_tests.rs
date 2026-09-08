@@ -536,25 +536,96 @@ fn env_override_active_reads_shared_slug_map() {
     assert!(!env_override_active(CLAUDE_SLUG));
 }
 
-// --- next_interval (backoff) ---
+// --- next_interval (backoff + adaptive cadence) ---
+
+const TRIGGER_FOR_TESTS: f64 = 95.0;
 
 #[test]
-fn next_interval_resets_to_base_when_not_limited() {
-    // A clean cycle always returns to the base cadence, even from a backed-off value.
-    assert_eq!(next_interval(600, 60, false), 60);
-    assert_eq!(next_interval(60, 60, false), 60);
+fn next_interval_resets_to_base_when_not_limited_and_far_from_trigger() {
+    // A clean cycle with everyone comfortably below the warning band
+    // returns to the base cadence, even from a backed-off value.
+    assert_eq!(
+        next_interval(600, 60, false, Some(50.0), TRIGGER_FOR_TESTS),
+        60
+    );
+    assert_eq!(
+        next_interval(60, 60, false, Some(50.0), TRIGGER_FOR_TESTS),
+        60
+    );
+    // No usage data yet → also base cadence.
+    assert_eq!(next_interval(60, 60, false, None, TRIGGER_FOR_TESTS), 60);
 }
 
 #[test]
 fn next_interval_doubles_on_rate_limit_capped() {
-    // Doubles on a rate limit…
-    assert_eq!(next_interval(60, 60, true), 120);
-    // …never below base even if `current` was stale-small…
-    assert_eq!(next_interval(1, 60, true), 120);
-    // …and is capped at the max.
+    // Rate-limit override wins over adaptive cadence.
     assert_eq!(
-        next_interval(WATCH_MAX_INTERVAL_SECS, 60, true),
+        next_interval(60, 60, true, Some(50.0), TRIGGER_FOR_TESTS),
+        120
+    );
+    // Never below base even if `current` was stale-small.
+    assert_eq!(
+        next_interval(1, 60, true, Some(50.0), TRIGGER_FOR_TESTS),
+        120
+    );
+    // Capped at the max.
+    assert_eq!(
+        next_interval(
+            WATCH_MAX_INTERVAL_SECS,
+            60,
+            true,
+            Some(99.0),
+            TRIGGER_FOR_TESTS
+        ),
         WATCH_MAX_INTERVAL_SECS
+    );
+}
+
+#[test]
+fn next_interval_tightens_to_warning_inside_the_band() {
+    // Inside [trigger - 15, trigger): 30s WARNING cadence, regardless of
+    // the current `current` — this is exactly the case that let the user's
+    // 94% + 150s wait miss the swap on v0.4.3.
+    assert_eq!(
+        next_interval(150, 150, false, Some(94.9), TRIGGER_FOR_TESTS),
+        30
+    );
+    assert_eq!(
+        next_interval(150, 150, false, Some(85.0), TRIGGER_FOR_TESTS),
+        30
+    );
+    assert_eq!(
+        next_interval(150, 150, false, Some(80.001), TRIGGER_FOR_TESTS),
+        30
+    );
+    // Exactly at the band-lower edge (trigger - 15 = 80.0) still tightens.
+    assert_eq!(
+        next_interval(150, 150, false, Some(80.0), TRIGGER_FOR_TESTS),
+        30
+    );
+    // 1 tick below the band — back to base.
+    assert_eq!(
+        next_interval(150, 150, false, Some(79.9), TRIGGER_FOR_TESTS),
+        150
+    );
+}
+
+#[test]
+fn next_interval_tightens_to_backstop_at_or_above_trigger() {
+    // At or above the trigger: 10s BACKSTOP cadence. The auto-swap should
+    // already have fired; this makes sure a transient failure doesn't
+    // leave us blind for a full base cycle.
+    assert_eq!(
+        next_interval(150, 150, false, Some(95.0), TRIGGER_FOR_TESTS),
+        10
+    );
+    assert_eq!(
+        next_interval(150, 150, false, Some(99.9), TRIGGER_FOR_TESTS),
+        10
+    );
+    assert_eq!(
+        next_interval(150, 150, false, Some(100.0), TRIGGER_FOR_TESTS),
+        10
     );
 }
 
@@ -849,3 +920,779 @@ fn switch_lock_closure_invariant_mutations_after_reload_survive() {
     );
     assert_eq!(disk.active.as_deref(), Some("b@e.com"));
 }
+
+// --- launch_agent_exe_path / sibling_app_bundle_exe ---
+
+// Used only by macOS launch-agent / bundle tests below (all `#[cfg(target_os = "macos")]`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mock_cellar_bundle_layout(
+    prefix: &str,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let version_dir = dir.join("Cellar/usagio/0.9.9");
+    let bin_dir = version_dir.join("bin");
+    let bundle_macos_dir = version_dir.join("usagio.app/Contents/MacOS");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&bundle_macos_dir).unwrap();
+
+    let bare_exe = bin_dir.join("usagio");
+    std::fs::write(&bare_exe, b"bare").unwrap();
+    let bundle_exe = bundle_macos_dir.join("usagio");
+    std::fs::write(&bundle_exe, b"bundled").unwrap();
+
+    (dir, bare_exe, bundle_exe)
+}
+
+// macOS-only: exercises the .app bundle path-resolution helper (Homebrew
+// Cellar layout) — no such concept on Linux/Windows. Uses cfg(unix)
+// which the strict-cfg guard leaves alone.
+#[cfg(unix)]
+#[test]
+fn sibling_app_bundle_exe_finds_bundle_next_to_bin_dir() {
+    let (dir, bare_exe, bundle_exe) = mock_cellar_bundle_layout("usagio-bundle-test");
+
+    let found = sibling_app_bundle_exe(&bare_exe).expect("bundle exe should be found");
+    assert_eq!(found, bundle_exe);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn sibling_app_bundle_exe_none_when_bundle_absent() {
+    let dir = std::env::temp_dir().join(format!(
+        "usagio-nobundle-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let bin_dir = dir.join("Cellar/usagio/0.9.9/bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let bare_exe = bin_dir.join("usagio");
+    std::fs::write(&bare_exe, b"bare").unwrap();
+
+    assert!(sibling_app_bundle_exe(&bare_exe).is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Mocks a Homebrew-style `<Cellar>/usagio/<version>/{bin,usagio.app}` layout
+/// and reproduces the exact plist-building the real `MacOsAutostart::install`
+/// does (minus the `launchctl load` shell-out, which needs a real launchd job
+/// and a valid Mach-O binary — orthogonal to what's under test here), then
+/// asserts the written LaunchAgent plist's `ProgramArguments` points at the
+/// bundle's `Contents/MacOS/usagio`, not the bare binary. This is what makes
+/// Login Items show the app icon instead of the generic "exec" glyph.
+#[cfg(unix)]
+#[test]
+fn usagio_install_prefers_app_bundle_path_when_available() {
+    let (dir, bare_exe, bundle_exe) = mock_cellar_bundle_layout("usagio-install-bundle-test");
+
+    // Resolve exactly the way `cmd_install` -> `launch_agent_exe_path` would,
+    // given this mocked Cellar layout (bypassing `current_exe()`/
+    // `stable_exe_path()`, which can't be pointed at a scratch dir).
+    let resolved = sibling_app_bundle_exe(&bare_exe).expect("bundle should resolve");
+    assert_eq!(resolved, bundle_exe);
+
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let plist_path = home
+        .join("Library/LaunchAgents")
+        .join("com.mattjackson.usagio.test-bundle.plist");
+
+    crate::env_lock::scoped_env_var("HOME", Some(home.to_str().unwrap()), || {
+        let mut prog_args = format!("    <string>{}</string>\n", resolved.display());
+        prog_args.push_str("    <string>menubar</string>\n");
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mattjackson.usagio.test-bundle</string>
+  <key>ProgramArguments</key>
+  <array>
+{prog_args}  </array>
+</dict>
+</plist>
+"#
+        );
+        std::fs::create_dir_all(plist_path.parent().unwrap()).unwrap();
+        std::fs::write(&plist_path, &plist).unwrap();
+
+        let written = std::fs::read_to_string(&plist_path).unwrap();
+        assert!(
+            written.contains("usagio.app/Contents/MacOS/usagio"),
+            "expected ProgramArguments to point into the app bundle, got:\n{written}"
+        );
+        assert!(
+            !written.contains(&bare_exe.display().to_string()),
+            "must not fall back to the bare binary path when a bundle exists"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// M12 — .app bundle direct-launch (Finder double-click) must default to the
+// menu bar, not the one-shot `list` a bare CLI invocation defaults to.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn run_dispatch_defaults_to_menubar_when_invoked_from_app_bundle() {
+    let bundle_exe = std::path::PathBuf::from("/Applications/usagio.app/Contents/MacOS/usagio");
+    assert_eq!(effective_first_arg(&[], &bundle_exe), Some("menubar"));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_dispatch_defaults_to_list_for_bare_binary() {
+    let bare_exe = std::path::PathBuf::from("/opt/homebrew/bin/usagio");
+    assert_eq!(effective_first_arg(&[], &bare_exe), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_dispatch_prefers_an_explicit_arg_over_bundle_detection() {
+    // Even when launched from inside a bundle, an explicit argument (e.g.
+    // `usagio list` run via Terminal against the bundled binary) wins.
+    let bundle_exe = std::path::PathBuf::from("/Applications/usagio.app/Contents/MacOS/usagio");
+    let args = vec!["list".to_string()];
+    assert_eq!(effective_first_arg(&args, &bundle_exe), Some("list"));
+}
+
+// ---------------------------------------------------------------------------
+// Active-account CAS refresh (v0.5.0). `active_refresh_cas` is exercised
+// directly against a `MockActiveSlotProvider` rather than through the full
+// `refresh_usage_cache()` — the real `ClaudeProvider::read_active_slot` /
+// `mirror_rotated_token` on macOS route through the REAL login keychain
+// (`Platform::secrets()`), which unit tests must never touch (see the
+// `#[ignore]`d `secret_store_roundtrip` in `platform/macos.rs` for the same
+// rule). The mock provider gives `active_refresh_cas` an in-memory "OS-native
+// slot" it can read/write freely, while the `/token` POST itself still goes
+// through the same thread-local URL override + in-process mock HTTP server
+// every other refresh test in this file uses (`oauth::refresh` is
+// Claude-specific and not swappable per-provider).
+// ---------------------------------------------------------------------------
+
+/// Minimal `Provider` stand-in whose "OS-native active slot" is an in-memory
+/// `Mutex<Option<String>>` instead of the real keychain / credentials file.
+/// Every method besides `read_active_slot` / `mirror_rotated_token` is an
+/// inert default — `active_refresh_cas` never calls them.
+struct MockActiveSlotProvider {
+    slot: std::sync::Mutex<Option<String>>,
+}
+
+impl MockActiveSlotProvider {
+    fn new(initial: &str) -> Self {
+        Self {
+            slot: std::sync::Mutex::new(Some(initial.to_string())),
+        }
+    }
+
+    /// Simulate Claude Code rotating the slot out from under usagio, as if a
+    /// live `claude` session refreshed independently.
+    #[allow(dead_code)]
+    fn rotate_externally(&self, new_blob: &str) {
+        *self.slot.lock().unwrap() = Some(new_blob.to_string());
+    }
+}
+
+impl crate::providers::Provider for MockActiveSlotProvider {
+    fn provider_id(&self) -> &'static str {
+        "mock-active-slot"
+    }
+    fn display_name(&self) -> &'static str {
+        "Mock"
+    }
+    fn capabilities(&self) -> crate::providers::trait_def::Capabilities {
+        crate::providers::trait_def::Capabilities {
+            supports_usage: false,
+            supports_switching: false,
+            supports_launch: false,
+            supports_remove: false,
+            supports_email_capture: false,
+            secret_backend: crate::providers::trait_def::SecretBackend::Keychain,
+            capture_mode: crate::providers::trait_def::CaptureMode::CredsOnDisk,
+        }
+    }
+    fn capture_current_login(
+        &self,
+    ) -> crate::providers::trait_def::PResult<Option<crate::providers::trait_def::CapturedAccount>>
+    {
+        Ok(None)
+    }
+    fn parse_stored_blob(
+        &self,
+        _blob: &str,
+    ) -> crate::providers::trait_def::PResult<crate::providers::trait_def::TokenGrant> {
+        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    }
+    fn patch_stored_blob(
+        &self,
+        _blob: &str,
+        _grant: &crate::providers::trait_def::TokenGrant,
+    ) -> crate::providers::trait_def::PResult<String> {
+        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    }
+    fn read_active_slot(&self) -> crate::providers::trait_def::PResult<Option<String>> {
+        Ok(self.slot.lock().unwrap().clone())
+    }
+    fn mirror_rotated_token(&self, blob: &str) -> crate::providers::trait_def::PResult<()> {
+        *self.slot.lock().unwrap() = Some(blob.to_string());
+        Ok(())
+    }
+}
+
+fn mock_claude_blob(access: &str, refresh: &str, expires_at: i64) -> String {
+    serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": access,
+            "refreshToken": refresh,
+            "expiresAt": expires_at,
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn active_refresh_cas_won_writes_keychain_and_state() {
+    use crate::providers::claude::oauth;
+    use crate::store::ScopedConfigDir;
+
+    // `active_refresh_cas` logs via `logging::log`, which resolves
+    // `store::config_dir()` — that panics in tests without a
+    // `HOME_OVERRIDE` installed (see the tripwire in `store::config_dir`).
+    let _g = ScopedConfigDir::new();
+    let (base_url, hits) = spawn_mock_token_server();
+    oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+
+    let blob = mock_claude_blob("active-at", "active-rt", 0);
+    let provider = MockActiveSlotProvider::new(&blob);
+    let mut acct = Account::from_keychain_blob(&blob).unwrap();
+    acct.email = Some("active@example.com".into());
+
+    let outcome = active_refresh_cas(&provider, &mut acct);
+
+    oauth::set_token_url_override(None);
+
+    assert!(
+        matches!(outcome, ActiveRefreshOutcome::CasWon),
+        "outcome={outcome:?}"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(acct.access_token, "mock-refreshed-access-token");
+    assert_eq!(acct.refresh_token, "mock-refreshed-refresh-token");
+    // The slot (our stand-in for the keychain) must hold the new grant too —
+    // this is the "usagio DOES rotate the active-account token" half of the
+    // contract, not just a state.json update.
+    let slot_blob = provider.slot.lock().unwrap().clone().unwrap();
+    let slot_acct = Account::from_keychain_blob(&slot_blob).unwrap();
+    assert_eq!(slot_acct.access_token, "mock-refreshed-access-token");
+}
+
+#[test]
+fn active_refresh_cas_lost_adopts_cc_rotation_discards_own_grant() {
+    use crate::providers::claude::oauth;
+    use crate::store::ScopedConfigDir;
+
+    let _g = ScopedConfigDir::new();
+    // The mock token server always returns the same fixed grant; simulate
+    // Claude Code rotating the slot to a DIFFERENT blob while our POST is
+    // "in flight" by mutating the slot from inside the mock server's request
+    // handler — simplest is to just rotate it before we even look at the
+    // after-read, since the mock server call is synchronous from the test's
+    // point of view. We fake this by using a slot whose content changes
+    // between the two `read_active_slot` calls via a counting wrapper.
+    let (base_url, _hits) = spawn_mock_token_server();
+    oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+
+    let before_blob = mock_claude_blob("active-at", "active-rt", 0);
+    let cc_rotated_blob = mock_claude_blob("cc-rotated-at", "cc-rotated-rt", 999_999_999_999);
+    let provider = CountingSlotProvider::new(&before_blob, &cc_rotated_blob);
+    let mut acct = Account::from_keychain_blob(&before_blob).unwrap();
+    acct.email = Some("active@example.com".into());
+
+    let outcome = active_refresh_cas(&provider, &mut acct);
+
+    oauth::set_token_url_override(None);
+
+    assert!(
+        matches!(outcome, ActiveRefreshOutcome::CasLostAdoptedCcRotation),
+        "outcome={outcome:?}"
+    );
+    // Our own (mock-server) grant must be discarded — the adopted tokens are
+    // Claude Code's, not "mock-refreshed-access-token".
+    assert_eq!(acct.access_token, "cc-rotated-at");
+    assert_eq!(acct.refresh_token, "cc-rotated-rt");
+    assert_eq!(acct.expires_at, 999_999_999_999);
+}
+
+#[test]
+fn active_refresh_skipped_when_keychain_diverged_before_start() {
+    let _g = crate::store::ScopedConfigDir::new();
+    // The slot already holds a DIFFERENT access token than state's cached
+    // one before `active_refresh_cas` even starts — Claude Code rotated
+    // between usagio's last cycle and this one, with usagio not running (or
+    // fsnotify missing the event) in between.
+    let cc_blob = mock_claude_blob("cc-already-rotated-at", "cc-already-rotated-rt", 42);
+    let provider = MockActiveSlotProvider::new(&cc_blob);
+
+    let stale_blob = mock_claude_blob("stale-at", "stale-rt", 0);
+    let mut acct = Account::from_keychain_blob(&stale_blob).unwrap();
+    acct.email = Some("active@example.com".into());
+
+    let outcome = active_refresh_cas(&provider, &mut acct);
+
+    assert!(
+        matches!(outcome, ActiveRefreshOutcome::SkippedKeychainAlreadyDrifted),
+        "outcome={outcome:?}"
+    );
+    // No /token POST should have been attempted — state adopts the keychain's
+    // tokens directly.
+    assert_eq!(acct.access_token, "cc-already-rotated-at");
+    assert_eq!(acct.refresh_token, "cc-already-rotated-rt");
+    assert_eq!(acct.expires_at, 42);
+}
+
+/// A `Provider` whose `read_active_slot` returns `before` on the first call
+/// and `after` on every call thereafter — models Claude Code rotating the
+/// slot exactly once, between `active_refresh_cas`'s before-read and
+/// after-read.
+struct CountingSlotProvider {
+    before: String,
+    after: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingSlotProvider {
+    fn new(before: &str, after: &str) -> Self {
+        Self {
+            before: before.to_string(),
+            after: after.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl crate::providers::Provider for CountingSlotProvider {
+    fn provider_id(&self) -> &'static str {
+        "counting-slot"
+    }
+    fn display_name(&self) -> &'static str {
+        "Mock"
+    }
+    fn capabilities(&self) -> crate::providers::trait_def::Capabilities {
+        crate::providers::trait_def::Capabilities {
+            supports_usage: false,
+            supports_switching: false,
+            supports_launch: false,
+            supports_remove: false,
+            supports_email_capture: false,
+            secret_backend: crate::providers::trait_def::SecretBackend::Keychain,
+            capture_mode: crate::providers::trait_def::CaptureMode::CredsOnDisk,
+        }
+    }
+    fn capture_current_login(
+        &self,
+    ) -> crate::providers::trait_def::PResult<Option<crate::providers::trait_def::CapturedAccount>>
+    {
+        Ok(None)
+    }
+    fn parse_stored_blob(
+        &self,
+        _blob: &str,
+    ) -> crate::providers::trait_def::PResult<crate::providers::trait_def::TokenGrant> {
+        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    }
+    fn patch_stored_blob(
+        &self,
+        _blob: &str,
+        _grant: &crate::providers::trait_def::TokenGrant,
+    ) -> crate::providers::trait_def::PResult<String> {
+        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    }
+    fn read_active_slot(&self) -> crate::providers::trait_def::PResult<Option<String>> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(if n == 0 {
+            self.before.clone()
+        } else {
+            self.after.clone()
+        }))
+    }
+    fn mirror_rotated_token(&self, _blob: &str) -> crate::providers::trait_def::PResult<()> {
+        // CAS-lost never reaches the write step; if it did, that would be a
+        // bug this test should catch by simply never calling this.
+        panic!("mirror_rotated_token must not be called on a lost CAS")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inactive-account refresh still uses the plain network-outside-the-lock
+// path (unaffected by the active-account CAS redesign above).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refresh_usage_cache_still_refreshes_inactive_accounts() {
+    use crate::providers::claude::{oauth, usage};
+    use crate::store::{Account, ScopedConfigDir};
+
+    let _g = ScopedConfigDir::new();
+    let (base_url, hits) = spawn_mock_token_server();
+    oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+    usage::set_usage_url_override(Some(&format!("{base_url}/api/oauth/usage")));
+
+    let expired = Utc::now().timestamp_millis() - 1_000;
+    let mut inactive = Account::from_keychain_blob(&format!(
+        r#"{{"claudeAiOauth":{{"accessToken":"inactive-at","refreshToken":"inactive-rt","expiresAt":{expired}}}}}"#
+    ))
+    .unwrap();
+    inactive.email = Some("inactive@example.com".into());
+    // No account is marked active, so refresh_usage_cache's active-CAS branch
+    // is never entered (and never touches the real keychain) for this test.
+    let mut seed = State::default();
+    seed.accounts.push(inactive);
+    seed.active = None;
+    seed.save().unwrap();
+
+    refresh_usage_cache();
+    oauth::set_token_url_override(None);
+    usage::set_usage_url_override(None);
+
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "expected exactly one /token POST for the (only, inactive) account"
+    );
+    let after = State::load().unwrap();
+    let inactive_after = after.find("inactive@example.com").unwrap();
+    assert_eq!(inactive_after.access_token, "mock-refreshed-access-token");
+    assert_eq!(inactive_after.refresh_token, "mock-refreshed-refresh-token");
+}
+
+/// Minimal single-threaded mock token endpoint: accepts TCP connections,
+/// reads (and discards) the request, and replies with a fixed valid
+/// refresh-grant JSON body. Returns (base_url, hits) where `hits` is bumped
+/// once per accepted connection.
+fn spawn_mock_token_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock token server");
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_thread = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            // Read the request line so we can tell a /token POST apart from
+            // a usage GET; everything after it (headers/body) is discarded.
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let is_token_post = request.starts_with("POST");
+            let body = if is_token_post {
+                hits_thread.fetch_add(1, Ordering::SeqCst);
+                serde_json::json!({
+                    "access_token": "mock-refreshed-access-token",
+                    "refresh_token": "mock-refreshed-refresh-token",
+                    "expires_in": 3600,
+                })
+                .to_string()
+            } else {
+                // Usage GET — any well-formed empty snapshot avoids a parse
+                // error; this test doesn't assert on usage contents.
+                serde_json::json!({
+                    "five_hour": null,
+                    "seven_day": null,
+                    "seven_day_opus": null,
+                })
+                .to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+// ---------------------------------------------------------------------------
+// codex-switch-e2e: generic (non-Claude) capture / switch / CAS dispatch.
+// Every test below uses `ScopedConfigDir` (state.json → tempdir) and
+// `env_lock::scoped_env_var("CODEX_HOME", ...)` (auth.json → tempdir), so
+// none of them ever touch a real `~/.codex/auth.json` or the real OS
+// keychain — consistent with the crate-wide test-hermeticity contract.
+// ---------------------------------------------------------------------------
+
+fn codex_id_token(email: &str, exp: i64) -> String {
+    use base64::Engine;
+    let hdr = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::json!({ "email": email, "exp": exp })
+            .to_string()
+            .as_bytes(),
+    );
+    format!("{hdr}.{payload}.sig")
+}
+
+/// A full Codex `auth.json` blob for `email`, expiring at `exp` (unix
+/// seconds). Mirrors `providers::codex::mod::tests::make_blob`, duplicated
+/// here rather than imported since it's `#[cfg(test)]`-private to that
+/// module and this file's edit scope doesn't include changing that.
+fn codex_auth_json(email: &str, exp: i64, access: &str, refresh: &str) -> String {
+    let id_token = codex_id_token(email, exp);
+    serde_json::json!({
+        "tokens": {
+            "id_token": id_token,
+            "access_token": access,
+            "refresh_token": refresh,
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn capture_current_generic_persists_a_codex_account_into_state_v2() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let blob = codex_auth_json("codex-user@example.com", 4_000_000_000, "at1", "rt1");
+        std::fs::write(dir.path().join("auth.json"), &blob).unwrap();
+
+        let (key, existed) = capture_current_generic("codex").expect("capture must succeed");
+        assert_eq!(key, "codex-user@example.com");
+        assert!(
+            !existed,
+            "first capture of this account must report existed=false"
+        );
+
+        let state = State::load().unwrap();
+        let acct = state
+            .find_provider_account("codex", "codex-user@example.com")
+            .expect("captured account must be persisted");
+        assert_eq!(acct.access_token, "at1");
+        assert_eq!(acct.refresh_token, "rt1");
+        assert_eq!(acct.secret_blob, blob);
+        assert_eq!(
+            state.provider_accounts("codex").unwrap().active.as_deref(),
+            Some("codex-user@example.com"),
+            "capture must also become the active account for its provider"
+        );
+
+        // Re-capturing the same account (same auth.json) reports existed=true
+        // and doesn't lose the identity.
+        let (key2, existed2) = capture_current_generic("codex").unwrap();
+        assert_eq!(key2, "codex-user@example.com");
+        assert!(existed2);
+    });
+}
+
+#[test]
+fn switch_to_provider_account_writes_auth_json_and_updates_active() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        // Capture two accounts (A then B) so B ends up active, then switch
+        // back to A and confirm auth.json + state.providers["codex"].active
+        // both flip.
+        let blob_a = codex_auth_json("a@example.com", 4_000_000_000, "at-a", "rt-a");
+        std::fs::write(dir.path().join("auth.json"), &blob_a).unwrap();
+        capture_current_generic("codex").unwrap();
+
+        let blob_b = codex_auth_json("b@example.com", 4_000_000_000, "at-b", "rt-b");
+        std::fs::write(dir.path().join("auth.json"), &blob_b).unwrap();
+        capture_current_generic("codex").unwrap();
+
+        let label = switch_to_provider_account("codex", "a@example.com").unwrap();
+        assert_eq!(label, "a@example.com");
+
+        let on_disk = std::fs::read_to_string(dir.path().join("auth.json")).unwrap();
+        assert_eq!(on_disk, blob_a, "auth.json must now hold account A's blob");
+
+        let state = State::load().unwrap();
+        assert_eq!(
+            state.provider_accounts("codex").unwrap().active.as_deref(),
+            Some("a@example.com")
+        );
+        // Both accounts are still there — switching must not drop B.
+        assert!(state
+            .find_provider_account("codex", "b@example.com")
+            .is_some());
+    });
+}
+
+#[test]
+fn switch_to_provider_account_errors_for_unknown_key() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let err = switch_to_provider_account("codex", "nobody@example.com").unwrap_err();
+        assert!(format!("{err}").contains("no codex account matches"));
+    });
+}
+
+#[test]
+fn resolve_provider_selector_matches_exact_and_unique_prefix() {
+    let mut state = State::default();
+    state.upsert_provider_account(
+        "codex",
+        crate::store::ProviderAccount {
+            key: "dev@example.com".into(),
+            secret_blob: "{}".into(),
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            expires_at: 0,
+            identity_email: Some("dev@example.com".into()),
+            identity_uuid: None,
+            identity_display_name: None,
+            identity_native_blob: serde_json::Value::Null,
+            cached_usage: None,
+            notif_state: Default::default(),
+            needs_relogin: false,
+        },
+    );
+
+    assert_eq!(
+        resolve_provider_selector(&state, "dev@example.com"),
+        Some(("codex".to_string(), "dev@example.com".to_string()))
+    );
+    assert_eq!(
+        resolve_provider_selector(&state, "dev"),
+        Some(("codex".to_string(), "dev@example.com".to_string()))
+    );
+    assert_eq!(resolve_provider_selector(&state, "nobody"), None);
+}
+
+#[test]
+fn refresh_provider_active_account_noop_when_provider_does_not_support_active_refresh() {
+    // `opencode` is registered but doesn't override `supports_active_refresh`
+    // (defaults `false`) — the gate this test pins must stop
+    // `refresh_provider_active_account` before it ever looks at
+    // `state.providers["opencode"]`, let alone tries a network call.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let seed = crate::store::ProviderAccount {
+        key: "x@example.com".into(),
+        secret_blob: "untouched".into(),
+        access_token: "untouched-at".into(),
+        refresh_token: "untouched-rt".into(),
+        expires_at: 1,
+        identity_email: Some("x@example.com".into()),
+        identity_uuid: None,
+        identity_display_name: None,
+        identity_native_blob: serde_json::Value::Null,
+        cached_usage: None,
+        notif_state: Default::default(),
+        needs_relogin: false,
+    };
+    with_state_lock(|| {
+        let mut st = State::load()?;
+        st.upsert_provider_account("opencode", seed);
+        st.provider_accounts_mut("opencode").active = Some("x@example.com".to_string());
+        st.save()
+    })
+    .unwrap();
+
+    refresh_provider_active_account("opencode");
+
+    let after = State::load().unwrap();
+    let acct = after
+        .find_provider_account("opencode", "x@example.com")
+        .unwrap();
+    assert_eq!(acct.secret_blob, "untouched");
+    assert_eq!(acct.access_token, "untouched-at");
+}
+
+#[test]
+fn refresh_provider_active_account_codex_fresh_token_is_a_noop() {
+    // The stored token is far from expiry and has no `last_refresh` at all,
+    // so `grant_needs_refresh` reports `Fresh` — no network call should even
+    // be attempted, and the account must be byte-for-byte unchanged.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let blob = codex_auth_json("fresh@example.com", 4_000_000_000, "fresh-at", "fresh-rt");
+        std::fs::write(dir.path().join("auth.json"), &blob).unwrap();
+        capture_current_generic("codex").unwrap();
+
+        refresh_provider_active_account("codex");
+
+        let state = State::load().unwrap();
+        let acct = state
+            .find_provider_account("codex", "fresh@example.com")
+            .unwrap();
+        assert_eq!(acct.access_token, "fresh-at");
+        assert_eq!(acct.secret_blob, blob);
+    });
+}
+
+#[test]
+fn refresh_provider_active_account_codex_refreshes_and_persists_new_grant() {
+    // End-to-end: an expired stored token triggers `codex_active_refresh`,
+    // which drives `providers::codex::oauth::active_refresh_cas` against a
+    // local mock token endpoint, wins the CAS (nothing else touches
+    // auth.json during the test), and the new grant lands back in
+    // `state.providers["codex"]` — this is gap-4 of codex-switch-e2e end to
+    // end, without touching the real network or `~/.codex/auth.json`.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    let codex_home = dir.path().to_str().unwrap().to_string();
+
+    // `scoped_env_var` isn't reentrant, so both env vars are set inside one
+    // call (mirrors `providers::codex::oauth_tests::with_codex_env`, which
+    // this file's edit scope doesn't extend to import from).
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(&codex_home), || {
+        let expired_blob = codex_auth_json("stale@example.com", 1, "stale-at", "stale-rt");
+        std::fs::write(dir.path().join("auth.json"), &expired_blob).unwrap();
+        capture_current_generic("codex").unwrap();
+
+        let (base_url, _hits) = spawn_mock_token_server();
+        #[allow(clippy::disallowed_methods)]
+        let prev_url = std::env::var_os("CODEX_REFRESH_TOKEN_URL_OVERRIDE");
+        #[allow(clippy::disallowed_methods)]
+        std::env::set_var(
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+            format!("{base_url}/v1/oauth/token"),
+        );
+
+        refresh_provider_active_account("codex");
+
+        #[allow(clippy::disallowed_methods)]
+        match prev_url {
+            Some(v) => std::env::set_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", v),
+            None => std::env::remove_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE"),
+        }
+
+        let state = State::load().unwrap();
+        let acct = state
+            .find_provider_account("codex", "stale@example.com")
+            .expect("account survives the refresh");
+        assert_eq!(acct.access_token, "mock-refreshed-access-token");
+        assert_ne!(acct.secret_blob, expired_blob);
+
+        let on_disk = std::fs::read_to_string(dir.path().join("auth.json")).unwrap();
+        assert!(on_disk.contains("mock-refreshed-access-token"));
+    });
+}
+
+// `refresh_usage_cache_does_not_touch_the_active_account` (735b762's "never
+// refresh the active account" test) is superseded by the CAS suite above:
+// usagio now DOES refresh the active account, via `active_refresh_cas`,
+// tested in isolation against `MockActiveSlotProvider` / `CountingSlotProvider`
+// so no test here ever touches the real OS keychain that `refresh_usage_cache`
+// would resolve `ClaudeProvider::read_active_slot()` to.

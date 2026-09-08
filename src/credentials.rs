@@ -188,7 +188,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
         };
         match crate::providers::claude::oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
             Ok(true) => {
-                let _ = with_state_lock(|| {
+                let save_result = with_state_lock(|| {
                     let mut st = State::load()?;
                     // Belt-and-braces: don't clobber tokens for what is now
                     // the active account (a switch may have completed while
@@ -205,6 +205,16 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                     }
                     st.save()
                 });
+                // Surface persist failures (state.json write refused / lock
+                // poisoned / disk full). Same posture as the sibling
+                // InvalidGrant branch below — a silent `let _ =` here was
+                // exactly the pattern the earlier R2-EH-01 fix targeted.
+                if let Err(e) = save_result {
+                    crate::logging::log(&format!(
+                        "refresh_inactive_if_stale: post-refresh state save \
+                         failed for {email}: {e:#}"
+                    ));
+                }
             }
             Ok(false) => {}
             Err(crate::providers::claude::oauth::RefreshError::InvalidGrant) => {
@@ -217,6 +227,9 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                 };
                 let key = AccountKey::new("claude", &email);
                 if !last_chance_fallback(claude, &key) {
+                    crate::logging::log(&format!(
+                        "event=needs_relogin account={email} reason=invalid_grant"
+                    ));
                     // R2-EH-01 (round-2 codeaudit): mirror flag_needs_relogin's
                     // logging on save-Err so a state.json write failure here is
                     // visible instead of being silently discarded.
@@ -411,12 +424,8 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
                     ));
                     continue;
                 }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700));
-                }
+                // Best-effort, no-op on Windows — see `Platform::secure_permissions`.
+                let _ = crate::platform::current().secure_permissions(&parent);
             }
             // R2-EH-02: log watch failures (EMFILE/ENOSPC/permission/unsupported
             // FS) so a silent watch drop doesn't degrade us to the 150s poll

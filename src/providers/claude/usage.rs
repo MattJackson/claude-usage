@@ -51,8 +51,35 @@ pub struct Usage {
     pub seven_day_opus: Option<Window>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for the usage endpoint — see
+    /// `oauth::TOKEN_URL_OVERRIDE` for the rationale (an in-process mock
+    /// server standing in for the real Anthropic endpoint so tests never
+    /// depend on outbound network access).
+    static USAGE_URL_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear) the current thread's usage-URL override. Test-only.
+#[cfg(test)]
+pub(crate) fn set_usage_url_override(url: Option<&str>) {
+    USAGE_URL_OVERRIDE.with(|c| *c.borrow_mut() = url.map(String::from));
+}
+
+#[cfg(test)]
+fn usage_url() -> String {
+    USAGE_URL_OVERRIDE
+        .with(|c| c.borrow().clone())
+        .unwrap_or_else(|| config::USAGE_URL.to_string())
+}
+
+#[cfg(not(test))]
+fn usage_url() -> String {
+    config::USAGE_URL.to_string()
+}
+
 pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
-    let resp = ureq::get(config::USAGE_URL)
+    let resp = ureq::get(&usage_url())
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
         .set("anthropic-version", "2023-06-01")

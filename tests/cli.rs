@@ -3,6 +3,12 @@
 //! touches the real `~/.config/usagio/state.json`, `~/.claude.json`, or the
 //! network. (Keychain access isn't HOME-scoped, so `capture` is not exercised
 //! here.) Accounts are keyed by email.
+//!
+//! Unix-only: the isolation trick relies on `HOME` — on Windows the config
+//! path comes from `dirs::config_dir()` (`%APPDATA%`), which ignores `HOME`.
+//! Wiring cross-platform test isolation via `WindowsPaths` overrides is a
+//! v0.6 follow-up. Uses `cfg(unix)` so the strict-cfg guard leaves it alone.
+#![cfg(unix)]
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -18,10 +24,16 @@ use tempfile::TempDir;
 // `#[allow(dead_code)]` — so this incurs no runtime cost.
 mod common;
 
-/// A `usagio` command pinned to an isolated HOME.
+/// A `usagio` command pinned to an isolated HOME. On Linux the XDG spec
+/// says `$XDG_CONFIG_HOME` (if set) wins over `$HOME/.config` — GitHub's
+/// `ubuntu-latest` runner leaves it unset, but some Linux distros set it
+/// system-wide, so we `env_remove` it to force the fall-through path.
+/// Same for `$XDG_CACHE_HOME`. macOS ignores both.
 fn bin(home: &TempDir) -> Command {
     let mut c = Command::cargo_bin("usagio").expect("binary builds");
-    c.env("HOME", home.path());
+    c.env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_CACHE_HOME");
     c
 }
 

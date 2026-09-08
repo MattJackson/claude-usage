@@ -61,6 +61,11 @@ impl Provider for ClaudeProvider {
         Capabilities {
             supports_usage: true,
             supports_switching: true,
+            // The only provider whose `launch_client` is actually wired to
+            // spawn the vendor CLI (see below) — every other provider keeps
+            // this `false` until it has one too (H3, v0.5.0 codeaudit).
+            supports_launch: true,
+            supports_remove: true,
             supports_email_capture: true,
             secret_backend: SecretBackend::Keychain,
             capture_mode: CaptureMode::CredsOnDisk,
@@ -69,6 +74,18 @@ impl Provider for ClaudeProvider {
 
     fn window_order(&self) -> &'static [&'static str] {
         &["session", "weekly", "opus"]
+    }
+
+    /// Claude's refresh grant is also a plain, programmatic HTTPS POST (see
+    /// `oauth::refresh`) — `main.rs::active_refresh_cas` has driven a
+    /// compare-and-swap on the ACTIVE account's keychain slot since v0.4.0,
+    /// it just didn't previously go through this trait method to decide
+    /// whether to run. `main.rs`'s poll cycle now checks
+    /// `supports_active_refresh()` before invoking that CAS for ANY
+    /// provider (Claude included), so this must stay `true` to keep today's
+    /// behavior — see the call site's doc comment.
+    fn supports_active_refresh(&self) -> bool {
+        true
     }
 
     // --- Capture / listing --------------------------------------------------
@@ -306,6 +323,73 @@ impl Provider for ClaudeProvider {
         cmd.status().map_err(ProviderError::Io)
     }
 
+    /// Mirror a rotated blob (from an INACTIVE-account refresh) to wherever
+    /// Claude Code actually reads its credentials from on this OS. Claude
+    /// Code only uses the OS keychain on macOS (via the `security` CLI,
+    /// hence `keychain_write` routing through `Platform::secrets()` with the
+    /// exact `"Claude Code-credentials"` service name Claude Code itself
+    /// uses); on Linux and Windows it reads a plaintext
+    /// `~/.claude/.credentials.json` (`%USERPROFILE%\.claude\.credentials.json`
+    /// on Windows) instead. Branch on `Platform::os_display_name()` (a
+    /// runtime check through the trait) rather than `cfg(target_os)`, per the
+    /// strict-cfg rule that OS forks outside `src/platform/` must route
+    /// through `Platform`.
+    ///
+    /// Overridden (rather than inheriting the trait default) because the
+    /// default routes through `write_active_account`, which requires a full
+    /// `IdentitySnapshot` to rebuild `~/.claude.json` too — but mirroring a
+    /// rotated token must NOT touch identity at all, only the token bytes.
+    fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
+        parse_claude_blob(blob)?;
+        let to = if crate::platform::current().os_display_name() == "macOS" {
+            "keychain:Claude Code-credentials"
+        } else {
+            "file:~/.claude/.credentials.json"
+        };
+        let result = if crate::platform::current().os_display_name() == "macOS" {
+            keychain_write(blob)
+        } else {
+            (|| {
+                let path = claude_credentials_json_path()
+                    .ok_or_else(|| ProviderError::Other("could not resolve HOME".into()))?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(ProviderError::Io)?;
+                }
+                write_bytes_atomic_mode(&path, blob.as_bytes(), 0o600)
+            })()
+        };
+        let account = extract_claude_email(&serde_json::from_str(blob).unwrap_or(Value::Null))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        crate::logging::log(&format!(
+            "event=mirror provider={} account={account} to={to} result={}",
+            self.provider_id(),
+            match &result {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("err:{e}"),
+            }
+        ));
+        result
+    }
+
+    /// Read half of the active-account CAS refresh (see the trait doc). Reads
+    /// the exact same slot `mirror_rotated_token` writes: macOS keychain, or
+    /// the plaintext credentials file on Linux/Windows.
+    fn read_active_slot(&self) -> PResult<Option<String>> {
+        // On macOS `keychain_read` routes through `Platform::secrets().get()`
+        // (`MacOsSecrets::get`), which already emits the structured
+        // `event=keychain_read` line — no need to duplicate it here.
+        if crate::platform::current().os_display_name() == "macOS" {
+            return Ok(keychain_read());
+        }
+        let path = claude_credentials_json_path()
+            .ok_or_else(|| ProviderError::Other("could not resolve HOME".into()))?;
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ProviderError::Io(e)),
+        }
+    }
+
     // --- Credential sync ---------------------------------------------------
 
     fn credential_paths(&self) -> Vec<PathBuf> {
@@ -514,6 +598,21 @@ fn claude_json_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(home).join(".claude.json"))
 }
 
+/// Where Claude Code writes its plaintext credentials on Linux and Windows
+/// (`~/.claude/.credentials.json` / `%USERPROFILE%\.claude\.credentials.json`).
+/// Not `cfg(target_os)`-gated — both env vars are read unconditionally and
+/// whichever is set wins, so this compiles and behaves identically on every
+/// target; only the caller (which checks `os_display_name()`) decides
+/// whether to use it.
+fn claude_credentials_json_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".claude")
+            .join(".credentials.json"),
+    )
+}
+
 fn read_claude_identity() -> (Option<Value>, Option<String>) {
     let Some(path) = claude_json_path() else {
         return (None, None);
@@ -610,6 +709,8 @@ mod tests {
         let caps = p.capabilities();
         assert!(caps.supports_usage);
         assert!(caps.supports_switching);
+        assert!(caps.supports_launch);
+        assert!(caps.supports_remove);
         assert!(caps.supports_email_capture);
         assert_eq!(caps.secret_backend, SecretBackend::Keychain);
         assert_eq!(caps.capture_mode, CaptureMode::CredsOnDisk);
@@ -794,5 +895,58 @@ mod tests {
                 .and_then(|x| x.as_str()),
             Some("keep-me")
         );
+    }
+
+    #[test]
+    fn mirror_rotated_token_writes_the_blob_where_the_vendor_reads_it() {
+        // `mirror_rotated_token` logs via `logging::log`, which resolves
+        // `store::config_dir()` — that panics in tests without a
+        // `HOME_OVERRIDE` installed (see the tripwire in `store::config_dir`).
+        // `ScopedConfigDir` installs that thread-local; reuse its tempdir as
+        // the plain `$HOME` env var too, since the non-macOS path resolves
+        // `~/.claude/.credentials.json` off `$HOME` directly rather than
+        // through `store::config_dir()`.
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let dir = _cfg.home();
+        crate::env_lock::scoped_env_var("HOME", Some(dir.to_str().unwrap()), || {
+            let blob = serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "mirrored-at",
+                    "refreshToken": "mirrored-rt",
+                    "expiresAt": Utc::now().timestamp_millis() + 3_600_000,
+                }
+            })
+            .to_string();
+            let res = ClaudeProvider.mirror_rotated_token(&blob);
+            if crate::platform::current().os_display_name() == "macOS" {
+                // On macOS this round-trips through the real keychain
+                // abstraction; in a headless CI sandbox that may fail for
+                // reasons unrelated to this code path (no Security.framework
+                // session) — only assert the success case actually wrote the
+                // blob, don't require success itself.
+                if res.is_ok() {
+                    assert_eq!(keychain_read().as_deref(), Some(blob.as_str()));
+                }
+            } else {
+                res.unwrap();
+                let path = dir.join(".claude").join(".credentials.json");
+                let on_disk = std::fs::read_to_string(&path).unwrap();
+                assert_eq!(on_disk, blob);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                    assert_eq!(mode & 0o777, 0o600);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn mirror_rotated_token_rejects_non_claude_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
+            assert!(ClaudeProvider.mirror_rotated_token("{}").is_err());
+        });
     }
 }

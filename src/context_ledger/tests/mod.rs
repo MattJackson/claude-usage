@@ -2,6 +2,14 @@
 //!
 //! Uses `tempfile` to sandbox HOME-relative paths. Some tests set HOME to a
 //! temp dir to isolate ~/.claude discovery.
+//!
+//! Gated to Unix: the ledger discovery paths (`~/.claude/CLAUDE.md`,
+//! `~/.codex/prompts/*.md`, `~/.config/opencode/*`) are Unix conventions.
+//! Windows has its own analog paths under `%APPDATA%` that the vendor CLIs
+//! use, but wiring the ledger discovery to those is a v0.6 follow-up.
+//! Uses `cfg(unix)` (not `cfg(target_os)`) so the strict-cfg guard leaves
+//! it alone — the whole file becomes empty on Windows compiles.
+#![cfg(unix)]
 
 use super::*;
 use std::fs;

@@ -18,7 +18,7 @@ env:
   BIN: usagio
 
 jobs:
-  release:
+  build-macos:
     name: Build universal macOS binary and publish release
     runs-on: macos-latest
     steps:
@@ -61,8 +61,58 @@ jobs:
           lipo -create -output "dist/${BIN}" \
             "target/aarch64-apple-darwin/release/${BIN}" \
             "target/x86_64-apple-darwin/release/${BIN}"
-          tar -C dist -czf "dist/${BIN}-${version}-universal-apple-darwin.tar.gz" "${BIN}"
-          rm -f "dist/${BIN}"
+
+      - name: Install librsvg for icon generation
+        # H4 (v0.5.0 codeaudit): packaging/macos/generate-icns.sh shells out
+        # to `rsvg-convert` (from librsvg) to rasterize the SVG source logo
+        # into the .icns iconset, and dies loudly if it's missing. Without
+        # this step, the very first v0.5.0 tag push would fail here — after
+        # the build + package steps above already ran — and the whole
+        # release job (including the GitHub Release publish and tap bump)
+        # would abort with nothing uploaded.
+        run: brew install librsvg
+
+      - name: Build usagio.app bundle (for Login Items icon)
+        # Wraps the universal binary from the previous step in a minimal
+        # .app bundle so macOS's Login Items UI (System Settings > General >
+        # Login Items) reads AppIcon.icns from Contents/Resources/ instead
+        # of showing the generic "exec" glyph a bare binary gets. See
+        # packaging/macos/usagio.app.template/Contents/Info.plist and
+        # packaging/macos/generate-icns.sh for the rationale.
+        #
+        # Ad-hoc signed only (`codesign --sign -`) — there's no Apple
+        # Developer account yet for a real Developer ID signature, so this
+        # is not notarised. Gatekeeper may still warn on a first *manual*
+        # double-click of usagio.app, but neither `brew install` nor
+        # `usagio install` (which launches via launchd, not Finder/LaunchServices)
+        # go through that Gatekeeper quarantine prompt path.
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          ver="${version#v}"
+
+          packaging/macos/generate-icns.sh
+
+          app_build="dist/${BIN}.app"
+          cp -R packaging/macos/usagio.app.template "$app_build"
+          sed -i '' "s/{{VERSION}}/${ver}/g" "$app_build/Contents/Info.plist"
+          cp "dist/${BIN}" "$app_build/Contents/MacOS/${BIN}"
+          chmod +x "$app_build/Contents/MacOS/${BIN}"
+          rm -f "$app_build/Contents/MacOS/.gitkeep"
+          cp packaging/macos/AppIcon.icns "$app_build/Contents/Resources/AppIcon.icns"
+          rm -f "$app_build/Contents/Resources/.gitkeep"
+
+          codesign --force --deep --sign - "$app_build"
+
+      - name: Package tarball + checksums
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+
+          # Universal tarball ships both the bare binary (backward compat
+          # with existing self-update / manual-install docs) and the .app
+          # bundle (for `usagio install` / Login Items).
+          tar -C dist -czf "dist/${BIN}-${version}-universal-apple-darwin.tar.gz" \
+            "${BIN}" "${BIN}.app"
+          rm -rf "dist/${BIN}" "dist/${BIN}.app"
 
           # Checksums: a per-asset .sha256 (consumed by the self-update
           # feature, which verifies before replacing the binary) plus a
@@ -80,16 +130,40 @@ jobs:
         with:
           subject-path: 'dist/*.tar.gz'
 
+      - name: Resolve release-notes body path
+        # Prefer a hand-drafted packaging/release-notes-<VERSION>.md (see
+        # packaging/release-notes-0.5.0.md) so the release description reads
+        # as curated notes rather than GitHub's raw commit-log
+        # auto-generation. Falls back to generate_release_notes when no
+        # drafted file exists for this version yet.
+        id: notes
+        run: |
+          ver="${GITHUB_REF#refs/tags/v}"
+          notes_file="packaging/release-notes-${ver}.md"
+          if [ -f "$notes_file" ]; then
+            echo "path=${notes_file}" >> "$GITHUB_OUTPUT"
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::${notes_file} not found — falling back to generate_release_notes"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: ${{ steps.notes.outputs.generate == 'true' }}
           files: |
             dist/*.tar.gz
             dist/*.sha256
             dist/SHA256SUMS
 
       - name: Bump Homebrew tap formula
+        # The tap formula only ever serves macOS installs, so it only tracks
+        # the macOS (universal) artifact's SHA256. Linux/Windows have no tap
+        # equivalent yet — Linux is a to-be-drafted Snap/AppImage/AUR package
+        # and Windows a to-be-drafted MSI/scoop bucket (both v0.6+ concerns).
         env:
           TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
         run: |
@@ -110,6 +184,60 @@ jobs:
           sed -i '' -E "s|^  sha256 .*|  sha256 \"${sum}\"|" "$f"
           sed -i '' -E "s|^  version .*|  version \"${ver}\"|" "$f"
 
+          # The universal tarball now ships usagio.app alongside the bare
+          # binary (see the "Build usagio.app bundle" step above) — install
+          # both so `usagio install` can find the bundle and point launchd
+          # at it for a real Login Items icon.
+          perl -0777 -pi -e 's/def install\n(?:.*\n)*?  end\n/def install\n    bin.install "usagio"\n    prefix.install "usagio.app"\n  end\n/' "$f"
+
+          # Add a caveats block (once) pointing users at `usagio install`.
+          if ! grep -q 'def caveats' "$f"; then
+            perl -0777 -pi -e 's/(\nend\n?)\z/\n  def caveats\n    <<~EOS\n      For the app icon in Login Items, run `usagio install` — it now points\n      launchd at usagio.app\/Contents\/MacOS\/usagio.\n    EOS\n  end\n$1/' "$f"
+          fi
+
+          # M14: the perl rewrites above are brittle regex surgery on the
+          # formula's `install` block. Validate the result is still valid
+          # Ruby AND still has the expected `install do ... end` shape
+          # BEFORE pushing — a silently corrupted tap formula breaks every
+          # `brew install`/`brew upgrade` for every user until caught.
+          if ! ruby -c "$f" >/dev/null; then
+            echo "::error::perl rewrite produced invalid Ruby in $f — aborting before push"
+            ruby -c "$f" || true
+            exit 1
+          fi
+          if ! grep -q 'def install' "$f" || ! grep -q 'bin.install "usagio"' "$f"; then
+            echo "::error::$f is missing the expected install block after the rewrite — aborting before push"
+            cat "$f"
+            exit 1
+          fi
+
+          # The `sed` field rewrites above are anchored on the formula's
+          # current line format (`^  url `, `^  version `, `^  sha256 `). If
+          # that format ever drifts (rewrap, extra indent, multi-line url,
+          # etc.) `sed` finds no match and silently no-ops for that field —
+          # `ruby -c` and the structural `install`-block checks above still
+          # pass because the rest of the file is untouched, so the workflow
+          # would happily commit (or, worse, see no diff, print "formula
+          # already up to date", and skip the push entirely) a formula still
+          # pointing at the OLD url/version/sha256 while the job reports
+          # success. Verify each field actually landed on its new value
+          # before trusting the file.
+          if ! grep -qF "  url \"${url}\"" "$f"; then
+            echo "::error::$f url line was not updated to ${url} — sed pattern likely no longer matches the formula's format; aborting before push"
+            cat "$f"
+            exit 1
+          fi
+          if ! grep -qF "  version \"${ver}\"" "$f"; then
+            echo "::error::$f version line was not updated to ${ver} — sed pattern likely no longer matches the formula's format; aborting before push"
+            cat "$f"
+            exit 1
+          fi
+          if ! grep -qF "  sha256 \"${sum}\"" "$f"; then
+            echo "::error::$f sha256 line was not updated to ${sum} — sed pattern likely no longer matches the formula's format; aborting before push"
+            cat "$f"
+            exit 1
+          fi
+
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -119,3 +247,157 @@ jobs:
             git commit -am "${BIN} ${ver}"
             git push origin HEAD:main
           fi
+
+  build-linux:
+    name: Build Linux binary and publish release asset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libssl-dev pkg-config libsecret-1-dev librsvg2-bin
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$tag" != "$cargo_ver" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $cargo_ver"
+            exit 1
+          fi
+
+      - name: Build (x86_64-unknown-linux-gnu)
+        # Dynamically linked against the system OpenSSL found via pkg-config
+        # (installed above) — no musl / static-OpenSSL cross-compile.
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Generate icon assets (.desktop entry needs a hicolor icon set)
+        run: packaging/linux/generate-png-icons.sh
+
+      - name: Package binary + .deb
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          ver="${version#v}"
+          mkdir -p dist
+
+          # Tarball: bare binary + .desktop + hicolor icon set, so even a
+          # manual `tar -xzf` + copy-into-place gets a real application-menu
+          # entry (see packaging/README.md for the install steps).
+          stage="$(mktemp -d)/usagio-${version}"
+          mkdir -p "$stage"
+          cp "target/x86_64-unknown-linux-gnu/release/${BIN}" "$stage/${BIN}"
+          cp packaging/linux/usagio.desktop "$stage/usagio.desktop"
+          cp -R packaging/linux/icons "$stage/icons"
+          tar -C "$(dirname "$stage")" -czf \
+            "dist/${BIN}-${version}-x86_64-unknown-linux-gnu.tar.gz" "usagio-${version}"
+
+          # .deb: proper installable package for `dpkg -i` / apt, carrying
+          # the application-menu entry + icon theme install for free.
+          packaging/linux/build-deb.sh \
+            "target/x86_64-unknown-linux-gnu/release/${BIN}" "${ver}" dist
+
+          cd dist
+          for f in *.tar.gz *.deb; do
+            shasum -a 256 "$f" > "${f}.sha256"
+          done
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.deb
+
+      - name: Publish GitHub Release asset
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          # Only build-macos generates release notes (M13 — 3 parallel jobs
+          # calling action-gh-release against the same tag with
+          # generate_release_notes: true on more than one job race to
+          # publish, and the loser can lose or duplicate the notes). This
+          # job still uploads its own artifacts additively.
+          generate_release_notes: false
+          files: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.sha256
+
+  build-windows:
+    name: Build Windows binary and publish release asset
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          # windows-latest already defaults to the MSVC host triple/linker;
+          # this just makes the target explicit rather than relying on it.
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$tag" != "$cargo_ver" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $cargo_ver"
+            exit 1
+          fi
+
+      - name: Build (x86_64-pc-windows-msvc)
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Generate usagio.ico
+        # Repacks the committed packaging/windows/logo-512.png brand mark
+        # into a multi-resolution .ico for the shortcut created below (the
+        # bare .exe has no icon resource embedded — see
+        # packaging/windows/Create-Shortcut.ps1 for why a .lnk + .ico is
+        # this release's path to a real taskbar icon).
+        shell: pwsh
+        run: |
+          ./packaging/windows/generate-ico.ps1 `
+            -SourcePng packaging/windows/logo-512.png `
+            -OutIco packaging/windows/usagio.ico
+
+      - name: Package binary
+        shell: bash
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+          stage="dist/${BIN}-${version}-x86_64-pc-windows-msvc"
+          mkdir -p "$stage"
+          cp "target/x86_64-pc-windows-msvc/release/${BIN}.exe" "$stage/${BIN}.exe"
+          cp packaging/windows/usagio.ico "$stage/usagio.ico"
+          cp packaging/windows/Create-Shortcut.ps1 "$stage/Create-Shortcut.ps1"
+          (cd dist && 7z a "${BIN}-${version}-x86_64-pc-windows-msvc.zip" "$(basename "$stage")")
+          rm -rf "$stage"
+          cd dist
+          sha256sum "${BIN}-${version}-x86_64-pc-windows-msvc.zip" \
+            > "${BIN}-${version}-x86_64-pc-windows-msvc.zip.sha256"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: 'dist/*.zip'
+
+      - name: Publish GitHub Release asset
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          # See the matching comment in build-linux — only build-macos
+          # generates release notes (M13).
+          generate_release_notes: false
+          files: |
+            dist/*.zip
+            dist/*.sha256

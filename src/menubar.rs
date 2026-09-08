@@ -12,24 +12,39 @@
 //! shows, with one row per REGISTERED provider (installed or not).
 
 use anyhow::Result;
+#[cfg(target_os = "macos")]
 use std::cell::RefCell;
 use std::time::Duration;
 
-use block2::RcBlock;
 use chrono::{DateTime, Utc};
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-use objc2_foundation::NSTimer;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::TrayIconBuilder;
+// macOS native NSMenu renderer deps. `objc2`/`objc2-app-kit`/`objc2-foundation`/
+// `block2` are `[target.'cfg(target_os = "macos")'.dependencies]` in
+// Cargo.toml — they don't exist in the dependency graph on Linux/Windows, so
+// this group needs real `#[cfg(target_os = "macos")]`, not just an
+// unused-import allow. `tray_icon::menu`/`TrayIconBuilder` compile
+// everywhere (top-level dep) but are grouped in here too since they're only
+// used by the macOS-only `run`/`build_menu`/`build_account_submenu`/
+// `install_menu` below — Linux/Windows render through `platform::MenuTree`
+// instead (see the `cross_platform` module near the end of this file).
+#[cfg(target_os = "macos")]
+use {
+    block2::RcBlock,
+    objc2::MainThreadMarker,
+    objc2_app_kit::{NSApplication, NSApplicationActivationPolicy},
+    objc2_foundation::NSTimer,
+    tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    tray_icon::TrayIconBuilder,
+};
 
 use crate::countdown::{self, AccountUsage, BlockingWindow, DisplayState};
 use crate::providers::{self, CaptureMode, Provider, SeverityBands};
 use crate::store::State;
 use crate::{
-    age_str, capture_current, env_override_active, menu_order, next_interval, notify, optimize_now,
-    remove_account, row_from_account, switch_to, watch_cycle, with_state_lock, Row, SwapGuard,
-    CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
+    age_str, capture_current, capture_current_generic, env_override_active, menu_order,
+    next_interval, notify, optimize_now, remove_account, remove_provider_account_generic,
+    row_from_account, row_from_provider_account, switch_to, switch_to_provider_account,
+    watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT,
+    WATCH_INTERVAL_SECS,
 };
 
 /// Exact title of the disabled section row inserted when a provider's env
@@ -79,6 +94,16 @@ pub(crate) struct ProviderSection {
     provider_id: &'static str,
     display_name: &'static str,
     supports_switching: bool,
+    /// Gates the "Launch client" row (H3, v0.5.0 codeaudit). Independent of
+    /// `supports_switching` — a provider can have one wired without the
+    /// other; the row must not appear (and error on click) for a provider
+    /// whose `launch_client` is still the `Unsupported` trait default.
+    supports_launch: bool,
+    /// Gates the "Remove…" row (H3, v0.5.0 codeaudit). Defaults `true` for
+    /// every current provider — removing a captured account is a generic
+    /// state.json operation — but stays explicit so a provider needing extra
+    /// cleanup can opt out until that's wired.
+    supports_remove: bool,
     supports_usage: bool,
     severity_bands: SeverityBands,
     /// True when the provider's OAuth env-override is set on this process's
@@ -117,6 +142,8 @@ struct Snapshot {
     capture_api_key: Vec<RegisteredProvider>,
     autoswap: bool,
     threshold: f64,
+    /// Settings ▸ Notifications ▸ per-trigger enable checkboxes.
+    notification_config: crate::notifications::NotificationConfig,
 }
 
 /// How near a limit a percentage is, for at-a-glance coloring.
@@ -143,6 +170,7 @@ fn severity_with(p: Option<f64>, bands: SeverityBands) -> Option<Severity> {
 /// `attributedTitle` on the rows named here. Offsets are **UTF-16 code units**
 /// (what `NSRange` uses); all our runs are ASCII so char == utf16 in practice,
 /// but the helpers stay correct if an email ever isn't.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct RowStyle {
     /// The exact plain title set on the item; used to find it in the menu.
     plain: String,
@@ -170,6 +198,34 @@ struct RowStyle {
     /// trailing label on the enabled Quit row: right-aligned via `tab_x`,
     /// grey via this field, without disabling the row's click.
     grey_tail_from: Option<usize>,
+    /// v0.5.0: paint the WHOLE row in `NSColor::labelColor()` (the normal
+    /// enabled-text color — white in dark mode, black in light) even though
+    /// the underlying muda item is `enabled: true`. Used for the reset-window
+    /// / model-breakdown informational rows inside an account submenu: they
+    /// must read as normal text (not the greyed "disabled" look `enabled:
+    /// false` produces) while still routing clicks to a no-op (see the
+    /// `("noop", _, _)` arm in `handle_click`) since there's nothing to do
+    /// when you click "Session resets in 3h".
+    disabled_but_white: bool,
+}
+
+impl RowStyle {
+    /// A row with no special styling beyond its plain title — construction
+    /// sites override just the fields they need via struct-update syntax so
+    /// adding a new `RowStyle` field never requires touching every call site.
+    fn plain_row(plain: String) -> RowStyle {
+        RowStyle {
+            plain,
+            bold: false,
+            section_header: false,
+            colors: Vec::new(),
+            tab_x: None,
+            icon_slug: None,
+            checkmark: false,
+            grey_tail_from: None,
+            disabled_but_white: false,
+        }
+    }
 }
 
 /// Fixed x (points) for the right-aligned trailing `S% / W%`. The menu font is
@@ -206,8 +262,8 @@ fn summary_pcts(a: &AcctView) -> (Option<f64>, Option<f64>) {
 
 /// Fold an `AcctView` into the shape `countdown::compute_display` expects —
 /// pcts from the first two windows plus the raw reset instants we captured off
-/// the row. Used by both `header_row` and `top_header_row` so a row that
-/// switches to "locked · Xd Yh" in one place never disagrees with the other.
+/// the row. Used by both `main_row` and `switch_target_lock_countdown` so a
+/// row that switches to "locked · Xd Yh" agrees with the switch-refusal path.
 fn account_usage_for(a: &AcctView) -> AccountUsage {
     let (sp, wp) = summary_pcts(a);
     AccountUsage {
@@ -242,96 +298,61 @@ fn now_utc() -> DateTime<Utc> {
     tests::test_now()
 }
 
-/// The active-account submenu header: `display \t A% / B%`, bold if active,
-/// with each high percentage colored per the provider's severity bands. When
-/// the account is fully consumed (`countdown::compute_display` → Locked), the
-/// `A% / B%` run is swapped for `locked · <countdown>` and colored red — the
-/// user is being told *when* the account is next usable, not *how used* it is.
-fn header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
+/// Left column width (chars) the provider name is padded to in the flat main
+/// list row, so every account's email starts at the same x regardless of
+/// provider-name length ("Claude" vs "Codex").
+const PROVIDER_COL: usize = 10;
+
+/// v0.5.0 flat main-list row: `{provider}    {email}\tS {n}%  W {n}%`, bold +
+/// checkmarked if active, high percentages colored per the provider's
+/// severity bands. When the account is fully consumed
+/// (`countdown::compute_display` → Locked), the `S n%  W n%` run is swapped
+/// for `locked · <countdown>` and colored red — the user is being told *when*
+/// the account is next usable, not *how used* it is. This same string is both
+/// the row's `RowStyle` (for `apply_menu_styles`) and the plain title of the
+/// top-level `Submenu` `build_account_submenu` builds for the account (the
+/// row IS the submenu trigger — there's no separate provider header row).
+fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowStyle {
+    let label = format!("{provider_display:<PROVIDER_COL$}{}", a.display);
+    let base = u16len(&label) + 1; // + '\t'
     if let Some((cd, _win)) = locked_countdown_for(a, now_utc()) {
-        let trailing = format!("locked · {cd}");
-        let plain = format!("{}\t{trailing}", a.display);
-        let off = u16len(&a.display) + 1; // + '\t'
-                                          // A "locked" account is by definition red — no need to consult bands.
-        let colors = vec![(off, u16len(&trailing), Severity::Red)];
+        // UX (v0.5.0): drop the "locked · " prefix — the trailing run is
+        // rendered in red (visually implying locked) and the payload is a
+        // time-until-reset instead of a percentage (structurally implying
+        // locked, since a healthy row shows "S n%  W n%"). The old
+        // "locked · Xh Ym" wording repeated the same fact three ways.
+        let trailing = cd.clone();
+        let plain = format!("{label}\t{trailing}");
+        // A "locked" account is by definition red — no need to consult bands.
+        let colors = vec![(base, u16len(&trailing), Severity::Red)];
         return RowStyle {
-            plain,
             bold: a.active,
-            section_header: false,
             colors,
             tab_x: Some(TAB_X),
-            icon_slug: None,
             checkmark: a.active,
-            grey_tail_from: None,
+            ..RowStyle::plain_row(plain)
         };
     }
     let (pa, pb) = summary_pcts(a);
     let sa = pct(pa);
     let sb = pct(pb);
-    let plain = format!("{}\t{sa} / {sb}", a.display);
+    let trailing = format!("S {sa}  W {sb}");
+    let plain = format!("{label}\t{trailing}");
     let mut colors = Vec::new();
-    let s_off = u16len(&a.display) + 1; // + '\t'
+    let s_off = base + u16len("S ");
     if let Some(sev) = severity_with(pa, bands) {
         colors.push((s_off, u16len(&sa), sev));
     }
-    let w_off = s_off + u16len(&sa) + u16len(" / ");
+    let w_off = s_off + u16len(&sa) + u16len("  W ");
     if let Some(sev) = severity_with(pb, bands) {
         colors.push((w_off, u16len(&sb), sev));
     }
     RowStyle {
-        plain,
         bold: a.active,
-        section_header: false,
         colors,
         tab_x: Some(TAB_X),
-        icon_slug: None,
         checkmark: a.active,
-            grey_tail_from: None,
-    }
-}
-
-/// The top info line for the active account: `display  ·  A% / B%`,
-/// percentages colored (no bold, no tab — it's a disabled header, not a row).
-/// Mirrors `header_row`'s locked-state swap so the two headers can never
-/// disagree (the info line above the sections would look stale otherwise).
-fn top_header_row(a: &AcctView, bands: SeverityBands) -> RowStyle {
-    let plain = header_line(a);
-    if let Some((cd, _win)) = locked_countdown_for(a, now_utc()) {
-        let trailing = format!("locked · {cd}");
-        let off = u16len(&a.display) + u16len("  ·  ");
-        let colors = vec![(off, u16len(&trailing), Severity::Red)];
-        return RowStyle {
-            plain,
-            bold: false,
-            section_header: false,
-            colors,
-            tab_x: None,
-            icon_slug: None,
-            checkmark: false,
-            grey_tail_from: None,
-        };
-    }
-    let (pa, pb) = summary_pcts(a);
-    let sa = pct(pa);
-    let sb = pct(pb);
-    let mut colors = Vec::new();
-    let s_off = u16len(&a.display) + u16len("  ·  ");
-    if let Some(sev) = severity_with(pa, bands) {
-        colors.push((s_off, u16len(&sa), sev));
-    }
-    let w_off = s_off + u16len(&sa) + u16len(" / ");
-    if let Some(sev) = severity_with(pb, bands) {
-        colors.push((w_off, u16len(&sb), sev));
-    }
-    RowStyle {
-        plain,
-        bold: false,
-        section_header: false,
-        colors,
-        tab_x: None,
-        icon_slug: None,
-        checkmark: false,
-            grey_tail_from: None,
+        ..RowStyle::plain_row(plain)
     }
 }
 
@@ -345,50 +366,27 @@ fn quit_row_plain() -> String {
     format!("Quit\tusagio v{}", env!("CARGO_PKG_VERSION"))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
     let mut styles = Vec::new();
-    // Top header: pick the active account across all sections. Its own
-    // section's severity bands drive coloring so a provider with different
-    // thresholds gets its own numbers colored right.
-    if let Some((sec, a)) = active_account(snap) {
-        styles.push(top_header_row(a, sec.severity_bands));
-    }
+    // v0.5.0: the top "resets in X" header rows are gone (item 1 of the menu
+    // redesign) and there's no separate disabled provider-header row either —
+    // the provider name now lives inline in each account's own row (see
+    // `main_row`). Every row carries its provider's 16px icon (looked up by
+    // slug in `crate::icons::png16_for`; a missing PNG is a no-op).
     for sec in &snap.sections {
-        // The section header row itself gets styled (bold, disabled). Plain
-        // title matches the muda MenuItem title so the walker finds it.
-        styles.push(RowStyle {
-            plain: sec.display_name.to_string(),
-            bold: false,
-            section_header: true,
-            colors: Vec::new(),
-            tab_x: None,
-            // Section header carries the provider's 16px icon (looked up by
-            // slug in `crate::icons::png16_for`). A slug with no bundled PNG
-            // just leaves the row text-only — no error, no missing-image glyph.
-            icon_slug: Some(sec.provider_id),
-            checkmark: false,
-            grey_tail_from: None,
-        });
         for a in &sec.accounts {
-            styles.push(header_row(a, sec.severity_bands));
-            if a.has_data {
-                for w in &a.windows {
-                    if let Some(sev) = severity_with(w.pct, sec.severity_bands) {
-                        let (plain, span) = stat_row(stat_display_label(w), w.pct, &w.reset);
-                        if let Some((off, len)) = span {
-                            styles.push(RowStyle {
-                                plain,
-                                bold: false,
-                                section_header: false,
-                                colors: vec![(off, len, sev)],
-                                tab_x: None,
-                                icon_slug: None,
-                                checkmark: false,
-                                grey_tail_from: None,
-                            });
-                        }
-                    }
-                }
+            let mut style = main_row(sec.display_name, a, sec.severity_bands);
+            style.icon_slug = Some(sec.provider_id);
+            styles.push(style);
+            // Submenu info rows (reset windows, burn-rate/cost, "updated …")
+            // render enabled but must read as normal (not disabled-grey)
+            // text — see `disabled_but_white` and `submenu_info_rows`.
+            for row in submenu_info_rows(sec, a) {
+                styles.push(RowStyle {
+                    disabled_but_white: true,
+                    ..RowStyle::plain_row(row)
+                });
             }
         }
     }
@@ -398,14 +396,9 @@ fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
     let quit_plain = quit_row_plain();
     let grey_from = u16len("Quit") + 1; // +1 for the '\t'
     styles.push(RowStyle {
-        plain: quit_plain,
-        bold: false,
-        section_header: false,
-        colors: Vec::new(),
         tab_x: Some(TAB_X),
-        icon_slug: None,
-        checkmark: false,
         grey_tail_from: Some(grey_from),
+        ..RowStyle::plain_row(quit_plain)
     });
     styles
 }
@@ -420,6 +413,19 @@ fn active_account(snap: &Snapshot) -> Option<(&ProviderSection, &AcctView)> {
     None
 }
 
+/// Entry point dispatched by `usagio menubar` (see `main.rs`). macOS drives a
+/// native `NSApplication` run loop with attributedTitle NSMenu styling;
+/// Linux/Windows route through the cross-platform `platform::MenuBackend`
+/// trait instead (`cross_platform::run`, near the end of this file) —
+/// richer per-row coloring / right-aligned tab stops aren't representable
+/// through the generic `MenuTree`, so those platforms get a plain (but fully
+/// functional) muda/tray-icon menu.
+#[cfg(not(target_os = "macos"))]
+pub fn run() -> Result<()> {
+    cross_platform::run()
+}
+
+#[cfg(target_os = "macos")]
 pub fn run() -> Result<()> {
     // Register providers on the main thread before anything else — the poll
     // thread and menu build both dispatch through `providers::get`.
@@ -445,7 +451,7 @@ pub fn run() -> Result<()> {
         .with_title(title_for(&initial))
         .build()
         .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
-    install_menu(&tray, &initial);
+    mac_style::install_menu(&tray, &initial);
     let _ = tray.set_tooltip(Some(tooltip_for(&initial)));
 
     // All UI updates happen in this timer, scheduled in the DEFAULT run-loop mode.
@@ -472,7 +478,7 @@ pub fn run() -> Result<()> {
         let snap = build_snapshot();
         let sig = menu_signature(&snap);
         if *last_sig.borrow() != sig {
-            install_menu(&tray, &snap);
+            mac_style::install_menu(&tray, &snap);
             let _ = tray.set_tooltip(Some(tooltip_for(&snap)));
             *last_sig.borrow_mut() = sig;
         }
@@ -502,10 +508,17 @@ fn poll_loop() {
         // Fetch usage + auto-swap; this writes cached usage to state.json, which
         // the main-thread timer reads back to render. This is the ONLY thing that
         // hits the network, so ordinary use can never rate-limit.
-        let rate_limited = run_cycle(&mut guard);
-        current = next_interval(current, base, rate_limited);
+        let (rate_limited, max_session_pct, trigger) = run_cycle(&mut guard);
+        let prev = current;
+        current = next_interval(current, base, rate_limited, max_session_pct, trigger);
         if rate_limited {
             crate::logging::log(&format!("rate limited; backing off to {current}s"));
+        } else if current != prev && current < base {
+            let max_pct = max_session_pct.unwrap_or(0.0);
+            crate::logging::log(&format!(
+                "cadence: {prev}s → {current}s (max session {max_pct:.1}%, trigger {trigger:.0}%) \
+                 event=cadence prev={prev}s new={current}s max_pct={max_pct:.1} trigger={trigger:.0}"
+            ));
         }
         std::thread::sleep(Duration::from_secs(current));
     }
@@ -523,6 +536,24 @@ fn poll_loop() {
 /// -k`), which relaunches it in a fresh job context. A bare/from-source run has
 /// no such job, so there the orphaned self-spawn survives our exit as usual.
 fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
+    // Called from the macOS main-thread NSTimer tick (~0.75s). `canonicalize`
+    // is a real syscall that hits disk; skip it 90%+ of the time via a
+    // per-process last-check clock so the tray thread doesn't do blocking I/O
+    // on the hot path (R2-PERF audit finding). A stale check window of 10s
+    // is plenty — the brew upgrade + relaunch is best-effort and doesn't need
+    // sub-second detection.
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut g = LAST_CHECK.lock().unwrap();
+        let should_check = !matches!(*g, Some(t) if t.elapsed() < Duration::from_secs(10));
+        if !should_check {
+            return;
+        }
+        *g = Some(Instant::now());
+    }
+
     let stable = crate::stable_exe_path();
     let Ok(now) = std::fs::canonicalize(&stable) else {
         return;
@@ -558,6 +589,7 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
 }
 
 /// Outcome of attempting a launchd-driven restart.
+#[cfg_attr(not(unix), allow(dead_code))]
 enum LaunchdRestart {
     /// kickstart succeeded — the caller should wait to be replaced.
     Issued,
@@ -575,6 +607,16 @@ fn relaunch_via_launchd() -> LaunchdRestart {
     if !is_launchd_managed() {
         return LaunchdRestart::NotManaged;
     }
+    relaunch_via_launchd_kickstart()
+}
+
+// Split out from `relaunch_via_launchd` so the `libc::getuid()` call (`libc`
+// is a `[target.'cfg(unix)'.dependencies]` crate — not available on Windows
+// at all) doesn't have to gate on `target_os` (which `tests/strict_cfg.rs`
+// restricts outside `src/platform/`). `cfg(unix)`/`cfg(not(unix))` aren't
+// `target_os` checks, so this needs no allowlist entry.
+#[cfg(unix)]
+fn relaunch_via_launchd_kickstart() -> LaunchdRestart {
     let uid = unsafe { libc::getuid() };
     let target = format!("gui/{uid}/{}", crate::AUTOSTART_LABEL);
     crate::logging::log(&format!("relaunching via launchctl kickstart -k {target}"));
@@ -594,6 +636,15 @@ fn relaunch_via_launchd() -> LaunchdRestart {
     }
 }
 
+/// launchd is macOS-only; `is_launchd_managed()` (an `XPC_SERVICE_NAME` env
+/// check) can only be true there, so this is unreachable at runtime on
+/// Windows — it exists purely so `relaunch_via_launchd` compiles without
+/// `libc` (a unix-only dependency).
+#[cfg(not(unix))]
+fn relaunch_via_launchd_kickstart() -> LaunchdRestart {
+    LaunchdRestart::NotManaged
+}
+
 /// Whether we're the launchd-managed agent. `XPC_SERVICE_NAME` is set by launchd
 /// to the job label for a LaunchAgent, so a manual `usagio menubar` run
 /// (which self-spawns fine) isn't misrouted to the kickstart path.
@@ -607,17 +658,22 @@ fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
 }
 
 /// Run one poll+auto-swap cycle; returns whether it was rate limited.
-fn run_cycle(guard: &mut SwapGuard) -> bool {
+/// Runs one poll cycle and returns `(rate_limited, max_session_pct, trigger)`
+/// so the caller's adaptive-cadence math has everything it needs. The
+/// menubar poller uses the trigger the user actually configured (via
+/// `Settings ▸ Auto-swap threshold`), matching what `watch_cycle` itself
+/// dispatched on.
+fn run_cycle(guard: &mut SwapGuard) -> (bool, Option<f64>, f64) {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
     match watch_cycle(trigger, TARGET_CEILING_PCT, guard) {
-        Ok(o) => o.rate_limited,
+        Ok(o) => (o.rate_limited, o.max_session_pct, trigger),
         Err(e) => {
             crate::logging::log(&format!("menubar poll failed: {e}"));
-            false
+            (false, None, trigger)
         }
     }
 }
@@ -710,25 +766,40 @@ fn build_snapshot() -> Snapshot {
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     let active = st.active.clone();
 
-    // v1 state only has Claude accounts. Group by provider slug so once state
-    // v2 lands (each account tagged with its provider), this loop generalises
-    // with a one-line change (filter by account's slug instead of hardcoded
-    // CLAUDE_SLUG).
+    // Claude's accounts live in `st.accounts` (its own dedicated slot); every
+    // other provider's captured accounts live in `st.providers[slug]` (state
+    // v2 — see `store.rs`'s `State` doc). Build one flat `Row` list tagged by
+    // `provider_id` from both, same as before this changed from "always
+    // Claude" to "Claude + whichever providers have captured accounts".
     let mut rows: Vec<Row> = st.accounts.iter().map(row_from_account).collect();
+    for (slug, pa) in &st.providers {
+        rows.extend(
+            pa.accounts
+                .iter()
+                .map(|a| row_from_provider_account(slug, a)),
+        );
+    }
     rows.sort_by(menu_order);
 
     let mut sections: Vec<ProviderSection> = Vec::new();
     for provider in providers::all() {
         let slug = provider.provider_id();
-        // In v1 every stored row is a Claude account. Once state carries a
-        // per-account slug this becomes `rows.iter().filter(|r| r.provider_id == slug)`.
         let provider_rows: Vec<&Row> = rows.iter().filter(|r| r.provider_id == slug).collect();
         if provider_rows.is_empty() {
             continue; // no captured accounts → no section (no header, no rows).
         }
+        // Claude's "active" selection is `st.active`; every other provider
+        // tracks its own active key in `st.providers[slug].active` (state
+        // v2), since a provider's captured accounts are independent of
+        // Claude's.
+        let active_for_slug = if slug == CLAUDE_SLUG {
+            active.clone()
+        } else {
+            st.providers.get(slug).and_then(|p| p.active.clone())
+        };
         let mut accounts: Vec<AcctView> = provider_rows
             .into_iter()
-            .map(|r| acctview_from_row(r, &active, slug, provider.window_order()))
+            .map(|r| acctview_from_row(r, &active_for_slug, slug, provider.window_order()))
             .collect();
         // Primary sort: soonest-to-expire first, using the weekly-reset instant
         // as the "expiration" signal (accounts with no data yet sort last).
@@ -745,6 +816,8 @@ fn build_snapshot() -> Snapshot {
             provider_id: slug,
             display_name: provider.display_name(),
             supports_switching: caps.supports_switching,
+            supports_launch: caps.supports_launch,
+            supports_remove: caps.supports_remove,
             supports_usage: caps.supports_usage,
             severity_bands: provider.severity_bands(),
             env_override_active: env_override_for(slug),
@@ -756,8 +829,12 @@ fn build_snapshot() -> Snapshot {
     // login on this host — filtered by `capture_menu_providers` so stub
     // providers (`supports_usage == false`) don't clutter the onboarding UX.
     // Providers with `capture_mode == ApiKey` go into the "Paste API key ▸"
-    // sub-submenu instead of the main list.
-    let (creds_providers, api_key_providers) = capture_menu_providers();
+    // sub-submenu instead of the main list — UNLESS they already have a
+    // captured account (i.e. a section above), in which case that account now
+    // renders in the main list and "Paste API key ▸" stops offering it (item
+    // 9 of the redesign: capture is for NEW accounts only once one exists).
+    let captured_provider_ids: Vec<&str> = sections.iter().map(|s| s.provider_id).collect();
+    let (creds_providers, api_key_providers) = capture_menu_providers(&captured_provider_ids);
     let capture_creds: Vec<RegisteredProvider> =
         creds_providers.into_iter().map(register_provider).collect();
     let capture_api_key: Vec<RegisteredProvider> = api_key_providers
@@ -771,6 +848,7 @@ fn build_snapshot() -> Snapshot {
         capture_api_key,
         autoswap,
         threshold,
+        notification_config: st.notification_config.clone(),
     }
 }
 
@@ -797,9 +875,21 @@ fn register_provider(p: &'static dyn Provider) -> RegisteredProvider {
 /// - the first bucket renders directly under "Capture current login ▸";
 /// - the second renders under a "Paste API key ▸" sub-submenu.
 ///
-/// Pure function: no I/O, no state — only reads `Provider::capabilities`.
-pub(crate) fn capture_menu_providers() -> (Vec<&'static dyn Provider>, Vec<&'static dyn Provider>) {
-    partition_capture_providers(providers::all())
+/// `captured_provider_ids` excludes an API-key provider from the "Paste API
+/// key ▸" bucket once it already has a captured account (item 9): that
+/// account now renders in the main list instead, and the capture row would
+/// just be a confusing duplicate. Creds-on-disk providers (Claude, Codex) are
+/// NOT filtered this way — those support multiple captured accounts per
+/// provider, so "Capture current login ▸ Claude" must keep working even with
+/// an existing Claude account.
+///
+/// Pure function given its inputs: no I/O, no direct state reads — the caller
+/// (`build_snapshot`) is the one that turns `state.json` into
+/// `captured_provider_ids`.
+pub(crate) fn capture_menu_providers(
+    captured_provider_ids: &[&str],
+) -> (Vec<&'static dyn Provider>, Vec<&'static dyn Provider>) {
+    partition_capture_providers(providers::all(), captured_provider_ids)
 }
 
 /// Inner form of `capture_menu_providers` that operates on an arbitrary
@@ -807,6 +897,7 @@ pub(crate) fn capture_menu_providers() -> (Vec<&'static dyn Provider>, Vec<&'sta
 /// process-wide registry.
 fn partition_capture_providers<'a>(
     provs: &'a [Box<dyn Provider>],
+    captured_provider_ids: &[&str],
 ) -> (Vec<&'a dyn Provider>, Vec<&'a dyn Provider>) {
     let mut creds: Vec<&'a dyn Provider> = Vec::new();
     let mut api_key: Vec<&'a dyn Provider> = Vec::new();
@@ -818,7 +909,11 @@ fn partition_capture_providers<'a>(
         }
         match caps.capture_mode {
             CaptureMode::CredsOnDisk => creds.push(&**p),
-            CaptureMode::ApiKey => api_key.push(&**p),
+            CaptureMode::ApiKey => {
+                if !captured_provider_ids.contains(&p.provider_id()) {
+                    api_key.push(&**p);
+                }
+            }
         }
     }
     (creds, api_key)
@@ -867,36 +962,13 @@ fn cached_state() -> State {
     g.state.clone()
 }
 
-/// M6 (round-1 codeaudit): re-list backups only when the backups dir mtime
-/// advances. Every rebuild otherwise read + sorted the whole directory.
-fn cached_backups() -> Vec<(std::path::PathBuf, std::time::SystemTime)> {
-    use std::sync::{Mutex, OnceLock};
-    use std::time::SystemTime;
-    struct C {
-        dir_mtime: Option<SystemTime>,
-        items: Vec<(std::path::PathBuf, SystemTime)>,
-        loaded: bool,
-    }
-    static CELL: OnceLock<Mutex<C>> = OnceLock::new();
-    let cell = CELL.get_or_init(|| {
-        Mutex::new(C {
-            dir_mtime: None,
-            items: Vec::new(),
-            loaded: false,
-        })
-    });
-    let dir = crate::store::config_dir()
-        .map(|d| d.join("backups"))
-        .unwrap_or_default();
-    let mtime = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
-    let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.loaded || g.dir_mtime != mtime {
-        g.items = crate::store::list_backups().unwrap_or_default();
-        g.dir_mtime = mtime;
-        g.loaded = true;
-    }
-    g.items.clone()
-}
+// The old "Backup Config ▸ Restore from backup ▸ <list>" submenu (and its
+// `cached_backups()` mtime-cached directory listing) was replaced in v0.5.0
+// by native Save…/Restore… file panels under Settings ▸ Advanced ▸ Backups ▸
+// (see `handle_backup_save` / `handle_backup_restore_dialog`). The automatic
+// rolling backups `store::list_backups()` enumerates still exist on disk —
+// `handle_backup_restore_dialog` just defaults the OPEN panel's directory to
+// them instead of rendering a menu row per file.
 
 // (Login-item probe cache removed in 0.4.3 alongside the osascript path —
 // see the comment on the removed "Launch at login" menu row for rationale.
@@ -919,33 +991,17 @@ pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<&'static str> 
     rows
 }
 
+/// macOS-only: builds the native `tray_icon::menu::Menu` tree directly (the
+/// NSMenu attributedTitle styling walk in `apply_menu_styles` below needs a
+/// live native menu to mutate). Linux/Windows build the equivalent tree via
+/// `cross_platform::menu_tree_from_snapshot` instead, which emits the
+/// generic `platform::MenuTree` the `MenuBackend` trait consumes.
+#[cfg(target_os = "macos")]
 fn build_menu(snap: &Snapshot) -> Menu {
     let menu = Menu::new();
 
-    // Top header — active account across every section, or a placeholder.
-    match active_account(snap) {
-        Some((_sec, a)) => {
-            add(&menu, MenuItem::with_id("hdr", header_line(a), false, None));
-            // "weekly resets in X" — use the second window's reset text if
-            // populated, mirroring the v1 Claude two-window layout.
-            // Second-line header preserved verbatim from v1 ("weekly resets in
-            // X"). Uses the second window's reset text — for Claude that's the
-            // 7-day window, matching the v1 layout. Providers whose "weekly-
-            // analog" window isn't 7d still get accurate copy, since the
-            // countdown text itself comes from `resets_in()`.
-            let weekly_reset = a.windows.get(1).map(|w| w.reset.as_str()).unwrap_or("");
-            if !weekly_reset.is_empty() {
-                let line = format!("weekly resets in {weekly_reset}");
-                add(&menu, MenuItem::with_id("hdr2", line, false, None));
-            }
-        }
-        None => add(
-            &menu,
-            MenuItem::with_id("hdr", "No active account", false, None),
-        ),
-    }
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
+    // v0.5.0 menu redesign: the two "resets in X" status header rows are gone
+    // (item 1) — the same numbers now live inline in each account's own row.
     if snap.sections.is_empty() {
         add(
             &menu,
@@ -953,15 +1009,12 @@ fn build_menu(snap: &Snapshot) -> Menu {
         );
     }
 
-    // Per-provider sections. Only emit a header + submenus if the provider
-    // has at least one captured account — the "no header, no rows" rule.
+    // Flat main list: one top-level Submenu row per (provider, account), no
+    // separate provider-header row and no separator between providers — the
+    // provider name is folded into each row by `main_row` (item 2). Providers
+    // still only contribute rows when they have at least one captured
+    // account (the "no header, no rows" rule survives the redesign).
     for sec in &snap.sections {
-        // Section header: bold, disabled (styled later by `apply_menu_styles`
-        // via the RowStyle matching on the plain title).
-        add(
-            &menu,
-            MenuItem::with_id("noop", sec.display_name, false, None),
-        );
         for title in section_headline_rows(sec) {
             add(
                 &menu,
@@ -976,47 +1029,26 @@ fn build_menu(snap: &Snapshot) -> Menu {
         for a in &sec.accounts {
             build_account_submenu(&menu, sec, a);
         }
-        let _ = menu.append(&PredefinedMenuItem::separator());
     }
-
-    // Auto-swap: one submenu, Off / 90 / 95 / 98. Stays global for v1 (the
-    // click grammar reserves `autoswap:<slug>:<n>` for per-provider later).
-    let cur = if snap.autoswap {
-        snap.threshold.round() as i32
-    } else {
-        0
-    };
-    let swap = Submenu::with_id("autoswap", "Auto-swap at high usage", true);
-    let _ = swap.append(&CheckMenuItem::with_id(
-        "autoswap:off",
-        "Off",
-        true,
-        cur == 0,
-        None,
-    ));
-    for t in [90i32, 95, 98] {
-        let _ = swap.append(&CheckMenuItem::with_id(
-            format!("autoswap:{t}"),
-            format!("{t}%"),
-            true,
-            cur == t,
-            None,
-        ));
-    }
-    let _ = swap.append(&PredefinedMenuItem::separator());
-    let _ = swap.append(&MenuItem::with_id(
-        "autoswap:now",
-        "Switch to best account now",
-        true,
-        None,
-    ));
-    let _ = menu.append(&swap);
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    // Capture current login: always shows. Creds-on-disk providers render
-    // directly; API-key providers roll up under a "Paste API key ▸" sub-
-    // submenu. Stub providers (capabilities().supports_usage == false) are
-    // filtered out upstream by `capture_menu_providers`.
+    // Auto-swap: a single top-level checkbox now (item 4 of the target tree).
+    // The Off/90/95/98/"switch now" picker moves under Settings ▸ Auto-swap
+    // threshold ▸ below.
+    let _ = menu.append(&CheckMenuItem::with_id(
+        "autoswap:toggle",
+        "Auto-swap enabled",
+        true,
+        snap.autoswap,
+        None,
+    ));
+    let _ = menu.append(&PredefinedMenuItem::separator());
+
+    // Capture current login ▸ FIRST, then Settings ▸ — the redesign reorders
+    // these (item 4). Creds-on-disk providers render directly; API-key
+    // providers roll up under a "Paste API key ▸" sub-submenu, but ONLY while
+    // they have no captured account yet (item 9) — once captured, the
+    // account itself renders in the main list above instead.
     let capture = Submenu::with_id("capture", "Capture current login", true);
     if snap.capture_creds.is_empty() && snap.capture_api_key.is_empty() {
         let _ = capture.append(&MenuItem::with_id(
@@ -1064,6 +1096,82 @@ fn build_menu(snap: &Snapshot) -> Menu {
     }
     let _ = menu.append(&capture);
 
+    // Settings ▸ Notifications ▸ / Auto-swap threshold ▸ / Advanced ▸.
+    let settings = Submenu::with_id("settings", "Settings", true);
+
+    let notifications = Submenu::with_id("settings:notifications", "Notifications", true);
+    let _ = notifications.append(&CheckMenuItem::with_id(
+        "notifications:threshold",
+        "Threshold alerts (70% / 90%)",
+        true,
+        snap.notification_config.threshold_enabled,
+        None,
+    ));
+    let _ = notifications.append(&CheckMenuItem::with_id(
+        "notifications:resetback",
+        "Window reset alerts",
+        true,
+        snap.notification_config.reset_back_enabled,
+        None,
+    ));
+    let _ = notifications.append(&CheckMenuItem::with_id(
+        "notifications:pace",
+        "Weekly pace projection (experimental)",
+        true,
+        snap.notification_config.pace_enabled,
+        None,
+    ));
+    let _ = settings.append(&notifications);
+
+    // Auto-swap threshold ▸ — moved wholesale from the old top-level submenu.
+    let cur = if snap.autoswap {
+        snap.threshold.round() as i32
+    } else {
+        0
+    };
+    let threshold = Submenu::with_id("settings:autoswap-threshold", "Auto-swap threshold", true);
+    let _ = threshold.append(&CheckMenuItem::with_id(
+        "autoswap:off",
+        "Off",
+        true,
+        cur == 0,
+        None,
+    ));
+    for t in [90i32, 95, 98] {
+        let _ = threshold.append(&CheckMenuItem::with_id(
+            format!("autoswap:{t}"),
+            format!("{t}%"),
+            true,
+            cur == t,
+            None,
+        ));
+    }
+    let _ = threshold.append(&PredefinedMenuItem::separator());
+    let _ = threshold.append(&MenuItem::with_id(
+        "autoswap:now",
+        "Switch to best account now",
+        true,
+        None,
+    ));
+    let _ = settings.append(&threshold);
+
+    // Advanced ▸ Backups ▸ (Save… / Restore… via native file panels) and
+    // Refresh usage now (items 5, 6, 7).
+    let advanced = Submenu::with_id("settings:advanced", "Advanced", true);
+    let backups = Submenu::with_id("settings:advanced:backups", "Backups", true);
+    let _ = backups.append(&MenuItem::with_id("backup:save", "Save…", true, None));
+    let _ = backups.append(&MenuItem::with_id("backup:restore", "Restore…", true, None));
+    let _ = advanced.append(&backups);
+    let _ = advanced.append(&MenuItem::with_id(
+        "refresh:now",
+        "Refresh usage now",
+        true,
+        None,
+    ));
+    let _ = settings.append(&advanced);
+
+    let _ = menu.append(&settings);
+
     // Context Ledger is intentionally CLI-only (`usagio context`). It was
     // previously a submenu here that shelled out via osascript to a new
     // Terminal window — but that path needed macOS Automation permission
@@ -1080,50 +1188,6 @@ fn build_menu(snap: &Snapshot) -> Menu {
     // the toggle in 0.4.3 and rely on the CLI for autostart. To clean out
     // the stale System Events entry a prior version installed, remove
     // "usagio" from System Settings → General → Login Items → Open at Login.
-
-    // Backup Config ▸ — one-click "copy current state to /tmp" plus a live
-    // "Restore from backup ▸" submenu listing the rolling backups the store
-    // writes on every save. Both entries are wired to click ids the dispatcher
-    // routes to `handle_backup_*`.
-    let backup = Submenu::with_id("backup", "Backup Config", true);
-    let _ = backup.append(&MenuItem::with_id(
-        "backup:copy",
-        "Copy current state to /tmp",
-        true,
-        None,
-    ));
-    let restore = Submenu::with_id("backup:restore", "Restore from backup", true);
-    // M6 (round-1 codeaudit): cache the listing keyed on the backups dir's
-    // mtime so unchanged rebuilds don't re-read the directory. The dir mtime
-    // ticks on any file create/delete inside it, which is precisely when we
-    // want to refresh.
-    let backups = cached_backups();
-    if backups.is_empty() {
-        let _ = restore.append(&MenuItem::with_id("noop", "(no backups yet)", false, None));
-    } else {
-        for (path, _mtime) in &backups {
-            let name = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("<unnamed>")
-                .to_string();
-            // Human-facing label: strip the "state-" prefix and ".json" suffix
-            // so the user sees just "20260906-131204" (its captured moment).
-            let label = name
-                .strip_prefix("state-")
-                .and_then(|s| s.strip_suffix(".json"))
-                .unwrap_or(&name)
-                .to_string();
-            let _ = restore.append(&MenuItem::with_id(
-                format!("backup:restore:{name}"),
-                label,
-                true,
-                None,
-            ));
-        }
-    }
-    let _ = backup.append(&restore);
-    let _ = menu.append(&backup);
 
     let _ = menu.append(&PredefinedMenuItem::separator());
     // Quit on the left, version grey + right-aligned on the same row using
@@ -1143,17 +1207,93 @@ fn build_menu(snap: &Snapshot) -> Menu {
     menu
 }
 
-/// Build one account's submenu inside a provider section. Splits Switch /
-/// stats / Launch / Remove; the pieces vary by capability so a reporting-only
-/// provider drops the Switch item and a no-usage provider swaps the stat block
-/// for a `(no usage endpoint — headers only)` disabled row.
-fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
-    let head = header_row(a, sec.severity_bands).plain;
-    let sub = Submenu::with_id(format!("sub:{}:{}", sec.provider_id, a.key), head, true);
-    if sec.supports_switching {
-        if a.active {
-            let _ = sub.append(&MenuItem::with_id("noop", "✓ Active", false, None));
+/// Human-facing "{Label} resets in X" copy for a window row inside an account
+/// submenu. Percentages are deliberately NOT shown here (item 3 of the
+/// redesign moved them to the main-list row via `main_row`) — this row is
+/// purely about *when* the window refreshes.
+fn window_reset_row(w: &WindowView) -> String {
+    let label = stat_display_label(w);
+    if w.reset.is_empty() {
+        format!("{label}: no reset info yet")
+    } else {
+        format!("{label} resets in {}", w.reset)
+    }
+}
+
+/// Non-clickable informational rows shown inside an account submenu — reset
+/// windows, burn-rate / cost estimates, and the "updated Xm ago" footer (or
+/// the has_data / no-usage-endpoint fallbacks). Shared by
+/// `build_account_submenu` (which renders each as an `enabled: true` `noop`
+/// item so it reads as normal text rather than muda's greyed-out disabled
+/// look) and `menu_styles` (which marks each `disabled_but_white` so the
+/// native walk explicitly paints `NSColor::labelColor()`) — pulling this out
+/// keeps the two lists from drifting apart, the same trick `quit_row_plain`
+/// uses for the Quit row.
+///
+/// Deliberately excludes the burn-rate / cost-estimate / "updated" footer
+/// rows (`build_account_submenu` appends those separately): those touch the
+/// on-disk usage log via `crate::usage_log`, and `menu_styles` — the other
+/// caller of this function — must stay pure (no disk I/O) so it's safe to
+/// call from a unit test without a `ScopedConfigDir`.
+fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
+    let mut rows = Vec::new();
+    if sec.supports_usage {
+        if a.has_data && !a.windows.is_empty() {
+            for w in &a.windows {
+                rows.push(window_reset_row(w));
+            }
         } else {
+            rows.push("no data yet".to_string());
+        }
+    } else {
+        rows.push("(no usage endpoint — headers only)".to_string());
+    }
+    rows
+}
+
+/// Which optional rows `build_account_submenu` should append for `sec`'s
+/// account `a`. Pure over `ProviderSection`/`AcctView` fields, with no
+/// `muda`/`tray_icon` types involved, so this decision is unit-testable
+/// without a live main-thread `NSApplication` (a bare `muda::Menu` can only
+/// be constructed on the main thread, which `cargo test`'s worker threads
+/// aren't). H3, v0.5.0 codeaudit: `supports_switching` used to be the only
+/// gate consulted, for BOTH the Switch and Launch rows, and Remove had no
+/// gate at all.
+#[derive(Debug, PartialEq, Eq)]
+struct AccountSubmenuRows {
+    /// `Some(true)` → render "✓ Active" (this account is the active one).
+    /// `Some(false)` → render a clickable "Switch to this account" row.
+    /// `None` → the provider doesn't support switching; render neither.
+    switch_row: Option<bool>,
+    launch_row: bool,
+    remove_row: bool,
+}
+
+fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRows {
+    AccountSubmenuRows {
+        switch_row: sec.supports_switching.then_some(a.active),
+        launch_row: sec.supports_launch,
+        remove_row: sec.supports_remove,
+    }
+}
+
+/// Build one account's submenu inside a provider section. Splits Switch /
+/// reset-info / Launch / Remove; the pieces vary by capability so a
+/// reporting-only provider drops the Switch item and a no-usage provider
+/// swaps the info block for a `(no usage endpoint — headers only)` row.
+/// macOS-only counterpart to `build_menu` above — see its doc comment.
+/// Linux/Windows build the same rows via
+/// `cross_platform::build_account_submenu_items`.
+#[cfg(target_os = "macos")]
+fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
+    let head = main_row(sec.display_name, a, sec.severity_bands).plain;
+    let sub = Submenu::with_id(format!("sub:{}:{}", sec.provider_id, a.key), head, true);
+    let rows = account_submenu_rows(sec, a);
+    match rows.switch_row {
+        Some(true) => {
+            let _ = sub.append(&MenuItem::with_id("noop", "✓ Active", false, None));
+        }
+        Some(false) => {
             let _ = sub.append(&MenuItem::with_id(
                 format!("switch:{}:{}", sec.provider_id, a.key),
                 "Switch to this account",
@@ -1161,67 +1301,65 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
                 None,
             ));
         }
+        None => {}
     }
     let _ = sub.append(&PredefinedMenuItem::separator());
-    if sec.supports_usage {
-        if a.has_data && !a.windows.is_empty() {
-            for w in &a.windows {
-                let _ = sub.append(&stat_item(stat_display_label(w), w.pct, &w.reset));
-            }
-            // Burn-rate + cost estimator rows sit under the raw window stats,
-            // above the "updated" footer. Cheap best-effort reads against the
-            // usage log — if we don't have enough samples yet the rows are
-            // simply skipped.
-            let account_key =
-                crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
-            if let Some(est) = crate::burn_rate::estimate(
-                &account_key,
-                crate::providers::trait_def::Window::Weekly,
-                Utc::now(),
-            ) {
-                if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
-                    let _ = sub.append(&MenuItem::with_id(
-                        "noop",
-                        crate::burn_rate::format_menu_row(&est),
-                        false,
-                        None,
-                    ));
-                }
-            }
-            if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
-                &account_key,
-                crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
-            ) {
+    // v0.5.0 (item 3): these rows are informational, not disabled — enabled:
+    // true so `apply_menu_styles`'s `disabled_but_white` can paint them in
+    // the normal (white/black) text color instead of muda's greyed
+    // "disabled" look, while a click still routes to the `noop` no-op.
+    for row in submenu_info_rows(sec, a) {
+        let _ = sub.append(&MenuItem::with_id("noop", row, true, None));
+    }
+    // Burn-rate + cost estimator rows sit under the raw window stats, above
+    // the "updated" footer. Cheap best-effort reads against the usage log —
+    // if we don't have enough samples yet the rows are simply skipped. Not
+    // part of `submenu_info_rows` (which `menu_styles` also calls, and must
+    // stay disk-I/O-free) since these touch `crate::usage_log` on disk.
+    if sec.supports_usage && a.has_data && !a.windows.is_empty() {
+        let account_key =
+            crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
+        if let Some(est) = crate::burn_rate::estimate(
+            &account_key,
+            crate::providers::trait_def::Window::Weekly,
+            Utc::now(),
+        ) {
+            if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
                 let _ = sub.append(&MenuItem::with_id(
                     "noop",
-                    format!("~${:.2} this cycle (est)", cost.estimated_usd),
-                    false,
+                    crate::burn_rate::format_menu_row(&est),
+                    true,
                     None,
                 ));
             }
+        }
+        if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
+            &account_key,
+            crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
+        ) {
             let _ = sub.append(&MenuItem::with_id(
                 "noop",
-                format!("updated {}", a.updated),
-                false,
+                format!("~${:.2} this cycle (est)", cost.estimated_usd),
+                true,
                 None,
             ));
-        } else {
-            let _ = sub.append(&MenuItem::with_id("noop", "no data yet", false, None));
         }
-    } else {
         let _ = sub.append(&MenuItem::with_id(
             "noop",
-            "(no usage endpoint — headers only)",
-            false,
+            format!("updated {}", a.updated),
+            true,
             None,
         ));
     }
     let _ = sub.append(&PredefinedMenuItem::separator());
-    // "Launch" only exposed for providers that both switch and know how to
-    // spawn their client. The trait's default `launch_client` returns
-    // `Unsupported`, so a click on this for a stub provider surfaces a
-    // real error rather than doing nothing.
-    if sec.supports_switching {
+    // "Launch" is gated on `supports_launch`, NOT `supports_switching` (H3,
+    // v0.5.0 codeaudit): the two are independent — a provider can have
+    // `write_active_account` wired (switching) without `launch_client` wired
+    // (spawning the vendor CLI), and vice versa. Building this row off
+    // `supports_switching` used to expose a "Launch client" row for any
+    // switching-capable provider even when its `launch_client` was still the
+    // `Unsupported` trait default, so every click errored.
+    if rows.launch_row {
         let _ = sub.append(&MenuItem::with_id(
             format!("launch:{}:{}", sec.provider_id, a.key),
             "Launch client",
@@ -1229,41 +1367,51 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
             None,
         ));
     }
-    let _ = sub.append(&MenuItem::with_id(
-        format!("remove:{}:{}", sec.provider_id, a.key),
-        "Remove…",
-        true,
-        None,
-    ));
+    // "Remove…" is gated on `supports_remove` (H3, v0.5.0 codeaudit): the
+    // row used to be built unconditionally regardless of what the provider
+    // actually supports. Every current provider sets `supports_remove:
+    // true`, so this is not a behavior change today, but it stops a future
+    // provider that needs `supports_remove: false` from getting a row that
+    // silently does nothing useful.
+    if rows.remove_row {
+        let _ = sub.append(&MenuItem::with_id(
+            format!("remove:{}:{}", sec.provider_id, a.key),
+            "Remove…",
+            true,
+            None,
+        ));
+    }
     let _ = menu.append(&sub);
 }
 
-/// Build the menu for `snap`, install it on the tray, then style the native
-/// rows (bold active account, right-aligned trailing `S% / W%`, high
-/// percentages colored) via `attributedTitle`. We take the `NSMenu` pointer
-/// before moving the menu into `set_menu`: the menu is reference-counted and the
-/// tray retains it, so the pointer stays valid for the walk. The attributed
-/// titles persist until the next rebuild (muda only overwrites a title if we
-/// call `set_text`, which we never do on these items).
-fn install_menu(tray: &tray_icon::TrayIcon, snap: &Snapshot) {
-    let menu = build_menu(snap);
-    #[cfg(target_os = "macos")]
-    let ns_menu = {
-        use tray_icon::menu::ContextMenu;
-        menu.ns_menu()
-    };
-    tray.set_menu(Some(Box::new(menu)));
-    #[cfg(target_os = "macos")]
-    apply_menu_styles(ns_menu, &menu_styles(snap));
-    #[cfg(not(target_os = "macos"))]
-    let _ = snap;
-}
-
-/// Walk the native `NSMenu` (and its submenus) and set `attributedTitle` on any
-/// item whose plain title matches a `RowStyle` — the mechanism muda's plain
-/// string API can't reach (right-aligned tab stops and arbitrary colors).
+/// macOS-only NSMenu attributedTitle styling. Grouped into one module (rather
+/// than gating `install_menu`/`color_for`/`attributed`/`apply_menu_styles`
+/// individually) so the `objc2`/`objc2-app-kit`/`objc2-foundation` imports
+/// they need — real Cargo target-specific dependencies that don't exist in
+/// the dependency graph on Linux/Windows (see the top-of-file import comment)
+/// — sit behind a single `#[cfg(target_os = "macos")]`. Linux/Windows never
+/// call into this module; they render through `cross_platform` instead.
 #[cfg(target_os = "macos")]
-fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
+mod mac_style {
+    use super::*;
+
+    /// Build the menu for `snap`, install it on the tray, then style the native
+    /// rows (bold active account, right-aligned trailing `S% / W%`, high
+    /// percentages colored) via `attributedTitle`. We take the `NSMenu` pointer
+    /// before moving the menu into `set_menu`: the menu is reference-counted and the
+    /// tray retains it, so the pointer stays valid for the walk. The attributed
+    /// titles persist until the next rebuild (muda only overwrites a title if we
+    /// call `set_text`, which we never do on these items).
+    pub(super) fn install_menu(tray: &tray_icon::TrayIcon, snap: &Snapshot) {
+        let menu = build_menu(snap);
+        let ns_menu = {
+            use tray_icon::menu::ContextMenu;
+            menu.ns_menu()
+        };
+        tray.set_menu(Some(Box::new(menu)));
+        apply_menu_styles(ns_menu, &menu_styles(snap));
+    }
+
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     use objc2::AllocAnyThread;
@@ -1277,10 +1425,6 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
         NSString,
     };
 
-    if ns_menu.is_null() {
-        return;
-    }
-
     fn color_for(sev: Severity) -> Retained<NSColor> {
         match sev {
             Severity::Amber => NSColor::systemOrangeColor(),
@@ -1288,8 +1432,13 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
         }
     }
 
-    /// Build the attributed title for one row from its `RowStyle`.
-    fn attributed(style: &RowStyle) -> Retained<NSAttributedString> {
+    /// Build the attributed title for one row from its `RowStyle`. Module-level
+    /// (not nested in `apply_menu_styles`) so `#[cfg(test)]` can exercise it
+    /// directly — e.g. asserting `disabled_but_white` produces a `labelColor`
+    /// foreground-color attribute over the full row. `pub(super)` (rather than
+    /// private) so the macOS-only tests at the bottom of this file's `tests`
+    /// module can call `mac_style::attributed(...)` directly.
+    pub(super) fn attributed(style: &RowStyle) -> Retained<NSAttributedString> {
         let ns_text = NSString::from_str(&style.plain);
         // NSRange is UTF-16 code units — use NSString::length, not byte length.
         let full_len = ns_text.length();
@@ -1321,7 +1470,7 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
             }
         }
 
-        // Bold marks either the active account (via header_row) or a section
+        // Bold marks either the active account (via `main_row`) or a section
         // header (via `section_header`). Both use the same appearance.
         if style.bold || style.section_header {
             // 0.0 => default menu font size.
@@ -1353,6 +1502,22 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
             }
         }
 
+        // v0.5.0: force the normal (non-disabled) text color over the WHOLE row
+        // for informational submenu rows that are `enabled: true` for
+        // click-routing purposes but must not look like muda's greyed-out
+        // disabled rows (item 3 of the redesign — "white but not clickable").
+        if style.disabled_but_white {
+            let normal = NSColor::labelColor();
+            // SAFETY: value type matches the foreground-color attribute key.
+            unsafe {
+                attr.addAttribute_value_range(
+                    NSForegroundColorAttributeName,
+                    &normal,
+                    NSRange::new(0, full_len),
+                );
+            }
+        }
+
         // Tint high percentages (amber approaching, red near the wall).
         for &(off, len, sev) in &style.colors {
             if len == 0 || off >= full_len {
@@ -1373,84 +1538,78 @@ fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
         Retained::into_super(attr)
     }
 
-    /// Style every item whose plain title matches, descending into submenus.
-    /// `top_level` is true on the outermost NSMenu only; section-header styles
-    /// are suppressed inside submenus so a section header whose plain title
-    /// happens to match a submenu row (e.g. the "Claude" row inside the
-    /// "Capture current login" submenu) doesn't inherit the bold header style.
-    /// Turn a bundled PNG's bytes into a 16×16 `NSImage`. Nil-safe: a corrupt
-    /// or unsupported blob returns `None` (the caller just skips setImage:).
-    fn image_from_bytes(bytes: &[u8]) -> Option<Retained<NSImage>> {
-        let data = NSData::with_bytes(bytes);
-        let img = NSImage::initWithData(NSImage::alloc(), &data)?;
-        // Force the drawn size to menu-item height (16pt); PNGs are already
-        // 16×16 but `NSImage`'s reported size is 72dpi-scaled, which reads too
-        // big at Retina. `usesSize` is not required here — NSMenuItem uses the
-        // image's `size` directly.
-        use objc2_foundation::NSSize;
-        img.setSize(NSSize {
-            width: 16.0,
-            height: 16.0,
-        });
-        Some(img)
-    }
+    /// Walk the native `NSMenu` (and its submenus) and set `attributedTitle` on any
+    /// item whose plain title matches a `RowStyle` — the mechanism muda's plain
+    /// string API can't reach (right-aligned tab stops and arbitrary colors).
+    fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
+        if ns_menu.is_null() {
+            return;
+        }
 
-    fn walk(menu: &NSMenu, styles: &[RowStyle], top_level: bool) {
-        for item in menu.itemArray().iter() {
-            let title = item.title().to_string();
-            if let Some(style) = styles
-                .iter()
-                .find(|s| s.plain == title && (top_level || !s.section_header))
-            {
-                item.setAttributedTitle(Some(&attributed(style)));
-                // Per-provider 16px icon on section header rows. Look up by
-                // slug; a missing PNG (or an unknown slug like `vertex-ai`) is
-                // a no-op so a future provider without a bundled icon still
-                // renders — just text-only.
-                if let Some(slug) = style.icon_slug {
-                    if let Some(bytes) = crate::icons::png16_for(slug) {
-                        if let Some(img) = image_from_bytes(bytes) {
-                            item.setImage(Some(&img));
+        /// Turn a bundled PNG's bytes into a 16×16 `NSImage`. Nil-safe: a corrupt
+        /// or unsupported blob returns `None` (the caller just skips setImage:).
+        fn image_from_bytes(bytes: &[u8]) -> Option<Retained<NSImage>> {
+            let data = NSData::with_bytes(bytes);
+            let img = NSImage::initWithData(NSImage::alloc(), &data)?;
+            // Force the drawn size to menu-item height (16pt); PNGs are already
+            // 16×16 but `NSImage`'s reported size is 72dpi-scaled, which reads too
+            // big at Retina. `usesSize` is not required here — NSMenuItem uses the
+            // image's `size` directly.
+            use objc2_foundation::NSSize;
+            img.setSize(NSSize {
+                width: 16.0,
+                height: 16.0,
+            });
+            Some(img)
+        }
+
+        /// Style every item whose plain title matches, descending into submenus.
+        /// `top_level` is true on the outermost NSMenu only; section-header styles
+        /// (unused in v0.5.0's flat main list, but the flag stays load-bearing for
+        /// any future disabled/bold top-level row) are suppressed inside submenus
+        /// so a plain-title collision with a submenu row doesn't inherit them.
+        fn walk(menu: &NSMenu, styles: &[RowStyle], top_level: bool) {
+            for item in menu.itemArray().iter() {
+                let title = item.title().to_string();
+                if let Some(style) = styles
+                    .iter()
+                    .find(|s| s.plain == title && (top_level || !s.section_header))
+                {
+                    item.setAttributedTitle(Some(&attributed(style)));
+                    // Per-provider 16px icon on section header rows. Look up by
+                    // slug; a missing PNG (or an unknown slug like `vertex-ai`) is
+                    // a no-op so a future provider without a bundled icon still
+                    // renders — just text-only.
+                    if let Some(slug) = style.icon_slug {
+                        if let Some(bytes) = crate::icons::png16_for(slug) {
+                            if let Some(img) = image_from_bytes(bytes) {
+                                item.setImage(Some(&img));
+                            }
                         }
                     }
+                    // Leading checkmark glyph for the active-account row (the
+                    // "✓ trailing glyph" spec). AppKit renders `state == On` as a
+                    // checkmark in the item's `stateColumn`.
+                    if style.checkmark {
+                        item.setState(NSControlStateValueOn);
+                    }
                 }
-                // Leading checkmark glyph for the active-account row (the
-                // "✓ trailing glyph" spec). AppKit renders `state == On` as a
-                // checkmark in the item's `stateColumn`.
-                if style.checkmark {
-                    item.setState(NSControlStateValueOn);
+                if let Some(sub) = item.submenu() {
+                    walk(&sub, styles, false);
                 }
-            }
-            if let Some(sub) = item.submenu() {
-                walk(&sub, styles, false);
             }
         }
-    }
 
-    // SAFETY: called only on the main thread (the run-loop timer), with a live
-    // NSMenu pointer from muda's ns_menu() that the tray keeps retained.
-    let menu: &NSMenu = unsafe { &*(ns_menu as *const NSMenu) };
-    walk(menu, styles, true);
-}
+        // SAFETY: called only on the main thread (the run-loop timer), with a live
+        // NSMenu pointer from muda's ns_menu() that the tray keeps retained.
+        let menu: &NSMenu = unsafe { &*(ns_menu as *const NSMenu) };
+        walk(menu, styles, true);
+    }
+} // mod mac_style
 
 /// A submenu stat line and the span of its percentage (for coloring). Returns
 /// `(plain_title, Some((utf16_offset, utf16_len)))`; the offset locates the
 /// `NN%` so the native walk can tint just the number.
-fn stat_row(label: &str, pct_val: Option<f64>, reset: &str) -> (String, Option<(usize, usize)>) {
-    let p = pct(pct_val);
-    let plain = if reset.is_empty() {
-        format!("{label}  {p}")
-    } else {
-        format!("{label}  {p}  · resets in {reset}")
-    };
-    let off = u16len(label) + u16len("  ");
-    (plain, Some((off, u16len(&p))))
-}
-
-fn stat_item(label: &str, pct_val: Option<f64>, reset: &str) -> MenuItem {
-    MenuItem::with_id("noop", stat_row(label, pct_val, reset).0, false, None)
-}
-
 /// A stable fingerprint of everything the menu renders. When it's unchanged we
 /// skip `set_menu`, so an open menu is never dismissed by a no-op poll.
 ///
@@ -1494,7 +1653,7 @@ fn menu_signature(snap: &Snapshot) -> String {
             // output into the signature so each minute (or hour, depending on
             // remaining time) the fingerprint changes and the tray redraws with
             // the fresh remaining time. Uses `now_utc()` — the same clock
-            // `header_row`/`top_header_row`/`header_line` render from.
+            // `main_row` renders from.
             let now = now_utc();
             let lock = match countdown::compute_display(&account_usage_for(a), now) {
                 DisplayState::Locked {
@@ -1553,14 +1712,8 @@ fn menu_signature(snap: &Snapshot) -> String {
     s
 }
 
-fn header_line(a: &AcctView) -> String {
-    if let Some((cd, _win)) = locked_countdown_for(a, now_utc()) {
-        return format!("{}  ·  locked · {cd}", a.display);
-    }
-    let (pa, pb) = summary_pcts(a);
-    format!("{}  ·  {} / {}", a.display, pct(pa), pct(pb))
-}
-
+/// macOS-only: `build_menu` helper (see its doc comment for why it's mac-only).
+#[cfg(target_os = "macos")]
 fn add(menu: &Menu, item: MenuItem) {
     let _ = menu.append(&item);
 }
@@ -1584,6 +1737,7 @@ fn title_for(snap: &Snapshot) -> String {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn tooltip_for(snap: &Snapshot) -> String {
     match active_account(snap) {
         // Preserve the v1 tooltip format verbatim: `email — session X, weekly Y`.
@@ -1609,9 +1763,10 @@ fn pct(p: Option<f64>) -> String {
 // ---------------------------------------------------------------------------
 
 /// Parsed click id: `action[:slug[:key]]`. `slug`/`key` are `None` for global
-/// actions (`quit`, `autoswap:off`, `autoswap:95`, `autoswap:now`, `noop`,
-/// `startlogin`, `capture` — the plain-capture id used only by the submenu
-/// title itself, never a click).
+/// actions (`quit`, `autoswap:toggle`, `autoswap:off`, `autoswap:95`,
+/// `autoswap:now`, `notifications:threshold` / `:resetback` / `:pace`,
+/// `backup:save`, `backup:restore`, `refresh:now`, `noop`, `capture` — the
+/// plain-capture id used only by the submenu title itself, never a click).
 struct ClickId<'a> {
     action: &'a str,
     slug: Option<&'a str>,
@@ -1633,6 +1788,7 @@ fn handle_click(id: &str) {
     match (c.action, c.slug, c.key) {
         ("quit", _, _) => std::process::exit(0),
         ("noop", _, _) => {}
+        ("autoswap", Some("toggle"), None) => toggle_autoswap(),
         ("autoswap", Some("off"), None) => set_autoswap(false),
         ("autoswap", Some("now"), None) => match optimize_now() {
             Ok(Some(email)) => notify(&format!("Switched to {email}")),
@@ -1644,16 +1800,17 @@ fn handle_click(id: &str) {
                 set_autoswap_threshold(v);
             }
         }
+        ("notifications", Some(trigger @ ("threshold" | "resetback" | "pace")), None) => {
+            toggle_notification_trigger(trigger)
+        }
         ("capture", Some(slug), None) => handle_capture(slug),
         ("apikey", Some(slug), None) => handle_apikey_capture(slug),
         ("switch", Some(slug), Some(key)) => handle_switch(slug, key),
         ("remove", Some(slug), Some(key)) => handle_remove(slug, key),
         ("launch", Some(slug), Some(key)) => handle_launch(slug, key),
-        ("backup", Some("copy"), None) => handle_backup_copy(),
-        // For a restore click the third segment is the backup filename (e.g.
-        // "state-20260906-131204.json"); `parse_click_id` uses splitn(3), so
-        // the filename lands intact in `key` even though it contains dashes.
-        ("backup", Some("restore"), Some(filename)) => handle_backup_restore(filename),
+        ("backup", Some("save"), None) => handle_backup_save(),
+        ("backup", Some("restore"), None) => handle_backup_restore_dialog(),
+        ("refresh", Some("now"), None) => handle_refresh_now(),
         // Ignore unrecognized ids (e.g. the top-level "capture"/"capture:apikey"
         // submenu titles or a future action added by a later phase we don't
         // yet handle).
@@ -1662,109 +1819,193 @@ fn handle_click(id: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Backup Config ▸ handlers
+// Settings ▸ Advanced ▸ Backups ▸ handlers (native Save…/Restore… panels)
 // ---------------------------------------------------------------------------
 
-/// "Copy current state to /tmp" click. Copies the live `state.json` to a
-/// timestamped file under `/tmp`, then opens Finder pointed at it so the user
-/// can drag it out. Best-effort: any failure surfaces as a notification.
-fn handle_backup_copy() {
-    let src = match crate::store::state_json_path() {
-        Ok(p) => p,
-        Err(e) => {
-            notify(&format!("Backup failed: {e}"));
-            return;
-        }
-    };
-    if !src.exists() {
-        notify("Backup failed: state.json doesn't exist yet");
-        return;
-    }
-    let ts = chrono::Utc::now().timestamp();
-    let dst = std::path::PathBuf::from(format!("/tmp/usagio-backup-{ts}.json"));
-    if let Err(e) = std::fs::copy(&src, &dst) {
-        notify(&format!("Backup failed: {e}"));
-        return;
-    }
-    // `open -R <file>` reveals the file in Finder.
-    let _ = std::process::Command::new("open")
-        .arg("-R")
-        .arg(&dst)
-        .status();
-    notify(&format!("Copied state.json to {}", dst.display()));
+/// "Save…" click: opens a native SAVE panel (via
+/// `Platform::file_dialog().save_file(...)`) defaulting to
+/// `~/Downloads/usagio-state-{timestamp}.json`, then writes a
+/// REDACTED (token-free) dump of the current state to the chosen path with
+/// mode 0600. This is a portable diagnostics/config snapshot — the same
+/// shape `redact_state_for_dump` already produces for the "REFUSED save"
+/// diagnostic dump — NOT a working credential backup. The full-fidelity
+/// automatic rolling backups under `config_dir()/backups/` (written on every
+/// real `state.json` save; see `write_rolling_backup`) are what "Restore…"
+/// below defaults its file panel to.
+fn handle_backup_save() {
+    handle_backup_save_with(crate::platform().file_dialog());
 }
 
-/// "Restore from backup ▸ <ts>" click. Prompts the user via NSAlert (routed
-/// through `osascript` for consistency with the existing `confirm` helper),
-/// then — if confirmed — moves the current `state.json` to a `pre-restore`
-/// sidecar in `/tmp` and copies the chosen backup into place.
-fn handle_backup_restore(filename: &str) {
-    let backups_dir = match crate::store::state_json_path() {
-        Ok(p) => p.parent().map(|d| d.join("backups")),
-        Err(_) => None,
-    };
-    let Some(backups_dir) = backups_dir else {
-        notify("Restore failed: could not resolve backups directory");
-        return;
-    };
-    let src = backups_dir.join(filename);
-    if !src.exists() {
-        notify(&format!("Restore failed: backup {filename} is gone"));
-        return;
-    }
-    // Human-facing timestamp label — strip the "state-" prefix and ".json"
-    // suffix so the confirm dialog shows e.g. "20260906-131204".
-    let label = filename
-        .strip_prefix("state-")
-        .and_then(|s| s.strip_suffix(".json"))
-        .unwrap_or(filename);
-    let ts = chrono::Utc::now().timestamp();
-    let pre_restore = std::path::PathBuf::from(format!("/tmp/usagio-state-pre-restore-{ts}.json"));
-    let question = format!(
-        "Restore backup from {label}? Current state will be moved to {}.",
-        pre_restore.display()
+/// Testable core of the Save… click: takes the `FileDialog` as a parameter
+/// so `#[cfg(test)]` can pass a `platform::MockFileDialog` instead of
+/// popping a real native panel. See `platform::Platform::file_dialog`.
+fn handle_backup_save_with(dialog: &dyn crate::platform::FileDialog) {
+    let default_name = format!(
+        "usagio-state-{}.json",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
     );
-    if !confirm(&question) {
-        return;
-    }
-
-    let live = match crate::store::state_json_path() {
-        Ok(p) => p,
+    let default_dir = dirs::download_dir();
+    let Some(path) = dialog.save_file(&default_name, default_dir.as_deref()) else {
+        return; // user cancelled
+    };
+    let st = match State::load() {
+        Ok(s) => s,
         Err(e) => {
-            notify(&format!("Restore failed: {e}"));
+            notify(&format!("Save failed: {e}"));
             return;
         }
     };
-    // Move the CURRENT state.json out of the way so the user can inspect /
-    // revert. rename() only works within the same filesystem; fall back to
-    // copy+remove if it doesn't.
-    if live.exists() && std::fs::rename(&live, &pre_restore).is_err() {
-        if let Err(e) = std::fs::copy(&live, &pre_restore).and_then(|_| std::fs::remove_file(&live))
-        {
-            notify(&format!("Restore failed while moving current state: {e}"));
-            return;
-        }
-    }
-    // Copy the backup into place. Preserves 0600 via write_private-style
-    // permissions on the destination: we go through a read + write so the
-    // umask doesn't accidentally widen the mode.
-    let backup_bytes = match std::fs::read(&src) {
+    let redacted = crate::store::redact_state_for_dump(&st);
+    let bytes = match serde_json::to_vec_pretty(&redacted) {
         Ok(b) => b,
         Err(e) => {
-            notify(&format!("Restore failed reading backup: {e}"));
+            notify(&format!("Save failed: {e}"));
             return;
         }
     };
-    if let Err(e) = std::fs::write(&live, backup_bytes) {
-        notify(&format!("Restore failed writing state: {e}"));
+    if let Err(e) = crate::store::write_private(&path, &bytes) {
+        notify(&format!("Save failed: {e}"));
         return;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600));
+    notify(&format!("Saved to {}", path.display()));
+}
+
+/// "Restore…" click: opens a native OPEN panel (via
+/// `Platform::file_dialog().pick_file(...)`) defaulting to the automatic
+/// rolling-backups directory, validates the chosen file is state-shaped,
+/// warns — by NAME, not just count — before a restore would drop accounts,
+/// then replaces `state.json` through the same `save_state_safe`
+/// drop-protection every other write goes through. The rolling backups
+/// already snapshot the pre-restore state on every ordinary save, but we
+/// ALSO stash the live file to `<config_dir>/backups/` right before
+/// overwriting it, so the restore itself is reversible even if the user
+/// picked a very old backup.
+///
+/// H2 (v0.5.0 codeaudit): this used to (1) stash the live state — full OAuth
+/// tokens, non-redacted — to a `/tmp` sidecar, a world-writable shared
+/// directory, and (2) bypass `save_state_safe`'s drop-protection guard and
+/// the cross-process state lock entirely, gating the write on nothing but an
+/// account *count* comparison (same-count-different-accounts sailed through
+/// with zero confirmation). Both are fixed here: the stash moves under
+/// `config_dir()/backups/` (owner-only permissions), and the whole
+/// read-confirm-write sequence runs under `with_state_lock` with the actual
+/// write routed through `store::save_state_restore` (a thin, explicitly-
+/// authorized wrapper around `save_state_safe`). Note: the M2 concern
+/// (`State::load()` failure silently becoming "0 accounts") is subsumed by
+/// this restructure — `accounts_dropped_by(&new_state)?` bubbles the load
+/// error up out of `with_state_lock`, and the `Err(e) => notify(...)` arm
+/// below surfaces it, so the drop-warning path can't be silently skipped.
+fn handle_backup_restore_dialog() {
+    handle_backup_restore_dialog_with(crate::platform().file_dialog());
+}
+
+/// Testable core of the Restore… click: takes the `FileDialog` as a
+/// parameter so `#[cfg(test)]` can pass a `platform::MockFileDialog` instead
+/// of popping a real native panel. See `platform::Platform::file_dialog`.
+fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
+    let mut default_dir = None;
+    if let Ok(p) = crate::store::state_json_path() {
+        let backups_dir = p.parent().map(|d| d.join("backups"));
+        if let Some(dir) = backups_dir {
+            if dir.is_dir() {
+                default_dir = Some(dir);
+            }
+        }
     }
-    notify(&format!("Restored backup {label}"));
+    let Some(path) = dialog.pick_file(default_dir.as_deref()) else {
+        return; // user cancelled
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            notify(&format!("Restore failed reading {}: {e}", path.display()));
+            return;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            notify(&format!("Restore failed: not valid JSON ({e})"));
+            return;
+        }
+    };
+    if value.get("accounts").is_none() {
+        notify("Restore failed: not a usagio state file (missing 'accounts')");
+        return;
+    }
+    let new_state = State::from_value(&value);
+
+    let outcome = with_state_lock(|| -> Result<bool> {
+        let dropped = crate::store::accounts_dropped_by(&new_state)?;
+        if !dropped.is_empty() && !confirm(&restore_drop_confirmation(&dropped)) {
+            return Ok(false); // user declined; not an error
+        }
+        let dir = crate::store::config_dir()?;
+        crate::store::stash_pre_restore(&dir)?;
+        crate::store::save_state_restore(new_state.clone())?;
+        Ok(true)
+    });
+
+    match outcome {
+        Ok(true) => notify(&format!("Restored state from {}", path.display())),
+        Ok(false) => {} // user declined the drop confirmation; no-op
+        Err(e) => notify(&format!("Restore failed: {e}")),
+    }
+}
+
+/// Build the confirmation question shown before a restore that would drop
+/// accounts. Names the specific dropped emails (H2, v0.5.0 codeaudit — the
+/// prior wording was "will drop 2 account(s)", which told the user nothing
+/// about *which* accounts they were about to lose).
+fn restore_drop_confirmation(dropped: &[String]) -> String {
+    format!("Restoring will drop {}. Continue?", dropped.join(", "))
+}
+
+/// Guards against piling up blocked threads when "Refresh usage now" is
+/// clicked repeatedly: a stalled network call (see `run_cycle`) means each
+/// new click would otherwise stack up its own throwaway `SwapGuard` and
+/// thread. `false` = no refresh in flight; CAS to `true` before spawning,
+/// reset to `false` when the spawned thread's cycle completes.
+static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// "Refresh usage now" click (Settings ▸ Advanced ▸). Runs one poll +
+/// auto-swap cycle on a background thread — same `run_cycle` the poll loop
+/// calls every `WATCH_INTERVAL_SECS` — so the menu never blocks on network
+/// I/O. The main-thread timer picks up the refreshed cache on its next tick.
+///
+/// De-duplicated via `REFRESH_IN_FLIGHT`: a second click while a refresh is
+/// still running notifies instead of spawning another thread. See
+/// `try_start_refresh` for the testable core.
+fn handle_refresh_now() {
+    try_start_refresh(|| {
+        std::thread::spawn(|| {
+            let mut guard = SwapGuard::default();
+            let (rate_limited, _max_pct, _trigger) = run_cycle(&mut guard);
+            REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            if rate_limited {
+                notify("Refresh: rate limited, backing off");
+            } else {
+                notify("Usage refreshed");
+            }
+        });
+    })
+}
+
+/// CAS `REFRESH_IN_FLIGHT` from `false` to `true`; if it was already `true`
+/// (a refresh is still running), notify and return without calling `spawn`.
+/// Factored out from `handle_refresh_now` so a test can inject a counting
+/// closure in place of a real `std::thread::spawn` and assert the second of
+/// two rapid calls never invokes it.
+fn try_start_refresh(spawn: impl FnOnce()) {
+    use std::sync::atomic::Ordering;
+    if REFRESH_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        notify("Refresh already running");
+        return;
+    }
+    spawn();
 }
 
 /// Capture the current login for `slug`. For Claude, use the full v1 flow
@@ -1788,25 +2029,71 @@ fn handle_capture(slug: &str) {
         ));
         return;
     };
-    match provider.capture_current_login() {
-        Ok(Some(_)) => notify(&format!(
-            "Captured {} account (persistence lands in a later phase)",
+    // State v2 (codex-switch-e2e): every non-Claude provider now has a real
+    // multi-account slot (`State::providers[slug]`) to persist into, closing
+    // the gap this used to leave as "persistence lands in a later phase".
+    match capture_current_generic(slug) {
+        Ok((key, existed)) => notify(&format!(
+            "{} {} {key}",
+            if existed { "Refreshed" } else { "Captured" },
             provider.display_name()
         )),
-        Ok(None) => notify(&format!("{} — nothing to capture", provider.display_name())),
         Err(e) => notify(&format!("Capture failed: {e}")),
     }
 }
 
+/// If `key`'s account is currently "locked" (session or weekly window at
+/// ≥99.5% with a still-future reset — the same rule `header_row`'s "locked ·
+/// Xh Ym" display uses), return the human countdown string. `None` if the
+/// account isn't found, the provider isn't registered, or it has headroom.
+/// Pure over its `State` argument so tests don't need to touch state.json.
+fn switch_target_lock_countdown(st: &State, slug: &str, key: &str) -> Option<String> {
+    let provider = providers::get(slug)?;
+    let acct = st
+        .accounts
+        .iter()
+        .find(|a| a.key().eq_ignore_ascii_case(key))?;
+    let row = row_from_account(acct);
+    let view = acctview_from_row(
+        &row,
+        &st.active,
+        provider.provider_id(),
+        provider.window_order(),
+    );
+    locked_countdown_for(&view, now_utc()).map(|(cd, _win)| cd)
+}
+
 fn handle_switch(slug: &str, key: &str) {
-    // v1 state only knows Claude accounts; a switch on any other slug can't
-    // be persisted yet, so gate on Claude and route to the shared free
-    // function that already knows the v1 identity/keychain dance.
-    if slug != CLAUDE_SLUG {
-        notify(&format!("Switching is not yet supported for {slug}"));
-        return;
+    // Item 8 of the v0.5.0 redesign: refuse a switch into an account still
+    // under its own rate-limit wall — auto-swap will pick it back up the
+    // moment it resets, and switching now would just leave the user on a
+    // 0%-headroom account. Only meaningful for Claude today —
+    // `switch_target_lock_countdown` reads `st.accounts`, which state v2
+    // keeps Claude-only (see `store.rs`); non-Claude providers have no
+    // persisted usage signal to gate on yet, so the check is a no-op for
+    // them rather than a false negative.
+    if let Ok(st) = State::load() {
+        if let Some(cd) = switch_target_lock_countdown(&st, slug, key) {
+            notify(&format!(
+                "Can't switch to {key}: at 100% for the next {cd}. \
+                 Auto-swap will pick it back up when it resets."
+            ));
+            return;
+        }
     }
-    match switch_to(key) {
+    // State v2 (codex-switch-e2e): dispatch by provider slug instead of
+    // hard-gating on Claude — `capabilities().supports_switching` already
+    // keeps the "Switch to this account" row from being built for a
+    // non-switching provider (`build_account_submenu`, H3 in the v0.5.0
+    // codeaudit), and `switch_to_provider_account` itself re-checks that
+    // capability as belt-and-suspenders against a stray/future click id
+    // shaped like `switch:<slug>:<key>` reaching this function directly.
+    let result = if slug == CLAUDE_SLUG {
+        switch_to(key)
+    } else {
+        switch_to_provider_account(slug, key)
+    };
+    match result {
         Ok(label) => notify(&format!("Switched to {label}")),
         Err(e) => notify(&format!("Switch failed: {e}")),
     }
@@ -1846,14 +2133,19 @@ fn handle_apikey_capture(slug: &str) {
 }
 
 fn handle_remove(slug: &str, key: &str) {
-    if slug != CLAUDE_SLUG {
-        notify(&format!("Remove is not yet supported for {slug}"));
-        return;
-    }
     if !confirm(&format!("Remove account {key}? This cannot be undone.")) {
         return;
     }
-    match remove_account(key) {
+    // State v2 (codex-switch-e2e): a non-Claude provider's accounts can now
+    // actually render a "Remove…" row (see `build_snapshot`), so route it to
+    // the matching state.json bucket instead of the old blanket
+    // "not yet supported" refusal.
+    let result = if slug == CLAUDE_SLUG {
+        remove_account(key)
+    } else {
+        remove_provider_account_generic(slug, key)
+    };
+    match result {
         Ok(_) => notify(&format!("Removed {key}")),
         Err(e) => notify(&format!("Remove failed: {e}")),
     }
@@ -1904,6 +2196,51 @@ fn set_autoswap(enabled: bool) {
     }
 }
 
+/// The top-level "☑ Auto-swap enabled" checkbox click: flips whatever the
+/// on-disk state currently says, rather than assuming a fixed target — so a
+/// stale menu (built just before an external `usagio` CLI toggle) can't
+/// un-toggle a setting it never actually observed.
+///
+/// Read-modify-write happens entirely INSIDE `with_state_lock`, atomic with
+/// respect to other in-process AND cross-process writers (the CLI `usagio`
+/// binary and the menu-bar app both take the same advisory file lock — see
+/// `with_state_lock`). A previous version read the current value with a
+/// separate `State::load()` call *outside* the lock, decided the new bool
+/// from that stale read, and only entered the lock to write it — a
+/// concurrent writer between the read and the write could have its own
+/// toggle silently lost ("toggle lost" under contention).
+fn toggle_autoswap() {
+    let r = with_state_lock(|| {
+        let mut st = State::load()?;
+        st.autoswap_disabled = !st.autoswap_disabled;
+        st.save()
+    });
+    if let Err(e) = r {
+        notify(&format!("Could not save auto-swap setting: {e}"));
+    }
+}
+
+/// Flip one Settings ▸ Notifications ▸ per-trigger checkbox. `trigger` is one
+/// of "threshold" / "resetback" / "pace" (the three click-id suffixes
+/// `build_menu` wires up) — reads-then-flips the on-disk value so a stale
+/// menu snapshot can't clobber a setting changed elsewhere in the meantime.
+fn toggle_notification_trigger(trigger: &str) {
+    let r = with_state_lock(|| {
+        let mut st = State::load()?;
+        let cfg = &mut st.notification_config;
+        match trigger {
+            "threshold" => cfg.threshold_enabled = !cfg.threshold_enabled,
+            "resetback" => cfg.reset_back_enabled = !cfg.reset_back_enabled,
+            "pace" => cfg.pace_enabled = !cfg.pace_enabled,
+            _ => {}
+        }
+        st.save()
+    });
+    if let Err(e) = r {
+        notify(&format!("Could not save notification setting: {e}"));
+    }
+}
+
 /// Set the swap threshold AND enable auto-swap.
 fn set_autoswap_threshold(v: f64) {
     let r = with_state_lock(|| {
@@ -1917,20 +2254,26 @@ fn set_autoswap_threshold(v: f64) {
     }
 }
 
-/// A native confirm dialog; true only if the user clicks the destructive button.
+/// A native confirm dialog; true only if the user clicks the destructive
+/// button. Cross-platform via `rfd::MessageDialog` (already a crate
+/// dependency for the Backups Save…/Restore… file panels) rather than the
+/// macOS-only `osascript -e 'display dialog …'` this used to shell out to —
+/// `rfd::MessageDialog` has native backends on macOS (NSAlert), Windows
+/// (MessageBoxW), and Linux (our xdg-portal `rfd` feature shells out to
+/// `zenity(1)` for message dialogs specifically; if `zenity` isn't installed
+/// the dialog fails closed to `Cancel`, so a missing binary can't accidentally
+/// confirm a destructive action).
 fn confirm(question: &str) -> bool {
-    let script = format!(
-        "display dialog {question:?} buttons {{\"Cancel\", \"Remove\"}} \
-         default button \"Cancel\" with title \"usagio\""
-    );
-    match std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).contains("Remove"),
-        _ => false,
-    }
+    let result = rfd::MessageDialog::new()
+        .set_title("usagio")
+        .set_description(question)
+        .set_level(rfd::MessageLevel::Warning)
+        .set_buttons(rfd::MessageButtons::OkCancelCustom(
+            "Remove".to_string(),
+            "Cancel".to_string(),
+        ))
+        .show();
+    matches!(result, rfd::MessageDialogResult::Custom(label) if label == "Remove")
 }
 
 // ---------------------------------------------------------------------------
@@ -1940,6 +2283,367 @@ fn confirm(question: &str) -> bool {
 // upgrade (binary hash changed → macOS treated the new binary as a
 // different app), and it was redundant with `usagio install` which
 // registers a proper launchd LaunchAgent (no osascript, no prompt).
+
+// ---------------------------------------------------------------------------
+// Cross-platform (Linux/Windows) renderer — muda/tray-icon via the
+// `platform::MenuBackend` trait, so the GTK/Win32 event-loop pump and the
+// thread-confinement rules `tray_icon`'s native menu types need live once in
+// `platform::{linux,windows}` (already built + tested there) instead of
+// being duplicated here. macOS keeps its native NSMenu attributedTitle
+// renderer (`mac_style` above, driven by `run` at the top of this file):
+// richer per-row coloring and right-aligned tab stops aren't representable
+// through the generic `platform::MenuTree`, so macOS is intentionally NOT
+// routed through this module.
+#[cfg(not(target_os = "macos"))]
+mod cross_platform {
+    use super::*;
+    use crate::platform::{MenuHandle, MenuItem as PMenuItem, MenuTree};
+
+    /// Cross-platform separator used in place of macOS's right-aligned tab
+    /// stop — muda has no rich-text / tab-stop support, so `S% / W%` etc.
+    /// just sit inline after this separator instead of being right-aligned.
+    /// Per-row red/amber severity coloring is dropped for the same reason
+    /// (see the module doc above) — the countdown / percentage TEXT is
+    /// still there, just not colored.
+    const SEP: &str = " · ";
+
+    /// A `RowStyle`'s plain title, with the macOS tab-stop swapped for `SEP`.
+    /// Reuses `main_row`/`quit_row_plain` (already OS-agnostic pure string
+    /// builders) instead of re-deriving the row text from scratch.
+    fn plain_text(style: &RowStyle) -> String {
+        style.plain.replace('\t', SEP)
+    }
+
+    fn noop_action(label: impl Into<String>) -> PMenuItem {
+        PMenuItem::Action {
+            id: "noop".to_string(),
+            label: label.into(),
+            icon_png: None,
+            enabled: true,
+            checked: false,
+            checkable: false,
+        }
+    }
+
+    fn action(id: impl Into<String>, label: impl Into<String>, enabled: bool) -> PMenuItem {
+        PMenuItem::Action {
+            id: id.into(),
+            label: label.into(),
+            icon_png: None,
+            enabled,
+            checked: false,
+            checkable: false,
+        }
+    }
+
+    fn checkbox(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        enabled: bool,
+        checked: bool,
+    ) -> PMenuItem {
+        PMenuItem::Action {
+            id: id.into(),
+            label: label.into(),
+            icon_png: None,
+            enabled,
+            checked,
+            checkable: true,
+        }
+    }
+
+    /// Cross-platform counterpart to `build_account_submenu` — same rows,
+    /// same click ids, generic `platform::MenuItem` shape instead of a
+    /// native `tray_icon::menu::Submenu`.
+    fn build_account_submenu_items(sec: &ProviderSection, a: &AcctView) -> Vec<PMenuItem> {
+        let mut items = Vec::new();
+        let rows = account_submenu_rows(sec, a);
+        match rows.switch_row {
+            // Matches the macOS renderer: this row is informational (disabled),
+            // not clickable — unlike the burn-rate/cost/reset-window `noop`
+            // rows below, which stay `enabled: true` so they don't render
+            // muda's greyed-out "disabled" look.
+            Some(true) => items.push(action("noop", "✓ Active", false)),
+            Some(false) => items.push(action(
+                format!("switch:{}:{}", sec.provider_id, a.key),
+                "Switch to this account",
+                true,
+            )),
+            None => {}
+        }
+        items.push(PMenuItem::Separator);
+        for row in submenu_info_rows(sec, a) {
+            items.push(noop_action(row));
+        }
+        if sec.supports_usage && a.has_data && !a.windows.is_empty() {
+            let account_key =
+                crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
+            if let Some(est) = crate::burn_rate::estimate(
+                &account_key,
+                crate::providers::trait_def::Window::Weekly,
+                Utc::now(),
+            ) {
+                if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
+                    items.push(noop_action(crate::burn_rate::format_menu_row(&est)));
+                }
+            }
+            if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
+                &account_key,
+                crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
+            ) {
+                items.push(noop_action(format!(
+                    "~${:.2} this cycle (est)",
+                    cost.estimated_usd
+                )));
+            }
+            items.push(noop_action(format!("updated {}", a.updated)));
+        }
+        items.push(PMenuItem::Separator);
+        if rows.launch_row {
+            items.push(action(
+                format!("launch:{}:{}", sec.provider_id, a.key),
+                "Launch client",
+                true,
+            ));
+        }
+        if rows.remove_row {
+            items.push(action(
+                format!("remove:{}:{}", sec.provider_id, a.key),
+                "Remove…",
+                true,
+            ));
+        }
+        items
+    }
+
+    /// Cross-platform counterpart to `build_menu` — same structure, same
+    /// click ids (`handle_click` doesn't care which renderer produced them),
+    /// generic `platform::MenuTree` shape instead of a native
+    /// `tray_icon::menu::Menu`.
+    fn menu_tree_from_snapshot(snap: &Snapshot) -> MenuTree {
+        let mut items = Vec::new();
+        if snap.sections.is_empty() {
+            items.push(action("none", "Capture a login below to begin", false));
+        }
+        for sec in &snap.sections {
+            for title in section_headline_rows(sec) {
+                items.push(action(
+                    format!("envoverride:{}", sec.provider_id),
+                    title,
+                    false,
+                ));
+            }
+            for a in &sec.accounts {
+                let head = plain_text(&main_row(sec.display_name, a, sec.severity_bands));
+                items.push(PMenuItem::Submenu {
+                    label: head,
+                    icon_png: crate::icons::png16_for(sec.provider_id).map(|b| b.to_vec()),
+                    items: build_account_submenu_items(sec, a),
+                });
+            }
+        }
+        items.push(PMenuItem::Separator);
+        items.push(checkbox(
+            "autoswap:toggle",
+            "Auto-swap enabled",
+            true,
+            snap.autoswap,
+        ));
+        items.push(PMenuItem::Separator);
+
+        let mut capture_items = Vec::new();
+        if snap.capture_creds.is_empty() && snap.capture_api_key.is_empty() {
+            capture_items.push(action("noop", "(no providers registered)", false));
+        } else {
+            for reg in &snap.capture_creds {
+                let title = if reg.installed {
+                    reg.display_name.to_string()
+                } else {
+                    format!("{} (not installed)", reg.display_name)
+                };
+                capture_items.push(action(format!("capture:{}", reg.provider_id), title, true));
+            }
+            if !snap.capture_api_key.is_empty() {
+                if !snap.capture_creds.is_empty() {
+                    capture_items.push(PMenuItem::Separator);
+                }
+                let mut paste_items = Vec::new();
+                for reg in &snap.capture_api_key {
+                    let title = if reg.installed {
+                        reg.display_name.to_string()
+                    } else {
+                        format!("{} (not installed)", reg.display_name)
+                    };
+                    paste_items.push(action(format!("apikey:{}", reg.provider_id), title, true));
+                }
+                capture_items.push(PMenuItem::Submenu {
+                    label: "Paste API key".to_string(),
+                    icon_png: None,
+                    items: paste_items,
+                });
+            }
+        }
+        items.push(PMenuItem::Submenu {
+            label: "Capture current login".to_string(),
+            icon_png: None,
+            items: capture_items,
+        });
+
+        // Settings ▸ Notifications ▸ / Auto-swap threshold ▸ / Advanced ▸.
+        let notifications = vec![
+            checkbox(
+                "notifications:threshold",
+                "Threshold alerts (70% / 90%)",
+                true,
+                snap.notification_config.threshold_enabled,
+            ),
+            checkbox(
+                "notifications:resetback",
+                "Window reset alerts",
+                true,
+                snap.notification_config.reset_back_enabled,
+            ),
+            checkbox(
+                "notifications:pace",
+                "Weekly pace projection (experimental)",
+                true,
+                snap.notification_config.pace_enabled,
+            ),
+        ];
+
+        let cur = if snap.autoswap {
+            snap.threshold.round() as i32
+        } else {
+            0
+        };
+        let mut threshold_items = vec![checkbox("autoswap:off", "Off", true, cur == 0)];
+        for t in [90i32, 95, 98] {
+            threshold_items.push(checkbox(
+                format!("autoswap:{t}"),
+                format!("{t}%"),
+                true,
+                cur == t,
+            ));
+        }
+        threshold_items.push(PMenuItem::Separator);
+        threshold_items.push(action("autoswap:now", "Switch to best account now", true));
+
+        let backups = vec![
+            action("backup:save", "Save…", true),
+            action("backup:restore", "Restore…", true),
+        ];
+        let advanced = vec![
+            PMenuItem::Submenu {
+                label: "Backups".to_string(),
+                icon_png: None,
+                items: backups,
+            },
+            action("refresh:now", "Refresh usage now", true),
+        ];
+
+        let settings_items = vec![
+            PMenuItem::Submenu {
+                label: "Notifications".to_string(),
+                icon_png: None,
+                items: notifications,
+            },
+            PMenuItem::Submenu {
+                label: "Auto-swap threshold".to_string(),
+                icon_png: None,
+                items: threshold_items,
+            },
+            PMenuItem::Submenu {
+                label: "Advanced".to_string(),
+                icon_png: None,
+                items: advanced,
+            },
+        ];
+        items.push(PMenuItem::Submenu {
+            label: "Settings".to_string(),
+            icon_png: None,
+            items: settings_items,
+        });
+
+        items.push(PMenuItem::Separator);
+        items.push(action(
+            "quit",
+            plain_text(&RowStyle::plain_row(quit_row_plain())),
+            true,
+        ));
+
+        MenuTree { items }
+    }
+
+    /// 16x16 PNG bytes for the initial tray icon. `MenuBackend::create_status_item`
+    /// requires real, decodable icon bytes on Linux/Windows (unlike macOS,
+    /// which is happy with a text-only title) — there's no dedicated app icon
+    /// asset yet (only per-provider 16px icons under `assets/icons/16/`), so
+    /// this reuses the active account's provider icon, falling back to
+    /// Claude's (always bundled, regardless of which provider Cargo features
+    /// are enabled — see `icons::png16_for`).
+    fn initial_icon_bytes(snap: &Snapshot) -> &'static [u8] {
+        active_account(snap)
+            .and_then(|(sec, _)| crate::icons::png16_for(sec.provider_id))
+            .or_else(|| crate::icons::png16_for(CLAUDE_SLUG))
+            .unwrap_or(&[0u8; 0])
+    }
+
+    /// Background redraw ticker: rebuilds the tray from cached state and
+    /// pushes updates through the `Send`-safe `MenuHandle`, mirroring the
+    /// macOS `NSTimer` tick in `run` above but off the (blocked)
+    /// `run_event_loop` thread instead of on it — `create_status_item` and
+    /// `run_event_loop` must share a thread (see `MenuBackend`'s doc in
+    /// `platform/mod.rs`), so this can't run on the main thread here.
+    fn redraw_loop(handle: Box<dyn MenuHandle>, initial: Snapshot) {
+        let mut last_sig = menu_signature(&initial);
+        let mut last_title = title_for(&initial);
+        let start_exe = std::fs::canonicalize(crate::stable_exe_path()).ok();
+        loop {
+            std::thread::sleep(Duration::from_millis(750));
+            if let Some(start) = &start_exe {
+                maybe_relaunch_after_upgrade(start);
+            }
+            let snap = build_snapshot();
+            let sig = menu_signature(&snap);
+            if sig != last_sig {
+                if let Err(e) = handle.set_menu(menu_tree_from_snapshot(&snap)) {
+                    crate::logging::log(&format!("menubar: set_menu failed: {e:#}"));
+                }
+                let _ = handle.set_icon(initial_icon_bytes(&snap));
+                last_sig = sig;
+            }
+            let title = title_for(&snap);
+            if title != last_title {
+                let _ = handle.set_title(&title);
+                last_title = title;
+            }
+        }
+    }
+
+    pub(super) fn run() -> Result<()> {
+        providers::init();
+        let backend = crate::platform().menu();
+        backend.on_click(Box::new(handle_click))?;
+
+        let initial = build_snapshot();
+        let handle =
+            backend.create_status_item(&title_for(&initial), initial_icon_bytes(&initial))?;
+        handle.set_menu(menu_tree_from_snapshot(&initial))?;
+        let _ = handle.set_title(&title_for(&initial));
+
+        // Poll + auto-swap on a background thread — same `poll_loop` the
+        // macOS `run` above uses (writes cached usage to state.json; nothing
+        // here calls into the native tray, so it's safe off-thread).
+        std::thread::spawn(poll_loop);
+        // Redraw ticker on its own background thread (see `redraw_loop`'s
+        // doc for why it can't be the main thread here).
+        std::thread::spawn(move || redraw_loop(handle, initial));
+
+        // Blocks, pumping the GTK (Linux) / Win32 (Windows) message loop —
+        // see `platform::linux::LinuxMenu` / `platform::windows::WindowsMenu`.
+        backend.run_event_loop()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2015,6 +2719,8 @@ mod tests {
                 display_name: "Claude",
                 supports_switching: true,
                 supports_usage: true,
+                supports_launch: true,
+                supports_remove: true,
                 severity_bands: bands(),
                 env_override_active: false,
                 accounts: vec![a],
@@ -2028,8 +2734,96 @@ mod tests {
             capture_api_key: Vec::new(),
             autoswap: false,
             threshold: 95.0,
+            notification_config: crate::notifications::NotificationConfig::default(),
         }
     }
+
+    #[test]
+    fn try_start_refresh_dedupes_rapid_clicks() {
+        // try_start_refresh reaches logging::log → store::config_dir(), which
+        // panics in tests without a HOME_OVERRIDE. Wrap in ScopedConfigDir so
+        // the tripwire (added post-hermeticity merge) doesn't fire here.
+        let _g = crate::store::ScopedConfigDir::new();
+        // Reset in case a prior test in this binary left it set (best-effort
+        // — tests run with --test-threads=1 so no other test races us here).
+        REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let spawn_count = std::rc::Rc::new(StdCell::new(0u32));
+        let c1 = spawn_count.clone();
+        try_start_refresh(move || {
+            c1.set(c1.get() + 1);
+            // Deliberately do NOT reset REFRESH_IN_FLIGHT here — this stands
+            // in for "the background thread is still running" so the second
+            // click below is the one under test.
+        });
+        assert_eq!(spawn_count.get(), 1, "first click must spawn");
+
+        let c2 = spawn_count.clone();
+        try_start_refresh(move || {
+            c2.set(c2.get() + 1);
+        });
+        assert_eq!(
+            spawn_count.get(),
+            1,
+            "second rapid click must NOT spawn a second refresh"
+        );
+
+        // Clean up so later tests in this binary see the flag cleared.
+        REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn toggle_autoswap_read_modify_write_is_atomic_under_contention() {
+        let g = crate::store::ScopedConfigDir::new();
+        let home = g.home();
+
+        State::default().save().expect("seed initial state");
+        let initial = State::load().unwrap().autoswap_disabled;
+
+        const ITERATIONS: usize = 100;
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let home = home.clone();
+                std::thread::spawn(move || {
+                    // HOME_OVERRIDE is thread-local (see store::ScopedConfigDir);
+                    // each worker thread must repoint it at the same tempdir
+                    // the parent test set up.
+                    crate::store::set_home_override(Some(home));
+                    for _ in 0..ITERATIONS {
+                        toggle_autoswap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let total_toggles = 2 * ITERATIONS;
+        let expected = if total_toggles % 2 == 1 {
+            !initial
+        } else {
+            initial
+        };
+        let final_state = State::load().unwrap();
+        assert_eq!(
+            final_state.autoswap_disabled, expected,
+            "final parity must match initial XOR (total_toggles % 2 == 1); a lost \
+             toggle under contention would flip this"
+        );
+
+        drop(g);
+    }
+
+    // NOTE: M2's `restore_old_account_count` helper + its two tests were
+    // deleted at aggregation time. The M2 concern (State::load failure
+    // silently becoming "0 accounts" and skipping the drop-warning prompt)
+    // is fully subsumed by H2's restructure: the new Restore flow runs
+    // under `with_state_lock`, delegates the drop-detection to
+    // `crate::store::accounts_dropped_by(&new_state)` (which propagates
+    // load errors via `?`), and the outer `Err(e) => notify(...)` arm
+    // surfaces the abort message to the user. Tests for the H2 path live
+    // in store_tests.rs and menubar's Restore… test block above.
 
     #[test]
     fn severity_bands_defaults() {
@@ -2062,10 +2856,10 @@ mod tests {
     }
 
     #[test]
-    fn header_row_colors_land_on_percentages() {
+    fn main_row_colors_land_on_percentages() {
         let a = acct("you@work.com", Some(82.0), Some(96.0), true);
-        let r = header_row(&a, bands());
-        assert_eq!(r.plain, "you@work.com\t82% / 96%");
+        let r = main_row("Claude", &a, bands());
+        assert_eq!(r.plain, "Claude    you@work.com\tS 82%  W 96%");
         assert!(r.bold, "active account is bold");
         assert_eq!(r.tab_x, Some(TAB_X), "trailing run is right-aligned");
         assert_eq!(r.colors.len(), 2);
@@ -2078,17 +2872,17 @@ mod tests {
     }
 
     #[test]
-    fn header_row_low_usage_has_no_colors_and_no_bold_when_inactive() {
+    fn main_row_low_usage_has_no_colors_and_no_bold_when_inactive() {
         let a = acct("dev@side.com", Some(3.0), Some(9.0), false);
-        let r = header_row(&a, bands());
+        let r = main_row("Claude", &a, bands());
         assert!(!r.bold);
         assert!(r.colors.is_empty());
     }
 
     #[test]
-    fn header_row_offsets_hold_for_unicode_email() {
+    fn main_row_offsets_hold_for_unicode_email() {
         let a = acct("café@x.com", Some(99.0), None, false);
-        let r = header_row(&a, bands());
+        let r = main_row("Claude", &a, bands());
         let (off, len, _) = r.colors[0];
         let utf16: Vec<u16> = r.plain.encode_utf16().collect();
         let picked = String::from_utf16(&utf16[off..off + len]).unwrap();
@@ -2096,41 +2890,47 @@ mod tests {
     }
 
     #[test]
-    fn top_header_row_colors_land_on_percentages() {
-        let a = acct("you@work.com", Some(50.0), Some(88.0), true);
-        let r = top_header_row(&a, bands());
-        assert_eq!(r.plain, "you@work.com  ·  50% / 88%");
-        assert!(!r.bold, "top info line is not bold");
-        assert_eq!(r.tab_x, None);
-        assert_eq!(r.colors.len(), 1);
-        let (o, l, s) = r.colors[0];
-        assert_eq!(span_text(&r.plain, o, l), "88%");
-        assert_eq!(s, Severity::Amber);
-    }
-
-    #[test]
-    fn stat_row_span_lands_on_percentage() {
-        let (plain, span) = stat_row("Session", Some(97.0), "3h");
-        assert_eq!(plain, "Session  97%  · resets in 3h");
-        let (off, len) = span.unwrap();
-        assert_eq!(span_text(&plain, off, len), "97%");
-    }
-
-    #[test]
-    fn menu_styles_emits_section_header_and_skips_low_stat_rows() {
-        let snap = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
-        let styles = menu_styles(&snap);
-        // Expect: top header + section header + account header. No stat rows
-        // (all under amber band).
-        let plains: Vec<&str> = styles.iter().map(|s| s.plain.as_str()).collect();
-        assert!(plains.contains(&"Claude"), "section header row present");
-        assert!(styles
-            .iter()
-            .any(|s| s.section_header && s.plain == "Claude"));
-        assert!(
-            styles.iter().all(|s| s.colors.is_empty()),
-            "all pcts are low → no colored spans"
+    fn main_row_includes_provider_name_padded() {
+        // Item 2 of the redesign: the provider name gets its own column-like
+        // padding, then the email, then the tab-stopped `S n%  W n%` run.
+        let claude = main_row(
+            "Claude",
+            &acct("a@x.com", Some(1.0), Some(2.0), false),
+            bands(),
         );
+        let codex = main_row(
+            "Codex",
+            &acct("b@x.com", Some(1.0), Some(2.0), false),
+            bands(),
+        );
+        let (claude_label, _) = claude.plain.split_once('\t').unwrap();
+        let (codex_label, _) = codex.plain.split_once('\t').unwrap();
+        assert!(claude_label.starts_with("Claude"));
+        assert!(codex_label.starts_with("Codex"));
+        // Both providers' emails start at the same column regardless of the
+        // provider-name length ("Claude" vs "Codex").
+        assert_eq!(claude_label.find("a@x.com"), codex_label.find("b@x.com"));
+    }
+
+    #[test]
+    fn submenu_info_rows_never_include_a_percentage() {
+        // Item 3 of the redesign: percentages move to the main-list row;
+        // submenu rows are reset-window / burn-rate / footer text only.
+        let a = acct("a@x.com", Some(97.0), Some(88.0), true);
+        let sec = ProviderSection {
+            provider_id: CLAUDE_SLUG,
+            display_name: "Claude",
+            supports_switching: true,
+            supports_usage: true,
+            supports_launch: true,
+            supports_remove: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![],
+        };
+        for row in submenu_info_rows(&sec, &a) {
+            assert!(!row.contains('%'), "submenu row leaked a percentage: {row}");
+        }
     }
 
     #[test]
@@ -2141,9 +2941,9 @@ mod tests {
     }
 
     #[test]
-    fn header_row_offsets_hold_for_astral_email() {
+    fn main_row_offsets_hold_for_astral_email() {
         let a = acct("😀@x.com", Some(99.0), None, false);
-        let r = header_row(&a, bands());
+        let r = main_row("Claude", &a, bands());
         let (off, len, _) = r.colors[0];
         let utf16: Vec<u16> = r.plain.encode_utf16().collect();
         let picked = String::from_utf16(&utf16[off..off + len]).unwrap();
@@ -2277,6 +3077,8 @@ mod tests {
                     display_name: "Claude",
                     supports_switching: true,
                     supports_usage: true,
+                    supports_launch: true,
+                    supports_remove: true,
                     severity_bands: bands(),
                     env_override_active: false,
                     accounts: vec![a],
@@ -2286,6 +3088,8 @@ mod tests {
                     display_name: "Codex",
                     supports_switching: true,
                     supports_usage: true,
+                    supports_launch: true,
+                    supports_remove: true,
                     severity_bands: bands(),
                     env_override_active: false,
                     accounts: vec![b],
@@ -2295,6 +3099,7 @@ mod tests {
             capture_api_key: Vec::new(),
             autoswap: false,
             threshold: 95.0,
+            notification_config: crate::notifications::NotificationConfig::default(),
         };
         let (sec, acc) = active_account(&snap).expect("active row found");
         assert_eq!(sec.provider_id, "codex");
@@ -2324,6 +3129,8 @@ mod tests {
             providers::Capabilities {
                 supports_usage: self.supports_usage,
                 supports_switching: false,
+                supports_launch: false,
+                supports_remove: true,
                 supports_email_capture: false,
                 secret_backend: providers::SecretBackend::File,
                 capture_mode: self.capture_mode,
@@ -2384,7 +3191,7 @@ mod tests {
             Box::new(apikey_stub),
         ];
 
-        let (creds, api_key) = partition_capture_providers(&regs);
+        let (creds, api_key) = partition_capture_providers(&regs, &[]);
 
         let creds_ids: Vec<&str> = creds.iter().map(|p| p.provider_id()).collect();
         let api_key_ids: Vec<&str> = api_key.iter().map(|p| p.provider_id()).collect();
@@ -2430,20 +3237,20 @@ mod tests {
     }
 
     #[test]
-    fn header_row_flat_shape_matches_spec_when_not_locked() {
-        // "{display} · S {n}% · W {n}%" per SCOPE — the crate's variant uses a
-        // TAB between the label and trailing run so AppKit right-aligns it,
-        // and " / " between the two pcts. The important structural invariants
-        // are: display first, one TAB, then the pcts. Any change to that
-        // layout will fail this assertion — a wall against silent drift.
+    fn main_row_flat_shape_matches_spec_when_not_locked() {
+        // "{provider}    {email}\tS {n}%  W {n}%" per the v0.5.0 redesign —
+        // the crate's variant uses a TAB between the label and trailing run
+        // so AppKit right-aligns it. The important structural invariants are:
+        // provider, then email, one TAB, then "S n%  W n%". Any change to
+        // that layout will fail this assertion — a wall against silent drift.
         let a = acct("you@work.com", Some(42.0), Some(61.0), false);
-        let r = header_row(&a, bands());
-        assert_eq!(r.plain, "you@work.com\t42% / 61%");
+        let r = main_row("Claude", &a, bands());
+        assert_eq!(r.plain, "Claude    you@work.com\tS 42%  W 61%");
         assert!(!r.checkmark, "inactive row: no leading checkmark");
     }
 
     #[test]
-    fn header_row_switches_to_locked_countdown_when_over_threshold() {
+    fn main_row_switches_to_locked_countdown_when_over_threshold() {
         // Session at 100% with a reset ~90 minutes out → row must swap the
         // percentages for "locked · 1h 30m" and paint it red. This is the
         // "usage → locked" transition the redesign spec calls out.
@@ -2458,53 +3265,32 @@ mod tests {
                 Some(reset),
                 None,
             );
-            let r = header_row(&a, bands());
-            assert_eq!(r.plain, "matt@example.com\tlocked · 1h 30m");
+            let r = main_row("Claude", &a, bands());
+            // v0.5.0 UX: no "locked · " prefix — red color + a time (not a
+            // percent) is the affordance. See main_row's locked-branch comment.
+            assert_eq!(r.plain, "Claude    matt@example.com\t1h 30m");
             assert!(r.bold, "active locked row is still bold");
             assert!(r.checkmark, "active row gets a leading checkmark");
-            // Exactly one colored span, red-tinted, covering the "locked · …" run.
+            // Exactly one colored span, red-tinted, covering the countdown run.
             assert_eq!(r.colors.len(), 1);
             let (off, len, sev) = r.colors[0];
             assert_eq!(sev, Severity::Red);
             let picked: String = r.plain.chars().skip(off).take(len).collect();
-            assert_eq!(picked, "locked · 1h 30m");
+            assert_eq!(picked, "1h 30m");
         });
     }
 
     #[test]
-    fn header_row_stays_usage_when_reset_is_stale() {
+    fn main_row_stays_usage_when_reset_is_stale() {
         // pct at 100 but reset already in the past — countdown treats it as
         // stale (next refresh will fix the pct), so the row stays "S / W".
         let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
         let past = now - chrono::Duration::minutes(5);
         with_now(now, || {
             let a = acct_with_resets("dev@x.com", Some(100.0), None, false, Some(past), None);
-            let r = header_row(&a, bands());
-            assert_eq!(r.plain, "dev@x.com\t100% / —");
+            let r = main_row("Claude", &a, bands());
+            assert_eq!(r.plain, "Claude    dev@x.com\tS 100%  W —");
             assert!(!r.plain.contains("locked"));
-        });
-    }
-
-    #[test]
-    fn top_header_row_mirrors_locked_state_of_the_active_account() {
-        // The top info line above the sections must swap in the same
-        // "locked · …" run as the section row — otherwise the two headers
-        // disagree the moment the account is fully consumed.
-        let now = Utc.timestamp_opt(2_000_000, 0).unwrap();
-        let reset = now + chrono::Duration::hours(6);
-        with_now(now, || {
-            let a = acct_with_resets(
-                "matt@example.com",
-                Some(100.0),
-                Some(80.0),
-                true,
-                Some(reset),
-                None,
-            );
-            let r = top_header_row(&a, bands());
-            assert_eq!(r.plain, "matt@example.com  ·  locked · 6h 0m");
-            assert_eq!(r.colors.len(), 1);
-            assert_eq!(r.colors[0].2, Severity::Red);
         });
     }
 
@@ -2571,22 +3357,22 @@ mod tests {
     }
 
     #[test]
-    fn menu_styles_attaches_icon_slug_to_section_header_only() {
-        // The section header row carries `icon_slug = Some("claude")` so the
-        // native walk knows to `setImage:` a bundled 16px PNG. The account's
-        // own header row must NOT carry an icon slug (no per-row iconography).
+    fn menu_styles_attaches_icon_slug_to_every_main_row() {
+        // v0.5.0 dropped the separate disabled provider-header row — each
+        // account's own flat main-list row now carries `icon_slug` so the
+        // native walk `setImage:`s a bundled 16px PNG directly on it.
         let snap = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
         let styles = menu_styles(&snap);
-        let sec_style = styles
+        let main_style = styles
             .iter()
-            .find(|s| s.plain == "Claude" && s.section_header)
-            .expect("section header row present");
-        assert_eq!(sec_style.icon_slug, Some(CLAUDE_SLUG));
-        // Every non-section-header row has no icon slug.
-        for s in styles.iter().filter(|s| !s.section_header) {
+            .find(|s| s.tab_x.is_some())
+            .expect("main-list row present");
+        assert_eq!(main_style.icon_slug, Some(CLAUDE_SLUG));
+        // The submenu info rows (no tab stop) carry no icon.
+        for s in styles.iter().filter(|s| s.tab_x.is_none()) {
             assert!(
                 s.icon_slug.is_none(),
-                "unexpected icon on non-header row: {}",
+                "unexpected icon on non-main row: {}",
                 s.plain,
             );
         }
@@ -2606,6 +3392,8 @@ mod tests {
                 display_name: "Claude",
                 supports_switching: true,
                 supports_usage: true,
+                supports_launch: true,
+                supports_remove: true,
                 severity_bands: bands(),
                 env_override_active: false,
                 accounts: vec![active, inactive],
@@ -2614,19 +3402,19 @@ mod tests {
             capture_api_key: Vec::new(),
             autoswap: false,
             threshold: 95.0,
+            notification_config: crate::notifications::NotificationConfig::default(),
         };
         let styles = menu_styles(&snap);
-        // Only inspect the per-account submenu-header rows (they carry a tab
-        // stop; the top info line does not). This isolates the checkmark
-        // assertions from the top header, which never carries one.
+        // Only inspect the per-account main-list rows (they carry a tab
+        // stop; the Quit row is excluded by matching on the email instead).
         let mut saw_active = false;
         let mut saw_inactive = false;
         for s in styles.iter().filter(|s| s.tab_x.is_some()) {
-            if s.plain.starts_with("active@x.com") {
+            if s.plain.contains("active@x.com") {
                 assert!(s.checkmark, "active row must carry the checkmark flag");
                 saw_active = true;
             }
-            if s.plain.starts_with("dev@x.com") {
+            if s.plain.contains("dev@x.com") {
                 assert!(
                     !s.checkmark,
                     "inactive row must NOT carry the checkmark flag"
@@ -2649,6 +3437,113 @@ mod tests {
             snap.sections.is_empty(),
             "empty snapshot has no sections — a provider with zero rows must never emit one",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // H3 (v0.5.0 codeaudit) — capability-gated menu rows. `supports_switching`
+    // used to be the sole gate for BOTH the "Switch to this account" row AND
+    // the "Launch client" row, and "Remove…" had no gate at all. A provider
+    // like Codex (usage-only, no switching, no launch wired) would still get
+    // a "Launch client" row that always errored on click.
+    // -----------------------------------------------------------------------
+
+    fn section_with_caps(
+        supports_switching: bool,
+        supports_launch: bool,
+        supports_remove: bool,
+    ) -> ProviderSection {
+        ProviderSection {
+            provider_id: "codex",
+            display_name: "Codex",
+            supports_switching,
+            supports_launch,
+            supports_remove,
+            supports_usage: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![],
+        }
+    }
+
+    #[test]
+    fn submenu_rows_omit_launch_when_supports_launch_is_false() {
+        // Codex today: supports_switching == false AND supports_launch ==
+        // false. Neither the Switch nor the Launch row may appear.
+        let sec = section_with_caps(false, false, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        let rows = account_submenu_rows(&sec, &a);
+        assert_eq!(rows.switch_row, None, "no switch row: {rows:?}");
+        assert!(!rows.launch_row, "no launch row: {rows:?}");
+    }
+
+    #[test]
+    fn submenu_rows_can_omit_launch_even_when_switching_is_supported() {
+        // The two capabilities are independent: a provider could (in
+        // principle) support switching without a wired client launcher.
+        // supports_launch alone must gate the Launch row.
+        let sec = section_with_caps(true, false, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        let rows = account_submenu_rows(&sec, &a);
+        assert_eq!(
+            rows.switch_row,
+            Some(false),
+            "clickable switch row present: {rows:?}"
+        );
+        assert!(
+            !rows.launch_row,
+            "launch row absent even though switching is supported: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn submenu_rows_include_launch_when_supports_launch_is_true() {
+        let sec = section_with_caps(true, true, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        assert!(account_submenu_rows(&sec, &a).launch_row);
+    }
+
+    #[test]
+    fn submenu_rows_marks_active_account_instead_of_a_clickable_switch_row() {
+        let sec = section_with_caps(true, true, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), true);
+        assert_eq!(account_submenu_rows(&sec, &a).switch_row, Some(true));
+    }
+
+    #[test]
+    fn submenu_rows_omit_remove_when_supports_remove_is_false() {
+        let sec = section_with_caps(false, false, false);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        assert!(!account_submenu_rows(&sec, &a).remove_row);
+    }
+
+    #[test]
+    fn submenu_rows_include_remove_when_supports_remove_is_true() {
+        let sec = section_with_caps(false, false, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        assert!(account_submenu_rows(&sec, &a).remove_row);
+    }
+
+    #[test]
+    fn codex_capabilities_advertise_switching_but_not_launch() {
+        // H3 (v0.5.0 codeaudit) is now closed: state v2 (`State::providers`)
+        // gives Codex somewhere to persist a second account, and
+        // `main.rs`/`menubar.rs` dispatch a switch by provider slug, so
+        // `write_active_account` is reachable from the live app —
+        // `supports_switching` is `true`. `launch_client` is still
+        // unimplemented for Codex, so `supports_launch` stays `false`.
+        let caps = crate::providers::codex::CodexProvider.capabilities();
+        assert!(caps.supports_switching);
+        assert!(!caps.supports_launch);
+        assert!(caps.supports_remove);
+    }
+
+    #[test]
+    fn claude_capabilities_advertise_launch_support() {
+        // Claude is the only provider with a wired `launch_client`.
+        let caps = crate::providers::claude::ClaudeProvider.capabilities();
+        assert!(caps.supports_switching);
+        assert!(caps.supports_launch);
+        assert!(caps.supports_remove);
     }
 
     #[test]
@@ -2686,7 +3581,7 @@ mod tests {
         // current login ▸" onboarding surface. Claude + Codex (the two full
         // providers) must be present in the creds bucket.
         providers::init();
-        let (creds, _api_key) = capture_menu_providers();
+        let (creds, _api_key) = capture_menu_providers(&[]);
         let creds_ids: Vec<&str> = creds.iter().map(|p| p.provider_id()).collect();
         assert!(creds_ids.contains(&"claude"), "claude in creds bucket");
         // Every registered stub with supports_usage == false must be filtered.
@@ -2709,9 +3604,9 @@ mod tests {
     }
 
     #[test]
-    fn header_row_locked_shape_swaps_only_the_trailing_run() {
-        // The locked row keeps the "{display}\t…" tab structure so
-        // right-alignment still works — only the trailing "S% / W%" run
+    fn main_row_locked_shape_swaps_only_the_trailing_run() {
+        // The locked row keeps the "{provider label}\t…" tab structure so
+        // right-alignment still works — only the trailing "S n%  W n%" run
         // becomes "locked · <countdown>". A test that pins the structure so
         // a future refactor can't accidentally lose the tab.
         let now = Utc.timestamp_opt(4_000_000, 0).unwrap();
@@ -2724,11 +3619,308 @@ mod tests {
                 Some(now + chrono::Duration::hours(23) + chrono::Duration::minutes(52)),
                 None,
             );
-            let r = header_row(&a, bands());
+            let r = main_row("Claude", &a, bands());
             let (label, trailing) = r.plain.split_once('\t').expect("tab preserved");
-            assert_eq!(label, "matt@example.com");
-            assert_eq!(trailing, "locked · 23h 52m");
+            assert_eq!(label, "Claude    matt@example.com");
+            // No "locked · " prefix — red color + a time (not a percent) is
+            // the affordance now. See main_row's locked-branch comment.
+            assert_eq!(trailing, "23h 52m");
             assert_eq!(r.tab_x, Some(TAB_X), "right-align tab-stop preserved");
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.5.0 redesign: locked-switch refusal, API-key-once-captured, and the
+    // "white but not clickable" submenu style.
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal Claude `Account` with cached usage, for
+    /// `switch_target_lock_countdown` fixtures. No I/O — a plain in-memory
+    /// `store::Account`, not anything touching state.json.
+    fn account_with_usage(
+        email: &str,
+        session_pct: Option<f64>,
+        session_reset: Option<DateTime<Utc>>,
+    ) -> crate::store::Account {
+        crate::store::Account {
+            email: Some(email.to_string()),
+            access_token: "tok".into(),
+            refresh_token: "ref".into(),
+            expires_at: 0,
+            keychain_blob: "{}".into(),
+            oauth_account: None,
+            user_id: None,
+            cached_usage: Some(crate::store::CachedUsage {
+                session_pct,
+                weekly_pct: Some(10.0),
+                session_reset: session_reset.map(|t| t.to_rfc3339()),
+                weekly_reset: None,
+                opus_pct: None,
+                opus_reset: None,
+                fetched_at: 0,
+            }),
+            notif_state: crate::notifications::NotifState::default(),
+            needs_relogin: false,
+        }
+    }
+
+    #[test]
+    fn switch_target_lock_countdown_refuses_a_maxed_out_account() {
+        // Item 8 of the redesign: a session at 100% with a still-future reset
+        // is "locked" — `handle_switch` must see this and refuse.
+        providers::init();
+        let now = Utc.timestamp_opt(5_000_000, 0).unwrap();
+        with_now(now, || {
+            let reset = now + chrono::Duration::minutes(45);
+            let st = State {
+                accounts: vec![account_with_usage(
+                    "matt@example.com",
+                    Some(100.0),
+                    Some(reset),
+                )],
+                ..State::default()
+            };
+            let cd = switch_target_lock_countdown(&st, CLAUDE_SLUG, "matt@example.com");
+            assert_eq!(cd, Some("45m".to_string()));
+        });
+    }
+
+    #[test]
+    fn switch_target_lock_countdown_allows_an_account_with_headroom() {
+        providers::init();
+        let now = Utc.timestamp_opt(5_000_000, 0).unwrap();
+        with_now(now, || {
+            let st = State {
+                accounts: vec![account_with_usage("matt@example.com", Some(40.0), None)],
+                ..State::default()
+            };
+            assert_eq!(
+                switch_target_lock_countdown(&st, CLAUDE_SLUG, "matt@example.com"),
+                None,
+            );
+        });
+    }
+
+    #[test]
+    fn switch_target_lock_countdown_is_none_for_an_unknown_account() {
+        providers::init();
+        let st = State::default();
+        assert_eq!(
+            switch_target_lock_countdown(&st, CLAUDE_SLUG, "nobody@example.com"),
+            None,
+        );
+    }
+
+    #[test]
+    fn partition_capture_providers_excludes_an_already_captured_api_key_provider() {
+        // Item 9 of the redesign: once an API-key provider has a captured
+        // account (surfaced to `partition_capture_providers` as its id being
+        // in `captured_provider_ids`), it must disappear from the "Paste API
+        // key ▸" bucket — the account itself now renders in the main list.
+        let openrouter_like = FakeProvider {
+            id: "openrouter-like",
+            name: "OpenRouter-like",
+            supports_usage: true,
+            capture_mode: CaptureMode::ApiKey,
+        };
+        let regs: Vec<Box<dyn Provider>> = vec![Box::new(openrouter_like)];
+
+        let (_, api_key_before) = partition_capture_providers(&regs, &[]);
+        assert_eq!(
+            api_key_before
+                .iter()
+                .map(|p| p.provider_id())
+                .collect::<Vec<_>>(),
+            vec!["openrouter-like"],
+            "not yet captured → still offered under Paste API key ▸",
+        );
+
+        let (_, api_key_after) = partition_capture_providers(&regs, &["openrouter-like"]);
+        assert!(
+            api_key_after.is_empty(),
+            "already captured → must NOT be offered under Paste API key ▸ anymore",
+        );
+    }
+
+    // These two tests exercise `mac_style::attributed` directly (NSAttributedString
+    // attribute inspection) — nested in their own `#[cfg(target_os = "macos")]`
+    // module since `objc2_app_kit`/`objc2_foundation` aren't in the dependency
+    // graph on Linux/Windows (see the top-of-file import comment).
+    #[cfg(target_os = "macos")]
+    mod mac_style_tests {
+        use super::*;
+        use objc2_app_kit::NSForegroundColorAttributeName;
+
+        #[test]
+        fn disabled_but_white_row_gets_a_full_range_labelcolor_attribute() {
+            // The "white but not clickable" style: `disabled_but_white` must
+            // produce an `NSForegroundColorAttributeName` run spanning the ENTIRE
+            // row (offset 0, full length) — not disabled grey, not a partial span.
+            let style = RowStyle {
+                disabled_but_white: true,
+                ..RowStyle::plain_row("Session resets in 3h".to_string())
+            };
+            let attr = mac_style::attributed(&style);
+            let full_len = attr.length();
+            assert!(full_len > 0);
+            let mut effective = objc2_foundation::NSRange::new(0, 0);
+            let value = unsafe {
+                attr.attribute_atIndex_effectiveRange(
+                    NSForegroundColorAttributeName,
+                    0,
+                    &mut effective,
+                )
+            };
+            assert!(value.is_some(), "expected a foreground-color attribute");
+            assert_eq!(
+                effective,
+                objc2_foundation::NSRange::new(0, full_len),
+                "labelColor must span the whole row",
+            );
+        }
+
+        #[test]
+        fn plain_row_with_no_disabled_but_white_has_no_forced_foreground_color() {
+            // A normal (non-info) row must NOT get the full-range labelColor
+            // treatment — only `disabled_but_white` rows opt into it.
+            let style = RowStyle::plain_row("Switch to this account".to_string());
+            let attr = mac_style::attributed(&style);
+            let mut effective = objc2_foundation::NSRange::new(0, 0);
+            let value = unsafe {
+                attr.attribute_atIndex_effectiveRange(
+                    NSForegroundColorAttributeName,
+                    0,
+                    &mut effective,
+                )
+            };
+            assert!(
+                value.is_none(),
+                "a plain row must not carry a forced foreground color",
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Backups Save…/Restore… ▸ FileDialog trait routing
+    //
+    // These assert the click handlers call `FileDialog` with the expected
+    // arguments WITHOUT ever popping a real native panel — the mock's
+    // `save_file`/`pick_file` return `None` by default, so each handler
+    // returns right after recording the call (the "user cancelled" path).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn backup_save_click_calls_file_dialog_with_default_name_and_downloads_dir() {
+        let dialog = crate::platform::MockFileDialog::default();
+        handle_backup_save_with(&dialog);
+
+        let calls = dialog.save_file_calls.borrow();
+        assert_eq!(calls.len(), 1, "expected exactly one save_file() call");
+        let (default_name, default_dir) = &calls[0];
+        assert!(
+            default_name.starts_with("usagio-state-") && default_name.ends_with(".json"),
+            "unexpected default file name: {default_name}"
+        );
+        assert_eq!(default_dir.as_deref(), dirs::download_dir().as_deref());
+    }
+
+    #[test]
+    fn backup_restore_click_calls_file_dialog_pick_file_once() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let dialog = crate::platform::MockFileDialog::default();
+        handle_backup_restore_dialog_with(&dialog);
+
+        let calls = dialog.pick_file_calls.borrow();
+        assert_eq!(calls.len(), 1, "expected exactly one pick_file() call");
+    }
+
+    // -----------------------------------------------------------------------
+    // H2 (v0.5.0 codeaudit) — Restore… drop-confirmation wording + store-level
+    // wiring. `handle_backup_restore_dialog` itself opens a native file panel
+    // and a native `rfd::MessageDialog` confirm prompt, neither of which is
+    // unit-testable; these tests cover the pure logic it's built from.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn restore_drop_confirmation_names_dropped_emails_not_just_a_count() {
+        let msg = super::restore_drop_confirmation(&[
+            "dev@getbusbar.com".to_string(),
+            "matthew@pq.io".to_string(),
+        ]);
+        assert_eq!(
+            msg,
+            "Restoring will drop dev@getbusbar.com, matthew@pq.io. Continue?"
+        );
+    }
+
+    /// Minimal restore-test account.
+    fn restore_test_acct(email: &str) -> crate::store::Account {
+        let blob = serde_json::json!({
+            "claudeAiOauth": { "accessToken": "at", "refreshToken": "rt", "expiresAt": 0 }
+        })
+        .to_string();
+        let mut a = crate::store::Account::from_keychain_blob(&blob).unwrap();
+        a.email = Some(email.to_string());
+        a
+    }
+
+    #[test]
+    fn restore_that_only_adds_an_account_reports_no_drops() {
+        use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
+        let _g = ScopedConfigDir::new();
+        let mut current = State::default();
+        current.accounts.push(restore_test_acct("a@e.com"));
+        current.save().unwrap();
+
+        let mut restore_target = State::load().unwrap();
+        restore_target.accounts.push(restore_test_acct("b@e.com"));
+
+        let dropped = accounts_dropped_by(&restore_target).unwrap();
+        assert!(
+            dropped.is_empty(),
+            "adding an account must not be reported as a drop"
+        );
+    }
+
+    #[test]
+    fn restore_that_drops_an_account_reports_exactly_that_email() {
+        use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
+        let _g = ScopedConfigDir::new();
+        let mut current = State::default();
+        for email in ["dev@getbusbar.com", "matthew@pq.io"] {
+            current.accounts.push(restore_test_acct(email));
+        }
+        current.save().unwrap();
+
+        let mut restore_target = State::default();
+        restore_target
+            .accounts
+            .push(restore_test_acct("dev@getbusbar.com"));
+
+        let dropped = accounts_dropped_by(&restore_target).unwrap();
+        assert_eq!(dropped, vec!["matthew@pq.io".to_string()]);
+        assert_eq!(
+            restore_drop_confirmation(&dropped),
+            "Restoring will drop matthew@pq.io. Continue?"
+        );
+    }
+
+    #[test]
+    fn pre_restore_stash_lands_under_config_backups_not_tmp() {
+        use crate::store::{config_dir, stash_pre_restore, ScopedConfigDir, State};
+        let g = ScopedConfigDir::new();
+        let mut current = State::default();
+        current.accounts.push(restore_test_acct("a@e.com"));
+        current.save().unwrap();
+
+        let dir = config_dir().unwrap();
+        let stash = stash_pre_restore(&dir)
+            .unwrap()
+            .expect("live state existed");
+        // Strong positive assertion: the stash MUST be inside the scoped tempdir's
+        // config backups dir. On Linux CI the tempdir itself lives under /tmp/xyz/,
+        // so a `!starts_with("/tmp")` guard would false-positive — the positive
+        // form here catches the real regression (stash landing outside backups/).
+        assert!(stash.starts_with(g.home().join(".config/usagio/backups")));
     }
 }
