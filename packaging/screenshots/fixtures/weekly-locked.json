@@ -13,10 +13,10 @@
       },
       "user_id": "demo-user-id-1",
       "cached_usage": {
-        "session_pct": 47.0,
-        "weekly_pct": 89.0,
+        "session_pct": 30.0,
+        "weekly_pct": 100.0,
         "session_reset": "2026-12-31T18:00:00Z",
-        "weekly_reset": "2027-01-04T00:00:00Z",
+        "weekly_reset": "NOW+2d14h",
         "opus_pct": 12.0,
         "opus_reset": "2027-01-04T00:00:00Z",
         "fetched_at": 4102358400
@@ -37,7 +37,7 @@
       "user_id": "demo-user-id-2",
       "cached_usage": {
         "session_pct": 2.0,
-        "weekly_pct": 98.0,
+        "weekly_pct": 55.0,
         "session_reset": "2026-12-31T20:00:00Z",
         "weekly_reset": "2027-01-04T00:00:00Z",
         "opus_pct": 0.0,
@@ -48,7 +48,7 @@
       "needs_relogin": false
     }
   ],
-  "active": "demo1@example.com",
+  "active": "dev@example.com",
   "providers": {
     "codex": {
       "accounts": [
@@ -97,18 +97,18 @@
           "needs_relogin": false
         },
         {
-          "key": "carol.locked@codex.example",
-          "secret_blob": "{\"OPENAI_API_KEY\":null,\"tokens\":{\"access_token\":\"demo-codex-access-token-3\",\"refresh_token\":\"demo-codex-refresh-token-3-invalid\",\"account_id\":\"demo-codex-account-3\"}}",
+          "key": "carol@codex.example",
+          "secret_blob": "{\"OPENAI_API_KEY\":null,\"tokens\":{\"access_token\":\"demo-codex-access-token-3\",\"refresh_token\":\"demo-codex-refresh-token-3\",\"account_id\":\"demo-codex-account-3\"}}",
           "access_token": "demo-codex-access-token-3",
-          "refresh_token": "demo-codex-refresh-token-3-invalid",
+          "refresh_token": "demo-codex-refresh-token-3",
           "expires_at": 4102444800,
-          "identity_email": "carol.locked@codex.example",
+          "identity_email": "carol@codex.example",
           "identity_uuid": "10000000-0000-4000-8000-000000000003",
-          "identity_display_name": "Carol (Demo, locked)",
+          "identity_display_name": "Carol (Demo)",
           "identity_native_blob": {},
           "cached_usage": {
-            "session_pct": 100.0,
-            "weekly_pct": 100.0,
+            "session_pct": 55.0,
+            "weekly_pct": 78.0,
             "session_reset": "2026-12-31T23:00:00Z",
             "weekly_reset": "2027-01-04T00:00:00Z",
             "opus_pct": null,
@@ -116,12 +116,12 @@
             "fetched_at": 4102358400
           },
           "notif_state": {},
-          "needs_relogin": true
+          "needs_relogin": false
         }
       ],
       "active": "alice@codex.example"
     }
   },
-  "autoswap_disabled": false,
+  "autoswap_disabled": true,
   "trigger_pct": 95.0
 }
