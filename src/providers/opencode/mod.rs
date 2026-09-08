@@ -12,6 +12,53 @@
 //!    optional `accountId` / `enterpriseUrl` — no email, no user_id.
 //!  - Single-slot per providerID; no macOS Keychain use.
 //!  - No dedicated usage/quota endpoint (only response headers).
+//!
+//! ## v0.5.0 never-re-login scope decision: DEFERRED to v0.6
+//!
+//! opencode's `auth.json` is MULTI-PROVIDER: one top-level JSON object keyed
+//! by `providerID` (`anthropic`, `openai`, `google`, ...), each holding an
+//! independent `{type: "oauth"|"api"|"wellknown", ...}` blob. Any active-login
+//! write-back (switching, or mirroring a rotated token) would have to PATCH
+//! exactly one key inside that shared file, never overwrite the whole thing —
+//! a naive whole-file write (the approach that works fine for Codex's
+//! single-purpose `auth.json`) would silently drop every other configured
+//! provider's login the moment usagio touched the file.
+//!
+//! Two ways to model that were considered:
+//!
+//!   (a) Treat opencode as a multiplexed provider — one usagio account per
+//!       opencode `providerID` — and implement a partial-file-patch
+//!       mirror-back (read the whole object, replace one key, write the
+//!       whole object back atomically).
+//!   (b) Defer opencode active-account handling to v0.6 entirely; keep this
+//!       provider read-only (capture only, no switching / no refresh
+//!       mirror-back) until the multi-provider modeling questions are
+//!       resolved.
+//!
+//! **(b) is what's implemented here**, for three reasons:
+//!   1. Scope: v0.5.0's contract is "never re-login" for accounts usagio
+//!      actively manages. opencode's `capture_current_login` is still a
+//!      stub (`Ok(None)` below) — there's no captured opencode account for a
+//!      refresh/mirror-back to apply to yet, so building CAS/mirror-back
+//!      plumbing now would have no caller.
+//!   2. Identity gap: per-`providerID` blobs carry no email/user_id (see
+//!      recon summary above) — `AccountKey`'s per-provider identity model
+//!      (email, else UUID, else anon-hash) doesn't have a natural per-account
+//!      key to hang a opencode-multiplexed account on without also deciding
+//!      how `providerID` composes with the *underlying* provider's own
+//!      identity (e.g. an opencode `anthropic` entry vs. a native Claude
+//!      account — are they the same "account" for switching purposes?). That
+//!      question needs its own design pass, not a v0.5.0-timeline decision.
+//!   3. Blast radius: a partial-file-patch bug here corrupts OTHER providers'
+//!      logins inside the same file, not just opencode's — a strictly higher
+//!      risk than any other provider's mirror-back, which only ever touches
+//!      its own single-provider credential file. That risk deserves its own
+//!      review cycle.
+//!
+//! `Capabilities` below are therefore all `false` except `supports_remove`
+//! (dropping a captured account from state.json is safe regardless), and
+//! `Provider::supports_active_refresh` is left at its `false` trait default.
+//! Revisit this file when v0.6 designs the multi-provider account model.
 
 #![allow(dead_code)]
 

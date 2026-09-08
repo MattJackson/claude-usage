@@ -44,6 +44,8 @@
 
 #![allow(dead_code)]
 
+pub mod oauth;
+
 use std::path::PathBuf;
 
 use base64::Engine;
@@ -97,6 +99,16 @@ impl Provider for CodexProvider {
 
     fn window_order(&self) -> &'static [&'static str] {
         &["primary", "secondary"]
+    }
+
+    /// Codex's refresh grant is a plain, programmatic HTTPS POST (no vendor
+    /// CLI / browser step) — see `oauth.rs`'s module doc for the endpoint
+    /// research. `oauth::active_refresh_cas` is the CAS-safe entry point a
+    /// future proactive-refresh caller should use for the single active
+    /// login; nothing in the credential-sync loop wires it up yet (that loop
+    /// lives in `credentials.rs`, out of this provider's scope).
+    fn supports_active_refresh(&self) -> bool {
+        true
     }
 
     // --- Capture -----------------------------------------------------------
@@ -218,6 +230,22 @@ impl Provider for CodexProvider {
             Value::String(Utc::now().to_rfc3339()),
         );
         Ok(v.to_string())
+    }
+
+    /// Refresh the access token via Codex's `/oauth/token` endpoint. See
+    /// `oauth.rs`'s module doc for the endpoint, client_id, and single-use
+    /// rotation semantics (mirrors Anthropic's: a stale refresh_token comes
+    /// back `refresh_token_reused`/`invalid_grant`, never retryable).
+    fn refresh_token(&self, refresh: &str) -> PResult<TokenGrant> {
+        oauth::refresh_token_grant(refresh)
+            .map(|g| g.into())
+            .map_err(|e| match e {
+                oauth::RefreshError::InvalidGrant => ProviderError::Auth,
+                oauth::RefreshError::RateLimited => ProviderError::RateLimited {
+                    retry_after_secs: None,
+                },
+                oauth::RefreshError::Transient(s) => ProviderError::Transient(s),
+            })
     }
 
     // --- Usage -------------------------------------------------------------
@@ -431,25 +459,35 @@ impl Provider for CodexProvider {
 // ---------------------------------------------------------------------------
 
 /// Parsed shape of `auth.json` — only the fields this provider reads.
+///
+/// `pub(super)` (not private): `oauth.rs`'s CAS refresh needs to parse the
+/// same shape (to pull `refresh_token` and check `last_refresh` staleness)
+/// without duplicating this struct.
 #[derive(Debug, Deserialize)]
-struct AuthDotJson {
+pub(super) struct AuthDotJson {
     #[serde(default)]
-    tokens: TokenData,
+    pub(super) tokens: TokenData,
+    /// RFC 3339 timestamp of the last successful refresh. Absent on a blob
+    /// that has never been refreshed since login. Used by `oauth.rs` to
+    /// enforce the same ~8-day proactive-refresh cadence the vendor CLI uses
+    /// independently of the access token's own expiry.
+    #[serde(default)]
+    pub(super) last_refresh: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct TokenData {
+pub(super) struct TokenData {
     #[serde(default)]
-    id_token: Option<String>,
+    pub(super) id_token: Option<String>,
     #[serde(default)]
-    access_token: String,
+    pub(super) access_token: String,
     #[serde(default)]
-    refresh_token: Option<String>,
+    pub(super) refresh_token: Option<String>,
     #[serde(default)]
-    account_id: Option<String>,
+    pub(super) account_id: Option<String>,
 }
 
-fn parse_codex_blob(blob: &str) -> PResult<AuthDotJson> {
+pub(super) fn parse_codex_blob(blob: &str) -> PResult<AuthDotJson> {
     let v: AuthDotJson = serde_json::from_str(blob)
         .map_err(|e| ProviderError::Other(format!("parsing codex auth.json: {e}")))?;
     if v.tokens.access_token.is_empty() {
@@ -460,8 +498,10 @@ fn parse_codex_blob(blob: &str) -> PResult<AuthDotJson> {
     Ok(v)
 }
 
-/// Resolve the Codex auth file path, honoring `$CODEX_HOME`.
-fn auth_json_path() -> Option<PathBuf> {
+/// Resolve the Codex auth file path, honoring `$CODEX_HOME`. `pub(super)`
+/// so `oauth.rs`'s CAS refresh resolves the same path this module uses for
+/// capture/switching — a single source of truth for "where is auth.json".
+pub(super) fn auth_json_path() -> Option<PathBuf> {
     if let Some(h) = std::env::var_os("CODEX_HOME") {
         return Some(PathBuf::from(h).join("auth.json"));
     }
@@ -496,7 +536,7 @@ fn fs_ctx<T>(r: std::io::Result<T>, op: &str, path: &std::path::Path) -> PResult
 /// the tmp file so a secret-bearing orphan never survives (H4 finding from
 /// the same audit).
 #[cfg(unix)]
-fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
+pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -545,7 +585,7 @@ fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult
 }
 
 #[cfg(not(unix))]
-fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
+pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
     let dir = path
         .parent()
         .ok_or_else(|| ProviderError::Other("auth.json path has no parent directory".into()))?;
@@ -562,8 +602,10 @@ fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult
 
 /// Decode a JWT and return its payload claims as a JSON map. Signature is not
 /// verified — Codex's id_token is bearer-signed by OpenAI; we're only reading
-/// claims we would trust the provider to have written.
-fn jwt_payload_claims(jwt: &str) -> Option<serde_json::Map<String, Value>> {
+/// claims we would trust the provider to have written. `pub(super)` so
+/// `oauth.rs` can compute `expires_in_secs` from a freshly-refreshed
+/// `access_token`/`id_token` the same way capture does.
+pub(super) fn jwt_payload_claims(jwt: &str) -> Option<serde_json::Map<String, Value>> {
     let mut parts = jwt.split('.');
     let _hdr = parts.next()?;
     let payload = parts.next()?;
