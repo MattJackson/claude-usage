@@ -8,6 +8,11 @@ const description =
 
 const github = 'https://github.com/MattJackson/usagio';
 const releases = `${github}/releases`;
+const assetBase = `${github}/releases/download/v0.5.0`;
+const macArm64 = `${assetBase}/usagio-0.5.0-aarch64-apple-darwin.tar.gz`;
+const macIntel = `${assetBase}/usagio-0.5.0-x86_64-apple-darwin.tar.gz`;
+const linuxTarball = `${assetBase}/usagio-0.5.0-x86_64-unknown-linux-gnu.tar.gz`;
+const windowsZip = `${assetBase}/usagio-0.5.0-x86_64-pc-windows-msvc.zip`;
 ---
 <Base title={title} description={description} path="/download/" current="download">
 
@@ -57,6 +62,11 @@ const releases = `${github}/releases`;
           >Copy install command</button>
           <a class="btn btn-secondary" href={releases} target="_blank" rel="noopener noreferrer">All releases on GitHub&nbsp;→</a>
         </div>
+        <p class="dl-p dl-p-fine" style="text-align: center; margin: 1rem auto 0;">
+          Prefer a manual install? Grab the archive directly:
+          <a href={macArm64}>Apple Silicon (.tar.gz)</a> ·
+          <a href={macIntel}>Intel (.tar.gz)</a>
+        </p>
       </div>
 
       <!-- ============ LINUX INSTALL ============ -->
@@ -78,13 +88,16 @@ const releases = `${github}/releases`;
         <p class="dl-p" style="margin-top: 1.25rem;">Or, without Homebrew:</p>
         <CodeBlock label="install (tarball)">
 <span class="c"># Download from the releases page, then:</span>
-<span class="p">$</span> tar xzf usagio-v0.5.0-x86_64-unknown-linux-gnu.tar.gz
+<span class="p">$</span> tar xzf usagio-0.5.0-x86_64-unknown-linux-gnu.tar.gz
 <span class="p">$</span> ./usagio watch
 
 <span class="c"># Or register the tray app + auto-swap daemon at login</span>
 <span class="c"># (writes ~/.config/autostart/usagio.desktop)</span>
 <span class="p">$</span> ./usagio install
 </CodeBlock>
+        <div class="btn-row" style="justify-content: center; margin-top: 1.25rem;">
+          <a class="btn btn-secondary" href={linuxTarball}>Download tarball (x86_64)&nbsp;↓</a>
+        </div>
       </div>
 
       <!-- ============ WINDOWS INSTALL ============ -->
@@ -98,13 +111,16 @@ const releases = `${github}/releases`;
           </p>
         </div>
         <CodeBlock label="install">
-<span class="c"># Download usagio-v0.5.0-x86_64-pc-windows-msvc.zip from the releases page,</span>
+<span class="c"># Download usagio-0.5.0-x86_64-pc-windows-msvc.zip from the releases page,</span>
 <span class="c"># then extract to %LOCALAPPDATA%\Programs\usagio\ and add it to PATH.</span>
 
 <span class="c"># Register the tray app + auto-swap daemon at login</span>
 <span class="c"># (writes to HKCU\Software\Microsoft\Windows\CurrentVersion\Run)</span>
 <span class="p">&gt;</span> usagio install
 </CodeBlock>
+        <div class="btn-row" style="justify-content: center; margin-top: 1.25rem;">
+          <a class="btn btn-secondary" href={windowsZip}>Download zip (x86_64)&nbsp;↓</a>
+        </div>
         <p class="dl-p dl-p-fine">
           The exe is unsigned, so Windows Defender may show a SmartScreen
           warning on first run — choose "More info" → "Run anyway". See
