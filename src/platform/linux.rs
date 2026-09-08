@@ -613,8 +613,9 @@ fn append_children(container: &dyn NativeMenuContainer, items: &[MenuItem]) {
                 icon_png,
                 enabled,
                 checked,
+                checkable,
             } => {
-                if *checked {
+                if *checkable {
                     container.append_native(&CheckMenuItem::with_id(
                         id.as_str(),
                         label,
