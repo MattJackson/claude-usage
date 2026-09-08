@@ -190,10 +190,21 @@ jobs:
           # at it for a real Login Items icon.
           perl -0777 -pi -e 's/def install\n(?:.*\n)*?  end\n/def install\n    bin.install "usagio"\n    prefix.install "usagio.app"\n  end\n/' "$f"
 
-          # Add a caveats block (once) pointing users at `usagio install`.
-          if ! grep -q 'def caveats' "$f"; then
-            perl -0777 -pi -e 's/(\nend\n?)\z/\n  def caveats\n    <<~EOS\n      For the app icon in Login Items, run `usagio install` — it now points\n      launchd at usagio.app\/Contents\/MacOS\/usagio.\n    EOS\n  end\n$1/' "$f"
-          fi
+          # v0.5.2: strip any existing post_install block first (idempotent
+          # — reruns on later releases must not stack up duplicate method
+          # defs), then insert a fresh one right after `install`. "install
+          # means install": `brew install`/`brew upgrade` should register
+          # the LaunchAgent and start the menu bar without a second manual
+          # `usagio install` step, matching the NSIS installer's equivalent
+          # auto-run on Windows (see packaging/windows/installer.nsi).
+          perl -0777 -pi -e 's/\n  def post_install\n(?:.*\n)*?  end\n//' "$f"
+          perl -0777 -pi -e 's/(def install\n(?:.*\n)*?  end\n)/$1\n  def post_install\n    system bin\/"usagio", "install"\n  end\n/' "$f"
+
+          # Caveats block: also strip-then-reinsert (always current, not
+          # "add once") so the wording keeps up with what post_install now
+          # does automatically.
+          perl -0777 -pi -e 's/\n  def caveats\n(?:.*\n)*?  end\n//' "$f"
+          perl -0777 -pi -e 's/(\nend\n?)\z/\n  def caveats\n    <<~EOS\n      usagio install ran automatically as part of this install\/upgrade --\n      it registers the menu bar app + auto-swap daemon to run now and at\n      every login, and (for the app icon in Login Items) points launchd at\n      usagio.app\/Contents\/MacOS\/usagio.\n\n      Run `usagio uninstall` to stop the menu bar and remove autostart.\n    EOS\n  end\n$1/' "$f"
 
           # M14: the perl rewrites above are brittle regex surgery on the
           # formula's `install` block. Validate the result is still valid
@@ -207,6 +218,16 @@ jobs:
           fi
           if ! grep -q 'def install' "$f" || ! grep -q 'bin.install "usagio"' "$f"; then
             echo "::error::$f is missing the expected install block after the rewrite — aborting before push"
+            cat "$f"
+            exit 1
+          fi
+          if [ "$(grep -c 'def post_install' "$f")" != "1" ] || ! grep -qF 'system bin/"usagio", "install"' "$f"; then
+            echo "::error::$f is missing (or has duplicate) the expected post_install block after the rewrite — aborting before push"
+            cat "$f"
+            exit 1
+          fi
+          if [ "$(grep -c 'def caveats' "$f")" != "1" ] || ! grep -q 'usagio uninstall' "$f"; then
+            echo "::error::$f is missing (or has duplicate) the expected caveats block after the rewrite — aborting before push"
             cat "$f"
             exit 1
           fi
@@ -387,10 +408,41 @@ jobs:
           sha256sum "${BIN}-${version}-x86_64-pc-windows-msvc.zip" \
             > "${BIN}-${version}-x86_64-pc-windows-msvc.zip.sha256"
 
+      - name: Install NSIS
+        shell: bash
+        run: |
+          choco install nsis -y
+          echo "C:\Program Files (x86)\NSIS" >> "$GITHUB_PATH"
+
+      - name: Build NSIS installer (.exe)
+        # Additional release asset alongside the .zip above — power users
+        # keep the portable unzip-and-run option; everyone else gets a
+        # real installer (PATH, Start Menu shortcut, Add/Remove Programs
+        # entry, `usagio install` run automatically). See
+        # packaging/windows/installer.nsi for the full behavior. Staged
+        # into its own directory (not dist/) so makensis's OutFile — a
+        # relative path — lands next to the .nsi script rather than
+        # colliding with the .zip staging above.
+        shell: bash
+        run: |
+          ver="${GITHUB_REF#refs/tags/v}"
+          stage="$(mktemp -d)"
+          cp "target/x86_64-pc-windows-msvc/release/${BIN}.exe" "$stage/${BIN}.exe"
+          cp packaging/windows/usagio.ico "$stage/usagio.ico"
+          cp packaging/windows/installer.nsi "$stage/installer.nsi"
+          (cd "$stage" && makensis "-DVERSION=${ver}" installer.nsi)
+          mv "$stage/${BIN}-v${ver}-x86_64-pc-windows-msvc-setup.exe" \
+            "dist/${BIN}-v${ver}-x86_64-pc-windows-msvc-setup.exe"
+          cd dist
+          sha256sum "${BIN}-v${ver}-x86_64-pc-windows-msvc-setup.exe" \
+            > "${BIN}-v${ver}-x86_64-pc-windows-msvc-setup.exe.sha256"
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: 'dist/*.zip'
+          subject-path: |
+            dist/*.zip
+            dist/*setup.exe
 
       - name: Publish GitHub Release asset
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
@@ -400,4 +452,5 @@ jobs:
           generate_release_notes: false
           files: |
             dist/*.zip
+            dist/*setup.exe
             dist/*.sha256
