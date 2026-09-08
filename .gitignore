@@ -8,6 +8,14 @@
 # Generated once per release by packaging/macos/generate-icns.sh — not source.
 packaging/macos/AppIcon.icns
 
+# Generated once per release by packaging/linux/generate-png-icons.sh — not source.
+packaging/linux/icons/
+
+# Generated once per release by packaging/windows/generate-ico.ps1 — not
+# source (packaging/windows/logo-512.png, the source PNG it's rasterized
+# from, IS committed).
+packaging/windows/usagio.ico
+
 # Editor / OS cruft
 **/*.rs.bk
 .DS_Store

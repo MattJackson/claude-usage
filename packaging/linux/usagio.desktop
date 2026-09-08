@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=usagio
+Comment=Track usage / limits across every AI coding CLI, and switch between accounts
+Exec=usagio
+Icon=usagio
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+# NoDisplay=false so it shows up in application menus/launchers. usagio's own
+# `usagio install` (src/platform/linux.rs) writes a *separate* autostart
+# entry to ~/.config/autostart/ per the XDG Autostart spec -- this file is
+# only the application-menu entry, not the autostart trigger.
+NoDisplay=false

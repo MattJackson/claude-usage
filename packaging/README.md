@@ -83,13 +83,30 @@ cargo test --tests --all-features -- --test-threads=1
 A separate `build` job does a release build on `qa`/`main` pushes
 (macOS-only; a straight compile sanity check, not a full re-test).
 
-`.github/workflows/release.yml` builds and publishes three artifacts per
-tagged release: a universal macOS binary (existing, also drives the
-Homebrew tap bump), a Linux `x86_64-unknown-linux-gnu` tarball, and a
-Windows `x86_64-pc-windows-msvc` zip. The Homebrew formula only tracks the
-macOS SHA256 — there's no Linux or Windows package yet (planned as a
-Snap/AppImage/AUR package and an MSI/scoop bucket respectively, both
-post-v0.5.0 work).
+`.github/workflows/release.yml` builds and publishes installable bundles
+per tagged release for all three OSes:
+
+- **macOS**: a universal (arm64 + x86_64) tarball containing both the bare
+  `usagio` binary and `usagio.app` (see `packaging/macos/`) — the `.app`
+  drives the Login Items icon and the Homebrew tap bump.
+- **Linux**: a `usagio_<version>_amd64.deb` (installable via `dpkg -i` /
+  `apt install ./usagio_*.deb`) built by `packaging/linux/build-deb.sh`,
+  *plus* a tarball with the same `.desktop` entry and hicolor icon set for
+  users who'd rather not use dpkg. Both install a real application-menu
+  entry with the usagio icon; the app's own `usagio install` command still
+  handles the XDG autostart entry separately (`~/.config/autostart/`).
+- **Windows**: a zip containing `usagio.exe`, `usagio.ico`
+  (`packaging/windows/generate-ico.ps1`, rasterized from the checked-in
+  `packaging/windows/logo-512.png`), and `Create-Shortcut.ps1` — run once
+  after unzipping to create a Start Menu shortcut carrying the usagio icon,
+  which can then be pinned to the taskbar. (The bare `.exe` has no icon
+  resource embedded, so pinning it directly falls back to Windows' generic
+  executable icon — the shortcut is what carries `usagio.ico`.)
+
+The Homebrew formula only tracks the macOS SHA256 — Linux/Windows have no
+package-manager-hosted distribution yet (a PPA/AUR entry for the `.deb` and
+a scoop bucket / MSI for Windows are still open, post-v0.5.0 work; the
+`.deb` and shortcut+`.ico` zip above are the interim installable bundles).
 
 ## The "no scattered `#[cfg(target_os)]`" rule
 
