@@ -107,6 +107,36 @@ pub fn read_blob(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Shared credential-path-walk skeleton: read each of `provider`'s
+/// credential paths, identify the account (if any) it holds, and compute its
+/// freshness — then hand the result to `f`. Eliminates the
+/// path→read_blob→identify_credential→freshness duplication that used to be
+/// copy-pasted between `absorb_all_lagging` and `last_chance_fallback`
+/// (simplification-03, v0.5.2 audit).
+///
+/// `identified` is `None` when the path doesn't exist / isn't readable UTF-8
+/// (silently skipped — the common case for optional paths), or `Some((key,
+/// freshness))` when `identify_credential` recognised the blob. Note this
+/// does NOT distinguish "unreadable" from "readable but unrecognised" — a
+/// caller that needs that distinction (e.g. to log unrecognised blobs, as
+/// `last_chance_fallback` does) should check `read_blob` itself rather than
+/// use this helper for that path. Both current callers only need the
+/// "recognised or not" split, which `identified` already gives them.
+fn for_each_credential_path<F>(provider: &dyn Provider, mut f: F)
+where
+    F: FnMut(&Path, &str, Option<(AccountKey, CredentialFreshness)>),
+{
+    for path in provider.credential_paths() {
+        let Some(blob) = read_blob(&path) else {
+            continue;
+        };
+        let identified = provider
+            .identify_credential(&blob)
+            .map(|key| (key.clone(), provider.credential_freshness(&blob)));
+        f(&path, &blob, identified);
+    }
+}
+
 /// Scan a provider's credential paths and let it absorb any lagging
 /// rotations. Returns the set of AccountKeys observed on disk (whether we
 /// absorbed them or not — the caller can use this to detect additions).
@@ -117,20 +147,16 @@ pub fn read_blob(path: &Path) -> Option<String> {
 /// polling for another). Absorb those too.
 pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
     let mut seen = Vec::new();
-    for path in provider.credential_paths() {
-        let Some(blob) = read_blob(&path) else {
-            continue;
-        };
-        let Some(key) = provider.identify_credential(&blob) else {
-            continue;
+    for_each_credential_path(provider, |path, blob, identified| {
+        let Some((key, freshness)) = identified else {
+            return;
         };
         // Only absorb if the blob is at least usable — an Invalid blob is
         // most likely a partial write we caught mid-rename.
-        let freshness = provider.credential_freshness(&blob);
         if matches!(freshness, CredentialFreshness::Invalid) {
-            continue;
+            return;
         }
-        if let Err(e) = provider.absorb_credential(&key, &blob) {
+        if let Err(e) = provider.absorb_credential(&key, blob) {
             crate::logging::log(&format!(
                 "credentials: absorb of {}:{} from {} failed: {e}",
                 key.provider,
@@ -139,7 +165,7 @@ pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
             ));
         }
         seen.push(key);
-    }
+    });
     seen
 }
 
@@ -281,20 +307,16 @@ pub fn absorb_before_switch(provider: &dyn Provider) {
 /// the data in hand, no reason not to update it.
 pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> bool {
     let mut best_for_target: Option<(String, CredentialFreshness)> = None;
-    for path in provider.credential_paths() {
-        let Some(blob) = read_blob(&path) else {
-            continue;
-        };
-        let Some(key) = provider.identify_credential(&blob) else {
+    for_each_credential_path(provider, |path, blob, identified| {
+        let Some((key, freshness)) = identified else {
             // L6 (round-1 codeaudit): log unrecognised blobs so a mismatched
             // rotation shape (e.g. vendor CLI schema change) is visible.
             crate::logging::log(&format!(
                 "credentials: last_chance_fallback: unrecognised blob at {}",
                 path.display()
             ));
-            continue;
+            return;
         };
-        let freshness = provider.credential_freshness(&blob);
         if key == *target {
             // Track the freshest blob for the target; commit outside the loop.
             let take = match &best_for_target {
@@ -302,21 +324,21 @@ pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> boo
                 Some((_, cur)) => freshness.rank() > cur.rank(),
             };
             if take {
-                best_for_target = Some((blob, freshness));
+                best_for_target = Some((blob.to_string(), freshness));
             }
         } else if freshness.is_usable() {
             // Free sync for other tracked accounts we happened to see.
             // M3 (round-1 codeaudit): don't silently drop the Err — log at
             // least the account key + error so a persistent write failure
             // is visible in the daemon log.
-            if let Err(e) = provider.absorb_credential(&key, &blob) {
+            if let Err(e) = provider.absorb_credential(&key, blob) {
                 crate::logging::log(&format!(
                     "credentials: free-sync absorb of {}:{} failed: {e}",
                     key.provider, key.key
                 ));
             }
         }
-    }
+    });
     match best_for_target {
         Some((blob, f)) if f.is_usable() => {
             if let Err(e) = provider.absorb_credential(target, &blob) {
@@ -457,19 +479,7 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
     let providers_static: Vec<&'static dyn Provider> = providers;
     let thread = std::thread::Builder::new()
         .name("usagio-credentials-watcher".into())
-        .spawn(move || {
-            // Debounce: coalesce a burst of writes (atomic rename fires
-            // multiple events) into one absorb pass.
-            let debounce = Duration::from_millis(250);
-            while rx.recv().is_ok() {
-                while rx.recv_timeout(debounce).is_ok() {}
-                for p in &providers_static {
-                    let _ = absorb_all_lagging(*p);
-                }
-                let active = State::load().ok().and_then(|s| s.active.clone());
-                refresh_inactive_if_stale(active.as_deref());
-            }
-        });
+        .spawn(move || fsnotify_watcher_supervisor(rx, providers_static));
     // R3-EH-01: log watcher-thread spawn failure (previously .ok()? silently
     // dropped ENOMEM/EAGAIN/RLIMIT_NPROC without a signal).
     let thread = match thread {
@@ -484,6 +494,72 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
         _watcher: watcher,
         _thread: thread,
     })
+}
+
+/// Backoff after a caught panic in the fsnotify watcher's processing loop,
+/// before we resume listening on `rx`. Mirrors the poll loop's supervisor
+/// backoff (errors-03, v0.5.2 audit): short enough that real-time credential
+/// absorption isn't meaningfully delayed, long enough that a panic which
+/// recurs on every event (e.g. a provider bug triggered by a specific blob
+/// shape) doesn't spin the CPU logging the same panic thousands of times a
+/// second.
+const WATCHER_PANIC_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Runs for the lifetime of the fsnotify watcher thread. Blocks on `rx` for
+/// the next raw filesystem event, then hands the debounce+absorb+refresh work
+/// to a `catch_unwind`-guarded closure so a panic anywhere in a provider's
+/// `identify_credential`/`credential_freshness`/`absorb_credential` (or in
+/// `refresh_inactive_if_stale`) can't silently kill the whole watcher thread.
+/// Without this, a single panicking event permanently degrades real-time
+/// credential absorption to the slow (150s) poll path for the rest of the
+/// process's life, with no diagnostic (errors-03, v0.5.2 audit).
+fn fsnotify_watcher_supervisor(
+    rx: mpsc::Receiver<notify::Event>,
+    providers: Vec<&'static dyn Provider>,
+) {
+    // Debounce: coalesce a burst of writes (atomic rename fires multiple
+    // events) into one absorb pass.
+    let debounce = Duration::from_millis(250);
+    loop {
+        // Block for the next event outside the panic guard — recv() itself
+        // can't meaningfully panic, and keeping it outside means a caught
+        // panic below doesn't have to re-enter catch_unwind just to wait.
+        if rx.recv().is_err() {
+            // Sender (the notify watcher) dropped — WatcherHandle was
+            // dropped, shutting down intentionally. Exit quietly.
+            return;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            while rx.recv_timeout(debounce).is_ok() {}
+            for p in &providers {
+                let _ = absorb_all_lagging(*p);
+            }
+            // efficiency-1 (v0.5.2 audit): `refresh_inactive_if_stale`
+            // ignores its hint parameter entirely (it snapshots {accounts,
+            // active} itself under the state lock — see that function's
+            // doc), so the `State::load()` that used to sit here was a
+            // second, fully redundant disk read + JSON parse on every single
+            // debounced credential-file-change event, forever, for zero
+            // effect on behavior.
+            refresh_inactive_if_stale(None);
+        }));
+        if let Err(payload) = result {
+            let reason = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            crate::logging::log(&format!(
+                "event=fsnotify_watcher_panic reason={reason} ; respawning"
+            ));
+            std::thread::sleep(WATCHER_PANIC_BACKOFF);
+            // Loop back to rx.recv(): the channel and watcher are untouched
+            // by the panic (they live in the caller's stack frame / the
+            // WatcherHandle respectively), so simply resuming the read loop
+            // is equivalent to "respawning" the processing without losing
+            // any state the thread itself doesn't own.
+        }
+    }
 }
 
 #[cfg(test)]

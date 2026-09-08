@@ -8,15 +8,18 @@
 //! Serialize the tools response to JSON and count its tokens — that's
 //! approximately what enters the model's context per turn.
 //!
-//! Timeout: best-effort ~3s per server (a blocking `read_line` between polls
-//! may exceed it if the child stops emitting bytes). Missing binaries /
-//! crashes surface as errors and the caller skips that row.
+//! Timeout: a hard wall-clock ~3s per server, enforced regardless of whether
+//! the child ever writes a byte (robustness-02, v0.5.2 audit — see
+//! `read_line_with_timeout`'s doc for why a plain polling loop around a
+//! blocking `read_until` isn't enough). Missing binaries / crashes surface as
+//! errors and the caller skips that row.
 
 use super::tokenize;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// RAII guard that kills + reaps a spawned MCP child on drop. Ensures every
@@ -90,8 +93,20 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
     // early return between here and the happy-path drop at fn end.
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
-    let mut reader = BufReader::new(stdout);
+    let reader = BufReader::new(stdout);
     let _guard = ChildGuard::new(child);
+
+    // robustness-02 (v0.5.2 audit): hand the blocking reader off to a
+    // dedicated thread so the 3s budget below is a real wall-clock timeout,
+    // not just a gap check between blocking `read_until` calls. A server
+    // that writes nothing and never exits would otherwise block
+    // `read_until` inside the kernel indefinitely — the old polling loop's
+    // `start.elapsed() > RPC_TIMEOUT` check can only run BETWEEN calls, so it
+    // never fires while a call is in flight. The reader thread itself
+    // terminates naturally once `_guard`'s `Drop` kills the child: killing
+    // it closes the write end of the stdout pipe, so the blocked
+    // `read_until` unblocks with EOF instead of leaking the thread.
+    let rx = spawn_line_reader(reader);
 
     // Initialize request
     let init = json!({
@@ -109,7 +124,7 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
     // Wait for initialize response; if the server rejected our handshake
     // (JSON-RPC error object at top level), surface it now instead of
     // proceeding into a `tools/list` that would fail the same way.
-    let init_response = read_line_with_timeout(&mut reader, start)?;
+    let init_response = read_line_with_timeout(&rx, start)?;
     if let Ok(parsed) = serde_json::from_str::<Value>(&init_response) {
         if let Some(err) = parsed.get("error") {
             return Err(format!("initialize failed: {}", err));
@@ -132,7 +147,7 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
     });
     writeln!(&mut stdin, "{}", tools_req).map_err(|e| format!("write tools/list: {}", e))?;
 
-    let tools_response = read_line_with_timeout(&mut reader, start)?;
+    let tools_response = read_line_with_timeout(&rx, start)?;
     let parsed: Value =
         serde_json::from_str(&tools_response).map_err(|e| format!("parse tools/list: {}", e))?;
     let tools = parsed
@@ -152,39 +167,87 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
     })
 }
 
-fn read_line_with_timeout(
-    reader: &mut BufReader<std::process::ChildStdout>,
-    start: Instant,
-) -> Result<String, String> {
-    // Polling read: check elapsed each iteration, bail if we're over budget.
-    // Not perfect (blocking read_line can hang beyond timeout), but pragmatic
-    // for the ledger's "skip on trouble" contract.
-    loop {
-        if start.elapsed() > RPC_TIMEOUT {
-            return Err(format!("timeout after {:?}", RPC_TIMEOUT));
-        }
+/// One outcome of the background reader thread's attempt to produce the next
+/// non-empty line.
+enum LineMsg {
+    Line(String),
+    Eof,
+    Err(String),
+}
+
+/// Spawn a thread that owns `reader` for the rest of the child's lifetime,
+/// blocking on `read_until(b'\n')` in a loop and forwarding each non-empty
+/// line (or the terminal EOF/error) over the returned channel. This is what
+/// lets `read_line_with_timeout` enforce a real wall-clock deadline: the
+/// blocking syscall lives on this thread, so the caller's `recv_timeout` can
+/// give up on it without waiting for the kernel read to return.
+fn spawn_line_reader(mut reader: BufReader<ChildStdout>) -> mpsc::Receiver<LineMsg> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || loop {
         // R3-RES-01: cap per-line reads at MAX_LINE_BYTES so a server that
-        // streams bytes without a newline can't grow this buffer unboundedly
-        // between timeout polls.
+        // streams bytes without a newline can't grow this buffer unboundedly.
         let mut bytes: Vec<u8> = Vec::new();
         let mut limited = reader.by_ref().take(MAX_LINE_BYTES);
-        match limited.read_until(b'\n', &mut bytes) {
-            Ok(0) => return Err("eof before response".into()),
+        let msg = match limited.read_until(b'\n', &mut bytes) {
+            Ok(0) => {
+                let _ = tx.send(LineMsg::Eof);
+                return;
+            }
             Ok(_) => {
                 if bytes.len() as u64 >= MAX_LINE_BYTES && !bytes.ends_with(b"\n") {
-                    return Err(format!(
+                    let _ = tx.send(LineMsg::Err(format!(
                         "line exceeded {} bytes without newline",
                         MAX_LINE_BYTES
-                    ));
+                    )));
+                    return;
                 }
-                let s =
-                    String::from_utf8(bytes).map_err(|e| format!("non-utf8 in response: {}", e))?;
-                if s.trim().is_empty() {
-                    continue;
+                match String::from_utf8(bytes) {
+                    Ok(s) if s.trim().is_empty() => continue,
+                    Ok(s) => LineMsg::Line(s),
+                    Err(e) => {
+                        let _ = tx.send(LineMsg::Err(format!("non-utf8 in response: {}", e)));
+                        return;
+                    }
                 }
-                return Ok(s);
             }
-            Err(e) => return Err(format!("read: {}", e)),
+            Err(e) => {
+                let _ = tx.send(LineMsg::Err(format!("read: {}", e)));
+                return;
+            }
+        };
+        // The receiver may already be gone (fetch_tools returned early on a
+        // prior error and dropped `rx`) — stop reading rather than spin
+        // forever against a child nobody is listening to anymore. The
+        // ChildGuard has already killed the process by the time that
+        // happens, so this thread exits promptly either way.
+        if tx.send(msg).is_err() {
+            return;
+        }
+    });
+    rx
+}
+
+/// Wait for the next line the background reader thread (see
+/// `spawn_line_reader`) produces, enforcing a hard wall-clock deadline of
+/// `RPC_TIMEOUT` measured from `start` — regardless of whether the child
+/// ever writes anything. Unlike a polling loop around a blocking read, this
+/// deadline is real: `recv_timeout` returns on schedule even while the
+/// reader thread's `read_until` is still parked in the kernel waiting on the
+/// child's stdout pipe.
+fn read_line_with_timeout(rx: &mpsc::Receiver<LineMsg>, start: Instant) -> Result<String, String> {
+    let remaining = RPC_TIMEOUT
+        .checked_sub(start.elapsed())
+        .unwrap_or(Duration::ZERO);
+    if remaining.is_zero() {
+        return Err(format!("timeout after {:?}", RPC_TIMEOUT));
+    }
+    match rx.recv_timeout(remaining) {
+        Ok(LineMsg::Line(s)) => Ok(s),
+        Ok(LineMsg::Eof) => Err("eof before response".into()),
+        Ok(LineMsg::Err(e)) => Err(e),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!("timeout after {:?}", RPC_TIMEOUT)),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("reader thread ended without a response".into())
         }
     }
 }

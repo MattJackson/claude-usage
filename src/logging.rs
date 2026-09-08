@@ -19,6 +19,32 @@ pub const MAX_BYTES: u64 = 1_000_000;
 /// `store.rs`'s backup writer uses for `state-rejected-*`/`pre-restore-*`.
 const ROTATE_UNIQUIFY_ATTEMPTS: u32 = 20;
 
+/// Open `path` for append, creating it owner-only (0600) on Unix from the
+/// start (no umask window) — mirrors `store::write_private`'s posture for
+/// every other token-adjacent file. `usagio.log` itself never contains raw
+/// secrets (see the module doc), but it does contain account emails, error
+/// text, and enough token-lifecycle metadata (`tok_prefix` 20-char prefixes)
+/// that it shouldn't be left world-readable under a default umask (security-02,
+/// v0.5.2 audit). No-op mode difference on Windows: NTFS ACLs already
+/// restrict the per-user profile directory this lands under.
+#[cfg(unix)]
+fn open_append_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_append_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
 /// robustness-04 (v0.5.1 audit): surface a rotation failure at least once per
 /// process instead of swallowing it forever. Without this, a single rename
 /// failure (Windows sharing violation from another `usagio` process/CLI
@@ -75,11 +101,7 @@ pub fn rotate_if_large(path: &std::path::Path, max_bytes: u64) {
                  for {}: {e}",
                 path.display()
             );
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
+            if let Ok(mut f) = open_append_private(path) {
                 let ts = chrono::Utc::now().to_rfc3339();
                 let _ = writeln!(f, "{ts} event=log_rotation_failed reason={msg}");
             } else {
@@ -116,11 +138,7 @@ pub fn log(msg: &str) {
     // Rotate if the file has grown too large (keep one previous generation).
     rotate_if_large(&path, MAX_BYTES);
 
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    if let Ok(mut f) = open_append_private(&path) {
         let ts = chrono::Utc::now().to_rfc3339();
         let _ = writeln!(f, "{ts} {msg}");
     }
@@ -129,6 +147,21 @@ pub fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// security-02 (v0.5.2 audit): the log file must be owner-only from
+    /// creation, not just left at whatever the process umask happens to be
+    /// (0644 under a default 022 umask — world-readable).
+    #[cfg(unix)]
+    #[test]
+    fn open_append_private_creates_file_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usagio.log");
+        let f = open_append_private(&path).unwrap();
+        drop(f);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "log file must be owner-only");
+    }
 
     /// robustness-04: when the primary rotated name (`.1`) is unavailable,
     /// rotation should fall through to the next uniquified name rather than

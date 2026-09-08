@@ -437,6 +437,25 @@ fn save_state_safe_backup_dir_is_0700_and_file_is_0600() {
     assert_eq!(file_mode, 0o600, "backup file is 0600");
 }
 
+#[test]
+fn config_dir_itself_is_0700() {
+    // security-01 (v0.5.2 audit): the top-level `~/.config/usagio` dir must
+    // be owner-only, not just `backups/` beneath it. `config_dir()` should
+    // harden it on every call, even before anything has ever been written
+    // (e.g. a fresh install whose first ever call is a read-only `list`).
+    use std::os::unix::fs::PermissionsExt;
+    let g = ScopedConfigDir::new();
+    let dir = config_dir().unwrap();
+    assert!(dir.exists(), "config_dir() must create the dir it returns");
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "top-level config dir must be 0700");
+    // Roundtrip: a save() afterwards must not regress the permission.
+    make_state_with(&["a@e.com"]).save().unwrap();
+    let mode_after_save = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode_after_save, 0o700, "config dir stays 0700 after a save");
+    drop(g);
+}
+
 // -----------------------------------------------------------------------------
 // cfg(test) tripwire: `config_dir()` must panic when called without an active
 // ScopedConfigDir/TestConfigDir guard. This is the safety net that keeps a
