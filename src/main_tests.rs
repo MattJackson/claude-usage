@@ -923,6 +923,8 @@ fn switch_lock_closure_invariant_mutations_after_reload_survive() {
 
 // --- launch_agent_exe_path / sibling_app_bundle_exe ---
 
+// Used only by macOS launch-agent / bundle tests below (all `#[cfg(target_os = "macos")]`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn mock_cellar_bundle_layout(
     prefix: &str,
 ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
