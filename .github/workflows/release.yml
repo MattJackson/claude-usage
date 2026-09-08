@@ -257,7 +257,7 @@ jobs:
       - name: Install Linux system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libssl-dev pkg-config libsecret-1-dev
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libssl-dev pkg-config libsecret-1-dev librsvg2-bin
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -280,21 +280,42 @@ jobs:
         # (installed above) — no musl / static-OpenSSL cross-compile.
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu
 
-      - name: Package binary
+      - name: Generate icon assets (.desktop entry needs a hicolor icon set)
+        run: packaging/linux/generate-png-icons.sh
+
+      - name: Package binary + .deb
         run: |
           version="${GITHUB_REF#refs/tags/}"
+          ver="${version#v}"
           mkdir -p dist
-          tar -C "target/x86_64-unknown-linux-gnu/release" -czf \
-            "dist/${BIN}-${version}-x86_64-unknown-linux-gnu.tar.gz" "${BIN}"
+
+          # Tarball: bare binary + .desktop + hicolor icon set, so even a
+          # manual `tar -xzf` + copy-into-place gets a real application-menu
+          # entry (see packaging/README.md for the install steps).
+          stage="$(mktemp -d)/usagio-${version}"
+          mkdir -p "$stage"
+          cp "target/x86_64-unknown-linux-gnu/release/${BIN}" "$stage/${BIN}"
+          cp packaging/linux/usagio.desktop "$stage/usagio.desktop"
+          cp -R packaging/linux/icons "$stage/icons"
+          tar -C "$(dirname "$stage")" -czf \
+            "dist/${BIN}-${version}-x86_64-unknown-linux-gnu.tar.gz" "usagio-${version}"
+
+          # .deb: proper installable package for `dpkg -i` / apt, carrying
+          # the application-menu entry + icon theme install for free.
+          packaging/linux/build-deb.sh \
+            "target/x86_64-unknown-linux-gnu/release/${BIN}" "${ver}" dist
 
           cd dist
-          shasum -a 256 "${BIN}-${version}-x86_64-unknown-linux-gnu.tar.gz" \
-            > "${BIN}-${version}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+          for f in *.tar.gz *.deb; do
+            shasum -a 256 "$f" > "${f}.sha256"
+          done
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: 'dist/*.tar.gz'
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.deb
 
       - name: Publish GitHub Release asset
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
@@ -307,6 +328,7 @@ jobs:
           generate_release_notes: false
           files: |
             dist/*.tar.gz
+            dist/*.deb
             dist/*.sha256
 
   build-windows:
@@ -337,14 +359,30 @@ jobs:
       - name: Build (x86_64-pc-windows-msvc)
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
+      - name: Generate usagio.ico
+        # Repacks the committed packaging/windows/logo-512.png brand mark
+        # into a multi-resolution .ico for the shortcut created below (the
+        # bare .exe has no icon resource embedded — see
+        # packaging/windows/Create-Shortcut.ps1 for why a .lnk + .ico is
+        # this release's path to a real taskbar icon).
+        shell: pwsh
+        run: |
+          ./packaging/windows/generate-ico.ps1 `
+            -SourcePng packaging/windows/logo-512.png `
+            -OutIco packaging/windows/usagio.ico
+
       - name: Package binary
         shell: bash
         run: |
           version="${GITHUB_REF#refs/tags/}"
           mkdir -p dist
-          cp "target/x86_64-pc-windows-msvc/release/${BIN}.exe" "dist/${BIN}.exe"
-          (cd dist && 7z a "${BIN}-${version}-x86_64-pc-windows-msvc.zip" "${BIN}.exe")
-          rm -f "dist/${BIN}.exe"
+          stage="dist/${BIN}-${version}-x86_64-pc-windows-msvc"
+          mkdir -p "$stage"
+          cp "target/x86_64-pc-windows-msvc/release/${BIN}.exe" "$stage/${BIN}.exe"
+          cp packaging/windows/usagio.ico "$stage/usagio.ico"
+          cp packaging/windows/Create-Shortcut.ps1 "$stage/Create-Shortcut.ps1"
+          (cd dist && 7z a "${BIN}-${version}-x86_64-pc-windows-msvc.zip" "$(basename "$stage")")
+          rm -rf "$stage"
           cd dist
           sha256sum "${BIN}-${version}-x86_64-pc-windows-msvc.zip" \
             > "${BIN}-${version}-x86_64-pc-windows-msvc.zip.sha256"
