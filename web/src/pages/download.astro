@@ -93,8 +93,8 @@ const windowsZip = `${assetBase}/usagio-0.5.0-x86_64-pc-windows-msvc.zip`;
 <span class="p">$</span> ./usagio watch
 </CodeBlock>
         <p class="dl-p dl-p-fine" style="margin-top: 1rem;">
-          To register the tray app and auto-swap daemon at login (writes
-          <code>~/.config/autostart/usagio.desktop</code>), run <code>./usagio install</code>.
+          To register the tray app and auto-swap daemon at login, run <code>./usagio install</code>.
+          (See the <a href="/faq/">FAQ</a> for what that writes to disk.)
         </p>
         <div class="btn-row" style="justify-content: center; margin-top: 1.25rem;">
           <a class="btn btn-secondary" href={linuxTarball}>Download tarball (x86_64)&nbsp;↓</a>
@@ -107,25 +107,19 @@ const windowsZip = `${assetBase}/usagio-0.5.0-x86_64-pc-windows-msvc.zip`;
           <span class="eyebrow">Windows</span>
           <h2 class="h-section">Prebuilt archive</h2>
           <p class="dl-primary-lede">
-            Download <code>usagio-0.5.0-x86_64-pc-windows-msvc.zip</code> from the releases page, extract
-            it to <code>%LOCALAPPDATA%\Programs\usagio\</code>, and add that folder to your PATH. Then
-            register the tray app and auto-swap daemon to start at login:
+            Download <code>usagio-0.5.0-x86_64-pc-windows-msvc.zip</code>, extract
+            it to <code>%LOCALAPPDATA%\Programs\usagio\</code>, and add that folder to your PATH. Then run:
           </p>
         </div>
         <CodeBlock label="install"><span class="p">&gt;</span> usagio install
 </CodeBlock>
         <p class="dl-p dl-p-fine" style="text-align: center; margin: 1rem auto 0;">
-          This writes an entry to <code>HKCU\Software\Microsoft\Windows\CurrentVersion\Run</code> so
-          usagio starts automatically.
+          Adds usagio to your PATH and enables autostart at login. See the
+          <a href="/faq/">FAQ</a> for SmartScreen and antivirus notes.
         </p>
         <div class="btn-row" style="justify-content: center; margin-top: 1.25rem;">
           <a class="btn btn-secondary" href={windowsZip}>Download zip (x86_64)&nbsp;↓</a>
         </div>
-        <p class="dl-p dl-p-fine">
-          The exe is unsigned, so Windows Defender may show a SmartScreen
-          warning on first run — choose "More info" → "Run anyway". See
-          <code>packaging/windows/DEPENDENCIES.md</code> in the repo for details.
-        </p>
       </div>
 
       <!-- ============ VERIFY ============ -->
@@ -165,9 +159,7 @@ const windowsZip = `${assetBase}/usagio-0.5.0-x86_64-pc-windows-msvc.zip`;
 
       <!-- ============ RELEASE NOTES LINK ============ -->
       <p class="dl-p dl-p-fine" style="text-align: center; margin: 1.25rem auto 0;">
-        See the <a href={`${github}/releases/tag/v0.5.0`} target="_blank" rel="noopener noreferrer">v0.5.0 release notes</a> and
-        <a href={`${github}/releases/tag/v0.5.1`} target="_blank" rel="noopener noreferrer">v0.5.1 release notes</a> for
-        per-OS details and known limitations.
+        See <a href="/whats-new/">release notes</a> for per-OS details and known limitations.
       </p>
 
       <!-- ============ FROM SOURCE ============ -->
