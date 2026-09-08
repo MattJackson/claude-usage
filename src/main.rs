@@ -9,15 +9,6 @@
 //! service string is intentionally frozen at "claude-usage" to preserve
 //! existing tokens (see `providers/state.rs`).
 
-// A handful of items (cost/burn constants, DisplayState/BlockingWindow,
-// state_json_path, and menu helpers) are only exercised from the macOS-only
-// menubar module. On Linux/Windows compiles they're legitimately dead — the
-// menu isn't yet wired through the Platform trait so `mod menubar;` is
-// still macOS-gated (see the allowlist in tests/strict_cfg.rs). This
-// silences those warnings only on non-macOS targets so clippy stays -D
-// warnings on all three OSes without hiding real dead code on macOS.
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
-
 mod burn_rate;
 mod context_ledger;
 mod cost_tracking;
@@ -25,10 +16,8 @@ mod countdown;
 mod credentials;
 #[cfg(test)]
 mod env_lock;
-#[cfg(target_os = "macos")]
 mod icons;
 mod logging;
-#[cfg(target_os = "macos")]
 mod menubar;
 mod notifications;
 mod paths;
@@ -248,7 +237,6 @@ fn run() -> Result<()> {
         }
         Some("token") => cmd_token(args.get(1).map(String::as_str)),
         Some("watch") => cmd_watch(&args[1..]),
-        #[cfg(target_os = "macos")]
         Some("menubar") => menubar::run(),
         Some("report") => cmd_report(&args[1..]),
         Some("context") => cmd_context(&args[1..]),

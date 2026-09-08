@@ -212,9 +212,10 @@ fn build_item(item: &MenuItem) -> Result<Box<dyn IsMenuItem>> {
             label,
             enabled,
             checked,
+            checkable,
             ..
         } => {
-            if *checked {
+            if *checkable {
                 Box::new(CheckMenuItem::with_id(
                     MenuId::new(id),
                     label,
