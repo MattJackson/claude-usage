@@ -43,16 +43,14 @@ const windowsZip = `${assetBase}/usagio-0.5.0-x86_64-pc-windows-msvc.zip`;
             app relaunches into the new binary without you restarting anything.
           </p>
         </div>
-        <CodeBlock label="install">
-<span class="c"># 1 — Approve the third-party tap (once)</span>
-<span class="p">$</span> brew tap --trust mattjackson/tap
-
-<span class="c"># 2 — Install</span>
+        <CodeBlock label="install"><span class="p">$</span> brew tap --trust mattjackson/tap
 <span class="p">$</span> brew install mattjackson/tap/usagio
-
-<span class="c"># 3 — Set up the menu-bar app + auto-swap daemon (now and every login)</span>
 <span class="p">$</span> usagio install
 </CodeBlock>
+        <p class="dl-p dl-p-fine" style="text-align: center; margin: 1rem auto 0;">
+          The first two commands add the tap and install the binary; <code>usagio install</code> registers
+          the menu-bar app and auto-swap daemon to start on every login.
+        </p>
         <div class="btn-row" style="justify-content: center; margin-top: 1.5rem;">
           <button
             type="button"
@@ -80,21 +78,24 @@ const windowsZip = `${assetBase}/usagio-0.5.0-x86_64-pc-windows-msvc.zip`;
             releases page instead.
           </p>
         </div>
-        <CodeBlock label="install (linuxbrew)">
-<span class="p">$</span> brew tap --trust mattjackson/tap
+        <CodeBlock label="install (linuxbrew)"><span class="p">$</span> brew tap --trust mattjackson/tap
 <span class="p">$</span> brew install mattjackson/tap/usagio
 <span class="p">$</span> usagio install
 </CodeBlock>
-        <p class="dl-p" style="margin-top: 1.25rem;">Or, without Homebrew:</p>
-        <CodeBlock label="install (tarball)">
-<span class="c"># Download from the releases page, then:</span>
-<span class="p">$</span> tar xzf usagio-0.5.0-x86_64-unknown-linux-gnu.tar.gz
+        <p class="dl-p dl-p-fine" style="margin-top: 1rem;">
+          This adds the tap, installs the binary, and registers the tray app and auto-swap daemon to
+          start on every login.
+        </p>
+        <p class="dl-p" style="margin-top: 1.25rem;">
+          Or, without Homebrew, download the tarball from the releases page, then extract and run it directly:
+        </p>
+        <CodeBlock label="install (tarball)"><span class="p">$</span> tar xzf usagio-0.5.0-x86_64-unknown-linux-gnu.tar.gz
 <span class="p">$</span> ./usagio watch
-
-<span class="c"># Or register the tray app + auto-swap daemon at login</span>
-<span class="c"># (writes ~/.config/autostart/usagio.desktop)</span>
-<span class="p">$</span> ./usagio install
 </CodeBlock>
+        <p class="dl-p dl-p-fine" style="margin-top: 1rem;">
+          To register the tray app and auto-swap daemon at login (writes
+          <code>~/.config/autostart/usagio.desktop</code>), run <code>./usagio install</code>.
+        </p>
         <div class="btn-row" style="justify-content: center; margin-top: 1.25rem;">
           <a class="btn btn-secondary" href={linuxTarball}>Download tarball (x86_64)&nbsp;↓</a>
         </div>
@@ -106,18 +107,17 @@ const windowsZip = `${assetBase}/usagio-0.5.0-x86_64-pc-windows-msvc.zip`;
           <span class="eyebrow">Windows</span>
           <h2 class="h-section">Prebuilt archive</h2>
           <p class="dl-primary-lede">
-            Download the zip from the releases page, extract it, and add it to
-            your PATH.
+            Download <code>usagio-0.5.0-x86_64-pc-windows-msvc.zip</code> from the releases page, extract
+            it to <code>%LOCALAPPDATA%\Programs\usagio\</code>, and add that folder to your PATH. Then
+            register the tray app and auto-swap daemon to start at login:
           </p>
         </div>
-        <CodeBlock label="install">
-<span class="c"># Download usagio-0.5.0-x86_64-pc-windows-msvc.zip from the releases page,</span>
-<span class="c"># then extract to %LOCALAPPDATA%\Programs\usagio\ and add it to PATH.</span>
-
-<span class="c"># Register the tray app + auto-swap daemon at login</span>
-<span class="c"># (writes to HKCU\Software\Microsoft\Windows\CurrentVersion\Run)</span>
-<span class="p">&gt;</span> usagio install
+        <CodeBlock label="install"><span class="p">&gt;</span> usagio install
 </CodeBlock>
+        <p class="dl-p dl-p-fine" style="text-align: center; margin: 1rem auto 0;">
+          This writes an entry to <code>HKCU\Software\Microsoft\Windows\CurrentVersion\Run</code> so
+          usagio starts automatically.
+        </p>
         <div class="btn-row" style="justify-content: center; margin-top: 1.25rem;">
           <a class="btn btn-secondary" href={windowsZip}>Download zip (x86_64)&nbsp;↓</a>
         </div>
@@ -135,8 +135,7 @@ const windowsZip = `${assetBase}/usagio-0.5.0-x86_64-pc-windows-msvc.zip`;
           Confirm the binary is on your PATH and the version matches what you
           expected.
         </p>
-        <CodeBlock label="verify">
-<span class="p">$</span> usagio --version
+        <CodeBlock label="verify"><span class="p">$</span> usagio --version
 <span class="p">$</span> usagio status
 </CodeBlock>
       </div>
@@ -164,40 +163,12 @@ const windowsZip = `${assetBase}/usagio-0.5.0-x86_64-pc-windows-msvc.zip`;
         </div>
       </div>
 
-      <!-- ============ HONESTY NOTE ============ -->
-      <div class="dl-req fade-up" style="margin-top: 1.25rem;">
-        <div class="dl-req-inner">
-          <div>
-            <div class="dl-req-label">v0.5.0 platform notes</div>
-            <div class="dl-req-body">
-              v0.5.0 is the first usagio release shipping real Linux and
-              Windows support alongside macOS — same menu, same auto-swap,
-              same never-re-login contract on all three. Every push runs the
-              full CI matrix on macOS, Linux, and Windows, including live
-              tray, keychain/Secret-Service/Credential-Manager, and
-              autostart round-trip tests, so all three are ready to install.
-              Found something off anyway? Please
-              <a href={`${github}/issues`} target="_blank" rel="noopener noreferrer">file an issue</a>.
-            </div>
-            <div class="dl-req-body" style="margin-top: 0.6rem;">
-              The macOS build is signed ad-hoc, not notarised, so the first
-              launch may need a Right-Click → Open instead of a double-click.
-              Signed and notarised builds are planned once the project has an
-              Apple Developer account.
-            </div>
-            <div class="dl-req-body" style="margin-top: 0.6rem;">
-              The Linux tray icon needs <code>libayatana-appindicator3</code>:
-              <code>sudo apt install libayatana-appindicator3-1</code> on
-              Ubuntu/Debian, <code>sudo dnf install libayatana-appindicator-gtk3</code>
-              on Fedora, or <code>libayatana-appindicator</code> from the AUR on Arch.
-            </div>
-            <div class="dl-req-body" style="margin-top: 0.6rem;">
-              The Windows build is unsigned, so Defender may need an exception
-              on first run.
-            </div>
-          </div>
-        </div>
-      </div>
+      <!-- ============ RELEASE NOTES LINK ============ -->
+      <p class="dl-p dl-p-fine" style="text-align: center; margin: 1.25rem auto 0;">
+        See the <a href={`${github}/releases/tag/v0.5.0`} target="_blank" rel="noopener noreferrer">v0.5.0 release notes</a> and
+        <a href={`${github}/releases/tag/v0.5.1`} target="_blank" rel="noopener noreferrer">v0.5.1 release notes</a> for
+        per-OS details and known limitations.
+      </p>
 
       <!-- ============ FROM SOURCE ============ -->
       <details class="dl-source fade-up">
@@ -211,15 +182,15 @@ const windowsZip = `${assetBase}/usagio-0.5.0-x86_64-pc-windows-msvc.zip`;
             The workspace builds one binary that powers both the menu-bar app
             and the CLI.
           </p>
-          <CodeBlock label="build">
-<span class="p">$</span> git clone https://github.com/MattJackson/usagio.git
+          <CodeBlock label="build"><span class="p">$</span> git clone https://github.com/MattJackson/usagio.git
 <span class="p">$</span> cd usagio
 <span class="p">$</span> cargo build --release
-
-<span class="c"># Binary at target/release/usagio — copy anywhere on your PATH</span>
 <span class="p">$</span> cp target/release/usagio /usr/local/bin/
 <span class="p">$</span> usagio install
 </CodeBlock>
+          <p class="dl-p dl-p-fine">
+            The binary lands at <code>target/release/usagio</code>; copy it anywhere on your PATH.
+          </p>
           <p class="dl-p dl-p-fine">
             Contributing? The repo README covers the layout, tests, and the
             provider-adapter interface for adding new AI coding CLIs.
