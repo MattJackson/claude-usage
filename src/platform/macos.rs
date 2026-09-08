@@ -192,9 +192,7 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
             .status()
             .context("running `security add-generic-password`")?;
         if !status.success() {
-            bail!(
-                "`security add-generic-password` failed for service={service} account={account}"
-            );
+            bail!("`security add-generic-password` failed for service={service} account={account}");
         }
         Ok(())
     })();
