@@ -120,11 +120,15 @@ objc2-app-kit = { version = "0.3", features = [
     "NSResponder",
     "NSMenu",             # walk the native menu + submenus
     "NSMenuItem",         # setAttributedTitle
-    "NSFont",             # bold system font (active row)
+    "NSFont",             # bold system font (active row), menu font (measurement)
     "NSColor",            # systemOrange/systemRed (usage bands)
     "NSParagraphStyle",   # NSTextTab right-align tab stop
     "NSText",             # NSTextAlignment
     "NSAttributedString", # attribute-name constants live here
+    "NSStringDrawing",    # NSAttributedString::size() — measures a row's
+                           # natural width so the right-align tab stop can be
+                           # computed dynamically per snapshot instead of a
+                           # fixed magic number (v0.5.1)
     "NSImage",            # 16px provider icons on section header rows
     "objc2-core-foundation", # REQUIRED: CGFloat-typed methods are cfg-gated on it
 ] }

@@ -180,9 +180,14 @@ struct RowStyle {
     section_header: bool,
     /// Colored spans: (utf16 offset, utf16 length, band).
     colors: Vec<(usize, usize, Severity)>,
-    /// If set, right-align everything after the first `\t` at this x (points),
-    /// battery-menu style. Requires the plain title to contain a `\t`.
-    tab_x: Option<f64>,
+    /// If set, right-align everything after the first `\t` at a tab stop,
+    /// battery-menu style. Requires the plain title to contain a `\t`. The
+    /// concrete x (points) is NOT stored here — `TabX::MenuRight` is resolved
+    /// to a menu-wide point value at install time by
+    /// `mac_style::compute_menu_right_x`, which measures every row's actual
+    /// rendered width so the tab stop always clears the widest label instead
+    /// of relying on a fixed magic number (v0.5.1).
+    tab_x_kind: Option<TabX>,
     /// If set, attach the 16px provider icon (looked up by slug in
     /// `crate::icons::png16_for`) to the native menu item via `setImage:`. Only
     /// set on section-header rows so per-provider iconography appears once at
@@ -195,7 +200,7 @@ struct RowStyle {
     /// If set, paint the run from this UTF-16 offset to the end of the row in
     /// `NSColor::secondaryLabelColor` (macOS "grey secondary" — the same tint
     /// disabled menu items use). Used to render "usagio vX.Y.Z" as a subdued
-    /// trailing label on the enabled Quit row: right-aligned via `tab_x`,
+    /// trailing label on the enabled Quit row: right-aligned via `tab_x_kind`,
     /// grey via this field, without disabling the row's click.
     grey_tail_from: Option<usize>,
     /// v0.5.0: paint the WHOLE row in `NSColor::labelColor()` (the normal
@@ -219,7 +224,7 @@ impl RowStyle {
             bold: false,
             section_header: false,
             colors: Vec::new(),
-            tab_x: None,
+            tab_x_kind: None,
             icon_slug: None,
             checkmark: false,
             grey_tail_from: None,
@@ -228,10 +233,23 @@ impl RowStyle {
     }
 }
 
-/// Fixed x (points) for the right-aligned trailing `S% / W%`. The menu font is
-/// proportional, so this must clear the widest email; the menu auto-widens to
-/// fit, so over-provisioning only adds a little slack on the right.
-const TAB_X: f64 = 260.0;
+/// Kinds of right-align tab stop a row can request. Currently there's only
+/// one: right-align at the menu's actual content edge. Kept as an enum
+/// (rather than the row just carrying `bool`) so a future second alignment
+/// scheme (e.g. a submenu-local edge) has somewhere to go without another
+/// magic-number field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TabX {
+    /// Right-align at a point computed fresh for each rendered snapshot —
+    /// `max(label_width + trailing_width)` over every `MenuRight` row, plus
+    /// a small safety pad — so the tab stop always clears the widest label
+    /// instead of a fixed constant that silently misaligns past its bound.
+    /// Resolved to a concrete point value by
+    /// `mac_style::compute_menu_right_x` at install time; the
+    /// `cross_platform` (Linux/Windows) renderer has no tab-stop concept at
+    /// all and never reads this — it falls back to a plain ` · ` separator.
+    MenuRight,
+}
 
 /// Length of a string in UTF-16 code units (the unit `NSRange` counts in).
 fn u16len(s: &str) -> usize {
@@ -303,10 +321,10 @@ fn now_utc() -> DateTime<Utc> {
 /// provider-name length ("Claude" vs "Codex").
 const PROVIDER_COL: usize = 10;
 
-/// v0.5.0 flat main-list row: `{provider}    {email}\tS {n}%  W {n}%`, bold +
+/// v0.5.0 flat main-list row: `{provider}    {email}\t{n}% / {n}%`, bold +
 /// checkmarked if active, high percentages colored per the provider's
 /// severity bands. When the account is fully consumed
-/// (`countdown::compute_display` → Locked), the `S n%  W n%` run is swapped
+/// (`countdown::compute_display` → Locked), the `n% / n%` run is swapped
 /// for `locked · <countdown>` and colored red — the user is being told *when*
 /// the account is next usable, not *how used* it is. This same string is both
 /// the row's `RowStyle` (for `apply_menu_styles`) and the plain title of the
@@ -319,7 +337,7 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
         // UX (v0.5.0): drop the "locked · " prefix — the trailing run is
         // rendered in red (visually implying locked) and the payload is a
         // time-until-reset instead of a percentage (structurally implying
-        // locked, since a healthy row shows "S n%  W n%"). The old
+        // locked, since a healthy row shows "n% / n%"). The old
         // "locked · Xh Ym" wording repeated the same fact three ways.
         let trailing = cd.clone();
         let plain = format!("{label}\t{trailing}");
@@ -328,7 +346,7 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
         return RowStyle {
             bold: a.active,
             colors,
-            tab_x: Some(TAB_X),
+            tab_x_kind: Some(TabX::MenuRight),
             checkmark: a.active,
             ..RowStyle::plain_row(plain)
         };
@@ -336,21 +354,23 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
     let (pa, pb) = summary_pcts(a);
     let sa = pct(pa);
     let sb = pct(pb);
-    let trailing = format!("S {sa}  W {sb}");
+    // v0.5.1: drop the "S "/"W " label prefixes — "47% / 89%" is
+    // self-explanatory without them (item raised post-v0.5.0 UX pass).
+    let trailing = format!("{sa} / {sb}");
     let plain = format!("{label}\t{trailing}");
     let mut colors = Vec::new();
-    let s_off = base + u16len("S ");
+    let s_off = base;
     if let Some(sev) = severity_with(pa, bands) {
         colors.push((s_off, u16len(&sa), sev));
     }
-    let w_off = s_off + u16len(&sa) + u16len("  W ");
+    let w_off = s_off + u16len(&sa) + u16len(" / ");
     if let Some(sev) = severity_with(pb, bands) {
         colors.push((w_off, u16len(&sb), sev));
     }
     RowStyle {
         bold: a.active,
         colors,
-        tab_x: Some(TAB_X),
+        tab_x_kind: Some(TabX::MenuRight),
         checkmark: a.active,
         ..RowStyle::plain_row(plain)
     }
@@ -390,13 +410,14 @@ fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
             }
         }
     }
-    // Quit row: "Quit\tusagio vX.Y.Z" — right-align the trailing run at
-    // TAB_X and paint everything from the tab onward in secondaryLabelColor
-    // (macOS's disabled-text grey) while the row itself stays clickable.
+    // Quit row: "Quit\tusagio vX.Y.Z" — right-align the trailing run at the
+    // menu's computed right edge and paint everything from the tab onward
+    // in secondaryLabelColor (macOS's disabled-text grey) while the row
+    // itself stays clickable.
     let quit_plain = quit_row_plain();
     let grey_from = u16len("Quit") + 1; // +1 for the '\t'
     styles.push(RowStyle {
-        tab_x: Some(TAB_X),
+        tab_x_kind: Some(TabX::MenuRight),
         grey_tail_from: Some(grey_from),
         ..RowStyle::plain_row(quit_plain)
     });
@@ -1401,7 +1422,7 @@ mod mac_style {
     use super::*;
 
     /// Build the menu for `snap`, install it on the tray, then style the native
-    /// rows (bold active account, right-aligned trailing `S% / W%`, high
+    /// rows (bold active account, right-aligned trailing `n% / n%`, high
     /// percentages colored) via `attributedTitle`. We take the `NSMenu` pointer
     /// before moving the menu into `set_menu`: the menu is reference-counted and the
     /// tray retains it, so the pointer stays valid for the walk. The attributed
@@ -1414,16 +1435,19 @@ mod mac_style {
             menu.ns_menu()
         };
         tray.set_menu(Some(Box::new(menu)));
-        apply_menu_styles(ns_menu, &menu_styles(snap));
+        let styles = menu_styles(snap);
+        let menu_right_x = compute_menu_right_x(&styles);
+        apply_menu_styles(ns_menu, &styles, menu_right_x);
     }
 
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     use objc2::AllocAnyThread;
     use objc2_app_kit::{
-        NSColor, NSControlStateValueOn, NSFont, NSFontAttributeName,
-        NSForegroundColorAttributeName, NSImage, NSMenu, NSMutableParagraphStyle,
-        NSParagraphStyleAttributeName, NSTextAlignment, NSTextTab, NSTextTabOptionKey,
+        NSAttributedStringNSStringDrawing, NSColor, NSControlStateValueOn, NSFont,
+        NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSMenu,
+        NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSTextAlignment, NSTextTab,
+        NSTextTabOptionKey,
     };
     use objc2_foundation::{
         NSArray, NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange,
@@ -1437,21 +1461,89 @@ mod mac_style {
         }
     }
 
+    /// Extra padding (points) added beyond the widest row's measured natural
+    /// width so the right-aligned trailing run never sits flush against the
+    /// menu's own edge inset.
+    const RIGHT_ALIGN_PAD: f64 = 20.0;
+
+    /// The natural (unwrapped, single-line) width in points of `s` rendered
+    /// in `font`. Empty strings measure 0 without round-tripping through
+    /// AppKit. Uses `NSAttributedString::size()` — the `NSStringDrawing`
+    /// category's simple whole-string measurement — rather than
+    /// `boundingRectWithSize:options:`, which exists for constrained /
+    /// multi-line layout that a single menu-item row never needs.
+    fn measured_width(s: &str, font: &NSFont) -> f64 {
+        if s.is_empty() {
+            return 0.0;
+        }
+        let ns_text = NSString::from_str(s);
+        let full_len = ns_text.length();
+        let attr =
+            NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &ns_text);
+        // SAFETY: value type matches the font attribute key.
+        unsafe {
+            attr.addAttribute_value_range(NSFontAttributeName, font, NSRange::new(0, full_len));
+        }
+        let attr: Retained<NSAttributedString> = Retained::into_super(attr);
+        attr.size().width
+    }
+
+    /// Resolve `TabX::MenuRight` to a concrete point value for the CURRENT
+    /// snapshot: `max(label_width + trailing_width)` over every row that
+    /// wants the shared right-align tab stop, plus `RIGHT_ALIGN_PAD`. Using
+    /// one shared x for every row is what makes their trailing runs line up
+    /// in a column; computing it fresh per snapshot (rather than a fixed
+    /// constant) is what makes that column always land at the menu's actual
+    /// right edge regardless of how wide the longest email/label happens to
+    /// be. Each row is measured in the font it will actually render in
+    /// (`boldSystemFontOfSize` for bold/active rows, `menuFontOfSize`
+    /// otherwise) since bold glyphs are wider. No `MenuRight` rows → 0.0 (an
+    /// arbitrary, harmless x — nothing reads it).
+    fn compute_menu_right_x(styles: &[RowStyle]) -> f64 {
+        let mut widest = 0.0_f64;
+        for style in styles {
+            if style.tab_x_kind != Some(TabX::MenuRight) {
+                continue;
+            }
+            let Some((label, trailing)) = style.plain.split_once('\t') else {
+                continue;
+            };
+            let font = if style.bold || style.section_header {
+                NSFont::boldSystemFontOfSize(0.0)
+            } else {
+                NSFont::menuFontOfSize(0.0)
+            };
+            let w = measured_width(label, &font) + measured_width(trailing, &font);
+            if w > widest {
+                widest = w;
+            }
+        }
+        widest + RIGHT_ALIGN_PAD
+    }
+
     /// Build the attributed title for one row from its `RowStyle`. Module-level
     /// (not nested in `apply_menu_styles`) so `#[cfg(test)]` can exercise it
     /// directly — e.g. asserting `disabled_but_white` produces a `labelColor`
     /// foreground-color attribute over the full row. `pub(super)` (rather than
     /// private) so the macOS-only tests at the bottom of this file's `tests`
-    /// module can call `mac_style::attributed(...)` directly.
-    pub(super) fn attributed(style: &RowStyle) -> Retained<NSAttributedString> {
+    /// module can call `mac_style::attributed(...)` directly. `resolved_tab_x`
+    /// is the menu-wide point value `compute_menu_right_x` produced for this
+    /// snapshot — `None` means "no tab stop on this row" regardless of what
+    /// `style.tab_x_kind` says (callers gate that); a test exercising a row
+    /// with no tab stop can just pass `None`.
+    pub(super) fn attributed(
+        style: &RowStyle,
+        resolved_tab_x: Option<f64>,
+    ) -> Retained<NSAttributedString> {
         let ns_text = NSString::from_str(&style.plain);
         // NSRange is UTF-16 code units — use NSString::length, not byte length.
         let full_len = ns_text.length();
         let attr =
             NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &ns_text);
 
-        // Right-aligned trailing run at a fixed tab stop (battery-menu style).
-        if let Some(x) = style.tab_x {
+        // Right-aligned trailing run at the menu-wide computed tab stop
+        // (battery-menu style).
+        if let Some(x) = resolved_tab_x {
             let para = NSMutableParagraphStyle::new();
             let opts: Retained<NSDictionary<NSTextTabOptionKey, AnyObject>> = NSDictionary::new();
             // SAFETY: the options generic is the correct (empty) dictionary type.
@@ -1546,7 +1638,10 @@ mod mac_style {
     /// Walk the native `NSMenu` (and its submenus) and set `attributedTitle` on any
     /// item whose plain title matches a `RowStyle` — the mechanism muda's plain
     /// string API can't reach (right-aligned tab stops and arbitrary colors).
-    fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
+    /// `menu_right_x` is the point value `compute_menu_right_x` resolved for
+    /// this snapshot; every `TabX::MenuRight` row gets that same x so their
+    /// trailing runs line up in a column.
+    fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle], menu_right_x: f64) {
         if ns_menu.is_null() {
             return;
         }
@@ -1573,14 +1668,15 @@ mod mac_style {
         /// (unused in v0.5.0's flat main list, but the flag stays load-bearing for
         /// any future disabled/bold top-level row) are suppressed inside submenus
         /// so a plain-title collision with a submenu row doesn't inherit them.
-        fn walk(menu: &NSMenu, styles: &[RowStyle], top_level: bool) {
+        fn walk(menu: &NSMenu, styles: &[RowStyle], top_level: bool, menu_right_x: f64) {
             for item in menu.itemArray().iter() {
                 let title = item.title().to_string();
                 if let Some(style) = styles
                     .iter()
                     .find(|s| s.plain == title && (top_level || !s.section_header))
                 {
-                    item.setAttributedTitle(Some(&attributed(style)));
+                    let resolved_tab_x = style.tab_x_kind.map(|_| menu_right_x);
+                    item.setAttributedTitle(Some(&attributed(style, resolved_tab_x)));
                     // Per-provider 16px icon on section header rows. Look up by
                     // slug; a missing PNG (or an unknown slug like `vertex-ai`) is
                     // a no-op so a future provider without a bundled icon still
@@ -1600,7 +1696,7 @@ mod mac_style {
                     }
                 }
                 if let Some(sub) = item.submenu() {
-                    walk(&sub, styles, false);
+                    walk(&sub, styles, false, menu_right_x);
                 }
             }
         }
@@ -1608,7 +1704,7 @@ mod mac_style {
         // SAFETY: called only on the main thread (the run-loop timer), with a live
         // NSMenu pointer from muda's ns_menu() that the tray keeps retained.
         let menu: &NSMenu = unsafe { &*(ns_menu as *const NSMenu) };
-        walk(menu, styles, true);
+        walk(menu, styles, true, menu_right_x);
     }
 } // mod mac_style
 
@@ -2867,9 +2963,13 @@ mod tests {
     fn main_row_colors_land_on_percentages() {
         let a = acct("you@work.com", Some(82.0), Some(96.0), true);
         let r = main_row("Claude", &a, bands());
-        assert_eq!(r.plain, "Claude    you@work.com\tS 82%  W 96%");
+        assert_eq!(r.plain, "Claude    you@work.com\t82% / 96%");
         assert!(r.bold, "active account is bold");
-        assert_eq!(r.tab_x, Some(TAB_X), "trailing run is right-aligned");
+        assert_eq!(
+            r.tab_x_kind,
+            Some(TabX::MenuRight),
+            "trailing run is right-aligned"
+        );
         assert_eq!(r.colors.len(), 2);
         let (so, sl, ss) = r.colors[0];
         assert_eq!(span_text(&r.plain, so, sl), "82%");
@@ -2900,7 +3000,7 @@ mod tests {
     #[test]
     fn main_row_includes_provider_name_padded() {
         // Item 2 of the redesign: the provider name gets its own column-like
-        // padding, then the email, then the tab-stopped `S n%  W n%` run.
+        // padding, then the email, then the tab-stopped `n% / n%` run.
         let claude = main_row(
             "Claude",
             &acct("a@x.com", Some(1.0), Some(2.0), false),
@@ -3246,14 +3346,14 @@ mod tests {
 
     #[test]
     fn main_row_flat_shape_matches_spec_when_not_locked() {
-        // "{provider}    {email}\tS {n}%  W {n}%" per the v0.5.0 redesign —
-        // the crate's variant uses a TAB between the label and trailing run
-        // so AppKit right-aligns it. The important structural invariants are:
-        // provider, then email, one TAB, then "S n%  W n%". Any change to
-        // that layout will fail this assertion — a wall against silent drift.
+        // "{provider}    {email}\t{n}% / {n}%" per the v0.5.1 UX pass — the
+        // crate's variant uses a TAB between the label and trailing run so
+        // AppKit right-aligns it. The important structural invariants are:
+        // provider, then email, one TAB, then "n% / n%". Any change to that
+        // layout will fail this assertion — a wall against silent drift.
         let a = acct("you@work.com", Some(42.0), Some(61.0), false);
         let r = main_row("Claude", &a, bands());
-        assert_eq!(r.plain, "Claude    you@work.com\tS 42%  W 61%");
+        assert_eq!(r.plain, "Claude    you@work.com\t42% / 61%");
         assert!(!r.checkmark, "inactive row: no leading checkmark");
     }
 
@@ -3297,7 +3397,7 @@ mod tests {
         with_now(now, || {
             let a = acct_with_resets("dev@x.com", Some(100.0), None, false, Some(past), None);
             let r = main_row("Claude", &a, bands());
-            assert_eq!(r.plain, "Claude    dev@x.com\tS 100%  W —");
+            assert_eq!(r.plain, "Claude    dev@x.com\t100% / —");
             assert!(!r.plain.contains("locked"));
         });
     }
@@ -3373,15 +3473,65 @@ mod tests {
         let styles = menu_styles(&snap);
         let main_style = styles
             .iter()
-            .find(|s| s.tab_x.is_some())
+            .find(|s| s.tab_x_kind.is_some())
             .expect("main-list row present");
         assert_eq!(main_style.icon_slug, Some(CLAUDE_SLUG));
         // The submenu info rows (no tab stop) carry no icon.
-        for s in styles.iter().filter(|s| s.tab_x.is_none()) {
+        for s in styles.iter().filter(|s| s.tab_x_kind.is_none()) {
             assert!(
                 s.icon_slug.is_none(),
                 "unexpected icon on non-main row: {}",
                 s.plain,
+            );
+        }
+    }
+
+    #[test]
+    fn menu_styles_tab_stop_is_uniform_across_a_section() {
+        // v0.5.1: the concrete tab-stop x is resolved dynamically at install
+        // time (`mac_style::compute_menu_right_x`, from the actual rendered
+        // widths), not stored on `RowStyle` — so what a `RowStyle` carries,
+        // and what this test can pin without native AppKit calls, is just
+        // the *kind* of alignment it wants. Every main-list row in a section
+        // (and the Quit row) must request `TabX::MenuRight`, or the S%/W%
+        // columns wouldn't line up vertically. Vary email length across rows
+        // to prove the kind doesn't depend on content width either.
+        let short = acct("a@x.com", Some(10.0), Some(20.0), false);
+        let long = acct(
+            "a.very.long.email.address@example.com",
+            Some(30.0),
+            Some(40.0),
+            true,
+        );
+        let snap = Snapshot {
+            sections: vec![ProviderSection {
+                provider_id: CLAUDE_SLUG,
+                display_name: "Claude",
+                supports_switching: true,
+                supports_usage: true,
+                supports_launch: true,
+                supports_remove: true,
+                severity_bands: bands(),
+                env_override_active: false,
+                accounts: vec![long, short],
+            }],
+            capture_creds: Vec::new(),
+            capture_api_key: Vec::new(),
+            autoswap: false,
+            threshold: 95.0,
+            notification_config: crate::notifications::NotificationConfig::default(),
+        };
+        let styles = menu_styles(&snap);
+        let tab_kinds: Vec<TabX> = styles.iter().filter_map(|s| s.tab_x_kind).collect();
+        assert!(
+            tab_kinds.len() >= 2,
+            "expected a tab stop on every main row plus Quit"
+        );
+        for kind in &tab_kinds {
+            assert_eq!(
+                *kind,
+                TabX::MenuRight,
+                "every row must request the shared menu-right alignment"
             );
         }
     }
@@ -3417,7 +3567,7 @@ mod tests {
         // stop; the Quit row is excluded by matching on the email instead).
         let mut saw_active = false;
         let mut saw_inactive = false;
-        for s in styles.iter().filter(|s| s.tab_x.is_some()) {
+        for s in styles.iter().filter(|s| s.tab_x_kind.is_some()) {
             if s.plain.contains("active@x.com") {
                 assert!(s.checkmark, "active row must carry the checkmark flag");
                 saw_active = true;
@@ -3614,7 +3764,7 @@ mod tests {
     #[test]
     fn main_row_locked_shape_swaps_only_the_trailing_run() {
         // The locked row keeps the "{provider label}\t…" tab structure so
-        // right-alignment still works — only the trailing "S n%  W n%" run
+        // right-alignment still works — only the trailing "n% / n%" run
         // becomes "locked · <countdown>". A test that pins the structure so
         // a future refactor can't accidentally lose the tab.
         let now = Utc.timestamp_opt(4_000_000, 0).unwrap();
@@ -3633,7 +3783,11 @@ mod tests {
             // No "locked · " prefix — red color + a time (not a percent) is
             // the affordance now. See main_row's locked-branch comment.
             assert_eq!(trailing, "23h 52m");
-            assert_eq!(r.tab_x, Some(TAB_X), "right-align tab-stop preserved");
+            assert_eq!(
+                r.tab_x_kind,
+                Some(TabX::MenuRight),
+                "right-align tab-stop preserved"
+            );
         });
     }
 
@@ -3768,7 +3922,7 @@ mod tests {
                 disabled_but_white: true,
                 ..RowStyle::plain_row("Session resets in 3h".to_string())
             };
-            let attr = mac_style::attributed(&style);
+            let attr = mac_style::attributed(&style, None);
             let full_len = attr.length();
             assert!(full_len > 0);
             let mut effective = objc2_foundation::NSRange::new(0, 0);
@@ -3792,7 +3946,7 @@ mod tests {
             // A normal (non-info) row must NOT get the full-range labelColor
             // treatment — only `disabled_but_white` rows opt into it.
             let style = RowStyle::plain_row("Switch to this account".to_string());
-            let attr = mac_style::attributed(&style);
+            let attr = mac_style::attributed(&style, None);
             let mut effective = objc2_foundation::NSRange::new(0, 0);
             let value = unsafe {
                 attr.attribute_atIndex_effectiveRange(
