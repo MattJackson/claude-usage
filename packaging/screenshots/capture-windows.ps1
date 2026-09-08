@@ -73,21 +73,28 @@ try {
     if (-not $PythonCmd) { throw "no 'python' or 'python3' on PATH (needed for render_fixture.py / postprocess.py)" }
     $Python = $PythonCmd.Source
 
-    $UsagioBin = Get-Command usagio -ErrorAction SilentlyContinue
-    if (-not $UsagioBin) {
+    # v0.5.3: Get-Command returns a CommandInfo whose full path lives on
+    # `.Source`; Get-Item returns a FileInfo whose full path lives on
+    # `.FullName`. The old code passed `$UsagioBin.Source` for both, so the
+    # target-dir fallback silently produced a $null `-FilePath` and
+    # Start-Process failed validation. Normalise to a plain string here.
+    $UsagioBinPath = $null
+    $UsagioCmd = Get-Command usagio -ErrorAction SilentlyContinue
+    if ($UsagioCmd) { $UsagioBinPath = $UsagioCmd.Source }
+    if (-not $UsagioBinPath) {
         foreach ($cand in @(".\target\release\usagio.exe", ".\target\debug\usagio.exe")) {
             if (Test-Path $cand) {
-                $UsagioBin = Get-Item $cand
+                $UsagioBinPath = (Resolve-Path $cand).Path
                 break
             }
         }
     }
-    if (-not $UsagioBin) {
+    if (-not $UsagioBinPath) {
         throw "could not find a built usagio.exe (checked PATH, target\release, target\debug)"
     }
 
     Copy-Item -Force (Join-Path $FixturesDir "healthy.json") $StateFile
-    $UsagioProc = Start-Process -FilePath $UsagioBin.Source -ArgumentList "menubar" -PassThru
+    $UsagioProc = Start-Process -FilePath $UsagioBinPath -ArgumentList "menubar" -PassThru
     Start-Sleep -Seconds 3
 
     Add-Type -AssemblyName System.Windows.Forms

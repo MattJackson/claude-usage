@@ -86,7 +86,11 @@ jobs:
       # Pillow; render_fixture.py itself only needs the stdlib.
       - name: Install screenshot post-processing deps (Linux/macOS)
         if: matrix.os != 'windows-latest'
-        run: python3 -m pip install --quiet --disable-pip-version-check pillow
+        # macos-latest's system Python is PEP 668 (externally-managed), so a
+        # bare `pip install pillow` errors out. The runner is ephemeral, so
+        # `--break-system-packages` is the least-fuss unblock — no venv setup
+        # to thread through the rest of the job.
+        run: python3 -m pip install --quiet --disable-pip-version-check --break-system-packages pillow
 
       - name: Install screenshot post-processing deps (Windows)
         if: matrix.os == 'windows-latest'
