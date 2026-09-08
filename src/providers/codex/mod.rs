@@ -28,19 +28,14 @@
 //! *is* the entire switch. `launch_client` remains unimplemented
 //! (`ProviderError::Unsupported`) — a future phase may shell out to `codex`.
 //!
-//! TODO(v0.5.x, H3 — v0.5.0 codeaudit): `write_active_account` above is a
-//! complete, tested implementation of the auth.json-rewrite half of
-//! switching. `capabilities().supports_switching` is nonetheless `false`,
-//! because v1's `State` (see `crate::store`) has no bucket for non-Claude
-//! accounts at all — there is nowhere to persist a *second* Codex account's
-//! secret blob to switch *to*, so `main.rs::switch_to` / `menubar.rs`'s
-//! click dispatchers are hardcoded to the Claude slug and have no code path
-//! that would ever call `write_active_account` today. Advertising
-//! `supports_switching: true` here (as v0.5.0 originally shipped) built a
-//! "Switch to this account" row that could never succeed. Flip this back to
-//! `true` only once state v2 gives Codex accounts a real slot AND
-//! `main.rs`/`menubar.rs` dispatch switches by provider instead of assuming
-//! Claude.
+//! RESOLVED (v0.5.0, state v2): `write_active_account` above is the
+//! auth.json-rewrite half of switching; `capabilities().supports_switching`
+//! is now `true` because `crate::store::State::providers` gives Codex a real
+//! multi-account slot (`ProviderAccount`/`ProviderAccounts`) to persist a
+//! *second* captured account into, and `main.rs::switch_to_provider_account` /
+//! `menubar.rs::handle_switch` dispatch a switch by provider slug instead of
+//! assuming Claude (see the H3 finding this closes, formerly recorded here as
+//! a TODO).
 
 #![allow(dead_code)]
 
@@ -83,12 +78,12 @@ impl Provider for CodexProvider {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             supports_usage: true,
-            // See the module doc TODO: `write_active_account` below is fully
-            // implemented and tested, but nothing can call it yet because v1
-            // state has no slot to store a second Codex account in. Keep
-            // this `false` (and therefore the "Switch to this account" menu
-            // row hidden) until that changes (H3, v0.5.0 codeaudit).
-            supports_switching: false,
+            // See the module doc RESOLVED note: state v2's `State::providers`
+            // slot plus `main.rs`/`menubar.rs`'s provider-dispatched switch
+            // path mean `write_active_account` below is now reachable from
+            // the live app, so the "Switch to this account" row is safe to
+            // show (H3, v0.5.0 codeaudit — closed).
+            supports_switching: true,
             supports_launch: false,
             supports_remove: true,
             supports_email_capture: true,
@@ -442,15 +437,42 @@ impl Provider for CodexProvider {
         }
     }
 
-    /// Codex has no state.json slot yet (v1 stores only Claude accounts), so
-    /// absorb is a no-op — the trait contract of "overwrite the account's
-    /// slot" is a future-proof default we implement now for consistency.
-    fn absorb_credential(&self, account: &AccountKey, _blob: &str) -> PResult<()> {
+    /// Absorb a rotated `auth.json` blob into `account`'s state v2 slot
+    /// (`State::providers["codex"]`), mirroring `ClaudeProvider`'s
+    /// `absorb_credential`. Only updates an ALREADY-captured account (never
+    /// creates one from a bare fsnotify event) and only if the incoming
+    /// blob's expiry is at least as new as what's stored, so a stale read
+    /// racing a concurrent refresh can't clobber a fresher grant.
+    fn absorb_credential(&self, account: &AccountKey, blob: &str) -> PResult<()> {
         if account.provider != self.provider_id() {
-            return Ok(());
+            return Ok(()); // not ours
         }
-        // Nothing to do until Codex accounts are first-class in state v2.
-        Ok(())
+        let parsed = match parse_codex_blob(blob) {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // not a usable token blob; nothing to absorb
+        };
+        let id_claims = parsed
+            .tokens
+            .id_token
+            .as_deref()
+            .and_then(jwt_payload_claims)
+            .unwrap_or_default();
+        let expires_at = id_claims.get("exp").and_then(|x| x.as_i64()).unwrap_or(0);
+        let access = parsed.tokens.access_token.clone();
+        let refresh = parsed.tokens.refresh_token.clone().unwrap_or_default();
+        let blob_owned = blob.to_string();
+        crate::credentials::with_state_lock_absorb(|st| {
+            if let Some(a) = st.find_provider_account_mut(self.provider_id(), &account.key) {
+                if expires_at >= a.expires_at {
+                    a.secret_blob = blob_owned;
+                    a.access_token = access;
+                    a.refresh_token = refresh;
+                    a.expires_at = expires_at;
+                    a.needs_relogin = false;
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -584,6 +606,15 @@ pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str)
     Ok(())
 }
 
+/// robustness-02 (v0.5.1 audit): a rename failure on Windows commonly means
+/// another process (the real `codex` CLI, opened without `FILE_SHARE_DELETE`)
+/// briefly holds `path` open — transient, so retry a few times with a short
+/// backoff before giving up.
+#[cfg(not(unix))]
+const WINDOWS_RENAME_RETRIES: u32 = 3;
+#[cfg(not(unix))]
+const WINDOWS_RENAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
 #[cfg(not(unix))]
 pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
     let dir = path
@@ -595,9 +626,30 @@ pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str)
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
-    fs_ctx(std::fs::write(&tmp_path, contents), "write", &tmp_path)?;
-    fs_ctx(std::fs::rename(&tmp_path, path), "rename", &tmp_path)?;
-    Ok(())
+    // robustness-02: clean up the tmp file (which holds the plaintext OAuth
+    // blob being switched in) on ANY failure between creating it and
+    // completing the rename, mirroring the unix impl above — previously a
+    // write or rename failure here left a secret-bearing orphan on disk
+    // forever.
+    if let Err(e) = fs_ctx(std::fs::write(&tmp_path, contents), "write", &tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    let mut attempt = 0;
+    loop {
+        match fs_ctx(std::fs::rename(&tmp_path, path), "rename", &tmp_path) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < WINDOWS_RENAME_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(WINDOWS_RENAME_RETRY_DELAY);
+                let _ = e; // retrying; only the final failure is surfaced
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        }
+    }
 }
 
 /// Decode a JWT and return its payload claims as a JSON map. Signature is not
@@ -636,12 +688,11 @@ mod tests {
         assert_eq!(p.display_name(), "Codex");
         let caps = p.capabilities();
         assert!(caps.supports_usage);
-        // H3 (v0.5.0 codeaudit): `write_active_account` below is a real,
-        // tested implementation, but `supports_switching` stays `false`
-        // until state v2 gives Codex a place to store a second account to
-        // switch to — see the module doc TODO. Advertising `true` here
-        // built a menu row that could never succeed.
-        assert!(!caps.supports_switching);
+        // H3 (v0.5.0 codeaudit, closed): `write_active_account` below is a
+        // real, tested implementation, and state v2 (`State::providers`) now
+        // gives Codex a place to store a second account to switch to, wired
+        // through `main.rs`/`menubar.rs` — see the module doc RESOLVED note.
+        assert!(caps.supports_switching);
         assert!(!caps.supports_launch);
         assert!(caps.supports_remove);
         assert!(caps.supports_email_capture);
@@ -850,6 +901,62 @@ mod tests {
         );
     }
 
+    /// robustness-02 (v0.5.1 audit), Windows path: a rename failure must not
+    /// leak the secret-bearing tmp file, mirroring the unix test above.
+    /// Windows-only because the `#[cfg(not(unix))]` impl this exercises only
+    /// compiles there; CI runs this on the Windows runner.
+    #[test]
+    #[cfg(not(unix))]
+    fn write_auth_json_cleans_up_tmp_file_on_rename_failure_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        // Make the rename destination itself a non-empty directory so
+        // std::fs::rename(file -> dir) fails on every retry attempt too.
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keepme"), b"x").unwrap();
+
+        let result = write_auth_json_atomically(&target, r#"{"tokens":{"access_token":"at"}}"#);
+        assert!(result.is_err());
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".auth.json.tmp.")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "orphaned tmp file(s) left behind: {leftovers:?}"
+        );
+    }
+
+    /// robustness-02, Windows path: a transient rename failure that clears up
+    /// on its own (mirroring a vendor CLI briefly holding the file open)
+    /// must succeed via the retry loop rather than failing immediately.
+    #[test]
+    #[cfg(not(unix))]
+    fn write_auth_json_retries_transient_rename_failure_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        // Occupy the destination with a directory so the FIRST rename
+        // attempt fails, then remove it from a background thread shortly
+        // after so a later retry attempt succeeds.
+        std::fs::create_dir(&target).unwrap();
+        let target_clone = target.clone();
+        let remover = std::thread::spawn(move || {
+            std::thread::sleep(WINDOWS_RENAME_RETRY_DELAY);
+            let _ = std::fs::remove_dir(&target_clone);
+        });
+        let result = write_auth_json_atomically(&target, r#"{"tokens":{"access_token":"at"}}"#);
+        remover.join().unwrap();
+        assert!(result.is_ok(), "expected the retry to eventually succeed");
+        let on_disk = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(on_disk, r#"{"tokens":{"access_token":"at"}}"#);
+    }
+
     #[test]
     fn switch_account_missing_secret_errors() {
         // Defense in depth: an empty/absent secret blob (the caller couldn't
@@ -997,6 +1104,63 @@ mod tests {
         // provider — never touch Claude's slot from Codex or vice versa.
         let k = AccountKey::new("claude", "x@e.com");
         assert!(CodexProvider.absorb_credential(&k, "irrelevant").is_ok());
+    }
+
+    #[test]
+    fn absorb_credential_updates_existing_provider_account_in_state() {
+        // A rotated blob for an ALREADY-captured account must land in
+        // state.providers["codex"] via `with_state_lock_absorb` — the state
+        // v2 equivalent of Claude's `absorb_credential`.
+        let _cfg = crate::store::ScopedConfigDir::new();
+        crate::credentials::with_state_lock(|| {
+            let mut st = crate::store::State::load()?;
+            st.upsert_provider_account(
+                "codex",
+                crate::store::ProviderAccount {
+                    key: "user@example.com".into(),
+                    secret_blob: make_blob("user@example.com", 1000),
+                    access_token: "old-at".into(),
+                    refresh_token: "old-rt".into(),
+                    expires_at: 1000,
+                    identity_email: Some("user@example.com".into()),
+                    identity_uuid: None,
+                    identity_display_name: None,
+                    identity_native_blob: Value::Null,
+                    cached_usage: None,
+                    notif_state: Default::default(),
+                    needs_relogin: false,
+                },
+            );
+            st.save()
+        })
+        .unwrap();
+
+        let new_blob = make_blob("user@example.com", 5_000_000_000);
+        let k = AccountKey::new("codex", "user@example.com");
+        CodexProvider.absorb_credential(&k, &new_blob).unwrap();
+
+        let st = crate::store::State::load().unwrap();
+        let a = st
+            .find_provider_account("codex", "user@example.com")
+            .unwrap();
+        assert_eq!(a.access_token, "at");
+        assert_eq!(a.expires_at, 5_000_000_000);
+        assert_eq!(a.secret_blob, new_blob);
+    }
+
+    #[test]
+    fn absorb_credential_does_not_create_a_new_account() {
+        // Absorb must never CREATE an account from a bare fsnotify event —
+        // only refresh one that was already captured through
+        // `capture_current_login`.
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let blob = make_blob("nobody@example.com", 5_000_000_000);
+        let k = AccountKey::new("codex", "nobody@example.com");
+        CodexProvider.absorb_credential(&k, &blob).unwrap();
+        let st = crate::store::State::load().unwrap();
+        assert!(st
+            .find_provider_account("codex", "nobody@example.com")
+            .is_none());
     }
 
     #[test]

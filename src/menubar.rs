@@ -12,24 +12,39 @@
 //! shows, with one row per REGISTERED provider (installed or not).
 
 use anyhow::Result;
+#[cfg(target_os = "macos")]
 use std::cell::RefCell;
 use std::time::Duration;
 
-use block2::RcBlock;
 use chrono::{DateTime, Utc};
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-use objc2_foundation::NSTimer;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::TrayIconBuilder;
+// macOS native NSMenu renderer deps. `objc2`/`objc2-app-kit`/`objc2-foundation`/
+// `block2` are `[target.'cfg(target_os = "macos")'.dependencies]` in
+// Cargo.toml — they don't exist in the dependency graph on Linux/Windows, so
+// this group needs real `#[cfg(target_os = "macos")]`, not just an
+// unused-import allow. `tray_icon::menu`/`TrayIconBuilder` compile
+// everywhere (top-level dep) but are grouped in here too since they're only
+// used by the macOS-only `run`/`build_menu`/`build_account_submenu`/
+// `install_menu` below — Linux/Windows render through `platform::MenuTree`
+// instead (see the `cross_platform` module near the end of this file).
+#[cfg(target_os = "macos")]
+use {
+    block2::RcBlock,
+    objc2::MainThreadMarker,
+    objc2_app_kit::{NSApplication, NSApplicationActivationPolicy},
+    objc2_foundation::NSTimer,
+    tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    tray_icon::TrayIconBuilder,
+};
 
 use crate::countdown::{self, AccountUsage, BlockingWindow, DisplayState};
 use crate::providers::{self, CaptureMode, Provider, SeverityBands};
 use crate::store::State;
 use crate::{
-    age_str, capture_current, env_override_active, menu_order, next_interval, notify, optimize_now,
-    remove_account, row_from_account, switch_to, watch_cycle, with_state_lock, Row, SwapGuard,
-    CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
+    age_str, capture_current, capture_current_generic, env_override_active, menu_order,
+    next_interval, notify, optimize_now, remove_account, remove_provider_account_generic,
+    row_from_account, row_from_provider_account, switch_to, switch_to_provider_account,
+    watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT,
+    WATCH_INTERVAL_SECS,
 };
 
 /// Exact title of the disabled section row inserted when a provider's env
@@ -155,6 +170,7 @@ fn severity_with(p: Option<f64>, bands: SeverityBands) -> Option<Severity> {
 /// `attributedTitle` on the rows named here. Offsets are **UTF-16 code units**
 /// (what `NSRange` uses); all our runs are ASCII so char == utf16 in practice,
 /// but the helpers stay correct if an email ever isn't.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct RowStyle {
     /// The exact plain title set on the item; used to find it in the menu.
     plain: String,
@@ -164,9 +180,14 @@ struct RowStyle {
     section_header: bool,
     /// Colored spans: (utf16 offset, utf16 length, band).
     colors: Vec<(usize, usize, Severity)>,
-    /// If set, right-align everything after the first `\t` at this x (points),
-    /// battery-menu style. Requires the plain title to contain a `\t`.
-    tab_x: Option<f64>,
+    /// If set, right-align everything after the first `\t` at a tab stop,
+    /// battery-menu style. Requires the plain title to contain a `\t`. The
+    /// concrete x (points) is NOT stored here — `TabX::MenuRight` is resolved
+    /// to a menu-wide point value at install time by
+    /// `mac_style::compute_menu_right_x`, which measures every row's actual
+    /// rendered width so the tab stop always clears the widest label instead
+    /// of relying on a fixed magic number (v0.5.1).
+    tab_x_kind: Option<TabX>,
     /// If set, attach the 16px provider icon (looked up by slug in
     /// `crate::icons::png16_for`) to the native menu item via `setImage:`. Only
     /// set on section-header rows so per-provider iconography appears once at
@@ -179,7 +200,7 @@ struct RowStyle {
     /// If set, paint the run from this UTF-16 offset to the end of the row in
     /// `NSColor::secondaryLabelColor` (macOS "grey secondary" — the same tint
     /// disabled menu items use). Used to render "usagio vX.Y.Z" as a subdued
-    /// trailing label on the enabled Quit row: right-aligned via `tab_x`,
+    /// trailing label on the enabled Quit row: right-aligned via `tab_x_kind`,
     /// grey via this field, without disabling the row's click.
     grey_tail_from: Option<usize>,
     /// v0.5.0: paint the WHOLE row in `NSColor::labelColor()` (the normal
@@ -203,7 +224,7 @@ impl RowStyle {
             bold: false,
             section_header: false,
             colors: Vec::new(),
-            tab_x: None,
+            tab_x_kind: None,
             icon_slug: None,
             checkmark: false,
             grey_tail_from: None,
@@ -212,10 +233,23 @@ impl RowStyle {
     }
 }
 
-/// Fixed x (points) for the right-aligned trailing `S% / W%`. The menu font is
-/// proportional, so this must clear the widest email; the menu auto-widens to
-/// fit, so over-provisioning only adds a little slack on the right.
-const TAB_X: f64 = 260.0;
+/// Kinds of right-align tab stop a row can request. Currently there's only
+/// one: right-align at the menu's actual content edge. Kept as an enum
+/// (rather than the row just carrying `bool`) so a future second alignment
+/// scheme (e.g. a submenu-local edge) has somewhere to go without another
+/// magic-number field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TabX {
+    /// Right-align at a point computed fresh for each rendered snapshot —
+    /// `max(label_width + trailing_width)` over every `MenuRight` row, plus
+    /// a small safety pad — so the tab stop always clears the widest label
+    /// instead of a fixed constant that silently misaligns past its bound.
+    /// Resolved to a concrete point value by
+    /// `mac_style::compute_menu_right_x` at install time; the
+    /// `cross_platform` (Linux/Windows) renderer has no tab-stop concept at
+    /// all and never reads this — it falls back to a plain ` · ` separator.
+    MenuRight,
+}
 
 /// Length of a string in UTF-16 code units (the unit `NSRange` counts in).
 fn u16len(s: &str) -> usize {
@@ -287,10 +321,10 @@ fn now_utc() -> DateTime<Utc> {
 /// provider-name length ("Claude" vs "Codex").
 const PROVIDER_COL: usize = 10;
 
-/// v0.5.0 flat main-list row: `{provider}    {email}\tS {n}%  W {n}%`, bold +
+/// v0.5.0 flat main-list row: `{provider}    {email}\t{n}% / {n}%`, bold +
 /// checkmarked if active, high percentages colored per the provider's
 /// severity bands. When the account is fully consumed
-/// (`countdown::compute_display` → Locked), the `S n%  W n%` run is swapped
+/// (`countdown::compute_display` → Locked), the `n% / n%` run is swapped
 /// for `locked · <countdown>` and colored red — the user is being told *when*
 /// the account is next usable, not *how used* it is. This same string is both
 /// the row's `RowStyle` (for `apply_menu_styles`) and the plain title of the
@@ -303,7 +337,7 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
         // UX (v0.5.0): drop the "locked · " prefix — the trailing run is
         // rendered in red (visually implying locked) and the payload is a
         // time-until-reset instead of a percentage (structurally implying
-        // locked, since a healthy row shows "S n%  W n%"). The old
+        // locked, since a healthy row shows "n% / n%"). The old
         // "locked · Xh Ym" wording repeated the same fact three ways.
         let trailing = cd.clone();
         let plain = format!("{label}\t{trailing}");
@@ -312,7 +346,7 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
         return RowStyle {
             bold: a.active,
             colors,
-            tab_x: Some(TAB_X),
+            tab_x_kind: Some(TabX::MenuRight),
             checkmark: a.active,
             ..RowStyle::plain_row(plain)
         };
@@ -320,21 +354,23 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
     let (pa, pb) = summary_pcts(a);
     let sa = pct(pa);
     let sb = pct(pb);
-    let trailing = format!("S {sa}  W {sb}");
+    // v0.5.1: drop the "S "/"W " label prefixes — "47% / 89%" is
+    // self-explanatory without them (item raised post-v0.5.0 UX pass).
+    let trailing = format!("{sa} / {sb}");
     let plain = format!("{label}\t{trailing}");
     let mut colors = Vec::new();
-    let s_off = base + u16len("S ");
+    let s_off = base;
     if let Some(sev) = severity_with(pa, bands) {
         colors.push((s_off, u16len(&sa), sev));
     }
-    let w_off = s_off + u16len(&sa) + u16len("  W ");
+    let w_off = s_off + u16len(&sa) + u16len(" / ");
     if let Some(sev) = severity_with(pb, bands) {
         colors.push((w_off, u16len(&sb), sev));
     }
     RowStyle {
         bold: a.active,
         colors,
-        tab_x: Some(TAB_X),
+        tab_x_kind: Some(TabX::MenuRight),
         checkmark: a.active,
         ..RowStyle::plain_row(plain)
     }
@@ -350,6 +386,7 @@ fn quit_row_plain() -> String {
     format!("Quit\tusagio v{}", env!("CARGO_PKG_VERSION"))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
     let mut styles = Vec::new();
     // v0.5.0: the top "resets in X" header rows are gone (item 1 of the menu
@@ -373,13 +410,14 @@ fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
             }
         }
     }
-    // Quit row: "Quit\tusagio vX.Y.Z" — right-align the trailing run at
-    // TAB_X and paint everything from the tab onward in secondaryLabelColor
-    // (macOS's disabled-text grey) while the row itself stays clickable.
+    // Quit row: "Quit\tusagio vX.Y.Z" — right-align the trailing run at the
+    // menu's computed right edge and paint everything from the tab onward
+    // in secondaryLabelColor (macOS's disabled-text grey) while the row
+    // itself stays clickable.
     let quit_plain = quit_row_plain();
     let grey_from = u16len("Quit") + 1; // +1 for the '\t'
     styles.push(RowStyle {
-        tab_x: Some(TAB_X),
+        tab_x_kind: Some(TabX::MenuRight),
         grey_tail_from: Some(grey_from),
         ..RowStyle::plain_row(quit_plain)
     });
@@ -396,6 +434,19 @@ fn active_account(snap: &Snapshot) -> Option<(&ProviderSection, &AcctView)> {
     None
 }
 
+/// Entry point dispatched by `usagio menubar` (see `main.rs`). macOS drives a
+/// native `NSApplication` run loop with attributedTitle NSMenu styling;
+/// Linux/Windows route through the cross-platform `platform::MenuBackend`
+/// trait instead (`cross_platform::run`, near the end of this file) —
+/// richer per-row coloring / right-aligned tab stops aren't representable
+/// through the generic `MenuTree`, so those platforms get a plain (but fully
+/// functional) muda/tray-icon menu.
+#[cfg(not(target_os = "macos"))]
+pub fn run() -> Result<()> {
+    cross_platform::run()
+}
+
+#[cfg(target_os = "macos")]
 pub fn run() -> Result<()> {
     // Register providers on the main thread before anything else — the poll
     // thread and menu build both dispatch through `providers::get`.
@@ -421,7 +472,7 @@ pub fn run() -> Result<()> {
         .with_title(title_for(&initial))
         .build()
         .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
-    install_menu(&tray, &initial);
+    mac_style::install_menu(&tray, &initial);
     let _ = tray.set_tooltip(Some(tooltip_for(&initial)));
 
     // All UI updates happen in this timer, scheduled in the DEFAULT run-loop mode.
@@ -448,7 +499,7 @@ pub fn run() -> Result<()> {
         let snap = build_snapshot();
         let sig = menu_signature(&snap);
         if *last_sig.borrow() != sig {
-            install_menu(&tray, &snap);
+            mac_style::install_menu(&tray, &snap);
             let _ = tray.set_tooltip(Some(tooltip_for(&snap)));
             *last_sig.borrow_mut() = sig;
         }
@@ -506,6 +557,24 @@ fn poll_loop() {
 /// -k`), which relaunches it in a fresh job context. A bare/from-source run has
 /// no such job, so there the orphaned self-spawn survives our exit as usual.
 fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
+    // Called from the macOS main-thread NSTimer tick (~0.75s). `canonicalize`
+    // is a real syscall that hits disk; skip it 90%+ of the time via a
+    // per-process last-check clock so the tray thread doesn't do blocking I/O
+    // on the hot path (R2-PERF audit finding). A stale check window of 10s
+    // is plenty — the brew upgrade + relaunch is best-effort and doesn't need
+    // sub-second detection.
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut g = LAST_CHECK.lock().unwrap();
+        let should_check = !matches!(*g, Some(t) if t.elapsed() < Duration::from_secs(10));
+        if !should_check {
+            return;
+        }
+        *g = Some(Instant::now());
+    }
+
     let stable = crate::stable_exe_path();
     let Ok(now) = std::fs::canonicalize(&stable) else {
         return;
@@ -541,6 +610,7 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
 }
 
 /// Outcome of attempting a launchd-driven restart.
+#[cfg_attr(not(unix), allow(dead_code))]
 enum LaunchdRestart {
     /// kickstart succeeded — the caller should wait to be replaced.
     Issued,
@@ -558,6 +628,16 @@ fn relaunch_via_launchd() -> LaunchdRestart {
     if !is_launchd_managed() {
         return LaunchdRestart::NotManaged;
     }
+    relaunch_via_launchd_kickstart()
+}
+
+// Split out from `relaunch_via_launchd` so the `libc::getuid()` call (`libc`
+// is a `[target.'cfg(unix)'.dependencies]` crate — not available on Windows
+// at all) doesn't have to gate on `target_os` (which `tests/strict_cfg.rs`
+// restricts outside `src/platform/`). `cfg(unix)`/`cfg(not(unix))` aren't
+// `target_os` checks, so this needs no allowlist entry.
+#[cfg(unix)]
+fn relaunch_via_launchd_kickstart() -> LaunchdRestart {
     let uid = unsafe { libc::getuid() };
     let target = format!("gui/{uid}/{}", crate::AUTOSTART_LABEL);
     crate::logging::log(&format!("relaunching via launchctl kickstart -k {target}"));
@@ -575,6 +655,15 @@ fn relaunch_via_launchd() -> LaunchdRestart {
             LaunchdRestart::Failed
         }
     }
+}
+
+/// launchd is macOS-only; `is_launchd_managed()` (an `XPC_SERVICE_NAME` env
+/// check) can only be true there, so this is unreachable at runtime on
+/// Windows — it exists purely so `relaunch_via_launchd` compiles without
+/// `libc` (a unix-only dependency).
+#[cfg(not(unix))]
+fn relaunch_via_launchd_kickstart() -> LaunchdRestart {
+    LaunchdRestart::NotManaged
 }
 
 /// Whether we're the launchd-managed agent. `XPC_SERVICE_NAME` is set by launchd
@@ -698,25 +787,40 @@ fn build_snapshot() -> Snapshot {
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     let active = st.active.clone();
 
-    // v1 state only has Claude accounts. Group by provider slug so once state
-    // v2 lands (each account tagged with its provider), this loop generalises
-    // with a one-line change (filter by account's slug instead of hardcoded
-    // CLAUDE_SLUG).
+    // Claude's accounts live in `st.accounts` (its own dedicated slot); every
+    // other provider's captured accounts live in `st.providers[slug]` (state
+    // v2 — see `store.rs`'s `State` doc). Build one flat `Row` list tagged by
+    // `provider_id` from both, same as before this changed from "always
+    // Claude" to "Claude + whichever providers have captured accounts".
     let mut rows: Vec<Row> = st.accounts.iter().map(row_from_account).collect();
+    for (slug, pa) in &st.providers {
+        rows.extend(
+            pa.accounts
+                .iter()
+                .map(|a| row_from_provider_account(slug, a)),
+        );
+    }
     rows.sort_by(menu_order);
 
     let mut sections: Vec<ProviderSection> = Vec::new();
     for provider in providers::all() {
         let slug = provider.provider_id();
-        // In v1 every stored row is a Claude account. Once state carries a
-        // per-account slug this becomes `rows.iter().filter(|r| r.provider_id == slug)`.
         let provider_rows: Vec<&Row> = rows.iter().filter(|r| r.provider_id == slug).collect();
         if provider_rows.is_empty() {
             continue; // no captured accounts → no section (no header, no rows).
         }
+        // Claude's "active" selection is `st.active`; every other provider
+        // tracks its own active key in `st.providers[slug].active` (state
+        // v2), since a provider's captured accounts are independent of
+        // Claude's.
+        let active_for_slug = if slug == CLAUDE_SLUG {
+            active.clone()
+        } else {
+            st.providers.get(slug).and_then(|p| p.active.clone())
+        };
         let mut accounts: Vec<AcctView> = provider_rows
             .into_iter()
-            .map(|r| acctview_from_row(r, &active, slug, provider.window_order()))
+            .map(|r| acctview_from_row(r, &active_for_slug, slug, provider.window_order()))
             .collect();
         // Primary sort: soonest-to-expire first, using the weekly-reset instant
         // as the "expiration" signal (accounts with no data yet sort last).
@@ -908,6 +1012,12 @@ pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<&'static str> 
     rows
 }
 
+/// macOS-only: builds the native `tray_icon::menu::Menu` tree directly (the
+/// NSMenu attributedTitle styling walk in `apply_menu_styles` below needs a
+/// live native menu to mutate). Linux/Windows build the equivalent tree via
+/// `cross_platform::menu_tree_from_snapshot` instead, which emits the
+/// generic `platform::MenuTree` the `MenuBackend` trait consumes.
+#[cfg(target_os = "macos")]
 fn build_menu(snap: &Snapshot) -> Menu {
     let menu = Menu::new();
 
@@ -920,12 +1030,17 @@ fn build_menu(snap: &Snapshot) -> Menu {
         );
     }
 
-    // Flat main list: one top-level Submenu row per (provider, account), no
-    // separate provider-header row and no separator between providers — the
-    // provider name is folded into each row by `main_row` (item 2). Providers
-    // still only contribute rows when they have at least one captured
-    // account (the "no header, no rows" rule survives the redesign).
-    for sec in &snap.sections {
+    // Main list: rows grouped per provider, separated by a menu HR so the
+    // user can tell at a glance which accounts belong to which vendor
+    // (v0.5.1 UX fix — the v0.5.0 flat list was too busy with multiple
+    // providers). The provider name still appears on each row (main_row)
+    // for accessibility / when a section has only one account. Providers
+    // only contribute rows when they have at least one captured account
+    // (the "no header, no rows" rule survives).
+    for (idx, sec) in snap.sections.iter().enumerate() {
+        if idx > 0 {
+            let _ = menu.append(&PredefinedMenuItem::separator());
+        }
         for title in section_headline_rows(sec) {
             add(
                 &menu,
@@ -1192,6 +1307,10 @@ fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRo
 /// reset-info / Launch / Remove; the pieces vary by capability so a
 /// reporting-only provider drops the Switch item and a no-usage provider
 /// swaps the info block for a `(no usage endpoint — headers only)` row.
+/// macOS-only counterpart to `build_menu` above — see its doc comment.
+/// Linux/Windows build the same rows via
+/// `cross_platform::build_account_submenu_items`.
+#[cfg(target_os = "macos")]
 fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
     let head = main_row(sec.display_name, a, sec.severity_bands).plain;
     let sub = Submenu::with_id(format!("sub:{}:{}", sec.provider_id, a.key), head, true);
@@ -1291,209 +1410,303 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
     let _ = menu.append(&sub);
 }
 
-/// Build the menu for `snap`, install it on the tray, then style the native
-/// rows (bold active account, right-aligned trailing `S% / W%`, high
-/// percentages colored) via `attributedTitle`. We take the `NSMenu` pointer
-/// before moving the menu into `set_menu`: the menu is reference-counted and the
-/// tray retains it, so the pointer stays valid for the walk. The attributed
-/// titles persist until the next rebuild (muda only overwrites a title if we
-/// call `set_text`, which we never do on these items).
-fn install_menu(tray: &tray_icon::TrayIcon, snap: &Snapshot) {
-    let menu = build_menu(snap);
-    let ns_menu = {
-        use tray_icon::menu::ContextMenu;
-        menu.ns_menu()
-    };
-    tray.set_menu(Some(Box::new(menu)));
-    apply_menu_styles(ns_menu, &menu_styles(snap));
-}
+/// macOS-only NSMenu attributedTitle styling. Grouped into one module (rather
+/// than gating `install_menu`/`color_for`/`attributed`/`apply_menu_styles`
+/// individually) so the `objc2`/`objc2-app-kit`/`objc2-foundation` imports
+/// they need — real Cargo target-specific dependencies that don't exist in
+/// the dependency graph on Linux/Windows (see the top-of-file import comment)
+/// — sit behind a single `#[cfg(target_os = "macos")]`. Linux/Windows never
+/// call into this module; they render through `cross_platform` instead.
+#[cfg(target_os = "macos")]
+mod mac_style {
+    use super::*;
 
-use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::AllocAnyThread;
-use objc2_app_kit::{
-    NSColor, NSControlStateValueOn, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
-    NSImage, NSMenu, NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSTextAlignment,
-    NSTextTab, NSTextTabOptionKey,
-};
-use objc2_foundation::{
-    NSArray, NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange, NSString,
-};
-
-fn color_for(sev: Severity) -> Retained<NSColor> {
-    match sev {
-        Severity::Amber => NSColor::systemOrangeColor(),
-        Severity::Red => NSColor::systemRedColor(),
-    }
-}
-
-/// Build the attributed title for one row from its `RowStyle`. Module-level
-/// (not nested in `apply_menu_styles`) so `#[cfg(test)]` can exercise it
-/// directly — e.g. asserting `disabled_but_white` produces a `labelColor`
-/// foreground-color attribute over the full row.
-fn attributed(style: &RowStyle) -> Retained<NSAttributedString> {
-    let ns_text = NSString::from_str(&style.plain);
-    // NSRange is UTF-16 code units — use NSString::length, not byte length.
-    let full_len = ns_text.length();
-    let attr =
-        NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &ns_text);
-
-    // Right-aligned trailing run at a fixed tab stop (battery-menu style).
-    if let Some(x) = style.tab_x {
-        let para = NSMutableParagraphStyle::new();
-        let opts: Retained<NSDictionary<NSTextTabOptionKey, AnyObject>> = NSDictionary::new();
-        // SAFETY: the options generic is the correct (empty) dictionary type.
-        let tab = unsafe {
-            NSTextTab::initWithTextAlignment_location_options(
-                NSTextTab::alloc(),
-                NSTextAlignment::Right,
-                x,
-                &opts,
-            )
+    /// Build the menu for `snap`, install it on the tray, then style the native
+    /// rows (bold active account, right-aligned trailing `n% / n%`, high
+    /// percentages colored) via `attributedTitle`. We take the `NSMenu` pointer
+    /// before moving the menu into `set_menu`: the menu is reference-counted and the
+    /// tray retains it, so the pointer stays valid for the walk. The attributed
+    /// titles persist until the next rebuild (muda only overwrites a title if we
+    /// call `set_text`, which we never do on these items).
+    pub(super) fn install_menu(tray: &tray_icon::TrayIcon, snap: &Snapshot) {
+        let menu = build_menu(snap);
+        let ns_menu = {
+            use tray_icon::menu::ContextMenu;
+            menu.ns_menu()
         };
-        let tabs = NSArray::from_retained_slice(&[tab]);
-        para.setTabStops(Some(&tabs));
-        // SAFETY: value type matches the paragraph-style attribute key.
-        unsafe {
-            attr.addAttribute_value_range(
-                NSParagraphStyleAttributeName,
-                &para,
-                NSRange::new(0, full_len),
-            );
+        tray.set_menu(Some(Box::new(menu)));
+        let styles = menu_styles(snap);
+        let menu_right_x = compute_menu_right_x(&styles);
+        apply_menu_styles(ns_menu, &styles, menu_right_x);
+    }
+
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::AllocAnyThread;
+    use objc2_app_kit::{
+        NSAttributedStringNSStringDrawing, NSColor, NSControlStateValueOn, NSFont,
+        NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSMenu,
+        NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSTextAlignment, NSTextTab,
+        NSTextTabOptionKey,
+    };
+    use objc2_foundation::{
+        NSArray, NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange,
+        NSString,
+    };
+
+    fn color_for(sev: Severity) -> Retained<NSColor> {
+        match sev {
+            Severity::Amber => NSColor::systemOrangeColor(),
+            Severity::Red => NSColor::systemRedColor(),
         }
     }
 
-    // Bold marks either the active account (via `main_row`) or a section
-    // header (via `section_header`). Both use the same appearance.
-    if style.bold || style.section_header {
-        // 0.0 => default menu font size.
-        let font = NSFont::boldSystemFontOfSize(0.0);
+    /// Extra padding (points) added beyond the widest row's measured natural
+    /// width so the right-aligned trailing run never sits flush against the
+    /// menu's own edge inset.
+    const RIGHT_ALIGN_PAD: f64 = 20.0;
+
+    /// The natural (unwrapped, single-line) width in points of `s` rendered
+    /// in `font`. Empty strings measure 0 without round-tripping through
+    /// AppKit. Uses `NSAttributedString::size()` — the `NSStringDrawing`
+    /// category's simple whole-string measurement — rather than
+    /// `boundingRectWithSize:options:`, which exists for constrained /
+    /// multi-line layout that a single menu-item row never needs.
+    fn measured_width(s: &str, font: &NSFont) -> f64 {
+        if s.is_empty() {
+            return 0.0;
+        }
+        let ns_text = NSString::from_str(s);
+        let full_len = ns_text.length();
+        let attr =
+            NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &ns_text);
         // SAFETY: value type matches the font attribute key.
         unsafe {
-            attr.addAttribute_value_range(NSFontAttributeName, &font, NSRange::new(0, full_len));
+            attr.addAttribute_value_range(NSFontAttributeName, font, NSRange::new(0, full_len));
         }
+        let attr: Retained<NSAttributedString> = Retained::into_super(attr);
+        attr.size().width
     }
 
-    // Optional grey trailing run (Quit row: version rendered in
-    // NSColor::secondaryLabelColor — the same tint disabled items use,
-    // without actually disabling the row).
-    if let Some(from) = style.grey_tail_from {
-        if from < full_len {
-            let grey = NSColor::secondaryLabelColor();
+    /// Resolve `TabX::MenuRight` to a concrete point value for the CURRENT
+    /// snapshot: `max(label_width + trailing_width)` over every row that
+    /// wants the shared right-align tab stop, plus `RIGHT_ALIGN_PAD`. Using
+    /// one shared x for every row is what makes their trailing runs line up
+    /// in a column; computing it fresh per snapshot (rather than a fixed
+    /// constant) is what makes that column always land at the menu's actual
+    /// right edge regardless of how wide the longest email/label happens to
+    /// be. Each row is measured in the font it will actually render in
+    /// (`boldSystemFontOfSize` for bold/active rows, `menuFontOfSize`
+    /// otherwise) since bold glyphs are wider. No `MenuRight` rows → 0.0 (an
+    /// arbitrary, harmless x — nothing reads it).
+    fn compute_menu_right_x(styles: &[RowStyle]) -> f64 {
+        let mut widest = 0.0_f64;
+        for style in styles {
+            if style.tab_x_kind != Some(TabX::MenuRight) {
+                continue;
+            }
+            let Some((label, trailing)) = style.plain.split_once('\t') else {
+                continue;
+            };
+            let font = if style.bold || style.section_header {
+                NSFont::boldSystemFontOfSize(0.0)
+            } else {
+                NSFont::menuFontOfSize(0.0)
+            };
+            let w = measured_width(label, &font) + measured_width(trailing, &font);
+            if w > widest {
+                widest = w;
+            }
+        }
+        widest + RIGHT_ALIGN_PAD
+    }
+
+    /// Build the attributed title for one row from its `RowStyle`. Module-level
+    /// (not nested in `apply_menu_styles`) so `#[cfg(test)]` can exercise it
+    /// directly — e.g. asserting `disabled_but_white` produces a `labelColor`
+    /// foreground-color attribute over the full row. `pub(super)` (rather than
+    /// private) so the macOS-only tests at the bottom of this file's `tests`
+    /// module can call `mac_style::attributed(...)` directly. `resolved_tab_x`
+    /// is the menu-wide point value `compute_menu_right_x` produced for this
+    /// snapshot — `None` means "no tab stop on this row" regardless of what
+    /// `style.tab_x_kind` says (callers gate that); a test exercising a row
+    /// with no tab stop can just pass `None`.
+    pub(super) fn attributed(
+        style: &RowStyle,
+        resolved_tab_x: Option<f64>,
+    ) -> Retained<NSAttributedString> {
+        let ns_text = NSString::from_str(&style.plain);
+        // NSRange is UTF-16 code units — use NSString::length, not byte length.
+        let full_len = ns_text.length();
+        let attr =
+            NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &ns_text);
+
+        // Right-aligned trailing run at the menu-wide computed tab stop
+        // (battery-menu style).
+        if let Some(x) = resolved_tab_x {
+            let para = NSMutableParagraphStyle::new();
+            let opts: Retained<NSDictionary<NSTextTabOptionKey, AnyObject>> = NSDictionary::new();
+            // SAFETY: the options generic is the correct (empty) dictionary type.
+            let tab = unsafe {
+                NSTextTab::initWithTextAlignment_location_options(
+                    NSTextTab::alloc(),
+                    NSTextAlignment::Right,
+                    x,
+                    &opts,
+                )
+            };
+            let tabs = NSArray::from_retained_slice(&[tab]);
+            para.setTabStops(Some(&tabs));
+            // SAFETY: value type matches the paragraph-style attribute key.
+            unsafe {
+                attr.addAttribute_value_range(
+                    NSParagraphStyleAttributeName,
+                    &para,
+                    NSRange::new(0, full_len),
+                );
+            }
+        }
+
+        // Bold marks either the active account (via `main_row`) or a section
+        // header (via `section_header`). Both use the same appearance.
+        if style.bold || style.section_header {
+            // 0.0 => default menu font size.
+            let font = NSFont::boldSystemFontOfSize(0.0);
+            // SAFETY: value type matches the font attribute key.
+            unsafe {
+                attr.addAttribute_value_range(
+                    NSFontAttributeName,
+                    &font,
+                    NSRange::new(0, full_len),
+                );
+            }
+        }
+
+        // Optional grey trailing run (Quit row: version rendered in
+        // NSColor::secondaryLabelColor — the same tint disabled items use,
+        // without actually disabling the row).
+        if let Some(from) = style.grey_tail_from {
+            if from < full_len {
+                let grey = NSColor::secondaryLabelColor();
+                // SAFETY: value type matches the foreground-color attribute key.
+                unsafe {
+                    attr.addAttribute_value_range(
+                        NSForegroundColorAttributeName,
+                        &grey,
+                        NSRange::new(from, full_len - from),
+                    );
+                }
+            }
+        }
+
+        // v0.5.0: force the normal (non-disabled) text color over the WHOLE row
+        // for informational submenu rows that are `enabled: true` for
+        // click-routing purposes but must not look like muda's greyed-out
+        // disabled rows (item 3 of the redesign — "white but not clickable").
+        if style.disabled_but_white {
+            let normal = NSColor::labelColor();
             // SAFETY: value type matches the foreground-color attribute key.
             unsafe {
                 attr.addAttribute_value_range(
                     NSForegroundColorAttributeName,
-                    &grey,
-                    NSRange::new(from, full_len - from),
+                    &normal,
+                    NSRange::new(0, full_len),
                 );
             }
         }
-    }
 
-    // v0.5.0: force the normal (non-disabled) text color over the WHOLE row
-    // for informational submenu rows that are `enabled: true` for
-    // click-routing purposes but must not look like muda's greyed-out
-    // disabled rows (item 3 of the redesign — "white but not clickable").
-    if style.disabled_but_white {
-        let normal = NSColor::labelColor();
-        // SAFETY: value type matches the foreground-color attribute key.
-        unsafe {
-            attr.addAttribute_value_range(
-                NSForegroundColorAttributeName,
-                &normal,
-                NSRange::new(0, full_len),
-            );
+        // Tint high percentages (amber approaching, red near the wall).
+        for &(off, len, sev) in &style.colors {
+            if len == 0 || off >= full_len {
+                continue;
+            }
+            let end = (off + len).min(full_len);
+            let color = color_for(sev);
+            // SAFETY: value type matches the foreground-color attribute key.
+            unsafe {
+                attr.addAttribute_value_range(
+                    NSForegroundColorAttributeName,
+                    &color,
+                    NSRange::new(off, end - off),
+                );
+            }
         }
+
+        Retained::into_super(attr)
     }
 
-    // Tint high percentages (amber approaching, red near the wall).
-    for &(off, len, sev) in &style.colors {
-        if len == 0 || off >= full_len {
-            continue;
+    /// Walk the native `NSMenu` (and its submenus) and set `attributedTitle` on any
+    /// item whose plain title matches a `RowStyle` — the mechanism muda's plain
+    /// string API can't reach (right-aligned tab stops and arbitrary colors).
+    /// `menu_right_x` is the point value `compute_menu_right_x` resolved for
+    /// this snapshot; every `TabX::MenuRight` row gets that same x so their
+    /// trailing runs line up in a column.
+    fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle], menu_right_x: f64) {
+        if ns_menu.is_null() {
+            return;
         }
-        let end = (off + len).min(full_len);
-        let color = color_for(sev);
-        // SAFETY: value type matches the foreground-color attribute key.
-        unsafe {
-            attr.addAttribute_value_range(
-                NSForegroundColorAttributeName,
-                &color,
-                NSRange::new(off, end - off),
-            );
+
+        /// Turn a bundled PNG's bytes into a 16×16 `NSImage`. Nil-safe: a corrupt
+        /// or unsupported blob returns `None` (the caller just skips setImage:).
+        fn image_from_bytes(bytes: &[u8]) -> Option<Retained<NSImage>> {
+            let data = NSData::with_bytes(bytes);
+            let img = NSImage::initWithData(NSImage::alloc(), &data)?;
+            // Force the drawn size to menu-item height (16pt); PNGs are already
+            // 16×16 but `NSImage`'s reported size is 72dpi-scaled, which reads too
+            // big at Retina. `usesSize` is not required here — NSMenuItem uses the
+            // image's `size` directly.
+            use objc2_foundation::NSSize;
+            img.setSize(NSSize {
+                width: 16.0,
+                height: 16.0,
+            });
+            Some(img)
         }
-    }
 
-    Retained::into_super(attr)
-}
-
-/// Walk the native `NSMenu` (and its submenus) and set `attributedTitle` on any
-/// item whose plain title matches a `RowStyle` — the mechanism muda's plain
-/// string API can't reach (right-aligned tab stops and arbitrary colors).
-fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) {
-    if ns_menu.is_null() {
-        return;
-    }
-
-    /// Turn a bundled PNG's bytes into a 16×16 `NSImage`. Nil-safe: a corrupt
-    /// or unsupported blob returns `None` (the caller just skips setImage:).
-    fn image_from_bytes(bytes: &[u8]) -> Option<Retained<NSImage>> {
-        let data = NSData::with_bytes(bytes);
-        let img = NSImage::initWithData(NSImage::alloc(), &data)?;
-        // Force the drawn size to menu-item height (16pt); PNGs are already
-        // 16×16 but `NSImage`'s reported size is 72dpi-scaled, which reads too
-        // big at Retina. `usesSize` is not required here — NSMenuItem uses the
-        // image's `size` directly.
-        use objc2_foundation::NSSize;
-        img.setSize(NSSize {
-            width: 16.0,
-            height: 16.0,
-        });
-        Some(img)
-    }
-
-    /// Style every item whose plain title matches, descending into submenus.
-    /// `top_level` is true on the outermost NSMenu only; section-header styles
-    /// (unused in v0.5.0's flat main list, but the flag stays load-bearing for
-    /// any future disabled/bold top-level row) are suppressed inside submenus
-    /// so a plain-title collision with a submenu row doesn't inherit them.
-    fn walk(menu: &NSMenu, styles: &[RowStyle], top_level: bool) {
-        for item in menu.itemArray().iter() {
-            let title = item.title().to_string();
-            if let Some(style) = styles
-                .iter()
-                .find(|s| s.plain == title && (top_level || !s.section_header))
-            {
-                item.setAttributedTitle(Some(&attributed(style)));
-                // Per-provider 16px icon on section header rows. Look up by
-                // slug; a missing PNG (or an unknown slug like `vertex-ai`) is
-                // a no-op so a future provider without a bundled icon still
-                // renders — just text-only.
-                if let Some(slug) = style.icon_slug {
-                    if let Some(bytes) = crate::icons::png16_for(slug) {
-                        if let Some(img) = image_from_bytes(bytes) {
-                            item.setImage(Some(&img));
+        /// Style every item whose plain title matches, descending into submenus.
+        /// `top_level` is true on the outermost NSMenu only; section-header styles
+        /// (unused in v0.5.0's flat main list, but the flag stays load-bearing for
+        /// any future disabled/bold top-level row) are suppressed inside submenus
+        /// so a plain-title collision with a submenu row doesn't inherit them.
+        fn walk(menu: &NSMenu, styles: &[RowStyle], top_level: bool, menu_right_x: f64) {
+            for item in menu.itemArray().iter() {
+                let title = item.title().to_string();
+                if let Some(style) = styles
+                    .iter()
+                    .find(|s| s.plain == title && (top_level || !s.section_header))
+                {
+                    let resolved_tab_x = style.tab_x_kind.map(|_| menu_right_x);
+                    item.setAttributedTitle(Some(&attributed(style, resolved_tab_x)));
+                    // Per-provider 16px icon on section header rows. Look up by
+                    // slug; a missing PNG (or an unknown slug like `vertex-ai`) is
+                    // a no-op so a future provider without a bundled icon still
+                    // renders — just text-only.
+                    if let Some(slug) = style.icon_slug {
+                        if let Some(bytes) = crate::icons::png16_for(slug) {
+                            if let Some(img) = image_from_bytes(bytes) {
+                                item.setImage(Some(&img));
+                            }
                         }
                     }
+                    // Leading checkmark glyph for the active-account row (the
+                    // "✓ trailing glyph" spec). AppKit renders `state == On` as a
+                    // checkmark in the item's `stateColumn`.
+                    if style.checkmark {
+                        item.setState(NSControlStateValueOn);
+                    }
                 }
-                // Leading checkmark glyph for the active-account row (the
-                // "✓ trailing glyph" spec). AppKit renders `state == On` as a
-                // checkmark in the item's `stateColumn`.
-                if style.checkmark {
-                    item.setState(NSControlStateValueOn);
+                if let Some(sub) = item.submenu() {
+                    walk(&sub, styles, false, menu_right_x);
                 }
-            }
-            if let Some(sub) = item.submenu() {
-                walk(&sub, styles, false);
             }
         }
-    }
 
-    // SAFETY: called only on the main thread (the run-loop timer), with a live
-    // NSMenu pointer from muda's ns_menu() that the tray keeps retained.
-    let menu: &NSMenu = unsafe { &*(ns_menu as *const NSMenu) };
-    walk(menu, styles, true);
-}
+        // SAFETY: called only on the main thread (the run-loop timer), with a live
+        // NSMenu pointer from muda's ns_menu() that the tray keeps retained.
+        let menu: &NSMenu = unsafe { &*(ns_menu as *const NSMenu) };
+        walk(menu, styles, true, menu_right_x);
+    }
+} // mod mac_style
 
 /// A submenu stat line and the span of its percentage (for coloring). Returns
 /// `(plain_title, Some((utf16_offset, utf16_len)))`; the offset locates the
@@ -1600,6 +1813,8 @@ fn menu_signature(snap: &Snapshot) -> String {
     s
 }
 
+/// macOS-only: `build_menu` helper (see its doc comment for why it's mac-only).
+#[cfg(target_os = "macos")]
 fn add(menu: &Menu, item: MenuItem) {
     let _ = menu.append(&item);
 }
@@ -1623,6 +1838,7 @@ fn title_for(snap: &Snapshot) -> String {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn tooltip_for(snap: &Snapshot) -> String {
     match active_account(snap) {
         // Preserve the v1 tooltip format verbatim: `email — session X, weekly Y`.
@@ -1914,12 +2130,15 @@ fn handle_capture(slug: &str) {
         ));
         return;
     };
-    match provider.capture_current_login() {
-        Ok(Some(_)) => notify(&format!(
-            "Captured {} account (persistence lands in a later phase)",
+    // State v2 (codex-switch-e2e): every non-Claude provider now has a real
+    // multi-account slot (`State::providers[slug]`) to persist into, closing
+    // the gap this used to leave as "persistence lands in a later phase".
+    match capture_current_generic(slug) {
+        Ok((key, existed)) => notify(&format!(
+            "{} {} {key}",
+            if existed { "Refreshed" } else { "Captured" },
             provider.display_name()
         )),
-        Ok(None) => notify(&format!("{} — nothing to capture", provider.display_name())),
         Err(e) => notify(&format!("Capture failed: {e}")),
     }
 }
@@ -1946,23 +2165,14 @@ fn switch_target_lock_countdown(st: &State, slug: &str, key: &str) -> Option<Str
 }
 
 fn handle_switch(slug: &str, key: &str) {
-    // v1 state only knows Claude accounts; a switch on any other slug can't
-    // be persisted yet, so gate on Claude and route to the shared free
-    // function that already knows the v1 identity/keychain dance. This is
-    // belt-and-suspenders with `capabilities().supports_switching` (which
-    // already keeps the "Switch to this account" row from being built for a
-    // non-switching provider — see `build_account_submenu`, H3 in the
-    // v0.5.0 codeaudit): the click-id dispatch table is a single flat match
-    // in `handle_click`, so nothing stops a stray/future id shaped like
-    // `switch:<other-slug>:<key>` from reaching this function directly.
-    if slug != CLAUDE_SLUG {
-        notify(&format!("Switching is not yet supported for {slug}"));
-        return;
-    }
     // Item 8 of the v0.5.0 redesign: refuse a switch into an account still
     // under its own rate-limit wall — auto-swap will pick it back up the
     // moment it resets, and switching now would just leave the user on a
-    // 0%-headroom account.
+    // 0%-headroom account. Only meaningful for Claude today —
+    // `switch_target_lock_countdown` reads `st.accounts`, which state v2
+    // keeps Claude-only (see `store.rs`); non-Claude providers have no
+    // persisted usage signal to gate on yet, so the check is a no-op for
+    // them rather than a false negative.
     if let Ok(st) = State::load() {
         if let Some(cd) = switch_target_lock_countdown(&st, slug, key) {
             notify(&format!(
@@ -1972,7 +2182,19 @@ fn handle_switch(slug: &str, key: &str) {
             return;
         }
     }
-    match switch_to(key) {
+    // State v2 (codex-switch-e2e): dispatch by provider slug instead of
+    // hard-gating on Claude — `capabilities().supports_switching` already
+    // keeps the "Switch to this account" row from being built for a
+    // non-switching provider (`build_account_submenu`, H3 in the v0.5.0
+    // codeaudit), and `switch_to_provider_account` itself re-checks that
+    // capability as belt-and-suspenders against a stray/future click id
+    // shaped like `switch:<slug>:<key>` reaching this function directly.
+    let result = if slug == CLAUDE_SLUG {
+        switch_to(key)
+    } else {
+        switch_to_provider_account(slug, key)
+    };
+    match result {
         Ok(label) => notify(&format!("Switched to {label}")),
         Err(e) => notify(&format!("Switch failed: {e}")),
     }
@@ -2012,14 +2234,19 @@ fn handle_apikey_capture(slug: &str) {
 }
 
 fn handle_remove(slug: &str, key: &str) {
-    if slug != CLAUDE_SLUG {
-        notify(&format!("Remove is not yet supported for {slug}"));
-        return;
-    }
     if !confirm(&format!("Remove account {key}? This cannot be undone.")) {
         return;
     }
-    match remove_account(key) {
+    // State v2 (codex-switch-e2e): a non-Claude provider's accounts can now
+    // actually render a "Remove…" row (see `build_snapshot`), so route it to
+    // the matching state.json bucket instead of the old blanket
+    // "not yet supported" refusal.
+    let result = if slug == CLAUDE_SLUG {
+        remove_account(key)
+    } else {
+        remove_provider_account_generic(slug, key)
+    };
+    match result {
         Ok(_) => notify(&format!("Removed {key}")),
         Err(e) => notify(&format!("Remove failed: {e}")),
     }
@@ -2128,20 +2355,26 @@ fn set_autoswap_threshold(v: f64) {
     }
 }
 
-/// A native confirm dialog; true only if the user clicks the destructive button.
+/// A native confirm dialog; true only if the user clicks the destructive
+/// button. Cross-platform via `rfd::MessageDialog` (already a crate
+/// dependency for the Backups Save…/Restore… file panels) rather than the
+/// macOS-only `osascript -e 'display dialog …'` this used to shell out to —
+/// `rfd::MessageDialog` has native backends on macOS (NSAlert), Windows
+/// (MessageBoxW), and Linux (our xdg-portal `rfd` feature shells out to
+/// `zenity(1)` for message dialogs specifically; if `zenity` isn't installed
+/// the dialog fails closed to `Cancel`, so a missing binary can't accidentally
+/// confirm a destructive action).
 fn confirm(question: &str) -> bool {
-    let script = format!(
-        "display dialog {question:?} buttons {{\"Cancel\", \"Remove\"}} \
-         default button \"Cancel\" with title \"usagio\""
-    );
-    match std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).contains("Remove"),
-        _ => false,
-    }
+    let result = rfd::MessageDialog::new()
+        .set_title("usagio")
+        .set_description(question)
+        .set_level(rfd::MessageLevel::Warning)
+        .set_buttons(rfd::MessageButtons::OkCancelCustom(
+            "Remove".to_string(),
+            "Cancel".to_string(),
+        ))
+        .show();
+    matches!(result, rfd::MessageDialogResult::Custom(label) if label == "Remove")
 }
 
 // ---------------------------------------------------------------------------
@@ -2151,6 +2384,370 @@ fn confirm(question: &str) -> bool {
 // upgrade (binary hash changed → macOS treated the new binary as a
 // different app), and it was redundant with `usagio install` which
 // registers a proper launchd LaunchAgent (no osascript, no prompt).
+
+// ---------------------------------------------------------------------------
+// Cross-platform (Linux/Windows) renderer — muda/tray-icon via the
+// `platform::MenuBackend` trait, so the GTK/Win32 event-loop pump and the
+// thread-confinement rules `tray_icon`'s native menu types need live once in
+// `platform::{linux,windows}` (already built + tested there) instead of
+// being duplicated here. macOS keeps its native NSMenu attributedTitle
+// renderer (`mac_style` above, driven by `run` at the top of this file):
+// richer per-row coloring and right-aligned tab stops aren't representable
+// through the generic `platform::MenuTree`, so macOS is intentionally NOT
+// routed through this module.
+#[cfg(not(target_os = "macos"))]
+mod cross_platform {
+    use super::*;
+    use crate::platform::{MenuHandle, MenuItem as PMenuItem, MenuTree};
+
+    /// Cross-platform separator used in place of macOS's right-aligned tab
+    /// stop — muda has no rich-text / tab-stop support, so `S% / W%` etc.
+    /// just sit inline after this separator instead of being right-aligned.
+    /// Per-row red/amber severity coloring is dropped for the same reason
+    /// (see the module doc above) — the countdown / percentage TEXT is
+    /// still there, just not colored.
+    const SEP: &str = " · ";
+
+    /// A `RowStyle`'s plain title, with the macOS tab-stop swapped for `SEP`.
+    /// Reuses `main_row`/`quit_row_plain` (already OS-agnostic pure string
+    /// builders) instead of re-deriving the row text from scratch.
+    fn plain_text(style: &RowStyle) -> String {
+        style.plain.replace('\t', SEP)
+    }
+
+    fn noop_action(label: impl Into<String>) -> PMenuItem {
+        PMenuItem::Action {
+            id: "noop".to_string(),
+            label: label.into(),
+            icon_png: None,
+            enabled: true,
+            checked: false,
+            checkable: false,
+        }
+    }
+
+    fn action(id: impl Into<String>, label: impl Into<String>, enabled: bool) -> PMenuItem {
+        PMenuItem::Action {
+            id: id.into(),
+            label: label.into(),
+            icon_png: None,
+            enabled,
+            checked: false,
+            checkable: false,
+        }
+    }
+
+    fn checkbox(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        enabled: bool,
+        checked: bool,
+    ) -> PMenuItem {
+        PMenuItem::Action {
+            id: id.into(),
+            label: label.into(),
+            icon_png: None,
+            enabled,
+            checked,
+            checkable: true,
+        }
+    }
+
+    /// Cross-platform counterpart to `build_account_submenu` — same rows,
+    /// same click ids, generic `platform::MenuItem` shape instead of a
+    /// native `tray_icon::menu::Submenu`.
+    fn build_account_submenu_items(sec: &ProviderSection, a: &AcctView) -> Vec<PMenuItem> {
+        let mut items = Vec::new();
+        let rows = account_submenu_rows(sec, a);
+        match rows.switch_row {
+            // Matches the macOS renderer: this row is informational (disabled),
+            // not clickable — unlike the burn-rate/cost/reset-window `noop`
+            // rows below, which stay `enabled: true` so they don't render
+            // muda's greyed-out "disabled" look.
+            Some(true) => items.push(action("noop", "✓ Active", false)),
+            Some(false) => items.push(action(
+                format!("switch:{}:{}", sec.provider_id, a.key),
+                "Switch to this account",
+                true,
+            )),
+            None => {}
+        }
+        items.push(PMenuItem::Separator);
+        for row in submenu_info_rows(sec, a) {
+            items.push(noop_action(row));
+        }
+        if sec.supports_usage && a.has_data && !a.windows.is_empty() {
+            let account_key =
+                crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
+            if let Some(est) = crate::burn_rate::estimate(
+                &account_key,
+                crate::providers::trait_def::Window::Weekly,
+                Utc::now(),
+            ) {
+                if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
+                    items.push(noop_action(crate::burn_rate::format_menu_row(&est)));
+                }
+            }
+            if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
+                &account_key,
+                crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
+            ) {
+                items.push(noop_action(format!(
+                    "~${:.2} this cycle (est)",
+                    cost.estimated_usd
+                )));
+            }
+            items.push(noop_action(format!("updated {}", a.updated)));
+        }
+        items.push(PMenuItem::Separator);
+        if rows.launch_row {
+            items.push(action(
+                format!("launch:{}:{}", sec.provider_id, a.key),
+                "Launch client",
+                true,
+            ));
+        }
+        if rows.remove_row {
+            items.push(action(
+                format!("remove:{}:{}", sec.provider_id, a.key),
+                "Remove…",
+                true,
+            ));
+        }
+        items
+    }
+
+    /// Cross-platform counterpart to `build_menu` — same structure, same
+    /// click ids (`handle_click` doesn't care which renderer produced them),
+    /// generic `platform::MenuTree` shape instead of a native
+    /// `tray_icon::menu::Menu`.
+    fn menu_tree_from_snapshot(snap: &Snapshot) -> MenuTree {
+        let mut items = Vec::new();
+        if snap.sections.is_empty() {
+            items.push(action("none", "Capture a login below to begin", false));
+        }
+        for (idx, sec) in snap.sections.iter().enumerate() {
+            if idx > 0 {
+                items.push(PMenuItem::Separator);
+            }
+            for title in section_headline_rows(sec) {
+                items.push(action(
+                    format!("envoverride:{}", sec.provider_id),
+                    title,
+                    false,
+                ));
+            }
+            for a in &sec.accounts {
+                let head = plain_text(&main_row(sec.display_name, a, sec.severity_bands));
+                items.push(PMenuItem::Submenu {
+                    label: head,
+                    icon_png: crate::icons::png16_for(sec.provider_id).map(|b| b.to_vec()),
+                    items: build_account_submenu_items(sec, a),
+                });
+            }
+        }
+        items.push(PMenuItem::Separator);
+        items.push(checkbox(
+            "autoswap:toggle",
+            "Auto-swap enabled",
+            true,
+            snap.autoswap,
+        ));
+        items.push(PMenuItem::Separator);
+
+        let mut capture_items = Vec::new();
+        if snap.capture_creds.is_empty() && snap.capture_api_key.is_empty() {
+            capture_items.push(action("noop", "(no providers registered)", false));
+        } else {
+            for reg in &snap.capture_creds {
+                let title = if reg.installed {
+                    reg.display_name.to_string()
+                } else {
+                    format!("{} (not installed)", reg.display_name)
+                };
+                capture_items.push(action(format!("capture:{}", reg.provider_id), title, true));
+            }
+            if !snap.capture_api_key.is_empty() {
+                if !snap.capture_creds.is_empty() {
+                    capture_items.push(PMenuItem::Separator);
+                }
+                let mut paste_items = Vec::new();
+                for reg in &snap.capture_api_key {
+                    let title = if reg.installed {
+                        reg.display_name.to_string()
+                    } else {
+                        format!("{} (not installed)", reg.display_name)
+                    };
+                    paste_items.push(action(format!("apikey:{}", reg.provider_id), title, true));
+                }
+                capture_items.push(PMenuItem::Submenu {
+                    label: "Paste API key".to_string(),
+                    icon_png: None,
+                    items: paste_items,
+                });
+            }
+        }
+        items.push(PMenuItem::Submenu {
+            label: "Capture current login".to_string(),
+            icon_png: None,
+            items: capture_items,
+        });
+
+        // Settings ▸ Notifications ▸ / Auto-swap threshold ▸ / Advanced ▸.
+        let notifications = vec![
+            checkbox(
+                "notifications:threshold",
+                "Threshold alerts (70% / 90%)",
+                true,
+                snap.notification_config.threshold_enabled,
+            ),
+            checkbox(
+                "notifications:resetback",
+                "Window reset alerts",
+                true,
+                snap.notification_config.reset_back_enabled,
+            ),
+            checkbox(
+                "notifications:pace",
+                "Weekly pace projection (experimental)",
+                true,
+                snap.notification_config.pace_enabled,
+            ),
+        ];
+
+        let cur = if snap.autoswap {
+            snap.threshold.round() as i32
+        } else {
+            0
+        };
+        let mut threshold_items = vec![checkbox("autoswap:off", "Off", true, cur == 0)];
+        for t in [90i32, 95, 98] {
+            threshold_items.push(checkbox(
+                format!("autoswap:{t}"),
+                format!("{t}%"),
+                true,
+                cur == t,
+            ));
+        }
+        threshold_items.push(PMenuItem::Separator);
+        threshold_items.push(action("autoswap:now", "Switch to best account now", true));
+
+        let backups = vec![
+            action("backup:save", "Save…", true),
+            action("backup:restore", "Restore…", true),
+        ];
+        let advanced = vec![
+            PMenuItem::Submenu {
+                label: "Backups".to_string(),
+                icon_png: None,
+                items: backups,
+            },
+            action("refresh:now", "Refresh usage now", true),
+        ];
+
+        let settings_items = vec![
+            PMenuItem::Submenu {
+                label: "Notifications".to_string(),
+                icon_png: None,
+                items: notifications,
+            },
+            PMenuItem::Submenu {
+                label: "Auto-swap threshold".to_string(),
+                icon_png: None,
+                items: threshold_items,
+            },
+            PMenuItem::Submenu {
+                label: "Advanced".to_string(),
+                icon_png: None,
+                items: advanced,
+            },
+        ];
+        items.push(PMenuItem::Submenu {
+            label: "Settings".to_string(),
+            icon_png: None,
+            items: settings_items,
+        });
+
+        items.push(PMenuItem::Separator);
+        items.push(action(
+            "quit",
+            plain_text(&RowStyle::plain_row(quit_row_plain())),
+            true,
+        ));
+
+        MenuTree { items }
+    }
+
+    /// 16x16 PNG bytes for the initial tray icon. `MenuBackend::create_status_item`
+    /// requires real, decodable icon bytes on Linux/Windows (unlike macOS,
+    /// which is happy with a text-only title) — there's no dedicated app icon
+    /// asset yet (only per-provider 16px icons under `assets/icons/16/`), so
+    /// this reuses the active account's provider icon, falling back to
+    /// Claude's (always bundled, regardless of which provider Cargo features
+    /// are enabled — see `icons::png16_for`).
+    fn initial_icon_bytes(snap: &Snapshot) -> &'static [u8] {
+        active_account(snap)
+            .and_then(|(sec, _)| crate::icons::png16_for(sec.provider_id))
+            .or_else(|| crate::icons::png16_for(CLAUDE_SLUG))
+            .unwrap_or(&[0u8; 0])
+    }
+
+    /// Background redraw ticker: rebuilds the tray from cached state and
+    /// pushes updates through the `Send`-safe `MenuHandle`, mirroring the
+    /// macOS `NSTimer` tick in `run` above but off the (blocked)
+    /// `run_event_loop` thread instead of on it — `create_status_item` and
+    /// `run_event_loop` must share a thread (see `MenuBackend`'s doc in
+    /// `platform/mod.rs`), so this can't run on the main thread here.
+    fn redraw_loop(handle: Box<dyn MenuHandle>, initial: Snapshot) {
+        let mut last_sig = menu_signature(&initial);
+        let mut last_title = title_for(&initial);
+        let start_exe = std::fs::canonicalize(crate::stable_exe_path()).ok();
+        loop {
+            std::thread::sleep(Duration::from_millis(750));
+            if let Some(start) = &start_exe {
+                maybe_relaunch_after_upgrade(start);
+            }
+            let snap = build_snapshot();
+            let sig = menu_signature(&snap);
+            if sig != last_sig {
+                if let Err(e) = handle.set_menu(menu_tree_from_snapshot(&snap)) {
+                    crate::logging::log(&format!("menubar: set_menu failed: {e:#}"));
+                }
+                let _ = handle.set_icon(initial_icon_bytes(&snap));
+                last_sig = sig;
+            }
+            let title = title_for(&snap);
+            if title != last_title {
+                let _ = handle.set_title(&title);
+                last_title = title;
+            }
+        }
+    }
+
+    pub(super) fn run() -> Result<()> {
+        providers::init();
+        let backend = crate::platform().menu();
+        backend.on_click(Box::new(handle_click))?;
+
+        let initial = build_snapshot();
+        let handle =
+            backend.create_status_item(&title_for(&initial), initial_icon_bytes(&initial))?;
+        handle.set_menu(menu_tree_from_snapshot(&initial))?;
+        let _ = handle.set_title(&title_for(&initial));
+
+        // Poll + auto-swap on a background thread — same `poll_loop` the
+        // macOS `run` above uses (writes cached usage to state.json; nothing
+        // here calls into the native tray, so it's safe off-thread).
+        std::thread::spawn(poll_loop);
+        // Redraw ticker on its own background thread (see `redraw_loop`'s
+        // doc for why it can't be the main thread here).
+        std::thread::spawn(move || redraw_loop(handle, initial));
+
+        // Blocks, pumping the GTK (Linux) / Win32 (Windows) message loop —
+        // see `platform::linux::LinuxMenu` / `platform::windows::WindowsMenu`.
+        backend.run_event_loop()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2247,6 +2844,10 @@ mod tests {
 
     #[test]
     fn try_start_refresh_dedupes_rapid_clicks() {
+        // try_start_refresh reaches logging::log → store::config_dir(), which
+        // panics in tests without a HOME_OVERRIDE. Wrap in ScopedConfigDir so
+        // the tripwire (added post-hermeticity merge) doesn't fire here.
+        let _g = crate::store::ScopedConfigDir::new();
         // Reset in case a prior test in this binary left it set (best-effort
         // — tests run with --test-threads=1 so no other test races us here).
         REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2362,9 +2963,13 @@ mod tests {
     fn main_row_colors_land_on_percentages() {
         let a = acct("you@work.com", Some(82.0), Some(96.0), true);
         let r = main_row("Claude", &a, bands());
-        assert_eq!(r.plain, "Claude    you@work.com\tS 82%  W 96%");
+        assert_eq!(r.plain, "Claude    you@work.com\t82% / 96%");
         assert!(r.bold, "active account is bold");
-        assert_eq!(r.tab_x, Some(TAB_X), "trailing run is right-aligned");
+        assert_eq!(
+            r.tab_x_kind,
+            Some(TabX::MenuRight),
+            "trailing run is right-aligned"
+        );
         assert_eq!(r.colors.len(), 2);
         let (so, sl, ss) = r.colors[0];
         assert_eq!(span_text(&r.plain, so, sl), "82%");
@@ -2395,7 +3000,7 @@ mod tests {
     #[test]
     fn main_row_includes_provider_name_padded() {
         // Item 2 of the redesign: the provider name gets its own column-like
-        // padding, then the email, then the tab-stopped `S n%  W n%` run.
+        // padding, then the email, then the tab-stopped `n% / n%` run.
         let claude = main_row(
             "Claude",
             &acct("a@x.com", Some(1.0), Some(2.0), false),
@@ -2741,14 +3346,14 @@ mod tests {
 
     #[test]
     fn main_row_flat_shape_matches_spec_when_not_locked() {
-        // "{provider}    {email}\tS {n}%  W {n}%" per the v0.5.0 redesign —
-        // the crate's variant uses a TAB between the label and trailing run
-        // so AppKit right-aligns it. The important structural invariants are:
-        // provider, then email, one TAB, then "S n%  W n%". Any change to
-        // that layout will fail this assertion — a wall against silent drift.
+        // "{provider}    {email}\t{n}% / {n}%" per the v0.5.1 UX pass — the
+        // crate's variant uses a TAB between the label and trailing run so
+        // AppKit right-aligns it. The important structural invariants are:
+        // provider, then email, one TAB, then "n% / n%". Any change to that
+        // layout will fail this assertion — a wall against silent drift.
         let a = acct("you@work.com", Some(42.0), Some(61.0), false);
         let r = main_row("Claude", &a, bands());
-        assert_eq!(r.plain, "Claude    you@work.com\tS 42%  W 61%");
+        assert_eq!(r.plain, "Claude    you@work.com\t42% / 61%");
         assert!(!r.checkmark, "inactive row: no leading checkmark");
     }
 
@@ -2792,7 +3397,7 @@ mod tests {
         with_now(now, || {
             let a = acct_with_resets("dev@x.com", Some(100.0), None, false, Some(past), None);
             let r = main_row("Claude", &a, bands());
-            assert_eq!(r.plain, "Claude    dev@x.com\tS 100%  W —");
+            assert_eq!(r.plain, "Claude    dev@x.com\t100% / —");
             assert!(!r.plain.contains("locked"));
         });
     }
@@ -2868,15 +3473,65 @@ mod tests {
         let styles = menu_styles(&snap);
         let main_style = styles
             .iter()
-            .find(|s| s.tab_x.is_some())
+            .find(|s| s.tab_x_kind.is_some())
             .expect("main-list row present");
         assert_eq!(main_style.icon_slug, Some(CLAUDE_SLUG));
         // The submenu info rows (no tab stop) carry no icon.
-        for s in styles.iter().filter(|s| s.tab_x.is_none()) {
+        for s in styles.iter().filter(|s| s.tab_x_kind.is_none()) {
             assert!(
                 s.icon_slug.is_none(),
                 "unexpected icon on non-main row: {}",
                 s.plain,
+            );
+        }
+    }
+
+    #[test]
+    fn menu_styles_tab_stop_is_uniform_across_a_section() {
+        // v0.5.1: the concrete tab-stop x is resolved dynamically at install
+        // time (`mac_style::compute_menu_right_x`, from the actual rendered
+        // widths), not stored on `RowStyle` — so what a `RowStyle` carries,
+        // and what this test can pin without native AppKit calls, is just
+        // the *kind* of alignment it wants. Every main-list row in a section
+        // (and the Quit row) must request `TabX::MenuRight`, or the S%/W%
+        // columns wouldn't line up vertically. Vary email length across rows
+        // to prove the kind doesn't depend on content width either.
+        let short = acct("a@x.com", Some(10.0), Some(20.0), false);
+        let long = acct(
+            "a.very.long.email.address@example.com",
+            Some(30.0),
+            Some(40.0),
+            true,
+        );
+        let snap = Snapshot {
+            sections: vec![ProviderSection {
+                provider_id: CLAUDE_SLUG,
+                display_name: "Claude",
+                supports_switching: true,
+                supports_usage: true,
+                supports_launch: true,
+                supports_remove: true,
+                severity_bands: bands(),
+                env_override_active: false,
+                accounts: vec![long, short],
+            }],
+            capture_creds: Vec::new(),
+            capture_api_key: Vec::new(),
+            autoswap: false,
+            threshold: 95.0,
+            notification_config: crate::notifications::NotificationConfig::default(),
+        };
+        let styles = menu_styles(&snap);
+        let tab_kinds: Vec<TabX> = styles.iter().filter_map(|s| s.tab_x_kind).collect();
+        assert!(
+            tab_kinds.len() >= 2,
+            "expected a tab stop on every main row plus Quit"
+        );
+        for kind in &tab_kinds {
+            assert_eq!(
+                *kind,
+                TabX::MenuRight,
+                "every row must request the shared menu-right alignment"
             );
         }
     }
@@ -2912,7 +3567,7 @@ mod tests {
         // stop; the Quit row is excluded by matching on the email instead).
         let mut saw_active = false;
         let mut saw_inactive = false;
-        for s in styles.iter().filter(|s| s.tab_x.is_some()) {
+        for s in styles.iter().filter(|s| s.tab_x_kind.is_some()) {
             if s.plain.contains("active@x.com") {
                 assert!(s.checkmark, "active row must carry the checkmark flag");
                 saw_active = true;
@@ -3027,13 +3682,15 @@ mod tests {
     }
 
     #[test]
-    fn codex_capabilities_do_not_advertise_switching_or_launch() {
-        // Locks in the H3 downgrade at the real provider boundary (not just
-        // the ProviderSection fixture above): CodexProvider's actual
-        // capabilities() must not claim switching or launch support until
-        // state v2 gives it somewhere to persist a second account.
+    fn codex_capabilities_advertise_switching_but_not_launch() {
+        // H3 (v0.5.0 codeaudit) is now closed: state v2 (`State::providers`)
+        // gives Codex somewhere to persist a second account, and
+        // `main.rs`/`menubar.rs` dispatch a switch by provider slug, so
+        // `write_active_account` is reachable from the live app —
+        // `supports_switching` is `true`. `launch_client` is still
+        // unimplemented for Codex, so `supports_launch` stays `false`.
         let caps = crate::providers::codex::CodexProvider.capabilities();
-        assert!(!caps.supports_switching);
+        assert!(caps.supports_switching);
         assert!(!caps.supports_launch);
         assert!(caps.supports_remove);
     }
@@ -3107,7 +3764,7 @@ mod tests {
     #[test]
     fn main_row_locked_shape_swaps_only_the_trailing_run() {
         // The locked row keeps the "{provider label}\t…" tab structure so
-        // right-alignment still works — only the trailing "S n%  W n%" run
+        // right-alignment still works — only the trailing "n% / n%" run
         // becomes "locked · <countdown>". A test that pins the structure so
         // a future refactor can't accidentally lose the tab.
         let now = Utc.timestamp_opt(4_000_000, 0).unwrap();
@@ -3126,7 +3783,11 @@ mod tests {
             // No "locked · " prefix — red color + a time (not a percent) is
             // the affordance now. See main_row's locked-branch comment.
             assert_eq!(trailing, "23h 52m");
-            assert_eq!(r.tab_x, Some(TAB_X), "right-align tab-stop preserved");
+            assert_eq!(
+                r.tab_x_kind,
+                Some(TabX::MenuRight),
+                "right-align tab-stop preserved"
+            );
         });
     }
 
@@ -3243,44 +3904,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn disabled_but_white_row_gets_a_full_range_labelcolor_attribute() {
-        // The "white but not clickable" style: `disabled_but_white` must
-        // produce an `NSForegroundColorAttributeName` run spanning the ENTIRE
-        // row (offset 0, full length) — not disabled grey, not a partial span.
-        let style = RowStyle {
-            disabled_but_white: true,
-            ..RowStyle::plain_row("Session resets in 3h".to_string())
-        };
-        let attr = attributed(&style);
-        let full_len = attr.length();
-        assert!(full_len > 0);
-        let mut effective = objc2_foundation::NSRange::new(0, 0);
-        let value = unsafe {
-            attr.attribute_atIndex_effectiveRange(NSForegroundColorAttributeName, 0, &mut effective)
-        };
-        assert!(value.is_some(), "expected a foreground-color attribute");
-        assert_eq!(
-            effective,
-            objc2_foundation::NSRange::new(0, full_len),
-            "labelColor must span the whole row",
-        );
-    }
+    // These two tests exercise `mac_style::attributed` directly (NSAttributedString
+    // attribute inspection) — nested in their own `#[cfg(target_os = "macos")]`
+    // module since `objc2_app_kit`/`objc2_foundation` aren't in the dependency
+    // graph on Linux/Windows (see the top-of-file import comment).
+    #[cfg(target_os = "macos")]
+    mod mac_style_tests {
+        use super::*;
+        use objc2_app_kit::NSForegroundColorAttributeName;
 
-    #[test]
-    fn plain_row_with_no_disabled_but_white_has_no_forced_foreground_color() {
-        // A normal (non-info) row must NOT get the full-range labelColor
-        // treatment — only `disabled_but_white` rows opt into it.
-        let style = RowStyle::plain_row("Switch to this account".to_string());
-        let attr = attributed(&style);
-        let mut effective = objc2_foundation::NSRange::new(0, 0);
-        let value = unsafe {
-            attr.attribute_atIndex_effectiveRange(NSForegroundColorAttributeName, 0, &mut effective)
-        };
-        assert!(
-            value.is_none(),
-            "a plain row must not carry a forced foreground color",
-        );
+        #[test]
+        fn disabled_but_white_row_gets_a_full_range_labelcolor_attribute() {
+            // The "white but not clickable" style: `disabled_but_white` must
+            // produce an `NSForegroundColorAttributeName` run spanning the ENTIRE
+            // row (offset 0, full length) — not disabled grey, not a partial span.
+            let style = RowStyle {
+                disabled_but_white: true,
+                ..RowStyle::plain_row("Session resets in 3h".to_string())
+            };
+            let attr = mac_style::attributed(&style, None);
+            let full_len = attr.length();
+            assert!(full_len > 0);
+            let mut effective = objc2_foundation::NSRange::new(0, 0);
+            let value = unsafe {
+                attr.attribute_atIndex_effectiveRange(
+                    NSForegroundColorAttributeName,
+                    0,
+                    &mut effective,
+                )
+            };
+            assert!(value.is_some(), "expected a foreground-color attribute");
+            assert_eq!(
+                effective,
+                objc2_foundation::NSRange::new(0, full_len),
+                "labelColor must span the whole row",
+            );
+        }
+
+        #[test]
+        fn plain_row_with_no_disabled_but_white_has_no_forced_foreground_color() {
+            // A normal (non-info) row must NOT get the full-range labelColor
+            // treatment — only `disabled_but_white` rows opt into it.
+            let style = RowStyle::plain_row("Switch to this account".to_string());
+            let attr = mac_style::attributed(&style, None);
+            let mut effective = objc2_foundation::NSRange::new(0, 0);
+            let value = unsafe {
+                attr.attribute_atIndex_effectiveRange(
+                    NSForegroundColorAttributeName,
+                    0,
+                    &mut effective,
+                )
+            };
+            assert!(
+                value.is_none(),
+                "a plain row must not carry a forced foreground color",
+            );
+        }
     }
 
     // -----------------------------------------------------------------
@@ -3320,7 +3999,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // H2 (v0.5.0 codeaudit) — Restore… drop-confirmation wording + store-level
     // wiring. `handle_backup_restore_dialog` itself opens a native file panel
-    // and shells out to osascript for confirmation, neither of which is
+    // and a native `rfd::MessageDialog` confirm prompt, neither of which is
     // unit-testable; these tests cover the pure logic it's built from.
     // -----------------------------------------------------------------------
 
@@ -3400,7 +4079,10 @@ mod tests {
         let stash = stash_pre_restore(&dir)
             .unwrap()
             .expect("live state existed");
+        // Strong positive assertion: the stash MUST be inside the scoped tempdir's
+        // config backups dir. On Linux CI the tempdir itself lives under /tmp/xyz/,
+        // so a `!starts_with("/tmp")` guard would false-positive — the positive
+        // form here catches the real regression (stash landing outside backups/).
         assert!(stash.starts_with(g.home().join(".config/usagio/backups")));
-        assert!(!stash.starts_with("/tmp"));
     }
 }

@@ -19,6 +19,9 @@ pub struct AccountUsage {
     pub session_reset: Option<DateTime<Utc>>,
     pub weekly_pct: Option<f64>,
     pub weekly_reset: Option<DateTime<Utc>>,
+    /// When the cached usage values were fetched. Used to detect a stale
+    /// cache that predates a reset boundary (see `DisplayState::StaleAfterReset`).
+    pub fetched_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -30,6 +33,17 @@ pub enum DisplayState {
     Locked {
         until: DateTime<Utc>,
         window: BlockingWindow,
+    },
+    /// The cached percentage is at/above the locked threshold, but the
+    /// window's reset time has already passed *and* our last fetch predates
+    /// that reset — i.e. the cache is known-stale rather than a live
+    /// "still locked" reading. Rendering the raw cached pct here (typically
+    /// a misleading `100%`) would lie to the user; callers should render a
+    /// "pending refresh" placeholder (e.g. "-% / -%") until the next poll
+    /// picks up fresh, post-reset data.
+    StaleAfterReset {
+        window: BlockingWindow,
+        reset: DateTime<Utc>,
     },
 }
 
@@ -69,10 +83,39 @@ pub fn compute_display(usage: &AccountUsage, now: DateTime<Utc>) -> DisplayState
             until: w,
             window: BlockingWindow::Weekly,
         },
-        (None, None) => DisplayState::Usage {
-            session_pct: usage.session_pct,
-            weekly_pct: usage.weekly_pct,
-        },
+        (None, None) => {
+            // Neither window is actively blocking. Before falling back to a
+            // plain Usage display, check whether either window's cached pct
+            // is stale-after-reset: still at/above threshold, its reset has
+            // already passed, and our last fetch predates that reset. That
+            // combination means the cached value is a known lie (it can't
+            // still be true post-reset) rather than fresh data that happens
+            // to be low/zero. Session takes priority when both are stale,
+            // mirroring the Locked-branch tie-break above.
+            let session_stale = is_stale_after_reset(
+                usage.session_pct,
+                usage.session_reset,
+                usage.fetched_at,
+                now,
+            );
+            let weekly_stale =
+                is_stale_after_reset(usage.weekly_pct, usage.weekly_reset, usage.fetched_at, now);
+
+            match (session_stale, weekly_stale) {
+                (Some(reset), _) => DisplayState::StaleAfterReset {
+                    window: BlockingWindow::Session,
+                    reset,
+                },
+                (None, Some(reset)) => DisplayState::StaleAfterReset {
+                    window: BlockingWindow::Weekly,
+                    reset,
+                },
+                (None, None) => DisplayState::Usage {
+                    session_pct: usage.session_pct,
+                    weekly_pct: usage.weekly_pct,
+                },
+            }
+        }
     }
 }
 
@@ -88,6 +131,48 @@ fn is_blocking(
     } else {
         None
     }
+}
+
+/// Mirrors `is_blocking`, but for the *already-reset* case: the reset time
+/// has passed (so `is_blocking` returns `None`), yet the cached pct is still
+/// at/above threshold because it was fetched before that reset happened.
+fn is_stale_after_reset(
+    pct: Option<f64>,
+    reset: Option<DateTime<Utc>>,
+    fetched_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let pct = pct?;
+    let reset = reset?;
+    let fetched_at = fetched_at?;
+    if pct >= LOCKED_THRESHOLD_PCT && reset <= now && fetched_at < reset {
+        Some(reset)
+    } else {
+        None
+    }
+}
+
+/// Returns the soonest of `{session_reset, weekly_reset}` that falls
+/// strictly within `horizon` of `now` (i.e. `now < reset <= now + horizon`),
+/// or `None` if neither reset is known or both fall outside the horizon.
+///
+/// Intended for `main.rs`'s `cmd_watch` loop: rather than waiting for the
+/// next adaptive-cadence poll tick to notice a window has rolled over
+/// (which can leave a stale `Locked`/cached-100% reading on screen for up
+/// to that tick's full interval), the watch loop can call this to find the
+/// next reset boundary and schedule an extra wake-up right at/after it, so
+/// the stale-cache window is minimized.
+pub fn any_reset_within(
+    u: &AccountUsage,
+    now: DateTime<Utc>,
+    horizon: Duration,
+) -> Option<DateTime<Utc>> {
+    let deadline = now + horizon;
+    [u.session_reset, u.weekly_reset]
+        .into_iter()
+        .flatten()
+        .filter(|&reset| reset > now && reset <= deadline)
+        .min()
 }
 
 /// Format a remaining duration into one of: "1d 23h" | "23h 52m" | "51m" | "<1m".
@@ -214,6 +299,24 @@ mod tests {
             session_reset: sr.map(t),
             weekly_pct: wp,
             weekly_reset: wr.map(t),
+            fetched_at: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn usage_with_fetched_at(
+        sp: Option<f64>,
+        sr: Option<i64>,
+        wp: Option<f64>,
+        wr: Option<i64>,
+        fetched_at: i64,
+    ) -> AccountUsage {
+        AccountUsage {
+            session_pct: sp,
+            session_reset: sr.map(t),
+            weekly_pct: wp,
+            weekly_reset: wr.map(t),
+            fetched_at: Some(t(fetched_at)),
         }
     }
 
@@ -350,5 +453,75 @@ mod tests {
                 weekly_pct: None
             }
         );
+    }
+
+    // ---- stale-after-reset ----
+
+    #[test]
+    fn stale_after_weekly_reset_returns_stale_variant() {
+        // weekly at 100%, reset 30s ago, but our cache was fetched 5min ago
+        // (i.e. before the reset happened) — the cached 100% is a known lie.
+        let now = t(10_000);
+        let weekly_reset = 9_970; // 30s before `now`
+        let fetched_at = 9_700; // 5min before `now`, i.e. before weekly_reset too
+        let u = usage_with_fetched_at(None, None, Some(100.0), Some(weekly_reset), fetched_at);
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::StaleAfterReset {
+                window: BlockingWindow::Weekly,
+                reset: t(weekly_reset),
+            }
+        );
+    }
+
+    #[test]
+    fn fresh_poll_after_reset_returns_usage_variant() {
+        // Same reset as above, but fetched_at is only 10s ago — i.e. after
+        // the reset happened, so the cached pct (whatever it is) is fresh
+        // and trusted as-is.
+        let now = t(10_000);
+        let weekly_reset = 9_970; // 30s before `now`
+        let fetched_at = 9_990; // 10s before `now`, i.e. after weekly_reset
+        let u = usage_with_fetched_at(None, None, Some(0.0), Some(weekly_reset), fetched_at);
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::Usage {
+                session_pct: None,
+                weekly_pct: Some(0.0),
+            }
+        );
+    }
+
+    #[test]
+    fn still_before_reset_returns_locked_variant() {
+        // Reset is still 2min in the future — current locked behavior must
+        // be preserved regardless of fetched_at.
+        let now = t(10_000);
+        let session_reset = 10_120; // +2min
+        let u = usage_with_fetched_at(Some(100.0), Some(session_reset), None, None, 9_700);
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::Locked {
+                until: t(session_reset),
+                window: BlockingWindow::Session,
+            }
+        );
+    }
+
+    // ---- any_reset_within ----
+
+    #[test]
+    fn any_reset_within_finds_nearest() {
+        let now = t(10_000);
+        let session_reset = 10_300; // +5min
+        let weekly_reset = 10_600; // +10min
+        let u = usage(
+            Some(10.0),
+            Some(session_reset),
+            Some(20.0),
+            Some(weekly_reset),
+        );
+        let horizon = Duration::minutes(7);
+        assert_eq!(any_reset_within(&u, now, horizon), Some(t(session_reset)));
     }
 }

@@ -17,36 +17,74 @@ use std::path::{Path, PathBuf};
 /// Patterns that indicate a direct OS check. Covers the attribute form
 /// (`#[cfg(target_os = "...")]`), nested forms (`#[cfg(all(target_os = ...`,
 /// `#[cfg(any(target_os = ...`, `#[cfg(not(target_os = ...`), and the
-/// expression-macro form (`cfg!(target_os = "...")`).
-const NEEDLES: &[&str] = &["cfg(target_os", "cfg!(target_os"];
+/// expression-macro form (`cfg!(target_os = "...")`). Each nested wrapper
+/// needs its own needle — "cfg(not(target_os" does NOT contain "cfg(target_os"
+/// as a contiguous substring (there's a `not(` in between), so a single
+/// "cfg(target_os" needle would silently miss it. (Plain `cfg(unix)` /
+/// `cfg(windows)` — no `target_os` — are NOT covered here and don't need to
+/// be: those are the *sanctioned* per-OS-family escape hatch for code that
+/// merely varies by a std-lib-recognized family, not a `Platform`-trait-sized
+/// OS branch — see `menubar::relaunch_via_launchd_kickstart`.)
+const NEEDLES: &[&str] = &[
+    "cfg(target_os",
+    "cfg!(target_os",
+    "cfg(not(target_os",
+    "cfg(all(target_os",
+    "cfg(any(target_os",
+];
 
 /// Documented exceptions. Every entry is `(relative path, line number,
 /// rationale)`. Additions require a comment explaining WHY the site can't
 /// route through the `Platform` trait yet, and either a linked issue or a
 /// note explaining what would need to happen for the exception to go away.
 ///
-/// **Current exceptions — all in `src/main.rs`, all gating the macOS-only
-/// menu-bar module and its CLI subcommand.** The Linux + Windows `Platform`
-/// impls landed in v0.5.0 (tray backend, secrets, autostart, terminal
-/// probe, file dialogs), but wiring `menubar.rs` itself to compile against
-/// those backends — instead of straight-lining objc — is a follow-up for
-/// v0.5.x. Until that happens, `mod icons` / `mod menubar` / the `menubar`
-/// subcommand arm stay macOS-only, and the strict-cfg guard has to
-/// acknowledge that explicitly rather than silently accept them.
+/// **v0.5.x menubar cross-OS wiring**: `src/menubar.rs` now renders on all
+/// three OSes — macOS keeps its native NSMenu attributedTitle renderer
+/// (`mac_style` module + `run`'s macOS branch); Linux/Windows route through
+/// `platform::MenuBackend` instead (`cross_platform` module). The macOS-only
+/// renderer needs `objc2`/`objc2-app-kit`/`objc2-foundation`/`block2` —
+/// real `[target.'cfg(target_os = "macos")'.dependencies]` in Cargo.toml
+/// that don't exist in the dependency graph on Linux/Windows — so those
+/// pieces must be real `#[cfg(target_os = "macos")]`, not something
+/// routable through a runtime trait call. Each entry below is grouped (one
+/// `mod`/fn per macOS-only or non-macOS-only cluster) to keep this list as
+/// short as the dependency-gating requirement allows.
 const ALLOWLIST: &[(&str, u32)] = &[
-    // src/main.rs — icons module is macOS-only (bundled provider PNGs are
-    // baked into the objc-driven menu; Linux/Windows use tray-icon's own
-    // image path when their menubar wiring lands).
-    ("src/main.rs", 28),
-    // src/main.rs — menubar module is macOS-only until Linux/Windows
-    // menubar wiring lands (v0.5.x). Their `Platform` impls exist; the
-    // menu-render code paths still call macOS-native NSMenu attributedTitle
-    // helpers straight-lined here rather than through the trait.
-    ("src/main.rs", 31),
-    // src/main.rs — the `menubar` CLI subcommand arm dispatches into the
-    // macOS-only menubar module; must be cfg-gated to the same OS to
-    // avoid a link-time symbol miss on other platforms.
-    ("src/main.rs", 251),
+    // src/menubar.rs — `use std::cell::RefCell` (macOS thread-local NSMenu
+    // context storage; only reachable via mac_style).
+    ("src/menubar.rs", 15),
+    // src/menubar.rs — `objc2`/`objc2-app-kit`/`objc2-foundation`/`block2`
+    // imports for the macOS-only NSMenu renderer (see module doc above).
+    ("src/menubar.rs", 29),
+    // src/menubar.rs — `pub fn run()`, non-macOS branch: dispatches to
+    // `cross_platform::run` (the `platform::MenuBackend`-based renderer).
+    ("src/menubar.rs", 444),
+    // src/menubar.rs — `pub fn run()`, macOS branch: the native
+    // `NSApplication` run loop.
+    ("src/menubar.rs", 449),
+    // src/menubar.rs — `build_menu`: builds a native `tray_icon::menu::Menu`
+    // for the macOS `apply_menu_styles` NSMenu walk to mutate in place.
+    // Linux/Windows build the equivalent `platform::MenuTree` via
+    // `cross_platform::menu_tree_from_snapshot`.
+    ("src/menubar.rs", 1020),
+    // src/menubar.rs — `build_account_submenu`: macOS-only counterpart to
+    // `cross_platform::build_account_submenu_items`.
+    ("src/menubar.rs", 1313),
+    // src/menubar.rs — `mod mac_style`: the NSMenu attributedTitle styling
+    // walk (`install_menu`/`color_for`/`attributed`/`apply_menu_styles`) plus
+    // the `objc2*` imports it needs. Grouped into one module so this whole
+    // cluster needs exactly one cfg site instead of one per function.
+    ("src/menubar.rs", 1420),
+    // src/menubar.rs — `add`: `build_menu`/`build_account_submenu` helper
+    // (native `tray_icon::menu::Menu::append`).
+    ("src/menubar.rs", 1817),
+    // src/menubar.rs — `mod cross_platform`: the Linux/Windows renderer
+    // (`platform::MenuBackend`-based). Never compiled alongside `mac_style`.
+    ("src/menubar.rs", 2398),
+    // src/menubar.rs — `tests::mac_style_tests`: exercises
+    // `mac_style::attributed` (NSAttributedString attribute inspection)
+    // directly; needs the same `objc2*` crates as `mac_style` itself.
+    ("src/menubar.rs", 3911),
 ];
 
 fn src_root() -> PathBuf {

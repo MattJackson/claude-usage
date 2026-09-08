@@ -84,6 +84,13 @@ pub enum MenuItem {
         icon_png: Option<Vec<u8>>, // 16pt template
         enabled: bool,
         checked: bool, // check mark
+        /// Whether this row should render as a checkbox item at all (vs a
+        /// plain row). Separate from `checked` so an UNCHECKED checkbox
+        /// (e.g. "Auto-swap enabled" while auto-swap is off) still gets a
+        /// (empty) checkbox instead of silently degrading to a plain row —
+        /// `checked` alone can't distinguish "not a checkbox" from
+        /// "checkbox, currently unchecked".
+        checkable: bool,
     },
     /// Non-clickable header / status row.
     Static {

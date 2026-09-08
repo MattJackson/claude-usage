@@ -148,24 +148,34 @@ pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
 /// deliberately skipped — let the vendor CLI own its own rotation so our
 /// refresh can't race the tokens it's about to write.
 pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
-    // Snapshot {accounts, active} atomically under the state lock. Using the
-    // hint the caller computed outside the lock is unsafe: a switch that
-    // lands between the caller's read and this function's iteration could
-    // make the "inactive" list include what is now the active account, which
-    // we'd then proactively refresh — reintroducing the race with `claude`'s
-    // own rotation that this whole path is designed to avoid.
-    let (emails, mut active_at_snapshot): (Vec<String>, Option<String>) =
+    // Snapshot {accounts, active} atomically under the state lock, ONCE.
+    // Using the hint the caller computed outside the lock is unsafe: a
+    // switch that lands between the caller's read and this function's
+    // iteration could make the "inactive" list include what is now the
+    // active account, which we'd then proactively refresh — reintroducing
+    // the race with `claude`'s own rotation that this whole path is
+    // designed to avoid. That's still true; the fix below is just to stop
+    // re-reading and re-parsing the WHOLE state.json file twice per
+    // inactive account when this one snapshot already has everything
+    // needed to decide whether to refresh (efficiency-01, v0.5.1 audit).
+    // Re-checking "is this still inactive" against a fresher on-disk state
+    // only matters again once we're about to WRITE — a stale in-memory
+    // snapshot can't corrupt anything by being read from, only by being
+    // written back over a newer value, and the write path below already
+    // re-loads and re-checks `active` under the lock immediately before
+    // saving.
+    let (accounts, active_at_snapshot): (Vec<crate::store::Account>, Option<String>) =
         match with_state_lock(|| {
             let st = State::load()?;
             let active = st.active.clone();
-            let emails = st
+            let accounts = st
                 .accounts
                 .iter()
                 .filter(|a| !a.needs_relogin)
                 .filter(|a| Some(a.key()) != active.as_deref())
-                .map(|a| a.key().to_string())
+                .cloned()
                 .collect();
-            Ok((emails, active))
+            Ok((accounts, active))
         }) {
             Ok(t) => t,
             Err(e) => {
@@ -173,22 +183,19 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                 return;
             }
         };
-    for email in emails {
-        // Re-check active before doing network work: a concurrent switch may
-        // have promoted this account since the snapshot. Skip if so — the
-        // vendor CLI now owns rotation for it.
-        if let Ok(st) = State::load() {
-            active_at_snapshot = st.active.clone();
-        }
+    for mut acct in accounts {
+        let email = acct.key().to_string();
+        // The snapshot's `active` is authoritative enough to skip on: if a
+        // switch promoted this account after the snapshot, the write-back
+        // below re-checks `active` under the lock immediately before saving
+        // and no-ops if so — so a stale skip decision here can only cause a
+        // harmless extra refresh attempt, never a clobbered write.
         if active_at_snapshot.as_deref() == Some(email.as_str()) {
             continue;
         }
-        let Some(mut acct) = State::load().ok().and_then(|s| s.find(&email).cloned()) else {
-            continue;
-        };
         match crate::providers::claude::oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
             Ok(true) => {
-                let _ = with_state_lock(|| {
+                let save_result = with_state_lock(|| {
                     let mut st = State::load()?;
                     // Belt-and-braces: don't clobber tokens for what is now
                     // the active account (a switch may have completed while
@@ -205,6 +212,16 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                     }
                     st.save()
                 });
+                // Surface persist failures (state.json write refused / lock
+                // poisoned / disk full). Same posture as the sibling
+                // InvalidGrant branch below — a silent `let _ =` here was
+                // exactly the pattern the earlier R2-EH-01 fix targeted.
+                if let Err(e) = save_result {
+                    crate::logging::log(&format!(
+                        "refresh_inactive_if_stale: post-refresh state save \
+                         failed for {email}: {e:#}"
+                    ));
+                }
             }
             Ok(false) => {}
             Err(crate::providers::claude::oauth::RefreshError::InvalidGrant) => {

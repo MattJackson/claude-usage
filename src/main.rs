@@ -9,15 +9,6 @@
 //! service string is intentionally frozen at "claude-usage" to preserve
 //! existing tokens (see `providers/state.rs`).
 
-// A handful of items (cost/burn constants, DisplayState/BlockingWindow,
-// state_json_path, and menu helpers) are only exercised from the macOS-only
-// menubar module. On Linux/Windows compiles they're legitimately dead — the
-// menu isn't yet wired through the Platform trait so `mod menubar;` is
-// still macOS-gated (see the allowlist in tests/strict_cfg.rs). This
-// silences those warnings only on non-macOS targets so clippy stays -D
-// warnings on all three OSes without hiding real dead code on macOS.
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
-
 mod burn_rate;
 mod context_ledger;
 mod cost_tracking;
@@ -25,10 +16,8 @@ mod countdown;
 mod credentials;
 #[cfg(test)]
 mod env_lock;
-#[cfg(target_os = "macos")]
 mod icons;
 mod logging;
-#[cfg(target_os = "macos")]
 mod menubar;
 mod notifications;
 mod paths;
@@ -43,8 +32,9 @@ use providers::claude::{oauth, usage};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 
+use providers::trait_def::TokenGrant;
 use providers::Provider;
-use store::{Account, CachedUsage, State};
+use store::{Account, CachedUsage, ProviderAccount, State};
 
 /// Slug of the sole first-class provider in v1 (state.json is still keyed as
 /// a flat list of Claude accounts). Any code that needs to resolve "the
@@ -248,7 +238,6 @@ fn run() -> Result<()> {
         }
         Some("token") => cmd_token(args.get(1).map(String::as_str)),
         Some("watch") => cmd_watch(&args[1..]),
-        #[cfg(target_os = "macos")]
         Some("menubar") => menubar::run(),
         Some("report") => cmd_report(&args[1..]),
         Some("context") => cmd_context(&args[1..]),
@@ -382,6 +371,75 @@ fn merged_cached_usage(existing: Option<&Account>) -> Option<CachedUsage> {
     existing.and_then(|a| a.cached_usage.clone())
 }
 
+/// Capture whatever `slug` (a non-Claude provider) currently has logged in
+/// on this host and persist it into state v2's `State::providers[slug]`
+/// slot, exactly like `capture_current` does for Claude's `accounts` list.
+/// Closes the gap documented in `menubar.rs::handle_capture`'s prior
+/// "persistence lands in a later phase" notification. Returns the account
+/// key and whether it already existed (so callers can say "Captured" vs.
+/// "Refreshed").
+pub(crate) fn capture_current_generic(slug: &str) -> Result<(String, bool)> {
+    let provider = provider_by_slug(slug)?;
+    let captured = provider
+        .capture_current_login()
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| anyhow!("nothing to capture — is {slug} logged in on this host?"))?;
+    let key = provider.account_identifier(&captured.identity);
+    let expires_at = Utc::now().timestamp() + captured.tokens.expires_in_secs;
+
+    let existed = with_state_lock(|| {
+        let mut state = State::load()?;
+        let existing = state.find_provider_account(slug, &key).cloned();
+        let existed = existing.is_some();
+        let acct = ProviderAccount {
+            key: key.clone(),
+            secret_blob: captured.secret_blob.clone(),
+            access_token: captured.tokens.access.clone(),
+            refresh_token: captured.tokens.refresh.clone().unwrap_or_default(),
+            expires_at,
+            identity_email: captured.identity.email.clone(),
+            identity_uuid: captured.identity.uuid.clone(),
+            identity_display_name: captured.identity.display_name.clone(),
+            identity_native_blob: captured.identity.native_blob.clone(),
+            // Re-capturing only refreshes identity/tokens — keep any usage
+            // snapshot the scheduler already fetched (mirrors
+            // `merged_cached_usage` above for Claude).
+            cached_usage: existing.as_ref().and_then(|a| a.cached_usage.clone()),
+            notif_state: existing
+                .as_ref()
+                .map(|a| a.notif_state.clone())
+                .unwrap_or_default(),
+            needs_relogin: false,
+        };
+        state.upsert_provider_account(slug, acct);
+        // Capture always reflects whatever is currently logged in, so it
+        // also becomes the active account for this provider — matching
+        // Claude's `capture_current`, which sets `state.active` the same way.
+        state.provider_accounts_mut(slug).active = Some(key.clone());
+        state.save()?;
+        Ok(existed)
+    })?;
+    logging::log(&format!(
+        "event=capture provider={slug} account={key} existed={existed}"
+    ));
+    Ok((key, existed))
+}
+
+/// Remove a captured account from a non-Claude provider's state v2 slot
+/// (`State::providers[slug]`). Mirrors `remove_account` below for Claude —
+/// added alongside state v2 so the "Remove…" row that now appears for a
+/// provider whose accounts render in the menu (state v2 makes that possible
+/// for the first time) doesn't dead-end.
+pub(crate) fn remove_provider_account_generic(slug: &str, key: &str) -> Result<()> {
+    with_state_lock(|| {
+        let mut state = State::load()?;
+        if !state.remove_provider_account(slug, key) {
+            bail!("no {slug} account matches '{key}'");
+        }
+        state.save()
+    })
+}
+
 /// Remove an account by email (used by the CLI `rm` and the menu bar).
 pub(crate) fn remove_account(email: &str) -> Result<()> {
     with_state_lock(|| {
@@ -424,11 +482,52 @@ fn cmd_list(args: &[String]) -> Result<()> {
 
 fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
     let state = State::load()?;
+    if state.accounts.is_empty() && state.providers.values().all(|p| p.accounts.is_empty()) {
+        bail!("no accounts yet; capture one with: usagio capture");
+    }
+
+    // Explicit selector: try Claude's accounts first (unchanged v1 behavior,
+    // including `start`/`continue` launching `claude` afterward). If it
+    // doesn't resolve there, fall back to a provider-owned account slot
+    // (state v2's `State::providers`) — this is the CLI half of routing a
+    // switch by provider slug instead of assuming Claude, matching
+    // `menubar.rs::handle_switch`.
+    if let Some(sel) = selector {
+        if !state.accounts.is_empty() {
+            if let Ok(email) = state.resolve(sel) {
+                return finish_claude_switch(&email, launch);
+            }
+        }
+        if let Some((slug, key)) = resolve_provider_selector(&state, sel) {
+            let label = switch_to_provider_account(&slug, &key)?;
+            println!("Active login is now {label} ({slug}).");
+            println!(
+                "New `{slug}` sessions will use it. Already-running sessions keep their \
+                 current account until they're restarted."
+            );
+            if launch.is_some() {
+                println!(
+                    "\nNote: `usagio start`/`continue` only launches the `claude` CLI; \
+                     launch `{slug}` yourself to pick up this switch."
+                );
+            }
+            return Ok(());
+        }
+        bail!("no account matches '{sel}'");
+    }
+
+    // No selector: unchanged v1 auto-pick behavior, Claude-only.
     if state.accounts.is_empty() {
         bail!("no accounts yet; capture one with: usagio capture");
     }
-    let email = select_email(&state, selector)?;
-    let label = switch_to(&email)?;
+    let email = select_email(&state, None)?;
+    finish_claude_switch(&email, launch)
+}
+
+/// Shared tail of `cmd_switch` for a resolved Claude email: perform the
+/// switch, print the confirmation, and optionally launch `claude`.
+fn finish_claude_switch(email: &str, launch: Option<Launch>) -> Result<()> {
+    let label = switch_to(email)?;
 
     println!("Active login is now {label}.");
     println!("New `claude` sessions will use it. Already-running sessions keep their");
@@ -452,6 +551,67 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
             }
         }
     }
+}
+
+/// Resolve `selector` (a full account key, or a unique case-insensitive
+/// prefix) against every non-Claude provider's captured accounts in state.
+/// Returns `(provider_slug, account_key)` on an unambiguous match. Mirrors
+/// `State::resolve`'s prefix-matching contract, scoped across all provider
+/// slots instead of one flat list, since account keys are only unique within
+/// a single provider (a Codex and a future provider could share an email).
+pub(crate) fn resolve_provider_selector(state: &State, selector: &str) -> Option<(String, String)> {
+    let sel = selector.trim();
+    if sel.is_empty() {
+        return None;
+    }
+    let sel_lc = sel.to_lowercase();
+    let mut exact: Vec<(String, String)> = Vec::new();
+    let mut prefix: Vec<(String, String)> = Vec::new();
+    for (slug, pa) in &state.providers {
+        for a in &pa.accounts {
+            let key_lc = a.key.to_lowercase();
+            if key_lc == sel_lc {
+                exact.push((slug.clone(), a.key.clone()));
+            } else if key_lc.starts_with(&sel_lc) {
+                prefix.push((slug.clone(), a.key.clone()));
+            }
+        }
+    }
+    if exact.len() == 1 {
+        return Some(exact.into_iter().next().unwrap());
+    }
+    if exact.is_empty() && prefix.len() == 1 {
+        return Some(prefix.into_iter().next().unwrap());
+    }
+    None
+}
+
+/// Make `key` the active login for the non-Claude provider `slug` (state
+/// v2's `State::providers[slug]`). Mirrors `switch_to`'s contract for Claude:
+/// rewrites the vendor's on-disk credential file via
+/// `Provider::write_active_account`, then commits the new `active` selection
+/// to state.json under the state lock. Returns the account key as the
+/// display label (non-Claude providers have no separate display-name
+/// resolution step the way Claude's identity backfill does).
+pub(crate) fn switch_to_provider_account(slug: &str, key: &str) -> Result<String> {
+    let provider = provider_by_slug(slug)?;
+    if !provider.capabilities().supports_switching {
+        bail!("switching is not supported for {slug}");
+    }
+    with_state_lock(|| {
+        let mut state = State::load()?;
+        let acct = state
+            .find_provider_account(slug, key)
+            .cloned()
+            .ok_or_else(|| anyhow!("no {slug} account matches '{key}'"))?;
+        let identity = acct.identity_snapshot();
+        provider
+            .write_active_account(&acct.secret_blob, &identity)
+            .map_err(|e| anyhow!("switching {slug} account: {e}"))?;
+        state.provider_accounts_mut(slug).active = Some(acct.key.clone());
+        state.save()?;
+        Ok(acct.key)
+    })
 }
 
 /// Resolve `selector` to an account email, or auto-pick when none is given.
@@ -1086,12 +1246,40 @@ impl Cell {
 fn row_from_account(a: &Account) -> Row {
     let c = a.cached_usage.as_ref();
     Row {
-        // v1 state stores only Claude accounts; phase 3 (state v2) tags each
-        // account with its containing provider slug and this becomes a real
-        // per-account lookup.
+        // `State::accounts` is Claude's dedicated slot (state v2 keeps it
+        // that way rather than folding it into `State::providers` — see
+        // `store.rs`'s `State` doc), so every row built from it is Claude's.
         provider_id: CLAUDE_SLUG.to_string(),
         needs_relogin: a.needs_relogin,
         email: a.key().to_string(),
+        session: cell_from_parts(
+            c.and_then(|c| c.session_pct),
+            c.and_then(|c| c.session_reset.as_deref()),
+        ),
+        weekly: cell_from_parts(
+            c.and_then(|c| c.weekly_pct),
+            c.and_then(|c| c.weekly_reset.as_deref()),
+        ),
+        opus: c.and_then(|c| {
+            c.opus_pct
+                .map(|p| cell_from_parts(Some(p), c.opus_reset.as_deref()))
+        }),
+        error: None,
+        fetched_at: c.map(|c| c.fetched_at),
+    }
+}
+
+/// Build a display row from a non-Claude provider's captured account
+/// (`State::providers[slug]`). Mirrors `row_from_account` exactly, just
+/// reading `ProviderAccount`'s generic `cached_usage` instead of `Account`'s.
+/// No `opus` window — that's a Claude-specific bucket (see `window_order`
+/// filtering it back out for providers that don't declare it).
+pub(crate) fn row_from_provider_account(slug: &str, a: &ProviderAccount) -> Row {
+    let c = a.cached_usage.as_ref();
+    Row {
+        provider_id: slug.to_string(),
+        needs_relogin: a.needs_relogin,
+        email: a.key.clone(),
         session: cell_from_parts(
             c.and_then(|c| c.session_pct),
             c.and_then(|c| c.session_reset.as_deref()),
@@ -1648,6 +1836,161 @@ fn active_refresh_cas(provider: &dyn Provider, acct: &mut Account) -> ActiveRefr
 }
 
 // ---------------------------------------------------------------------------
+// Active-refresh CAS dispatch for non-Claude providers (state v2)
+// ---------------------------------------------------------------------------
+
+/// Run the active-account CAS refresh for a non-Claude provider whose active
+/// login is tracked in `State::providers[slug]` (currently only `codex`).
+/// Gap-4 of the codex-switch-e2e work: `active_refresh_cas` above is
+/// irreducibly Claude-shaped (it operates on `Account`/the macOS keychain
+/// slot), so rather than force Codex through that function's signature, this
+/// is the per-provider dispatch point `main.rs::active_refresh_cas` used to
+/// lack — for Codex it drives `providers::codex::oauth::active_refresh_cas`
+/// (the file-CAS on `auth.json`, already implemented and unit-tested) instead
+/// of any Claude-shaped flow. Gated on `Provider::supports_active_refresh()`
+/// exactly like the Claude path above, so a provider that hasn't opted in
+/// costs nothing here.
+fn refresh_provider_active_account(slug: &str) {
+    let Some(provider) = providers::get(slug) else {
+        return;
+    };
+    if !provider.supports_active_refresh() {
+        return;
+    }
+    let result = with_state_lock(|| {
+        let mut state = State::load()?;
+        let Some(active_key) = state.provider_accounts(slug).and_then(|p| p.active.clone()) else {
+            return Ok(()); // nothing captured / nothing active for this provider yet
+        };
+        let Some(acct) = state.find_provider_account(slug, &active_key).cloned() else {
+            return Ok(()); // active key points at an account that's since been removed
+        };
+        if acct.needs_relogin {
+            return Ok(());
+        }
+        let outcome = provider_active_refresh(slug, &acct);
+        match outcome {
+            ProviderRefreshOutcome::Nothing => return Ok(()),
+            ProviderRefreshOutcome::Refreshed(new_blob, grant) => {
+                if let Some(a) = state.find_provider_account_mut(slug, &active_key) {
+                    a.secret_blob = new_blob;
+                    a.access_token = grant.access.clone();
+                    if let Some(r) = grant.refresh.clone() {
+                        a.refresh_token = r;
+                    }
+                    a.expires_at = Utc::now().timestamp() + grant.expires_in_secs;
+                    a.needs_relogin = false;
+                }
+                state.save()?;
+            }
+            ProviderRefreshOutcome::InvalidGrant => {
+                // Vendor rejected our refresh_token — user must re-login. Flip
+                // the flag so the menu bar row surfaces "needs re-login" instead
+                // of silently retrying the same dead token every poll cycle.
+                if let Some(a) = state.find_provider_account_mut(slug, &active_key) {
+                    if !a.needs_relogin {
+                        logging::log(&format!(
+                            "event=needs_relogin_flipped provider={slug} \
+                             account={active_key} reason=invalid_grant"
+                        ));
+                        a.needs_relogin = true;
+                    }
+                }
+                state.save()?;
+            }
+            ProviderRefreshOutcome::Failed => {
+                // Already logged; leave state untouched, retry next cycle.
+            }
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
+        logging::log(&format!(
+            "poll: {slug} active-refresh CAS state operation failed: {e:#}"
+        ));
+    }
+}
+
+/// Outcome of a provider-specific active-account refresh cycle, so the caller
+/// can distinguish "vendor rejected the grant → flip needs_relogin" from
+/// "network hiccup → retry next cycle" from "nothing to do".
+enum ProviderRefreshOutcome {
+    /// Fresh enough already, or CAS lost / drift adopted (state was already
+    /// updated in-place by the CAS primitive); caller does nothing.
+    Nothing,
+    /// New blob + token grant to persist against the active account.
+    Refreshed(String, TokenGrant),
+    /// Vendor returned invalid_grant (RFC 6749 400/401). The refresh token
+    /// is dead — user must re-login. Caller flips `needs_relogin`.
+    InvalidGrant,
+    /// Anything else (network transient, 5xx, parse error, etc.) — already
+    /// logged. Leave state alone, retry next cycle.
+    Failed,
+}
+
+/// The provider-specific half of `refresh_provider_active_account`: drive
+/// whatever CAS primitive `slug` implements and normalize the outcome. Only
+/// Codex is wired today; a future provider adds an arm here rather than a
+/// parallel copy of the state-locking logic above.
+fn provider_active_refresh(slug: &str, acct: &ProviderAccount) -> ProviderRefreshOutcome {
+    match slug {
+        #[cfg(feature = "codex")]
+        "codex" => codex_active_refresh(acct),
+        _ => ProviderRefreshOutcome::Nothing,
+    }
+}
+
+/// Codex's CAS half: run `codex::oauth::active_refresh_cas` (skew + the
+/// vendor's own ~8-day session-staleness cadence, see that function's doc)
+/// against `acct.secret_blob` as the last-known-good comparison point. On
+/// `Refreshed`/`Adopted`, re-read the live `auth.json` via
+/// `capture_current_login` — reusing the provider's own parsing instead of
+/// hand-rolling a second blob->TokenGrant conversion here — so the result is
+/// guaranteed consistent with what a fresh capture would see.
+#[cfg(feature = "codex")]
+fn codex_active_refresh(acct: &ProviderAccount) -> ProviderRefreshOutcome {
+    use providers::codex::oauth::{
+        active_refresh_cas, CasOutcome, RefreshError, SESSION_STALE_AFTER_DAYS,
+    };
+    let stale_after_secs = SESSION_STALE_AFTER_DAYS * 24 * 60 * 60;
+    match active_refresh_cas(
+        credentials::REFRESH_SKEW_SECS,
+        stale_after_secs,
+        Some(&acct.secret_blob),
+    ) {
+        Ok(CasOutcome::Fresh) => ProviderRefreshOutcome::Nothing,
+        Ok(CasOutcome::Refreshed) | Ok(CasOutcome::Adopted(_)) => {
+            let Some(provider) = providers::get("codex") else {
+                return ProviderRefreshOutcome::Nothing;
+            };
+            match provider.capture_current_login() {
+                Ok(Some(captured)) => {
+                    ProviderRefreshOutcome::Refreshed(captured.secret_blob, captured.tokens)
+                }
+                Ok(None) => ProviderRefreshOutcome::Nothing,
+                Err(e) => {
+                    logging::log(&format!(
+                        "event=active_refresh_cas_failed provider=codex \
+                         reason=post_cas_reread:{e}"
+                    ));
+                    ProviderRefreshOutcome::Failed
+                }
+            }
+        }
+        Err(RefreshError::InvalidGrant) => {
+            logging::log("event=active_refresh_cas_failed provider=codex reason=invalid_grant");
+            ProviderRefreshOutcome::InvalidGrant
+        }
+        Err(e) => {
+            logging::log(&format!(
+                "event=active_refresh_cas_failed provider=codex reason={e}"
+            ));
+            ProviderRefreshOutcome::Failed
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Usage refresh (the ONE network path)
 // ---------------------------------------------------------------------------
 
@@ -1719,7 +2062,14 @@ fn refresh_usage_cache() -> RefreshOutcome {
         // process, and it backs off cleanly the instant it observes Claude
         // Code touched the same slot. Every other account uses the plain
         // network-outside-the-lock refresh below.
-        let is_active = state.active.as_deref() == Some(email.as_str());
+        // H3/gap-4 (v0.5.0 codeaudit + codex-switch-e2e): `supports_active_refresh`
+        // used to be read nowhere outside its own doc comment — this is the
+        // gate that makes it load-bearing. A provider that can't do a
+        // programmatic refresh grant (or, before this change, hasn't
+        // explicitly opted in) falls through to the plain `ensure_fresh`
+        // path below even for its active account, same as an inactive one.
+        let is_active =
+            state.active.as_deref() == Some(email.as_str()) && provider.supports_active_refresh();
         if is_active {
             let email_owned = email.clone();
             let cas = with_state_lock(|| {
@@ -2135,6 +2485,16 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
     credentials::refresh_inactive_if_stale(State::load().ok().and_then(|s| s.active).as_deref());
 
     let refresh = refresh_usage_cache();
+    // Gap-4 (codex-switch-e2e): drive the active-account CAS refresh for
+    // every non-Claude provider that has one wired (currently just codex).
+    // Best-effort and self-contained — logs and moves on rather than
+    // affecting `refresh`'s rate-limit signal, which only tracks the usage
+    // endpoint above.
+    for p in providers::all() {
+        if p.provider_id() != CLAUDE_SLUG {
+            refresh_provider_active_account(p.provider_id());
+        }
+    }
     let state = State::load()?;
     if state.accounts.is_empty() {
         return Ok(CycleOutcome {
@@ -2260,20 +2620,16 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
     })
 }
 
-/// Fire a native macOS notification (best effort).
+/// Fire a native "usagio: {msg}" notification (best effort, cross-platform).
+/// Delegates to `notifications::fire_plain`, which routes through notify-rust
+/// so macOS/Linux/Windows all get a real notification — the previous osascript
+/// path silently no-op'd on Linux and Windows. Best-effort: failures are
+/// logged (R2-EH-04) so H6's user-facing notification guarantee has
+/// diagnostic backing when the channel is unavailable (headless SSH, no
+/// notification daemon, denied permission, etc.).
 fn notify(msg: &str) {
-    let script = format!("display notification {msg:?} with title \"usagio\"");
-    // R2-EH-04: log osascript spawn/exit failures so H6's user-facing
-    // notification guarantee has diagnostic backing when the channel is
-    // silently unavailable (headless SSH, Automation permission denied).
-    match std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .status()
-    {
-        Ok(s) if s.success() => {}
-        Ok(s) => logging::log(&format!("notify: osascript exited {:?}", s.code())),
-        Err(e) => logging::log(&format!("notify: osascript spawn failed: {e}")),
+    if let Err(e) = notifications::fire_plain(msg) {
+        logging::log(&format!("notify: fire_plain failed: {e}"));
     }
 }
 
@@ -2701,12 +3057,47 @@ pub(crate) fn launch_agent_exe_path() -> std::path::PathBuf {
     sibling_app_bundle_exe(&stable).unwrap_or(stable)
 }
 
-/// Given a path to `.../<version>/bin/usagio` (or a symlink resolving to
-/// it), look for `.../<version>/usagio.app/Contents/MacOS/usagio` next to
-/// it. Checks both the path as given and its canonicalized form, so tests
-/// can point directly at a `bin/` directory without a real Homebrew symlink
-/// chain.
+/// Given a path to `.../bin/usagio` — typically the stable Homebrew symlink
+/// `<prefix>/bin/usagio` — resolve a **version-stable** path to the sibling
+/// `usagio.app/Contents/MacOS/usagio` that survives `brew upgrade`.
+///
+/// Homebrew keeps two stable roots per formula: `<prefix>/bin/<formula>`
+/// (symlink to the current Cellar bin), and `<prefix>/opt/<formula>/`
+/// (symlink to the current Cellar root — the whole version dir). Both point
+/// at the just-installed version and are updated atomically on `brew upgrade`.
+/// We MUST use one of those, not the canonicalized `<prefix>/Cellar/usagio/<version>/...`
+/// path, because Homebrew deletes the old version's Cellar directory on
+/// upgrade — pinning the LaunchAgent to the versioned path would silently
+/// break autostart on every user's next `brew upgrade`.
+///
+/// Resolution order:
+///   1. Given `<prefix>/bin/usagio`, derive `<prefix>` (bin's parent) and
+///      probe `<prefix>/opt/usagio/usagio.app/Contents/MacOS/usagio`. Homebrew
+///      creates that symlink whenever a formula ships a bundle. This is the
+///      preferred path — brew keeps it valid across upgrades.
+///   2. Given a non-brew layout (from-source install, custom deployment),
+///      look for `usagio.app` as a sibling of the binary's version dir
+///      (`../usagio.app/Contents/MacOS/usagio` from `bin/`). Not upgrade-
+///      stable for brew but doesn't apply to brew installs.
+///   3. Otherwise, `None` — callers fall back to the bare `stable_exe_path()`.
 fn sibling_app_bundle_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    // (1) Homebrew stable opt-path — the correct answer for a brew install.
+    if let Some(bin_dir) = exe.parent() {
+        if let Some(prefix) = bin_dir.parent() {
+            let opt_bundle = prefix
+                .join("opt")
+                .join("usagio")
+                .join("usagio.app")
+                .join("Contents")
+                .join("MacOS")
+                .join("usagio");
+            if opt_bundle.exists() {
+                return Some(opt_bundle);
+            }
+        }
+    }
+    // (2) Non-brew: sibling in the version dir. Match on canonicalized form
+    // too so a symlinked bin/usagio still finds a real sibling app.
     let mut candidates = vec![exe.to_path_buf()];
     if let Ok(resolved) = std::fs::canonicalize(exe) {
         candidates.push(resolved);

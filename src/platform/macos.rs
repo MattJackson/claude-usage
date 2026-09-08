@@ -98,130 +98,265 @@ impl MenuBackend for MacOsMenu {
 
 pub struct MacOsSecrets;
 
-impl SecretStore for MacOsSecrets {
-    fn get(&self, service: &str, account: &str) -> Result<Option<String>> {
-        // Only exit code 44 ("SecItem not found" per <Security/SecBase.h> /
-        // `security(1)` conventions) is a genuine "not present". Any other
-        // non-zero — keychain locked, permission denied, IPC failure —
-        // surfaces as Err so callers like `sync_active_from_keychain` treat
-        // it as "don't touch anything" rather than "assume gone" (which
-        // would let a subsequent switch overwrite a still-valid token).
-        // See H7 in the round-1 codeaudit findings.
-        let out = Command::new("security")
-            .args(["find-generic-password", "-s", service, "-a", account, "-w"])
-            .output()
-            .context("running `security find-generic-password`")?;
-        let result = if !out.status.success() {
-            match out.status.code() {
-                Some(44) => Ok(None),
-                other => {
-                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    Err(anyhow::anyhow!(
-                        "`security find-generic-password` failed \
-                         (exit {other:?}) for service={service} account={account}: {stderr}",
-                    ))
-                }
-            }
-        } else {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            Ok(if s.is_empty() { None } else { Some(s) })
-        };
-        // Belt-and-suspenders: log every keychain touch so a bug that leaves
-        // nothing else logged still shows up here (M4-audit finding).
-        crate::logging::log(&format!(
-            "event=keychain_read svc={service} acct={account} result={}",
-            match &result {
-                Ok(Some(_)) => "ok".to_string(),
-                Ok(None) => "not_found".to_string(),
-                Err(e) => format!("err:{e:#}"),
-            }
-        ));
-        result
-    }
+// ---------------------------------------------------------------------------
+// Real (subprocess-backed) implementation. Lives in ordinary free functions —
+// not gated on `cfg(not(test))` themselves — so the one `#[ignore]`d test
+// below that deliberately exercises the real login keychain can still call
+// them directly by name. Only the `SecretStore for MacOsSecrets` *trait impl*
+// is compiled differently between test and non-test builds (see below); that
+// split is what keeps `cargo test` from ever invoking `security(1)` through
+// the trait-dispatched path every other caller in the crate uses
+// (`platform().secrets()`).
+// ---------------------------------------------------------------------------
 
-    fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
-        // L5 (round-1 codeaudit): passing the secret via argv (`-w <secret>`)
-        // briefly exposes it in `ps(1)` output. Acknowledged limitation of
-        // `security(1)` — its stdin variant does not exist for
-        // add-generic-password. Alternative (Security.framework FFI) triggers
-        // "always allow?" keychain prompts on every launch of an unsigned
-        // brew-installed binary (see header comment at the top of this file).
-        // Kept as-is; documented as SEC-2 in security posture notes.
-        //
-        // M4-audit finding: `add-generic-password -U` (update-in-place)
-        // triggers a SecurityAgent "Keychain Not Found"/"always allow?"
-        // prompt when the existing item's ACL doesn't already list this
-        // (unsigned) binary — e.g. an item Claude Code itself created. Delete
-        // the item first (ignoring "not found", exit 44) and add it fresh
-        // WITHOUT `-U`, so the new item's ACL only ever contains usagio and
-        // no update-ACL negotiation with a differently-ACL'd existing item
-        // ever happens.
-        let result = (|| -> Result<()> {
-            let del = Command::new("security")
-                .args(["delete-generic-password", "-s", service, "-a", account])
-                .output()
-                .context("running `security delete-generic-password` (pre-set)")?;
-            if !del.status.success() && del.status.code() != Some(44) {
-                let stderr = String::from_utf8_lossy(&del.stderr);
+// ---- security(1) hang guard (robustness-01) ------------------------------
+//
+// A locked keychain, or a SecurityAgent "Allow/Deny" dialog with no
+// interactive user around to dismiss it (the common case: usagio runs as a
+// headless menu-bar poller), makes `security(1)` block indefinitely. Every
+// `Command::new("security")` invocation in this module is routed through
+// `security_command` below, which wraps it in `timeout(1) SECURITY_TIMEOUT_SECS`
+// so the poll thread can never hang forever on a keychain call. `security(1)`
+// normally completes in well under 100ms; 5s is generous headroom while still
+// bounding the worst case.
+const SECURITY_TIMEOUT_SECS: &str = "5";
+
+/// Exit code `timeout(1)` uses (GNU coreutils convention) to signal "the
+/// wrapped command was killed because it exceeded the deadline".
+const TIMEOUT_EXIT_CODE: i32 = 124;
+
+static TIMEOUT_BINARY_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static TIMEOUT_FALLBACK_LOGGED: std::sync::Once = std::sync::Once::new();
+
+/// Probes for a `timeout` binary on PATH (cached for the process lifetime).
+/// macOS does not ship `/usr/bin/timeout` — it's only present if coreutils
+/// was brew-installed (unprefixed, i.e. `brew install coreutils
+/// --with-default-names`, or a PATH that resolves `timeout` to `gtimeout`
+/// some other way).
+fn timeout_binary_available() -> bool {
+    *TIMEOUT_BINARY_AVAILABLE.get_or_init(|| {
+        Command::new("timeout")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Build a `security(1)` invocation. Wraps it in `timeout(1)
+/// SECURITY_TIMEOUT_SECS` when available so a locked keychain or an
+/// unattended SecurityAgent dialog can't hang the poll thread forever. Falls
+/// back to a bare `security` command (no hang guard) if `timeout` isn't on
+/// PATH — logs once at the first fallback use, then silently falls through
+/// on every subsequent call.
+fn security_command(args: &[&str]) -> Command {
+    if timeout_binary_available() {
+        let mut cmd = Command::new("timeout");
+        cmd.arg(SECURITY_TIMEOUT_SECS);
+        cmd.arg("security");
+        cmd.args(args);
+        cmd
+    } else {
+        TIMEOUT_FALLBACK_LOGGED.call_once(|| {
+            crate::logging::log(
+                "event=keychain_timeout_unavailable msg=\"'timeout' binary not on PATH; \
+                 security(1) calls run WITHOUT a hang guard\"",
+            );
+        });
+        let mut cmd = Command::new("security");
+        cmd.args(args);
+        cmd
+    }
+}
+
+/// True if `status` represents a `timeout(1)`-enforced kill (exit 124).
+/// Only meaningful when the command was actually run via `security_command`
+/// with the `timeout` wrapper in effect (see `timeout_binary_available`).
+fn is_timeout_exit(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(TIMEOUT_EXIT_CODE)
+}
+
+fn real_get(service: &str, account: &str) -> Result<Option<String>> {
+    // Only exit code 44 ("SecItem not found" per <Security/SecBase.h> /
+    // `security(1)` conventions) is a genuine "not present". Any other
+    // non-zero — keychain locked, permission denied, IPC failure —
+    // surfaces as Err so callers like `sync_active_from_keychain` treat
+    // it as "don't touch anything" rather than "assume gone" (which
+    // would let a subsequent switch overwrite a still-valid token).
+    // See H7 in the round-1 codeaudit findings.
+    let out = security_command(&["find-generic-password", "-s", service, "-a", account, "-w"])
+        .output()
+        .context("running `security find-generic-password`")?;
+    let timed_out = is_timeout_exit(&out.status);
+    let result = if timed_out {
+        // robustness-01: locked keychain / unattended SecurityAgent dialog.
+        // Distinct error branch, but still just an Err to the caller — same
+        // "don't touch anything" treatment as any other failure above.
+        Err(anyhow::anyhow!(
+            "`security find-generic-password` timed out after {SECURITY_TIMEOUT_SECS}s \
+             (locked keychain or an unattended SecurityAgent dialog) for \
+             service={service} account={account}",
+        ))
+    } else if !out.status.success() {
+        match out.status.code() {
+            Some(44) => Ok(None),
+            other => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                Err(anyhow::anyhow!(
+                    "`security find-generic-password` failed \
+                     (exit {other:?}) for service={service} account={account}: {stderr}",
+                ))
+            }
+        }
+    } else {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok(if s.is_empty() { None } else { Some(s) })
+    };
+    // Belt-and-suspenders: log every keychain touch so a bug that leaves
+    // nothing else logged still shows up here (M4-audit finding).
+    crate::logging::log(&format!(
+        "event={} svc={service} acct={account} result={}",
+        if timed_out {
+            "keychain_read_timeout"
+        } else {
+            "keychain_read"
+        },
+        match &result {
+            Ok(Some(_)) => "ok".to_string(),
+            Ok(None) => "not_found".to_string(),
+            Err(e) => format!("err:{e:#}"),
+        }
+    ));
+    result
+}
+
+fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
+    // L5 (round-1 codeaudit): passing the secret via argv (`-w <secret>`)
+    // briefly exposes it in `ps(1)` output. Acknowledged limitation of
+    // `security(1)` — its stdin variant does not exist for
+    // add-generic-password. Alternative (Security.framework FFI) triggers
+    // "always allow?" keychain prompts on every launch of an unsigned
+    // brew-installed binary (see header comment at the top of this file).
+    // Kept as-is; documented as SEC-2 in security posture notes.
+    //
+    // M4-audit finding: `add-generic-password -U` (update-in-place) triggers
+    // a SecurityAgent "Keychain Not Found"/"always allow?" prompt when the
+    // existing item's ACL doesn't already list this (unsigned) binary — e.g.
+    // an item Claude Code itself created. Delete the item first (ignoring
+    // "not found", exit 44) and add it fresh WITHOUT `-U`, so the new item's
+    // ACL only ever contains usagio and no update-ACL negotiation with a
+    // differently-ACL'd existing item ever happens.
+    let mut timed_out = false;
+    let result = (|| -> Result<()> {
+        let del = security_command(&["delete-generic-password", "-s", service, "-a", account])
+            .output()
+            .context("running `security delete-generic-password` (pre-set)")?;
+        if is_timeout_exit(&del.status) {
+            timed_out = true;
+            bail!(
+                "`security delete-generic-password` (pre-set) timed out after \
+                 {SECURITY_TIMEOUT_SECS}s (locked keychain or an unattended SecurityAgent \
+                 dialog) for service={service} account={account}",
+            );
+        }
+        if !del.status.success() && del.status.code() != Some(44) {
+            let stderr = String::from_utf8_lossy(&del.stderr);
+            bail!(
+                "`security delete-generic-password` (pre-set) failed \
+                 (exit {:?}) for service={service} account={account}: {}",
+                del.status.code(),
+                stderr.trim(),
+            );
+        }
+        let out = security_command(&[
+            "add-generic-password",
+            "-s",
+            service,
+            "-a",
+            account,
+            "-w",
+            secret,
+        ])
+        .output()
+        .context("running `security add-generic-password`")?;
+        if is_timeout_exit(&out.status) {
+            timed_out = true;
+            bail!(
+                "`security add-generic-password` timed out after {SECURITY_TIMEOUT_SECS}s \
+                 (locked keychain or an unattended SecurityAgent dialog) for \
+                 service={service} account={account}",
+            );
+        }
+        if !out.status.success() {
+            bail!("`security add-generic-password` failed for service={service} account={account}");
+        }
+        Ok(())
+    })();
+    crate::logging::log(&format!(
+        "event={} svc={service} acct={account} result={}",
+        if timed_out {
+            "keychain_write_timeout"
+        } else {
+            "keychain_write"
+        },
+        match &result {
+            Ok(()) => "ok".to_string(),
+            Err(e) => format!("err:{e:#}"),
+        }
+    ));
+    result
+}
+
+fn real_delete(service: &str, account: &str) -> Result<()> {
+    // Same class as H7 (round-1 codeaudit): distinguish "item not found"
+    // (exit 44, benign) from every other failure. Collapsing all non-zero
+    // to Ok(()) masked keychain-locked / permission errors, which then
+    // let callers assume the delete "succeeded" and move on.
+    let out = security_command(&["delete-generic-password", "-s", service, "-a", account])
+        .output()
+        .context("running `security delete-generic-password`")?;
+    if is_timeout_exit(&out.status) {
+        // robustness-01: same hang guard as real_get/real_set.
+        crate::logging::log(&format!(
+            "event=keychain_delete_timeout svc={service} acct={account}"
+        ));
+        bail!(
+            "`security delete-generic-password` timed out after {SECURITY_TIMEOUT_SECS}s \
+             (locked keychain or an unattended SecurityAgent dialog) for \
+             service={service} account={account}",
+        );
+    }
+    if !out.status.success() {
+        match out.status.code() {
+            Some(44) => return Ok(()),
+            other => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
                 bail!(
-                    "`security delete-generic-password` (pre-set) failed \
-                     (exit {:?}) for service={service} account={account}: {}",
-                    del.status.code(),
+                    "`security delete-generic-password` failed \
+                     (exit {other:?}) for service={service} account={account}: {}",
                     stderr.trim(),
                 );
             }
-            let status = Command::new("security")
-                .args([
-                    "add-generic-password",
-                    "-s",
-                    service,
-                    "-a",
-                    account,
-                    "-w",
-                    secret,
-                ])
-                .status()
-                .context("running `security add-generic-password`")?;
-            if !status.success() {
-                bail!(
-                    "`security add-generic-password` failed for service={service} account={account}"
-                );
-            }
-            Ok(())
-        })();
-        crate::logging::log(&format!(
-            "event=keychain_write svc={service} acct={account} result={}",
-            match &result {
-                Ok(()) => "ok".to_string(),
-                Err(e) => format!("err:{e:#}"),
-            }
-        ));
-        result
+        }
+    }
+    Ok(())
+}
+
+/// Production `SecretStore` impl: shells out to `security(1)`. Compiled only
+/// for non-test builds so `cargo test` can never reach the real login
+/// keychain through `platform().secrets()` — see the `cfg(test)` impl below.
+#[cfg(not(test))]
+impl SecretStore for MacOsSecrets {
+    fn get(&self, service: &str, account: &str) -> Result<Option<String>> {
+        real_get(service, account)
+    }
+
+    fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
+        real_set(service, account, secret)
     }
 
     fn delete(&self, service: &str, account: &str) -> Result<()> {
-        // Same class as H7 (round-1 codeaudit): distinguish "item not found"
-        // (exit 44, benign) from every other failure. Collapsing all non-zero
-        // to Ok(()) masked keychain-locked / permission errors, which then
-        // let callers assume the delete "succeeded" and move on.
-        let out = Command::new("security")
-            .args(["delete-generic-password", "-s", service, "-a", account])
-            .output()
-            .context("running `security delete-generic-password`")?;
-        if !out.status.success() {
-            match out.status.code() {
-                Some(44) => return Ok(()),
-                other => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    bail!(
-                        "`security delete-generic-password` failed \
-                         (exit {other:?}) for service={service} account={account}: {}",
-                        stderr.trim(),
-                    );
-                }
-            }
-        }
-        Ok(())
+        real_delete(service, account)
     }
 
     fn list(&self, _service: &str) -> Result<Vec<String>> {
@@ -229,6 +364,72 @@ impl SecretStore for MacOsSecrets {
         // Callers today track accounts via state.json; this stays empty
         // until a real caller needs it.
         Ok(Vec::new())
+    }
+}
+
+/// Test-only `SecretStore` impl: a process-local in-memory map, never a
+/// subprocess. Every unit / integration test that reaches `MacOsSecrets`
+/// through the `SecretStore` trait (e.g. via `platform().secrets()`) lands
+/// here instead of touching the developer's real login keychain — the crash
+/// this module exists to fix (SecurityAgent prompts + keychain writes fired
+/// by `cargo test`). The `#[ignore]`d `secret_store_roundtrip` test below
+/// deliberately bypasses this impl (calling `real_get`/`real_set`/
+/// `real_delete` directly) because its entire point is to exercise the real
+/// keychain, on demand, under `--ignored`.
+#[cfg(test)]
+impl SecretStore for MacOsSecrets {
+    fn get(&self, service: &str, account: &str) -> Result<Option<String>> {
+        Ok(in_memory::get(service, account))
+    }
+
+    fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
+        in_memory::set(service, account, secret);
+        Ok(())
+    }
+
+    fn delete(&self, service: &str, account: &str) -> Result<()> {
+        in_memory::delete(service, account);
+        Ok(())
+    }
+
+    fn list(&self, _service: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Backing store for the `cfg(test)` `SecretStore` impl above. A plain
+/// `Mutex<HashMap>` keyed by `(service, account)` — process-local, cleared
+/// only on process exit, which is exactly right for `cargo test` where each
+/// test binary is its own process and tests within it may legitimately want
+/// to observe state written by an earlier `set` in the same run (mirroring
+/// how the real keychain persists across calls within a process).
+#[cfg(test)]
+mod in_memory {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static STORE: Mutex<Option<HashMap<(String, String), String>>> = Mutex::new(None);
+
+    fn with_store<T>(f: impl FnOnce(&mut HashMap<(String, String), String>) -> T) -> T {
+        let mut guard = STORE.lock().unwrap_or_else(|e| e.into_inner());
+        f(guard.get_or_insert_with(HashMap::new))
+    }
+
+    pub(super) fn get(service: &str, account: &str) -> Option<String> {
+        with_store(|m| m.get(&(service.to_string(), account.to_string())).cloned())
+    }
+
+    pub(super) fn set(service: &str, account: &str, secret: &str) {
+        with_store(|m| {
+            m.insert(
+                (service.to_string(), account.to_string()),
+                secret.to_string(),
+            )
+        });
+    }
+
+    pub(super) fn delete(service: &str, account: &str) {
+        with_store(|m| m.remove(&(service.to_string(), account.to_string())));
     }
 }
 
@@ -243,6 +444,50 @@ impl MacOsAutostart {
             .join("Library")
             .join("LaunchAgents")
             .join(format!("{label}.plist")))
+    }
+
+    /// Best-effort `lsregister -f -R -trusted <app.app>` so Launch Services
+    /// knows about a freshly-installed bundle before anything (notably the
+    /// first notification) tries to resolve it. `binary` is expected to be
+    /// `<app>.app/Contents/MacOS/<name>`; walk up three levels to the `.app`
+    /// directory. A from-source / bare-binary install has no such bundle —
+    /// `parent()` chains bottom out to `None` (or the resolved dir doesn't
+    /// end in `.app`) and this is a silent no-op, same as any other failure
+    /// here (wrong lsregister path across macOS versions, missing bundle,
+    /// etc.) — never fatal to `install`.
+    fn register_with_launch_services(binary: &Path) {
+        const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+
+        let Some(app_bundle) = binary
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+        else {
+            return;
+        };
+        if app_bundle.extension().and_then(|e| e.to_str()) != Some("app") {
+            return;
+        }
+        if !Path::new(LSREGISTER).is_file() {
+            crate::logging::log(&format!(
+                "lsregister not found at {LSREGISTER}; skipping Launch Services registration"
+            ));
+            return;
+        }
+        match Command::new(LSREGISTER)
+            .args(["-f", "-R", "-trusted"])
+            .arg(app_bundle)
+            .status()
+        {
+            Ok(s) if s.success() => {
+                crate::logging::log(&format!(
+                    "registered {} with Launch Services",
+                    app_bundle.display()
+                ));
+            }
+            Ok(s) => crate::logging::log(&format!("lsregister exited with {s}")),
+            Err(e) => crate::logging::log(&format!("lsregister could not run: {e}")),
+        }
     }
 }
 
@@ -294,6 +539,19 @@ impl Autostart for MacOsAutostart {
         }
         std::fs::write(&path, plist).context("writing LaunchAgent plist")?;
 
+        // Register the app bundle with Launch Services before the LaunchAgent
+        // starts it. Without this, a freshly-installed `.app` (from `usagio
+        // install`) is unknown to LS, and the first `notify-rust` call (via
+        // `mac-notification-sys`, whose sound-name literal is `"use_default"`)
+        // pops a "Where is use_default?" Choose Application dialog instead of
+        // sending the notification — LS is trying to resolve a bundle
+        // identifier it's never seen. Best-effort: `lsregister`'s path can
+        // move across macOS versions, and a from-source install's `binary`
+        // isn't inside a `.app` at all, so any failure here just leaves the
+        // (also best-effort) notification path unregistered — never fatal to
+        // `install`.
+        Self::register_with_launch_services(binary);
+
         // Unload first to allow reload without a stale process holding the label.
         let _ = Command::new("launchctl")
             .args(["unload", &path.to_string_lossy()])
@@ -315,6 +573,30 @@ impl Autostart for MacOsAutostart {
             .status();
         if path.exists() {
             std::fs::remove_file(&path).context("removing plist")?;
+        }
+        // Also purge any legacy System Events login item that a pre-v0.4.3
+        // usagio (or its `claude-usage` predecessor) registered via the
+        // now-removed "Launch at login" menu toggle. Left in place, macOS
+        // re-launches the stale binary at every login even after the plist
+        // is gone — the exact bug that had usagio silently respawning
+        // post-uninstall. Best-effort: osascript exits non-zero if the item
+        // is already absent (the desired state), so all output is swallowed.
+        // Wrap in `timeout(1) 3` so a first-run TCC Automation dialog can't
+        // hang `brew uninstall` indefinitely — this login-item purge is
+        // best-effort defense-in-depth; if TCC prompts and the user doesn't
+        // dismiss it in 3 seconds, we move on (the plist deletion above is
+        // what actually stops autostart).
+        for name in ["usagio", "claude-usage"] {
+            let _ = Command::new("timeout")
+                .args([
+                    "3",
+                    "osascript",
+                    "-e",
+                    &format!("tell application \"System Events\" to delete login item \"{name}\""),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
         }
         Ok(())
     }
@@ -392,28 +674,81 @@ mod tests {
         });
     }
 
+    /// robustness-01: `security_command` must actually wrap the invocation in
+    /// `timeout(1) SECURITY_TIMEOUT_SECS security <args...>` — never invokes
+    /// the real keychain (no `security` process launched or asserted on;
+    /// this only inspects the `std::process::Command` we're about to run).
+    #[test]
+    fn security_command_wraps_with_timeout_when_available() {
+        // Skip (rather than fail) on a machine with no `timeout` on PATH —
+        // in that mode `security_command` deliberately falls back to a bare
+        // `security` invocation, which is covered by the test below.
+        if !timeout_binary_available() {
+            eprintln!("skipping: no `timeout` binary on PATH in this test environment");
+            return;
+        }
+        let cmd = security_command(&["find-generic-password", "-s", "svc", "-a", "acct", "-w"]);
+        assert_eq!(cmd.get_program(), "timeout");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                SECURITY_TIMEOUT_SECS.to_string(),
+                "security".to_string(),
+                "find-generic-password".to_string(),
+                "-s".to_string(),
+                "svc".to_string(),
+                "-a".to_string(),
+                "acct".to_string(),
+                "-w".to_string(),
+            ]
+        );
+    }
+
+    /// robustness-01: `is_timeout_exit` must key off exit code 124 (the
+    /// `timeout(1)` convention) specifically, and not treat every non-zero
+    /// exit — e.g. `security`'s own "not found" code 44 — as a timeout.
+    #[test]
+    fn is_timeout_exit_matches_only_exit_124() {
+        use std::os::unix::process::ExitStatusExt;
+        let timed_out = std::process::ExitStatus::from_raw(124 << 8);
+        let not_found = std::process::ExitStatus::from_raw(44 << 8);
+        let success = std::process::ExitStatus::from_raw(0);
+        assert!(is_timeout_exit(&timed_out));
+        assert!(!is_timeout_exit(&not_found));
+        assert!(!is_timeout_exit(&success));
+    }
+
     /// SecretStore round-trip against the real login keychain. `#[ignore]`d by
     /// default so `cargo test` doesn't touch the developer's keychain — run
     /// explicitly with `cargo test -- --ignored secret_store_roundtrip`.
     /// Uses a per-run unique service name and cleans up on both success and
     /// failure paths.
+    ///
+    /// Calls `real_get`/`real_set`/`real_delete` directly rather than going
+    /// through `MacOsSecrets`'s `SecretStore` impl: under `cfg(test)` that
+    /// impl is the in-memory mock (see above), so dispatching through the
+    /// trait here would silently test the mock instead of the real
+    /// `security(1)` subprocess path this test exists to exercise.
     #[test]
     #[ignore = "touches the real login keychain; run with --ignored"]
     fn secret_store_roundtrip() {
         let service = format!("usagio-platform-test-{}", std::process::id());
         let account = "roundtrip";
         let secret = "hunter2";
-        let ss = MacOsSecrets;
 
         // Ensure a clean starting point.
-        let _ = ss.delete(&service, account);
+        let _ = real_delete(&service, account);
 
-        ss.set(&service, account, secret).expect("set");
-        let got = ss.get(&service, account).expect("get");
+        real_set(&service, account, secret).expect("set");
+        let got = real_get(&service, account).expect("get");
         assert_eq!(got.as_deref(), Some(secret));
 
-        ss.delete(&service, account).expect("delete");
-        let after = ss.get(&service, account).expect("get after delete");
+        real_delete(&service, account).expect("delete");
+        let after = real_get(&service, account).expect("get after delete");
         assert!(after.is_none(), "secret still present after delete");
     }
 
