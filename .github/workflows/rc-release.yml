@@ -179,7 +179,12 @@ jobs:
       - name: Publish GitHub Release asset
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          generate_release_notes: true
+          # M13 (mirrored from release.yml): only build-macos generates
+          # release notes. Three parallel jobs calling action-gh-release
+          # against the same tag with generate_release_notes: true race to
+          # publish and the losers can lose or duplicate the notes. This job
+          # still uploads its own artifacts additively.
+          generate_release_notes: false
           prerelease: true
           files: |
             dist/*.tar.gz
@@ -232,7 +237,9 @@ jobs:
       - name: Publish GitHub Release asset
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          generate_release_notes: true
+          # See the matching comment in build-linux — only build-macos
+          # generates release notes (M13).
+          generate_release_notes: false
           prerelease: true
           files: |
             dist/*.zip

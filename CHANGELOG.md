@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-07
+
+Cross-platform release. Linux and Windows get real `Platform` trait
+implementations (menu bar, secure secret storage, autostart, paths) instead
+of `cfg(target_os)` stubs, Codex gains full account switching, and the menu
+gets a multi-provider-ready flat redesign.
+
+### Added
+- **Linux platform support.** Real `Platform` trait impl backed by
+  `tray-icon`/`libayatana-appindicator3` (tray), the D-Bus Secret Service
+  (`keyring`, with a permission-protected `~/.config/usagio/secrets.json`
+  fallback when no Secret Service daemon is reachable), XDG autostart
+  (`~/.config/autostart/*.desktop`), and XDG base-dir paths. See
+  `packaging/linux/DEPENDENCIES.md` for build/runtime deps.
+- **Windows platform support.** Real `Platform` trait impl backed by Win32
+  tray APIs, Windows Credential Manager, a `HKCU\...\Run` autostart entry,
+  and `%APPDATA%` paths. See `packaging/windows/DEPENDENCIES.md`.
+- **Codex account switching.** Codex moves from usage-reporting-only to full
+  `switch`/`start`/`continue` support via `auth.json` rewrite, matching
+  Claude's account-switching model.
+- **Menu-bar redesign.** Flat one-line-per-account main menu (scales to all
+  15 provider slots instead of one big status block per provider), a
+  Settings submenu tree, and native OS file dialogs (`rfd`) for Backups
+  Save/Restore instead of a Terminal-only flow.
+- **macOS `.app` bundle.** The universal tarball now ships `usagio.app`
+  alongside the bare binary, giving Login Items a real icon instead of the
+  generic "exec" glyph; ad-hoc signed (not yet notarised — no paid Apple
+  Developer account).
+- **Adaptive poll cadence.** `watch`'s background poll tightens its interval
+  as an account approaches its swap trigger, rather than a fixed cadence
+  throughout.
+- **`rc-release.yml`.** Push a `vX.Y.Z-rcN` tag to build and publish the same
+  three artifacts as a real release (as a GitHub prerelease) without
+  touching the Homebrew tap, so the full build/package/attest/publish
+  pipeline can be validated end-to-end before cutting the real tag.
+- **CI matrix.** `ci.yml`'s `check` job now runs on macOS, Linux, and
+  Windows (previously macOS-only), with a strict-cfg lint enforcing that all
+  OS-specific code lives behind the `Platform` trait rather than scattered
+  `cfg(target_os)`.
+
+### Fixed
+- A full pre-release code audit (H1-H4, M1-M14) closed: silent
+  `notification_config` parse failures now logged instead of silently
+  resetting; an aborted config restore no longer defaults old-count to 0;
+  `toggle_autoswap`'s read-modify-write is now atomic under the state lock;
+  a Codex TOCTOU on `auth.json` creation closed (0600, atomic); the config
+  restore flow now goes through `save_state_safe` and stashes to
+  `backups/`; rapid "Refresh usage now" clicks are deduped with an
+  in-flight guard; `request_quit()` called before the event loop starts is
+  now honored instead of dropped; `write_auth_json_atomically`'s error
+  cases are differentiated; a same-thread runtime check guards `TrayState`;
+  double-clicking the `.app` bundle now opens the menu bar instead of
+  running the CLI's default `list` command; the menu no longer shows a
+  stray `locked · ` prefix on a locked account's countdown row.
+- **`release.yml` (H4):** `librsvg` is now installed before
+  `generate-icns.sh` runs, so the very first tagged release doesn't fail
+  mid-job (after the build already succeeded) for want of `rsvg-convert`.
+- **`release.yml` (M13, M14):** only one of the three release jobs
+  (`build-macos`) generates GitHub's auto release notes — the other two
+  upload artifacts additively instead of racing to write the release body;
+  the Homebrew tap-bump's perl/sed regex surgery is validated with `ruby -c`
+  plus a structural check on the `install` block before pushing.
+
+### Internal
+- Real integration coverage closes the "compiles but was never actually
+  exercised" gap on OS-integration surfaces: a live GTK/appindicator tray
+  init under `xvfb-run`, a real Secret Service D-Bus round-trip via an
+  unlocked `gnome-keyring-daemon`, and the real-registry-write Windows
+  autostart test all now run on every push instead of being `#[ignore]`d or
+  verified only by `cargo build` linking successfully.
+- Backups Save/Restore file dialogs now route through a
+  `Platform::file_dialog()` trait method with a capturing mock for the
+  click-handler logic, since the Linux `xdg-desktop-portal` backend isn't
+  practical to exercise headlessly in CI.
+
 ## [0.4.3] - 2026-09-07
 
 Silences a recurring macOS Automation permission prompt and restores the
@@ -477,7 +552,8 @@ fixes; every top finding was independently confirmed before fixing.
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/claude-usage/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/MattJackson/usagio/compare/v0.4.3...v0.5.0
 [0.4.0]: https://github.com/MattJackson/claude-usage/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/MattJackson/claude-usage/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MattJackson/claude-usage/compare/v0.2.0...v0.3.0
