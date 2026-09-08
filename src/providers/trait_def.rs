@@ -314,13 +314,6 @@ pub trait Provider: Send + Sync + 'static {
     /// provider is a pure stub with no capture path wired yet.
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>>;
 
-    /// Enumerate captured accounts on this host. Default implementation lifts
-    /// `capture_current_login` into a `Vec`, which is right for single-slot
-    /// stores (all of the v1 providers).
-    fn list_accounts(&self) -> PResult<Vec<CapturedAccount>> {
-        Ok(self.capture_current_login()?.into_iter().collect())
-    }
-
     /// Register an account onboarded via a pasted API key. `nickname` is the
     /// user-supplied label (used for menu display and, for providers that
     /// can't derive an email from the key alone, for `account_identifier`);

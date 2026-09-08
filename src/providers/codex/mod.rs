@@ -48,12 +48,35 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::Value;
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::providers::trait_def::{
     AccountKey, Capabilities, CaptureMode, CapturedAccount, CredentialFreshness, IdentitySnapshot,
     PResult, Provider, ProviderError, SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
 };
+
+/// Read/write timeout applied to every outbound HTTP call this provider
+/// makes. The default `ureq::Agent` only bounds the TCP *connect* (30s); a
+/// server or proxy that accepts the connection but then stalls mid-response
+/// (or mid-request-write) would otherwise hang `menubar::poll_loop`'s
+/// network thread forever with no diagnostics. 15s is generous for a
+/// legitimate slow response but tight enough to fail fast and let the next
+/// poll tick retry.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+
+static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+/// Shared `ureq::Agent` for every Codex HTTP call site (token refresh, usage
+/// fetch), built once with [`HTTP_TIMEOUT`] applied to both read and write.
+pub(crate) fn http_agent() -> &'static ureq::Agent {
+    HTTP_AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_read(HTTP_TIMEOUT)
+            .timeout_write(HTTP_TIMEOUT)
+            .build()
+    })
+}
 
 /// Constructor called from `providers::build()` behind the `codex` feature.
 pub fn new() -> Box<dyn Provider> {
@@ -246,7 +269,8 @@ impl Provider for CodexProvider {
     // --- Usage -------------------------------------------------------------
 
     fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
-        let resp = ureq::get(USAGE_URL)
+        let resp = http_agent()
+            .get(USAGE_URL)
             .set("Authorization", &format!("Bearer {access_token}"))
             .set("Content-Type", "application/json")
             .call();
