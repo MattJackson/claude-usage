@@ -967,3 +967,32 @@ fn usagio_install_prefers_app_bundle_path_when_available() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// M12 — .app bundle direct-launch (Finder double-click) must default to the
+// menu bar, not the one-shot `list` a bare CLI invocation defaults to.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn run_dispatch_defaults_to_menubar_when_invoked_from_app_bundle() {
+    let bundle_exe = std::path::PathBuf::from("/Applications/usagio.app/Contents/MacOS/usagio");
+    assert_eq!(effective_first_arg(&[], &bundle_exe), Some("menubar"));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_dispatch_defaults_to_list_for_bare_binary() {
+    let bare_exe = std::path::PathBuf::from("/opt/homebrew/bin/usagio");
+    assert_eq!(effective_first_arg(&[], &bare_exe), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_dispatch_prefers_an_explicit_arg_over_bundle_detection() {
+    // Even when launched from inside a bundle, an explicit argument (e.g.
+    // `usagio list` run via Terminal against the bundled binary) wins.
+    let bundle_exe = std::path::PathBuf::from("/Applications/usagio.app/Contents/MacOS/usagio");
+    let args = vec!["list".to_string()];
+    assert_eq!(effective_first_arg(&args, &bundle_exe), Some("list"));
+}

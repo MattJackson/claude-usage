@@ -115,6 +115,31 @@ fn main() {
     }
 }
 
+/// True if `exe` looks like it was launched from inside a macOS `.app`
+/// bundle (a Finder double-click), as opposed to a bare CLI invocation
+/// (`/opt/homebrew/bin/usagio`, or a shell alias). Checked by path shape
+/// only — no `cfg(target_os)` needed, since `.app/Contents/MacOS/` simply
+/// never appears in a non-bundle exe path on any OS. Mirrors the same
+/// pattern `launch_agent_exe_path` already checks for the install path.
+fn is_app_bundle_launch(exe: &std::path::Path) -> bool {
+    exe.to_string_lossy().contains(".app/Contents/MacOS/")
+}
+
+/// Resolve the effective "first CLI argument" `run()`'s dispatch match
+/// switches on: the real first arg if one was given, otherwise `"menubar"`
+/// when we were launched from a `.app` bundle (so double-clicking
+/// usagio.app in Finder starts the menu bar, not a one-shot `list` that
+/// prints to a terminal nobody's watching), otherwise `None` (the bare
+/// binary's existing default: `cmd_list`).
+///
+/// Pure function of `args`/`exe` so a test can inject both without touching
+/// real argv or a real bundle.
+fn effective_first_arg<'a>(args: &'a [String], exe: &std::path::Path) -> Option<&'a str> {
+    args.first()
+        .map(String::as_str)
+        .or_else(|| is_app_bundle_launch(exe).then_some("menubar"))
+}
+
 fn run() -> Result<()> {
     // One-shot rename migration: if `~/.config/claude-usage/` still exists
     // and `~/.config/usagio/` doesn't, atomically move it (with a
@@ -199,7 +224,8 @@ fn run() -> Result<()> {
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
+    let exe = std::env::current_exe().unwrap_or_default();
+    match effective_first_arg(&args, &exe) {
         None => cmd_list(&[]),
         Some("list") | Some("ls") => cmd_list(&args[1..]),
         Some("capture") | Some("add") => cmd_capture(),
