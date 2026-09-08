@@ -327,9 +327,7 @@ impl Autostart for MacOsAutostart {
             let _ = Command::new("osascript")
                 .args([
                     "-e",
-                    &format!(
-                        "tell application \"System Events\" to delete login item \"{name}\""
-                    ),
+                    &format!("tell application \"System Events\" to delete login item \"{name}\""),
                 ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
