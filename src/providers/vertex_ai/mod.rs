@@ -37,6 +37,8 @@ impl Provider for VertexAiProvider {
         Capabilities {
             supports_usage: true,
             supports_switching: false,
+            supports_launch: false,
+            supports_remove: true,
             supports_email_capture: false,
             secret_backend: SecretBackend::Keychain,
             capture_mode: CaptureMode::ApiKey,

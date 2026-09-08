@@ -180,10 +180,31 @@ pub enum CaptureMode {
 
 /// Runtime feature flags a provider exposes so menu code can decide what UI
 /// elements to render (Switch row, usage rows, capture entry, ...).
+///
+/// H3 (v0.5.0 codeaudit): `supports_switching`, `supports_launch`, and
+/// `supports_remove` are read directly by the menu builder to decide whether
+/// to construct a "Switch to this account" / "Launch client" / "Remove…" row
+/// at all — they must stay truthful. Before this fix, `supports_switching`
+/// alone gated BOTH the Switch row and the Launch row (a provider whose
+/// `write_active_account` was wired but whose `launch_client` was still the
+/// `Unsupported` trait default would still get a Launch row that always
+/// errored), and the Remove row wasn't gated on anything.
 #[derive(Copy, Clone, Debug)]
 pub struct Capabilities {
     pub supports_usage: bool,
     pub supports_switching: bool,
+    /// True only if `launch_client` is actually wired to spawn the vendor
+    /// CLI. Independent of `supports_switching` — a provider can support one
+    /// without the other (e.g. `write_active_account` implemented, no client
+    /// launcher yet).
+    pub supports_launch: bool,
+    /// True if removing a captured account (dropping it from state.json) is
+    /// safe for this provider. Defaults to `true` for every provider that
+    /// sets it explicitly — removing an account is a generic state.json
+    /// operation every provider can, in principle, support — but stays an
+    /// explicit field so a future provider needing extra cleanup (e.g.
+    /// deleting an on-disk auth file) can flip it off until that's wired.
+    pub supports_remove: bool,
     pub supports_email_capture: bool,
     pub secret_backend: SecretBackend,
     pub capture_mode: CaptureMode,
@@ -446,6 +467,8 @@ mod tests {
             Capabilities {
                 supports_usage: false,
                 supports_switching: false,
+                supports_launch: false,
+                supports_remove: true,
                 supports_email_capture: false,
                 secret_backend: SecretBackend::File,
                 capture_mode: CaptureMode::CredsOnDisk,

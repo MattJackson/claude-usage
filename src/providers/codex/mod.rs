@@ -27,6 +27,20 @@
 //! identity file to touch (unlike `~/.claude.json`), so the auth.json write
 //! *is* the entire switch. `launch_client` remains unimplemented
 //! (`ProviderError::Unsupported`) — a future phase may shell out to `codex`.
+//!
+//! TODO(v0.5.x, H3 — v0.5.0 codeaudit): `write_active_account` above is a
+//! complete, tested implementation of the auth.json-rewrite half of
+//! switching. `capabilities().supports_switching` is nonetheless `false`,
+//! because v1's `State` (see `crate::store`) has no bucket for non-Claude
+//! accounts at all — there is nowhere to persist a *second* Codex account's
+//! secret blob to switch *to*, so `main.rs::switch_to` / `menubar.rs`'s
+//! click dispatchers are hardcoded to the Claude slug and have no code path
+//! that would ever call `write_active_account` today. Advertising
+//! `supports_switching: true` here (as v0.5.0 originally shipped) built a
+//! "Switch to this account" row that could never succeed. Flip this back to
+//! `true` only once state v2 gives Codex accounts a real slot AND
+//! `main.rs`/`menubar.rs` dispatch switches by provider instead of assuming
+//! Claude.
 
 #![allow(dead_code)]
 
@@ -67,7 +81,14 @@ impl Provider for CodexProvider {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             supports_usage: true,
-            supports_switching: true,
+            // See the module doc TODO: `write_active_account` below is fully
+            // implemented and tested, but nothing can call it yet because v1
+            // state has no slot to store a second Codex account in. Keep
+            // this `false` (and therefore the "Switch to this account" menu
+            // row hidden) until that changes (H3, v0.5.0 codeaudit).
+            supports_switching: false,
+            supports_launch: false,
+            supports_remove: true,
             supports_email_capture: true,
             secret_backend: SecretBackend::File,
             capture_mode: CaptureMode::CredsOnDisk,
@@ -520,7 +541,14 @@ mod tests {
         assert_eq!(p.display_name(), "Codex");
         let caps = p.capabilities();
         assert!(caps.supports_usage);
-        assert!(caps.supports_switching);
+        // H3 (v0.5.0 codeaudit): `write_active_account` below is a real,
+        // tested implementation, but `supports_switching` stays `false`
+        // until state v2 gives Codex a place to store a second account to
+        // switch to — see the module doc TODO. Advertising `true` here
+        // built a menu row that could never succeed.
+        assert!(!caps.supports_switching);
+        assert!(!caps.supports_launch);
+        assert!(caps.supports_remove);
         assert!(caps.supports_email_capture);
         assert_eq!(caps.secret_backend, SecretBackend::File);
         assert_eq!(caps.capture_mode, CaptureMode::CredsOnDisk);

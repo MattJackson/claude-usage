@@ -35,6 +35,8 @@ impl Provider for ClineProvider {
         Capabilities {
             supports_usage: false,
             supports_switching: false,
+            supports_launch: false,
+            supports_remove: true,
             supports_email_capture: false,
             secret_backend: SecretBackend::File,
             capture_mode: CaptureMode::CredsOnDisk,
