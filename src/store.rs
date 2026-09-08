@@ -445,7 +445,7 @@ impl State {
                 if let (Some(name), Some(em)) = (legacy_name, email.as_deref()) {
                     name_to_email.push((name.to_string(), em.to_string()));
                 }
-                accounts.push(Account {
+                let candidate = Account {
                     email,
                     access_token: access_token.to_string(),
                     refresh_token: refresh_token.to_string(),
@@ -471,7 +471,50 @@ impl State {
                         .get("needs_relogin")
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false),
-                });
+                };
+                // robustness-05 (v0.5.1 audit): dedup by lowercased email as we
+                // build the list. Every account-keyed lookup elsewhere in
+                // this type (`find`/`find_mut`/`upsert`) resolves to only
+                // the FIRST matching entry, so a second entry sharing an
+                // email (a hand-edited or merged-backup state.json) would
+                // otherwise load silently, double-count in every
+                // enumeration, and have its tokens rot forever since nothing
+                // could ever target it again. Only dedup when the email
+                // actually resolved — merging on the empty-string key would
+                // wrongly collapse multiple genuinely-unresolved accounts
+                // into one.
+                let existing_idx = if candidate.email.is_some() {
+                    accounts
+                        .iter()
+                        .position(|a: &Account| a.key().eq_ignore_ascii_case(candidate.key()))
+                } else {
+                    None
+                };
+                if let Some(existing_idx) = existing_idx {
+                    let existing = &accounts[existing_idx];
+                    if candidate.expires_at > existing.expires_at {
+                        crate::logging::log(&format!(
+                            "warn: state.json had duplicate account entries for {}; \
+                             keeping the newer grant (expires_at={}), dropping the \
+                             older (expires_at={})",
+                            candidate.key(),
+                            candidate.expires_at,
+                            existing.expires_at
+                        ));
+                        accounts[existing_idx] = candidate;
+                    } else {
+                        crate::logging::log(&format!(
+                            "warn: state.json had duplicate account entries for {}; \
+                             keeping the newer grant (expires_at={}), dropping the \
+                             older (expires_at={})",
+                            existing.key(),
+                            existing.expires_at,
+                            candidate.expires_at
+                        ));
+                    }
+                } else {
+                    accounts.push(candidate);
+                }
             }
         }
 

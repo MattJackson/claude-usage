@@ -490,6 +490,83 @@ fn refresh_inactive_if_stale_skips_currently_active_account() {
 }
 
 // -----------------------------------------------------------------------------
+// efficiency-01 (v0.5.1 audit): `refresh_inactive_if_stale` now snapshots
+// {active, accounts} ONCE under the lock and iterates the in-memory Vec
+// instead of re-reading+re-parsing the whole state.json twice per inactive
+// account. These tests are regression coverage for that refactor: fresh
+// (not-near-expiry) inactive accounts must come out completely untouched,
+// and ALL of them must still be considered from the single snapshot, not
+// just the first.
+// -----------------------------------------------------------------------------
+fn far_future_account(email: &str) -> crate::store::Account {
+    crate::store::Account {
+        email: Some(email.to_string()),
+        access_token: "tok".into(),
+        refresh_token: "rt".into(),
+        expires_at: (chrono::Utc::now().timestamp() + 3600) * 1000,
+        keychain_blob: String::new(),
+        oauth_account: None,
+        user_id: None,
+        cached_usage: None,
+        notif_state: crate::notifications::NotifState::default(),
+        needs_relogin: false,
+    }
+}
+
+#[test]
+fn refresh_inactive_if_stale_leaves_fresh_inactive_account_untouched() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        with_state_lock(|| {
+            let mut st = State::default();
+            st.accounts.push(far_future_account("inactive@e.com"));
+            st.active = None;
+            st.save()
+        })
+        .unwrap();
+
+        refresh_inactive_if_stale(None);
+
+        let st = State::load().unwrap();
+        assert_eq!(st.accounts.len(), 1);
+        assert_eq!(st.accounts[0].access_token, "tok");
+        assert!(!st.accounts[0].needs_relogin);
+    });
+}
+
+#[test]
+fn refresh_inactive_if_stale_considers_every_account_from_one_snapshot() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        with_state_lock(|| {
+            let mut st = State::default();
+            st.accounts.push(far_future_account("first@e.com"));
+            st.accounts.push(far_future_account("second@e.com"));
+            st.accounts.push(far_future_account("third@e.com"));
+            st.active = Some("first@e.com".into());
+            st.save()
+        })
+        .unwrap();
+
+        // first@e.com is active and must be skipped; second/third are
+        // inactive-but-fresh and must be considered (and left alone, since
+        // neither is near expiry) — proving the snapshot loop reaches every
+        // entry, not just the one the old per-iteration re-read happened to
+        // still see.
+        refresh_inactive_if_stale(None);
+
+        let st = State::load().unwrap();
+        assert_eq!(st.accounts.len(), 3);
+        for email in ["first@e.com", "second@e.com", "third@e.com"] {
+            let a = st.find(email).unwrap();
+            assert_eq!(a.access_token, "tok");
+            assert!(!a.needs_relogin);
+        }
+        assert_eq!(st.active.as_deref(), Some("first@e.com"));
+    });
+}
+
+// -----------------------------------------------------------------------------
 // Silence the unused-import warning on `Value` — kept around for future test
 // growth and to document that fixtures traffic in raw JSON strings, not
 // pre-parsed structures (the sync layer only ever sees blobs).

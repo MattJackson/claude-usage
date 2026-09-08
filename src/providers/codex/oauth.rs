@@ -309,6 +309,27 @@ pub enum CasOutcome {
 ///    our new tokens and write atomically. If it changed, we lost: discard
 ///    our (now-guaranteed-stale, about to be `refresh_token_reused`) grant
 ///    and adopt whatever's there instead.
+///
+/// concurrency-03 (v0.5.1 audit): step 4's "we won" conclusion is NOT a real
+/// atomic compare-and-swap on the filesystem — it's "read, POST, read, then
+/// separately write", and nothing excludes a genuinely concurrent writer
+/// (most importantly the real `codex` CLI, a separate process that has no
+/// knowledge of and cannot participate in any lock usagio takes) from
+/// writing `auth.json` in the gap between the confirming re-read and the
+/// `rename()` inside `write_auth_json_atomically`. There is no portable
+/// "compare bytes and write" filesystem primitive that closes this
+/// completely — doing so for real would require an OS-level lock file the
+/// vendor CLI would ALSO have to honor, which usagio cannot arrange since it
+/// doesn't control that binary. What this function does instead: (a) keep
+/// the re-read-to-write gap as small as physically possible (no I/O, no
+/// network calls, nothing but pure in-memory patching between the
+/// confirming read and the write below), and (b) immediately re-read once
+/// more right after the write completes, so if a third writer's rotation
+/// landed in that residual gap and our write clobbered it, we detect the
+/// mismatch on the very next line and adopt the now-current content instead
+/// of trusting our own write blindly. This narrows the blast radius to "we
+/// might silently clobber a rotation that lands in a multi-microsecond
+/// window" rather than "we might clobber a rotation and never notice."
 pub fn active_refresh_cas(
     skew_secs: i64,
     stale_after_secs: i64,
@@ -348,10 +369,38 @@ pub fn active_refresh_cas(
         return Ok(CasOutcome::Adopted(after));
     }
 
+    // Nothing but pure, in-memory patching between the confirming read
+    // above and the write below — see the concurrency-03 doc comment on
+    // this function for why that gap can't be closed to zero.
     let patched = apply_grant_to_blob(&before, &grant)
         .map_err(|e| RefreshError::Transient(format!("patching auth.json: {e}")))?;
     write_auth_json_atomically(&path, &patched)
         .map_err(|e| RefreshError::Transient(format!("writing auth.json: {e}")))?;
+
+    // Post-write confirmation re-read (concurrency-03): if a concurrent
+    // writer's rotation landed in the residual read-to-write gap and our
+    // `rename()` clobbered it, this catches the mismatch immediately and
+    // adopts what's actually on disk now instead of the caller believing
+    // our (possibly already-stale) write stuck.
+    match std::fs::read_to_string(&path) {
+        Ok(confirm) if confirm == patched => {
+            crate::logging::log("event=codex_cas_write_confirmed");
+        }
+        Ok(confirm) => {
+            crate::logging::log(
+                "event=codex_cas_post_write_race_detected reason=auth_json_changed_after_our_write",
+            );
+            return Ok(CasOutcome::Adopted(confirm));
+        }
+        Err(e) => {
+            // Can't confirm, but the write itself already reported success —
+            // log and proceed rather than fail an otherwise-successful
+            // refresh over a read error on the confirmation step alone.
+            crate::logging::log(&format!(
+                "event=codex_cas_post_write_confirm_read_failed reason={e}"
+            ));
+        }
+    }
     Ok(CasOutcome::Refreshed)
 }
 
