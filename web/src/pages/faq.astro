@@ -1,131 +1,86 @@
 ---
-// Help / FAQ page. Home for the platform-specific install caveats that used
-// to clutter /download/ (Windows SmartScreen, autostart registry/desktop-
-// entry detail) so that page can stay a clean "run this command" reference.
+// Help / FAQ page. Short answers only — the long-form install prose lives on
+// /download/ and in the repo's packaging docs. Each entry here should read in
+// a couple of sentences, then link out.
 import Base from '../layouts/Base.astro';
-import CodeBlock from '../components/CodeBlock.astro';
 
 const title = 'FAQ — usagio';
 const description =
-  'Answers to common usagio questions: Windows SmartScreen warnings, autostart registration details, and troubleshooting install issues.';
+  'Short answers to common usagio questions: install caveats, autostart, and where to look for more.';
 
 const github = 'https://github.com/MattJackson/usagio';
 ---
 <Base title={title} description={description} path="/faq/" current="faq">
-
-  <!-- ============ HERO ============ -->
-  <section class="faq-hero">
-    <div class="container container-narrow" style="text-align: center;">
-      <span class="eyebrow fade-up">Help</span>
-      <h1 class="h-display fade-up" style="font-size: clamp(2.2rem, 5vw, 3.4rem); margin-top: 0.5rem;">FAQ</h1>
-      <p class="lede fade-up" style="margin: 1rem auto 0;">
-        Platform-specific install notes and answers to things that come up
-        after you've downloaded usagio.
-      </p>
-    </div>
-  </section>
-
-  <!-- ============ WINDOWS ============ -->
   <section class="faq-section">
     <div class="container container-narrow">
-      <h2 class="h-section fade-up">Installing on Windows</h2>
-      <p class="faq-p fade-up">
-        The <code>.exe</code> is unsigned, so Windows Defender may show a
-        SmartScreen warning ("Windows protected your PC") the first time you
-        run it. Choose <strong>More info</strong> → <strong>Run anyway</strong> to
-        continue. This is expected for an independent, unsigned open-source
-        binary — see
-        <code>packaging/windows/DEPENDENCIES.md</code> in the repo for the
-        full build/signing story.
+      <h1 class="faq-title fade-up">FAQ</h1>
+      <p class="faq-lede fade-up">
+        Setup instructions live on <a href="/download/">/download/</a>. This
+        page covers questions that come up after that.
       </p>
-      <p class="faq-p fade-up">
-        Running <code>usagio install</code> writes an autostart entry to
-        <code>HKCU\Software\Microsoft\Windows\CurrentVersion\Run</code> so the
-        tray app and auto-swap daemon start on login. This is a per-user
-        registry key (no admin rights needed); <code>usagio uninstall</code> removes
-        it cleanly.
+
+      <h2 class="faq-q fade-up">Windows SmartScreen warned me — is that expected?</h2>
+      <p class="faq-a fade-up">
+        Yes. The <code>.exe</code> is unsigned, so Defender flags it the first
+        run. Choose <strong>More info → Run anyway</strong>.
+      </p>
+
+      <h2 class="faq-q fade-up">Where does autostart get registered?</h2>
+      <p class="faq-a fade-up">
+        Windows: per-user Run key at
+        <code>HKCU\Software\Microsoft\Windows\CurrentVersion\Run</code>. Linux:
+        <code>~/.config/autostart/usagio.desktop</code>. Both are removed by
+        <code>usagio uninstall</code>.
+      </p>
+
+      <h2 class="faq-q fade-up">What Linux packages do I need?</h2>
+      <p class="faq-a fade-up">
+        GTK 3, <code>libayatana-appindicator3</code>, <code>libsecret</code>,
+        and an <code>xdg-desktop-portal</code> backend — see
+        <code>packaging/linux/DEPENDENCIES.md</code> if something is missing.
+      </p>
+
+      <h2 class="faq-q fade-up">Where are the release notes?</h2>
+      <p class="faq-a fade-up">
+        On-site at <a href="/whats-new/">What's New</a>, grouped by Added /
+        Changed / Fixed / Removed.
+      </p>
+
+      <h2 class="faq-q fade-up">The binary isn't on my PATH.</h2>
+      <p class="faq-a fade-up">
+        Run <code>usagio --version</code> to confirm the install landed. If
+        not, open an issue on
+        <a href={`${github}/issues`} target="_blank" rel="noopener noreferrer">GitHub</a>
+        with your OS and install method.
       </p>
     </div>
   </section>
-
-  <!-- ============ LINUX ============ -->
-  <section class="faq-section section-soft">
-    <div class="container container-narrow">
-      <h2 class="h-section fade-up">Installing on Linux</h2>
-      <p class="faq-p fade-up">
-        <code>usagio install</code> registers autostart by writing a standard
-        XDG desktop entry to <code>~/.config/autostart/usagio.desktop</code> —
-        no system-level changes, no root required. Your desktop environment
-        picks it up on next login.
-      </p>
-      <p class="faq-p fade-up">
-        The tray icon, credential storage, and autostart entry need GTK 3,
-        <code>libayatana-appindicator3</code>, <code>libsecret</code>, and an
-        <code>xdg-desktop-portal</code> implementation respectively. Most
-        desktop distros ship these already; see the
-        <code>packaging/linux/DEPENDENCIES.md</code> in the repo if a package
-        is missing.
-      </p>
-    </div>
-  </section>
-
-  <!-- ============ RELEASE NOTES ============ -->
-  <section class="faq-section">
-    <div class="container container-narrow">
-      <h2 class="h-section fade-up">Where are the release notes?</h2>
-      <p class="faq-p fade-up">
-        The full changelog lives on-site at <a href="/whats-new/">What's New</a> —
-        every release, grouped by Added / Changed / Fixed / Removed. Each
-        entry also links out to its GitHub release for raw commit history.
-      </p>
-    </div>
-  </section>
-
-  <!-- ============ VERIFY / TROUBLESHOOT ============ -->
-  <section class="faq-section section-soft">
-    <div class="container container-narrow">
-      <h2 class="h-section fade-up">The binary isn't found on my PATH</h2>
-      <p class="faq-p fade-up">
-        Confirm the install actually landed and check the version:
-      </p>
-      <CodeBlock label="verify"><span class="p">$</span> usagio --version
-<span class="p">$</span> usagio status
-</CodeBlock>
-      <p class="faq-p fade-up">
-        Still stuck? Open an issue on
-        <a href={`${github}/issues`} target="_blank" rel="noopener noreferrer">GitHub</a> with
-        your OS, install method, and the output above.
-      </p>
-    </div>
-  </section>
-
 </Base>
 
 <style>
-  .faq-hero {
-    padding: clamp(3rem, 8vw, 5rem) 0 clamp(2rem, 5vw, 3rem);
-    background:
-      radial-gradient(70% 60% at 50% 0%, rgba(91,43,234,0.06), transparent 65%),
-      var(--bg);
-    border-bottom: var(--hairline);
+  .faq-section { padding: clamp(3rem, 7vw, 4.5rem) 0 clamp(4rem, 8vw, 6rem); }
+  .faq-title {
+    font-size: clamp(2rem, 4.4vw, 2.8rem);
+    line-height: 1.1; letter-spacing: -0.03em; font-weight: 700;
+    color: var(--ink); margin: 0 0 1rem;
   }
-  .faq-section { padding: clamp(2rem, 5vw, 3rem) 0; }
-  .faq-section .h-section { margin-bottom: 1rem; }
-  .faq-p {
-    color: var(--muted);
-    line-height: 1.65;
-    margin-bottom: 1rem;
-    max-width: 62ch;
+  .faq-lede {
+    color: var(--muted); font-size: var(--fs-body); line-height: 1.55;
+    max-width: 58ch; margin: 0 0 2.5rem;
   }
-  .faq-p code {
-    font-family: var(--font-mono);
-    font-size: 0.86em;
-    background: var(--accent-tint);
-    color: var(--accent);
-    padding: 0.05em 0.35em;
-    border-radius: 4px;
+  .faq-q {
+    font-size: 1.05rem; line-height: 1.35; letter-spacing: -0.01em;
+    font-weight: 600; color: var(--ink); margin: 1.75rem 0 0.4rem;
   }
-  .faq-p strong { color: var(--ink); font-weight: 650; }
-  .faq-p a { color: var(--accent); font-weight: 600; }
-  .faq-p a:hover { color: var(--accent-hover); }
+  .faq-a {
+    color: var(--ink-2); font-size: var(--fs-sm); line-height: 1.6;
+    max-width: 62ch; margin: 0;
+  }
+  .faq-a code { font-family: var(--font-mono); font-size: 0.92em; color: var(--muted); }
+  .faq-a strong { color: var(--ink); font-weight: 600; }
+  .faq-a a, .faq-lede a {
+    color: var(--ink); text-decoration: underline;
+    text-decoration-color: var(--line-strong); text-underline-offset: 2px;
+  }
+  .faq-a a:hover, .faq-lede a:hover { text-decoration-color: currentColor; }
 </style>
