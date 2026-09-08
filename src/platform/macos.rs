@@ -316,6 +316,25 @@ impl Autostart for MacOsAutostart {
         if path.exists() {
             std::fs::remove_file(&path).context("removing plist")?;
         }
+        // Also purge any legacy System Events login item that a pre-v0.4.3
+        // usagio (or its `claude-usage` predecessor) registered via the
+        // now-removed "Launch at login" menu toggle. Left in place, macOS
+        // re-launches the stale binary at every login even after the plist
+        // is gone — the exact bug that had usagio silently respawning
+        // post-uninstall. Best-effort: osascript exits non-zero if the item
+        // is already absent (the desired state), so all output is swallowed.
+        for name in ["usagio", "claude-usage"] {
+            let _ = Command::new("osascript")
+                .args([
+                    "-e",
+                    &format!(
+                        "tell application \"System Events\" to delete login item \"{name}\""
+                    ),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
         Ok(())
     }
 
