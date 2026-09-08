@@ -21,6 +21,22 @@ concurrency-01 lock fix, robustness-01 through 05, efficiency-01, and a
 concurrency-03 narrowing. See `CHANGELOG.md`'s `[0.5.1]` section for the
 full list.
 
+## v0.5.2 (robustness + hardening round) — done
+
+Follow-up pass after the v0.5.1 audit: `poll_loop` and the fsnotify
+credential-watcher thread both get panic supervisors (respawn instead of
+silently dying), `ureq` calls for every provider (Claude usage, Claude
+OAuth, Codex OAuth) get read+write timeouts, `refresh_usage_cache`'s merge
+no longer clobbers a concurrently-set `needs_relogin`, `poll_loop` and
+`handle_refresh_now` share one `SwapGuard`, `~/.config/usagio/` and
+`usagio.log` are hardened to 0700/0600, `usagio install` purges legacy
+System Events login items, `LinuxAutostart::restart()` handles paths with
+spaces, `context_ledger::mcp::read_line_with_timeout` enforces a real
+wall-clock timeout, the menu now renders accounts as HR-separated blocks,
+and four hot-path efficiency fixes landed. Dead `Provider::list_accounts`
+and `main.rs::capture_current` were deleted. See `CHANGELOG.md`'s
+`[0.5.2]` section for the full list.
+
 ### Menu-bar redesign (multi-provider prep)
 
 Now that Codex is coming and 13 more provider slots exist, the current
