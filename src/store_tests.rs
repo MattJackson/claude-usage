@@ -653,7 +653,20 @@ fn stash_pre_restore_lands_under_config_backups_not_tmp() {
         "stash filename: {}",
         stash_path.display()
     );
-    assert!(!stash_path.starts_with("/tmp"));
+    // Historical H2 concern: never move OAuth-token-bearing state to /tmp.
+    // On Linux CI, the whole ScopedConfigDir tempdir root is under /tmp/xyz/,
+    // so `starts_with("/tmp")` is a false positive there (the earlier
+    // positive assertion above already pins the correct location under
+    // config_dir/backups). Assert what actually matters: the stash is NOT
+    // in a shared tmp dir that isn't a subdirectory of config_dir/backups.
+    // The positive assertion above (`starts_with(g.home()/.config/usagio/
+    // backups)`) is the real invariant; this is belt-and-suspenders in
+    // case someone refactors stash_pre_restore to a shared temp path.
+    assert!(
+        stash_path.starts_with(g.home().join(".config/usagio/backups")),
+        "stash must be under config_dir/backups; got: {}",
+        stash_path.display()
+    );
 
     // The live state.json is gone (moved), and the stash carries its bytes.
     assert!(!config_dir().unwrap().join("state.json").exists());
