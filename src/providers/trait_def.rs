@@ -399,6 +399,26 @@ pub trait Provider: Send + Sync + 'static {
         }
     }
 
+    /// Read the vendor CLI's current OS-native credential blob for whichever
+    /// account it currently considers active — the same slot
+    /// `mirror_rotated_token` writes to (macOS keychain, or the on-disk
+    /// credentials file on Linux/Windows).
+    ///
+    /// This is the read half of the compare-and-swap the ACTIVE account's
+    /// refresh cycle uses (`main.rs::active_refresh_cas`): usagio reads this
+    /// slot before AND after its own `/token` POST to detect whether the
+    /// vendor CLI rotated the same slot concurrently, without introducing any
+    /// new OS-specific code outside `platform/*` — providers implement this
+    /// purely in terms of `Platform::secrets()` / `credential_paths()`, the
+    /// same primitives `mirror_rotated_token` already uses.
+    ///
+    /// `Ok(None)` means the slot is empty (nothing captured yet). Default is
+    /// `Unsupported` — only providers with `mirror_rotated_token` wired
+    /// (Claude, Codex) implement this.
+    fn read_active_slot(&self) -> PResult<Option<String>> {
+        Err(ProviderError::Unsupported)
+    }
+
     // --- Credential sync (fsnotify + proactive refresh + last-chance fallback) ---
 
     /// On-disk paths where the vendor CLI may write this provider's

@@ -1069,12 +1069,310 @@ fn run_dispatch_prefers_an_explicit_arg_over_bundle_detection() {
 }
 
 // ---------------------------------------------------------------------------
-// "usagio never refreshes the ACTIVE account" — refresh_usage_cache must
-// never POST /token for whichever account state.active names, only for
-// inactive ones. Proven with a tiny in-process HTTP server standing in for
-// the OAuth token endpoint, so we can count exactly how many POSTs land per
-// account rather than trusting the code not to call out.
+// Active-account CAS refresh (v0.5.0). `active_refresh_cas` is exercised
+// directly against a `MockActiveSlotProvider` rather than through the full
+// `refresh_usage_cache()` — the real `ClaudeProvider::read_active_slot` /
+// `mirror_rotated_token` on macOS route through the REAL login keychain
+// (`Platform::secrets()`), which unit tests must never touch (see the
+// `#[ignore]`d `secret_store_roundtrip` in `platform/macos.rs` for the same
+// rule). The mock provider gives `active_refresh_cas` an in-memory "OS-native
+// slot" it can read/write freely, while the `/token` POST itself still goes
+// through the same thread-local URL override + in-process mock HTTP server
+// every other refresh test in this file uses (`oauth::refresh` is
+// Claude-specific and not swappable per-provider).
 // ---------------------------------------------------------------------------
+
+/// Minimal `Provider` stand-in whose "OS-native active slot" is an in-memory
+/// `Mutex<Option<String>>` instead of the real keychain / credentials file.
+/// Every method besides `read_active_slot` / `mirror_rotated_token` is an
+/// inert default — `active_refresh_cas` never calls them.
+struct MockActiveSlotProvider {
+    slot: std::sync::Mutex<Option<String>>,
+}
+
+impl MockActiveSlotProvider {
+    fn new(initial: &str) -> Self {
+        Self {
+            slot: std::sync::Mutex::new(Some(initial.to_string())),
+        }
+    }
+
+    /// Simulate Claude Code rotating the slot out from under usagio, as if a
+    /// live `claude` session refreshed independently.
+    #[allow(dead_code)]
+    fn rotate_externally(&self, new_blob: &str) {
+        *self.slot.lock().unwrap() = Some(new_blob.to_string());
+    }
+}
+
+impl crate::providers::Provider for MockActiveSlotProvider {
+    fn provider_id(&self) -> &'static str {
+        "mock-active-slot"
+    }
+    fn display_name(&self) -> &'static str {
+        "Mock"
+    }
+    fn capabilities(&self) -> crate::providers::trait_def::Capabilities {
+        crate::providers::trait_def::Capabilities {
+            supports_usage: false,
+            supports_switching: false,
+            supports_launch: false,
+            supports_remove: false,
+            supports_email_capture: false,
+            secret_backend: crate::providers::trait_def::SecretBackend::Keychain,
+            capture_mode: crate::providers::trait_def::CaptureMode::CredsOnDisk,
+        }
+    }
+    fn capture_current_login(
+        &self,
+    ) -> crate::providers::trait_def::PResult<Option<crate::providers::trait_def::CapturedAccount>>
+    {
+        Ok(None)
+    }
+    fn parse_stored_blob(
+        &self,
+        _blob: &str,
+    ) -> crate::providers::trait_def::PResult<crate::providers::trait_def::TokenGrant> {
+        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    }
+    fn patch_stored_blob(
+        &self,
+        _blob: &str,
+        _grant: &crate::providers::trait_def::TokenGrant,
+    ) -> crate::providers::trait_def::PResult<String> {
+        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    }
+    fn read_active_slot(&self) -> crate::providers::trait_def::PResult<Option<String>> {
+        Ok(self.slot.lock().unwrap().clone())
+    }
+    fn mirror_rotated_token(&self, blob: &str) -> crate::providers::trait_def::PResult<()> {
+        *self.slot.lock().unwrap() = Some(blob.to_string());
+        Ok(())
+    }
+}
+
+fn mock_claude_blob(access: &str, refresh: &str, expires_at: i64) -> String {
+    serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": access,
+            "refreshToken": refresh,
+            "expiresAt": expires_at,
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn active_refresh_cas_won_writes_keychain_and_state() {
+    use crate::providers::claude::oauth;
+    use crate::store::ScopedConfigDir;
+
+    // `active_refresh_cas` logs via `logging::log`, which resolves
+    // `store::config_dir()` — that panics in tests without a
+    // `HOME_OVERRIDE` installed (see the tripwire in `store::config_dir`).
+    let _g = ScopedConfigDir::new();
+    let (base_url, hits) = spawn_mock_token_server();
+    oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+
+    let blob = mock_claude_blob("active-at", "active-rt", 0);
+    let provider = MockActiveSlotProvider::new(&blob);
+    let mut acct = Account::from_keychain_blob(&blob).unwrap();
+    acct.email = Some("active@example.com".into());
+
+    let outcome = active_refresh_cas(&provider, &mut acct);
+
+    oauth::set_token_url_override(None);
+
+    assert!(matches!(outcome, ActiveRefreshOutcome::CasWon), "outcome={outcome:?}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(acct.access_token, "mock-refreshed-access-token");
+    assert_eq!(acct.refresh_token, "mock-refreshed-refresh-token");
+    // The slot (our stand-in for the keychain) must hold the new grant too —
+    // this is the "usagio DOES rotate the active-account token" half of the
+    // contract, not just a state.json update.
+    let slot_blob = provider.slot.lock().unwrap().clone().unwrap();
+    let slot_acct = Account::from_keychain_blob(&slot_blob).unwrap();
+    assert_eq!(slot_acct.access_token, "mock-refreshed-access-token");
+}
+
+#[test]
+fn active_refresh_cas_lost_adopts_cc_rotation_discards_own_grant() {
+    use crate::providers::claude::oauth;
+    use crate::store::ScopedConfigDir;
+
+    let _g = ScopedConfigDir::new();
+    // The mock token server always returns the same fixed grant; simulate
+    // Claude Code rotating the slot to a DIFFERENT blob while our POST is
+    // "in flight" by mutating the slot from inside the mock server's request
+    // handler — simplest is to just rotate it before we even look at the
+    // after-read, since the mock server call is synchronous from the test's
+    // point of view. We fake this by using a slot whose content changes
+    // between the two `read_active_slot` calls via a counting wrapper.
+    let (base_url, _hits) = spawn_mock_token_server();
+    oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+
+    let before_blob = mock_claude_blob("active-at", "active-rt", 0);
+    let cc_rotated_blob = mock_claude_blob("cc-rotated-at", "cc-rotated-rt", 999_999_999_999);
+    let provider = CountingSlotProvider::new(&before_blob, &cc_rotated_blob);
+    let mut acct = Account::from_keychain_blob(&before_blob).unwrap();
+    acct.email = Some("active@example.com".into());
+
+    let outcome = active_refresh_cas(&provider, &mut acct);
+
+    oauth::set_token_url_override(None);
+
+    assert!(
+        matches!(outcome, ActiveRefreshOutcome::CasLostAdoptedCcRotation),
+        "outcome={outcome:?}"
+    );
+    // Our own (mock-server) grant must be discarded — the adopted tokens are
+    // Claude Code's, not "mock-refreshed-access-token".
+    assert_eq!(acct.access_token, "cc-rotated-at");
+    assert_eq!(acct.refresh_token, "cc-rotated-rt");
+    assert_eq!(acct.expires_at, 999_999_999_999);
+}
+
+#[test]
+fn active_refresh_skipped_when_keychain_diverged_before_start() {
+    let _g = crate::store::ScopedConfigDir::new();
+    // The slot already holds a DIFFERENT access token than state's cached
+    // one before `active_refresh_cas` even starts — Claude Code rotated
+    // between usagio's last cycle and this one, with usagio not running (or
+    // fsnotify missing the event) in between.
+    let cc_blob = mock_claude_blob("cc-already-rotated-at", "cc-already-rotated-rt", 42);
+    let provider = MockActiveSlotProvider::new(&cc_blob);
+
+    let stale_blob = mock_claude_blob("stale-at", "stale-rt", 0);
+    let mut acct = Account::from_keychain_blob(&stale_blob).unwrap();
+    acct.email = Some("active@example.com".into());
+
+    let outcome = active_refresh_cas(&provider, &mut acct);
+
+    assert!(
+        matches!(outcome, ActiveRefreshOutcome::SkippedKeychainAlreadyDrifted),
+        "outcome={outcome:?}"
+    );
+    // No /token POST should have been attempted — state adopts the keychain's
+    // tokens directly.
+    assert_eq!(acct.access_token, "cc-already-rotated-at");
+    assert_eq!(acct.refresh_token, "cc-already-rotated-rt");
+    assert_eq!(acct.expires_at, 42);
+}
+
+/// A `Provider` whose `read_active_slot` returns `before` on the first call
+/// and `after` on every call thereafter — models Claude Code rotating the
+/// slot exactly once, between `active_refresh_cas`'s before-read and
+/// after-read.
+struct CountingSlotProvider {
+    before: String,
+    after: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingSlotProvider {
+    fn new(before: &str, after: &str) -> Self {
+        Self {
+            before: before.to_string(),
+            after: after.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl crate::providers::Provider for CountingSlotProvider {
+    fn provider_id(&self) -> &'static str {
+        "counting-slot"
+    }
+    fn display_name(&self) -> &'static str {
+        "Mock"
+    }
+    fn capabilities(&self) -> crate::providers::trait_def::Capabilities {
+        crate::providers::trait_def::Capabilities {
+            supports_usage: false,
+            supports_switching: false,
+            supports_launch: false,
+            supports_remove: false,
+            supports_email_capture: false,
+            secret_backend: crate::providers::trait_def::SecretBackend::Keychain,
+            capture_mode: crate::providers::trait_def::CaptureMode::CredsOnDisk,
+        }
+    }
+    fn capture_current_login(
+        &self,
+    ) -> crate::providers::trait_def::PResult<Option<crate::providers::trait_def::CapturedAccount>>
+    {
+        Ok(None)
+    }
+    fn parse_stored_blob(
+        &self,
+        _blob: &str,
+    ) -> crate::providers::trait_def::PResult<crate::providers::trait_def::TokenGrant> {
+        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    }
+    fn patch_stored_blob(
+        &self,
+        _blob: &str,
+        _grant: &crate::providers::trait_def::TokenGrant,
+    ) -> crate::providers::trait_def::PResult<String> {
+        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    }
+    fn read_active_slot(&self) -> crate::providers::trait_def::PResult<Option<String>> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(if n == 0 {
+            self.before.clone()
+        } else {
+            self.after.clone()
+        }))
+    }
+    fn mirror_rotated_token(&self, _blob: &str) -> crate::providers::trait_def::PResult<()> {
+        // CAS-lost never reaches the write step; if it did, that would be a
+        // bug this test should catch by simply never calling this.
+        panic!("mirror_rotated_token must not be called on a lost CAS")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inactive-account refresh still uses the plain network-outside-the-lock
+// path (unaffected by the active-account CAS redesign above).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refresh_usage_cache_still_refreshes_inactive_accounts() {
+    use crate::providers::claude::{oauth, usage};
+    use crate::store::{Account, ScopedConfigDir};
+
+    let _g = ScopedConfigDir::new();
+    let (base_url, hits) = spawn_mock_token_server();
+    oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+    usage::set_usage_url_override(Some(&format!("{base_url}/api/oauth/usage")));
+
+    let expired = Utc::now().timestamp_millis() - 1_000;
+    let mut inactive = Account::from_keychain_blob(&format!(
+        r#"{{"claudeAiOauth":{{"accessToken":"inactive-at","refreshToken":"inactive-rt","expiresAt":{expired}}}}}"#
+    ))
+    .unwrap();
+    inactive.email = Some("inactive@example.com".into());
+    // No account is marked active, so refresh_usage_cache's active-CAS branch
+    // is never entered (and never touches the real keychain) for this test.
+    let mut seed = State::default();
+    seed.accounts.push(inactive);
+    seed.active = None;
+    seed.save().unwrap();
+
+    refresh_usage_cache();
+    oauth::set_token_url_override(None);
+    usage::set_usage_url_override(None);
+
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "expected exactly one /token POST for the (only, inactive) account"
+    );
+    let after = State::load().unwrap();
+    let inactive_after = after.find("inactive@example.com").unwrap();
+    assert_eq!(inactive_after.access_token, "mock-refreshed-access-token");
+    assert_eq!(inactive_after.refresh_token, "mock-refreshed-refresh-token");
+}
 
 /// Minimal single-threaded mock token endpoint: accepts TCP connections,
 /// reads (and discards) the request, and replies with a fixed valid
@@ -1129,54 +1427,9 @@ fn spawn_mock_token_server() -> (String, std::sync::Arc<std::sync::atomic::Atomi
     (format!("http://{addr}"), hits)
 }
 
-#[test]
-fn refresh_usage_cache_does_not_touch_the_active_account() {
-    use crate::providers::claude::{oauth, usage};
-    use crate::store::{Account, ScopedConfigDir};
-
-    let _g = ScopedConfigDir::new();
-    let (base_url, hits) = spawn_mock_token_server();
-    oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
-    usage::set_usage_url_override(Some(&format!("{base_url}/api/oauth/usage")));
-
-    // Both accounts are already expired, so `ensure_fresh` would attempt a
-    // refresh for either one if it were called.
-    let expired = Utc::now().timestamp_millis() - 1_000;
-    let mut active = Account::from_keychain_blob(&format!(
-        r#"{{"claudeAiOauth":{{"accessToken":"active-at","refreshToken":"active-rt","expiresAt":{expired}}}}}"#
-    ))
-    .unwrap();
-    active.email = Some("active@example.com".into());
-    let mut inactive = Account::from_keychain_blob(&format!(
-        r#"{{"claudeAiOauth":{{"accessToken":"inactive-at","refreshToken":"inactive-rt","expiresAt":{expired}}}}}"#
-    ))
-    .unwrap();
-    inactive.email = Some("inactive@example.com".into());
-
-    let mut seed = State::default();
-    seed.accounts.push(active);
-    seed.accounts.push(inactive);
-    seed.active = Some("active@example.com".into());
-    seed.save().unwrap();
-
-    refresh_usage_cache();
-    oauth::set_token_url_override(None);
-    usage::set_usage_url_override(None);
-
-    // Exactly one POST landed — for the inactive account. The active
-    // account's stored refresh token must be byte-for-byte unchanged: if
-    // `refresh_usage_cache` had called `ensure_fresh` on it, the mock server
-    // would have rotated it to "mock-refreshed-refresh-token".
-    assert_eq!(
-        hits.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "expected exactly one /token POST (for the inactive account only)"
-    );
-    let after = State::load().unwrap();
-    let active_after = after.find("active@example.com").unwrap();
-    assert_eq!(active_after.access_token, "active-at");
-    assert_eq!(active_after.refresh_token, "active-rt");
-    let inactive_after = after.find("inactive@example.com").unwrap();
-    assert_eq!(inactive_after.access_token, "mock-refreshed-access-token");
-    assert_eq!(inactive_after.refresh_token, "mock-refreshed-refresh-token");
-}
+// `refresh_usage_cache_does_not_touch_the_active_account` (735b762's "never
+// refresh the active account" test) is superseded by the CAS suite above:
+// usagio now DOES refresh the active account, via `active_refresh_cas`,
+// tested in isolation against `MockActiveSlotProvider` / `CountingSlotProvider`
+// so no test here ever touches the real OS keychain that `refresh_usage_cache`
+// would resolve `ClaudeProvider::read_active_slot()` to.

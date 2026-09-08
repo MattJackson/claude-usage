@@ -329,15 +329,53 @@ impl Provider for ClaudeProvider {
     /// rotated token must NOT touch identity at all, only the token bytes.
     fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
         parse_claude_blob(blob)?;
+        let to = if crate::platform::current().os_display_name() == "macOS" {
+            "keychain:Claude Code-credentials"
+        } else {
+            "file:~/.claude/.credentials.json"
+        };
+        let result = if crate::platform::current().os_display_name() == "macOS" {
+            keychain_write(blob)
+        } else {
+            (|| {
+                let path = claude_credentials_json_path()
+                    .ok_or_else(|| ProviderError::Other("could not resolve HOME".into()))?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(ProviderError::Io)?;
+                }
+                write_bytes_atomic_mode(&path, blob.as_bytes(), 0o600)
+            })()
+        };
+        let account = extract_claude_email(&serde_json::from_str(blob).unwrap_or(Value::Null))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        crate::logging::log(&format!(
+            "event=mirror provider={} account={account} to={to} result={}",
+            self.provider_id(),
+            match &result {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("err:{e}"),
+            }
+        ));
+        result
+    }
+
+    /// Read half of the active-account CAS refresh (see the trait doc). Reads
+    /// the exact same slot `mirror_rotated_token` writes: macOS keychain, or
+    /// the plaintext credentials file on Linux/Windows.
+    fn read_active_slot(&self) -> PResult<Option<String>> {
+        // On macOS `keychain_read` routes through `Platform::secrets().get()`
+        // (`MacOsSecrets::get`), which already emits the structured
+        // `event=keychain_read` line — no need to duplicate it here.
         if crate::platform::current().os_display_name() == "macOS" {
-            return keychain_write(blob);
+            return Ok(keychain_read());
         }
         let path = claude_credentials_json_path()
             .ok_or_else(|| ProviderError::Other("could not resolve HOME".into()))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(ProviderError::Io)?;
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ProviderError::Io(e)),
         }
-        write_bytes_atomic_mode(&path, blob.as_bytes(), 0o600)
     }
 
     // --- Credential sync ---------------------------------------------------
@@ -849,8 +887,16 @@ mod tests {
 
     #[test]
     fn mirror_rotated_token_writes_the_blob_where_the_vendor_reads_it() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
+        // `mirror_rotated_token` logs via `logging::log`, which resolves
+        // `store::config_dir()` — that panics in tests without a
+        // `HOME_OVERRIDE` installed (see the tripwire in `store::config_dir`).
+        // `ScopedConfigDir` installs that thread-local; reuse its tempdir as
+        // the plain `$HOME` env var too, since the non-macOS path resolves
+        // `~/.claude/.credentials.json` off `$HOME` directly rather than
+        // through `store::config_dir()`.
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let dir = _cfg.home();
+        crate::env_lock::scoped_env_var("HOME", Some(dir.to_str().unwrap()), || {
             let blob = serde_json::json!({
                 "claudeAiOauth": {
                     "accessToken": "mirrored-at",
@@ -871,7 +917,7 @@ mod tests {
                 }
             } else {
                 res.unwrap();
-                let path = dir.path().join(".claude").join(".credentials.json");
+                let path = dir.join(".claude").join(".credentials.json");
                 let on_disk = std::fs::read_to_string(&path).unwrap();
                 assert_eq!(on_disk, blob);
                 #[cfg(unix)]

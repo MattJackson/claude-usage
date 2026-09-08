@@ -337,7 +337,23 @@ impl Provider for CodexProvider {
             display_name: None,
             native_blob: serde_json::Value::Null,
         };
-        self.write_active_account(blob, &placeholder)
+        let result = self.write_active_account(blob, &placeholder);
+        let account = self
+            .identify_credential(blob)
+            .map(|k| k.key)
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let to = auth_json_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unresolved auth.json>".to_string());
+        crate::logging::log(&format!(
+            "event=mirror provider={} account={account} to={to} result={}",
+            self.provider_id(),
+            match &result {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("err:{e}"),
+            }
+        ));
+        result
     }
 
     // --- Credential sync ---------------------------------------------------
@@ -624,6 +640,11 @@ mod tests {
 
     #[test]
     fn mirror_rotated_token_writes_the_blob_where_the_vendor_reads_it() {
+        // `mirror_rotated_token` logs via `logging::log`, which resolves
+        // `store::config_dir()` — that panics in tests without a
+        // `HOME_OVERRIDE` installed (see the tripwire in `store::config_dir`).
+        // Unrelated to `$CODEX_HOME` below; just satisfies that tripwire.
+        let _cfg = crate::store::ScopedConfigDir::new();
         let p = CodexProvider;
         let dir = tempfile::tempdir().unwrap();
         let codex_home = dir.path().join("codex-home");

@@ -217,6 +217,9 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                 };
                 let key = AccountKey::new("claude", &email);
                 if !last_chance_fallback(claude, &key) {
+                    crate::logging::log(&format!(
+                        "event=needs_relogin account={email} reason=invalid_grant"
+                    ));
                     // R2-EH-01 (round-2 codeaudit): mirror flag_needs_relogin's
                     // logging on save-Err so a state.json write failure here is
                     // visible instead of being silently discarded.

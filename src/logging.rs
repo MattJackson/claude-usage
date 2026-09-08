@@ -28,6 +28,21 @@ pub fn rotate_if_large(path: &std::path::Path, max_bytes: u64) {
     }
 }
 
+/// Redact a token to its first 20 chars + `..` so structured token-lifecycle
+/// log lines (`event=...`) can show enough of a token to correlate across
+/// lines (e.g. "did the CAS-lost adopted prefix match the next cycle's
+/// before-blob prefix?") without ever writing a usable secret to disk.
+/// Tokens shorter than 20 chars (should never happen for a real OAuth access
+/// token, but keeps this total for stray test/fixture strings) are redacted
+/// in full rather than panicking on the slice.
+pub fn tok_prefix(t: &str) -> String {
+    if t.len() >= 20 {
+        format!("{}..", &t[..20])
+    } else {
+        format!("{t}..")
+    }
+}
+
 /// Append a timestamped line to the debug log. Best-effort: any failure is
 /// silently ignored so logging never disrupts the daemon.
 pub fn log(msg: &str) {

@@ -484,10 +484,10 @@ fn poll_loop() {
         if rate_limited {
             crate::logging::log(&format!("rate limited; backing off to {current}s"));
         } else if current != prev && current < base {
+            let max_pct = max_session_pct.unwrap_or(0.0);
             crate::logging::log(&format!(
-                "cadence: {prev}s → {current}s (max session {:.1}%, trigger {:.0}%)",
-                max_session_pct.unwrap_or(0.0),
-                trigger
+                "cadence: {prev}s → {current}s (max session {max_pct:.1}%, trigger {trigger:.0}%) \
+                 event=cadence prev={prev}s new={current}s max_pct={max_pct:.1} trigger={trigger:.0}"
             ));
         }
         std::thread::sleep(Duration::from_secs(current));

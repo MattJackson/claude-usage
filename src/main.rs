@@ -208,6 +208,18 @@ fn run() -> Result<()> {
     // here so it always precedes the dispatch below.
     providers::init();
 
+    let provider_slugs: Vec<&'static str> =
+        providers::all().iter().map(|p| p.provider_id()).collect();
+    logging::log(&format!(
+        "event=startup version={} pid={} config_dir={} providers=[{}]",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        store::config_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unresolved>".to_string()),
+        provider_slugs.join(","),
+    ));
+
     // Spawn fsnotify watchers on every provider's credential paths so
     // rotations the vendor CLI writes (or another usagio process makes)
     // are absorbed as they happen, not just on the next 150s watch tick.
@@ -339,6 +351,11 @@ pub(crate) fn capture_current() -> Result<(String, bool)> {
     acct.oauth_account = oauth_account;
     acct.user_id = user_id;
 
+    let (at_prefix, rt_prefix, expires_at) = (
+        logging::tok_prefix(&acct.access_token),
+        logging::tok_prefix(&acct.refresh_token),
+        acct.expires_at,
+    );
     let existed = with_state_lock(|| {
         let mut state = State::load()?;
         let existing = state.find(&email);
@@ -351,6 +368,10 @@ pub(crate) fn capture_current() -> Result<(String, bool)> {
         state.save()?;
         Ok(existed)
     })?;
+    logging::log(&format!(
+        "event=capture account={email} existed={existed} at_prefix={at_prefix} \
+         rt_prefix={rt_prefix} expires_at={expires_at}"
+    ));
     Ok((email, existed))
 }
 
@@ -642,6 +663,9 @@ fn flag_needs_relogin(email: &str) {
     // visible in the log. The next `refresh_usage_cache` tick re-sets the
     // flag from the invalid_grant observation, so we still make progress,
     // but the failure should be noisy.
+    logging::log(&format!(
+        "event=needs_relogin account={email} reason=invalid_grant"
+    ));
     if let Err(e) = with_state_lock(|| {
         let mut st = State::load()?;
         if let Some(a) = st.find_mut(email) {
@@ -713,8 +737,9 @@ fn switch_to_guarded(
                 );
             }
         }
+        let from = st.active.clone();
         // ~/.claude.json first, keychain last (the commit point), rollback on fail.
-        apply_account(provider, &acct, identity)?;
+        apply_account(provider, &acct, identity, from.as_deref(), &label)?;
         if let Some(a) = st.find_mut(email) {
             a.set_tokens_if_newer(
                 acct.access_token.clone(),
@@ -775,16 +800,30 @@ fn apply_account(
     provider: &'static dyn Provider,
     acct: &Account,
     identity: &serde_json::Value,
+    from: Option<&str>,
+    to: &str,
 ) -> Result<()> {
     let _ = provider;
     let prior = read_claude_json_raw();
-    write_claude_identity(identity, acct.user_id.as_deref())?;
+    let identity_result = write_claude_identity(identity, acct.user_id.as_deref());
+    if let Err(e) = &identity_result {
+        logging::log(&format!(
+            "event=switch from={} to={to} identity_written=err:{e:#} keychain_written=skipped",
+            from.unwrap_or("<none>"),
+        ));
+        identity_result?;
+    }
     if let Err(e) = keychain_write(&acct.keychain_blob) {
         if let Some((bytes, mode)) = &prior {
             // If the rollback ALSO fails we're half-applied (~/.claude.json points
             // at the new account, keychain still holds the old) — surface that
             // explicitly rather than silently swallowing the rollback error.
             if let Err(re) = restore_claude_json_raw(bytes, *mode) {
+                logging::log(&format!(
+                    "event=switch from={} to={to} identity_written=ok \
+                     keychain_written=err:{e:#} rollback=err:{re:#}",
+                    from.unwrap_or("<none>"),
+                ));
                 return Err(e).context(format!(
                     "writing the account into the keychain, and rolling back \
                      ~/.claude.json failed too ({re:#}); it may now point at the new \
@@ -793,8 +832,16 @@ fn apply_account(
                 ));
             }
         }
+        logging::log(&format!(
+            "event=switch from={} to={to} identity_written=ok keychain_written=err:{e:#}",
+            from.unwrap_or("<none>"),
+        ));
         return Err(e).context("writing the account into the keychain");
     }
+    logging::log(&format!(
+        "event=switch from={} to={to} identity_written=ok keychain_written=ok",
+        from.unwrap_or("<none>"),
+    ));
     Ok(())
 }
 
@@ -816,6 +863,47 @@ fn identity_matches(
             _ => false,
         },
     }
+}
+
+/// Best-effort mirror of a rotated INACTIVE account's new grant back to the
+/// vendor CLI's OS-native slot — but ONLY if the vendor's own active identity
+/// (`read_active_identity`) currently agrees this account is the one it's
+/// using. Claude Code's keychain / credentials-file slot is a single shared
+/// resource across every locally known account — there is no per-account
+/// file — so blindly mirroring an inactive account's rotation into it would
+/// silently clobber whatever account is genuinely logged in right now. This
+/// is the write-path counterpart of the identity check `sync_active_from_
+/// keychain` already uses before adopting a rotation FROM the slot.
+///
+/// Returns `None` when mirroring was skipped (no vendor identity, or it
+/// doesn't match this account) — the caller logs that as `mirror_back=skip`,
+/// distinct from an attempted mirror that failed (`Some(Err(_))`).
+fn mirror_inactive_rotation(
+    provider: &'static dyn Provider,
+    acct: &Account,
+) -> Option<std::result::Result<(), String>> {
+    let vendor_identity = match provider.read_active_identity() {
+        Ok(Some(id)) => id,
+        _ => return None,
+    };
+    let matches = identity_matches(
+        acct.identity_uuid().as_deref(),
+        acct.email.as_deref(),
+        vendor_identity.uuid.as_deref(),
+        vendor_identity
+            .email
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+    );
+    if !matches {
+        return None;
+    }
+    Some(
+        provider
+            .mirror_rotated_token(&acct.keychain_blob)
+            .map_err(|e| e.to_string()),
+    )
 }
 
 /// If the account currently in the keychain is genuinely our active account,
@@ -856,11 +944,18 @@ fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State)
         json_email.as_deref(),
     );
     if !matches {
-        logging::log(
-            "sync: keychain identity does not match the active account; not adopting tokens",
-        );
+        logging::log(&format!(
+            "sync: keychain identity does not match the active account; not adopting tokens \
+             (event=sync_active_from_keychain account={active} outcome=identity_mismatch)"
+        ));
         return;
     }
+    logging::log(&format!(
+        "event=sync_active_from_keychain account={active} outcome=adopted \
+         at_prefix={} rt_prefix={}",
+        logging::tok_prefix(&fresh.access_token),
+        logging::tok_prefix(&fresh.refresh_token),
+    ));
     acct.access_token = fresh.access_token;
     acct.refresh_token = fresh.refresh_token;
     acct.expires_at = fresh.expires_at;
@@ -1363,6 +1458,196 @@ fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str
 }
 
 // ---------------------------------------------------------------------------
+// Active-account refresh — compare-and-swap on the OS keychain
+// ---------------------------------------------------------------------------
+//
+// Claude Code (the vendor CLI) may rotate the same OS-native credential slot
+// (macOS keychain / `~/.claude/.credentials.json`) at any moment — its
+// refresh_token is single-use, and Anthropic invalidates the whole family the
+// instant either side rotates. A naive "usagio also refreshes the active
+// account" would race Claude Code's own rotation and strand one side with a
+// dead grant (the never-re-login regression this file's history is full of).
+// A naive "usagio never refreshes the active account" (the previous
+// redesign, commit 735b762) avoids the race but means an active account left
+// idle long enough goes stale with nobody to refresh it.
+//
+// The fix is a compare-and-swap: read the slot before refreshing, refresh
+// only if we're provably the sole owner of the current token generation, then
+// read the slot again before committing. If Claude Code touched the slot at
+// any point in that window, our own (already-stale) grant is discarded and
+// Claude Code's rotation is adopted instead — usagio never fights Claude Code
+// for the write, but it DOES rotate the token when nobody else is racing it.
+
+/// Outcome of one `active_refresh_cas` attempt.
+#[derive(Debug)]
+enum ActiveRefreshOutcome {
+    /// usagio held the sole write lease on the slot for the whole cycle:
+    /// POSTed `/token` and committed the new grant to the slot + state.json.
+    CasWon,
+    /// Claude Code rotated the slot WHILE our `/token` POST was in flight.
+    /// Our new grant is already stale (Anthropic's single-use refresh_token
+    /// semantics mean Claude Code's own refresh invalidated the token family
+    /// we just rotated); it is discarded and Claude Code's rotation is
+    /// adopted into `acct` instead.
+    CasLostAdoptedCcRotation,
+    /// Claude Code had already rotated the slot before this cycle started
+    /// (most likely while usagio wasn't running). No `/token` POST was
+    /// attempted; the rotation is adopted into `acct` and refresh is retried
+    /// next cycle if the adopted token still needs it.
+    SkippedKeychainAlreadyDrifted,
+    /// The read/refresh/write sequence failed outright (slot unreadable, the
+    /// refresh POST itself failed, or the commit write failed). `acct` is
+    /// left untouched; the caller keeps the existing cache for this cycle.
+    RefreshFailed,
+}
+
+/// Compare-and-swap refresh for the ACTIVE account only. MUST be run entirely
+/// inside `with_state_lock` by the caller (see `refresh_usage_cache`) so it's
+/// atomic with respect to every other in-process caller of `with_state_lock`
+/// (switch, capture, the inactive-account merge). Cross-process safety comes
+/// from the OS-native slot itself being sequentially consistent: one
+/// `security` CLI invocation (or one file write) completes fully before the
+/// next caller can observe it, so "read, POST, read again, compare" can never
+/// observe a torn write.
+///
+/// `provider` is used ONLY for `read_active_slot` / `mirror_rotated_token` —
+/// the actual `/token` POST goes through `oauth::refresh`, matching every
+/// other Claude refresh path in this file (v1 state is Claude-only). `acct`
+/// is the caller's just-reloaded in-memory copy; it is mutated in place to
+/// whichever tokens end up correct. This function does not save state.json —
+/// the caller does that once, after this returns.
+fn active_refresh_cas(provider: &dyn Provider, acct: &mut Account) -> ActiveRefreshOutcome {
+    let email = acct.email.clone().unwrap_or_default();
+
+    let before = match provider.read_active_slot() {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            logging::log(&format!(
+                "event=active_refresh_cas_failed account={email} reason=slot_empty"
+            ));
+            return ActiveRefreshOutcome::RefreshFailed;
+        }
+        Err(e) => {
+            logging::log(&format!(
+                "event=active_refresh_cas_failed account={email} reason=read_before:{e}"
+            ));
+            return ActiveRefreshOutcome::RefreshFailed;
+        }
+    };
+    let before_acct = match Account::from_keychain_blob(&before) {
+        Ok(a) => a,
+        Err(e) => {
+            logging::log(&format!(
+                "event=active_refresh_cas_failed account={email} reason=parse_before:{e:#}"
+            ));
+            return ActiveRefreshOutcome::RefreshFailed;
+        }
+    };
+
+    if before_acct.access_token != acct.access_token {
+        // Claude Code rotated behind us since our last cycle — we are not
+        // the sole owner of the current generation. Adopt the rotation and
+        // skip refreshing this cycle; the token we just adopted is fresher
+        // than ours anyway, and racing a POST against it would only risk
+        // invalidating the very grant we just picked up.
+        let cc_prefix = logging::tok_prefix(&before_acct.access_token);
+        acct.set_tokens(
+            before_acct.access_token,
+            before_acct.refresh_token,
+            before_acct.expires_at,
+        );
+        acct.keychain_blob = before;
+        logging::log(&format!(
+            "active refresh SKIPPED: keychain drifted (CC rotated), adopted {cc_prefix}.. \
+             (event=active_refresh_cas_skipped_drift account={email})"
+        ));
+        return ActiveRefreshOutcome::SkippedKeychainAlreadyDrifted;
+    }
+
+    // We're the sole owner of the current generation — POST /token.
+    let old_prefix = logging::tok_prefix(&acct.access_token);
+    if let Err(e) = oauth::refresh(acct) {
+        eprintln!("DEBUG active_refresh_cas refresh_http_error: {e:?}");
+        logging::log(&format!(
+            "event=active_refresh_cas_failed account={email} reason=refresh_http_error:{e}"
+        ));
+        return ActiveRefreshOutcome::RefreshFailed;
+    }
+    let new_grant_blob = acct.keychain_blob.clone();
+    let new_prefix = logging::tok_prefix(&acct.access_token);
+
+    let after = match provider.read_active_slot() {
+        Ok(v) => v,
+        Err(e) => {
+            // We can no longer tell whether we still own the generation.
+            // Refuse to write blindly — better to retry next cycle (our
+            // now-orphaned new grant is simply dropped; `acct` is left as it
+            // was before this call returns, via the caller's own reload).
+            logging::log(&format!(
+                "event=active_refresh_cas_failed account={email} reason=read_after:{e}"
+            ));
+            return ActiveRefreshOutcome::RefreshFailed;
+        }
+    };
+
+    if after.as_deref() == Some(before.as_str()) {
+        // Still sole owner: commit our new grant. `mirror_rotated_token`
+        // routes through `Platform::secrets()` (delete-then-add on macOS —
+        // see `MacOsSecrets::set` — or the credentials file on Linux/Windows).
+        if let Err(e) = provider.mirror_rotated_token(&new_grant_blob) {
+            logging::log(&format!(
+                "event=active_refresh_cas_failed account={email} reason=write_after:{e}"
+            ));
+            return ActiveRefreshOutcome::RefreshFailed;
+        }
+        logging::log(&format!(
+            "active refresh CAS OK: {old_prefix}.. -> {new_prefix}.. \
+             (event=active_refresh_cas_won account={email})"
+        ));
+        ActiveRefreshOutcome::CasWon
+    } else {
+        // Claude Code rotated DURING our POST. Our new grant is already
+        // stale — discard it and adopt whatever Claude Code wrote instead.
+        match after.as_deref().map(Account::from_keychain_blob) {
+            Some(Ok(cc_acct)) => {
+                let cc_prefix = logging::tok_prefix(&cc_acct.access_token);
+                acct.set_tokens(
+                    cc_acct.access_token,
+                    cc_acct.refresh_token,
+                    cc_acct.expires_at,
+                );
+                acct.keychain_blob = after.unwrap();
+                logging::log(&format!(
+                    "active refresh CAS LOST: CC rotated during our POST, discarding our \
+                     grant, adopting {cc_prefix}.. (event=active_refresh_cas_lost \
+                     account={email} discarded_at_prefix={new_prefix} adopted_at_prefix={cc_prefix})"
+                ));
+            }
+            _ => {
+                // After-blob missing/unparseable: can't confirm Claude Code's
+                // side landed cleanly. Revert to the pre-refresh tokens
+                // (identical to `before_acct`, since that's the invariant we
+                // established above) rather than keeping our now-discarded
+                // new grant.
+                logging::log(&format!(
+                    "active refresh CAS LOST: CC rotated during our POST but the after-blob \
+                     could not be read/parsed; discarding our grant only (event=\
+                     active_refresh_cas_lost account={email} discarded_at_prefix={new_prefix} \
+                     adopted_at_prefix=<unreadable>)"
+                ));
+                acct.set_tokens(
+                    before_acct.access_token,
+                    before_acct.refresh_token,
+                    before_acct.expires_at,
+                );
+                acct.keychain_blob = before;
+            }
+        }
+        ActiveRefreshOutcome::CasLostAdoptedCcRotation
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Usage refresh (the ONE network path)
 // ---------------------------------------------------------------------------
 
@@ -1427,22 +1712,82 @@ fn refresh_usage_cache() -> RefreshOutcome {
         if acct.needs_relogin {
             continue;
         }
-        // usagio NEVER refreshes the ACTIVE account. Claude Code owns
-        // rotation for it — its refresh_token is single-use, and Anthropic
-        // invalidates it server-side the instant either side rotates, so a
-        // concurrent usagio refresh would race Claude Code's own and one of
-        // the two processes would end up holding a dead refresh_token. Use
-        // whatever access token is on disk right now; if it's stale, wait for
-        // Claude Code to rotate it on its own next invocation rather than
-        // POSTing /token ourselves.
+        // The ACTIVE account gets the compare-and-swap treatment (see the
+        // `active_refresh_cas` doc above): usagio DOES rotate its token, but
+        // the read-refresh-read sequence is run entirely under the state
+        // lock so it can never race a concurrent switch/capture in this
+        // process, and it backs off cleanly the instant it observes Claude
+        // Code touched the same slot. Every other account uses the plain
+        // network-outside-the-lock refresh below.
         let is_active = state.active.as_deref() == Some(email.as_str());
-        if !is_active {
+        if is_active {
+            let email_owned = email.clone();
+            let cas = with_state_lock(|| {
+                let mut st = State::load()?;
+                let outcome = st
+                    .find_mut(&email_owned)
+                    .map(|a| active_refresh_cas(provider, a));
+                if outcome.is_some() {
+                    st.save()?;
+                }
+                let fresh = st.find(&email_owned).cloned();
+                Ok((outcome, fresh))
+            });
+            match cas {
+                Ok((Some(ActiveRefreshOutcome::RefreshFailed), _)) => {
+                    // Keep the existing cache this cycle; retry next tick.
+                    continue;
+                }
+                Ok((Some(_), Some(fresh))) => {
+                    // CasWon / CasLostAdoptedCcRotation / SkippedDrift all
+                    // leave `fresh` holding the tokens to use for the usage
+                    // fetch below.
+                    acct = fresh;
+                }
+                Ok((Some(_), None)) | Ok((None, _)) => {
+                    // Account vanished (a concurrent `rm`) mid-cycle.
+                    continue;
+                }
+                Err(e) => {
+                    logging::log(&format!(
+                        "poll: active CAS state operation failed for {email}: {e:#}"
+                    ));
+                    continue;
+                }
+            }
+        } else {
             match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
-                Ok(_) => {}
+                Ok(true) => {
+                    let old_prefix = logging::tok_prefix(&acct.access_token);
+                    // mirror_back is `skip` (not `ok`/`err`) when the vendor
+                    // CLI's own active identity doesn't match this account —
+                    // Claude Code's keychain/credentials-file slot is a
+                    // single shared resource across every locally known
+                    // account (there's no per-account file), so blindly
+                    // mirroring an inactive account's rotation into it would
+                    // clobber whichever account is genuinely logged in right
+                    // now. Only mirror when the vendor agrees this account IS
+                    // its current active identity.
+                    let mirror_back = mirror_inactive_rotation(provider, &acct);
+                    logging::log(&format!(
+                        "event=inactive_refresh account={email} at_prefix={old_prefix}.. -> \
+                         {}.. mirror_back={}",
+                        logging::tok_prefix(&acct.access_token),
+                        match &mirror_back {
+                            Some(Ok(())) => "ok",
+                            Some(Err(_)) => "err",
+                            None => "skip",
+                        }
+                    ));
+                }
+                Ok(false) => {}
                 Err(oauth::RefreshError::InvalidGrant) => {
                     logging::log(&format!(
                         "token refresh permanently rejected for {email} (invalid_grant); \
                          flagging for re-login"
+                    ));
+                    logging::log(&format!(
+                        "event=needs_relogin account={email} reason=invalid_grant"
                     ));
                     acct.needs_relogin = true;
                     // Fall through to the merge step so the flag is persisted;
@@ -1467,11 +1812,10 @@ fn refresh_usage_cache() -> RefreshOutcome {
                 None
             }
             Err(usage::FetchError::Auth) if is_active => {
-                // The active account's token was invalidated (most likely
-                // Claude Code rotated it and we're holding the stale side of
-                // that single-use pair). Not ours to fix — skip this account
-                // for the cycle and let the next `sync_active_from_keychain`
-                // pick up Claude Code's rotation.
+                // The active account's token was invalidated between our CAS
+                // and this fetch (Claude Code rotated again in that narrow
+                // window). Not ours to fix this cycle — skip and let the
+                // next cycle's CAS pick up the new rotation.
                 logging::log(&format!(
                     "active account token invalidated for {email}; waiting for Claude Code to rotate"
                 ));
@@ -1603,10 +1947,11 @@ fn cmd_watch(args: &[String]) -> Result<()> {
                 } else if current != prev && current < base {
                     // Log cadence tightening so a user chasing a missed swap can
                     // see the daemon was polling faster on approach.
+                    let max_pct = outcome.max_session_pct.unwrap_or(0.0);
                     logging::log(&format!(
-                        "cadence: {prev}s → {current}s (max session {:.1}%, trigger {:.0}%)",
-                        outcome.max_session_pct.unwrap_or(0.0),
-                        trigger
+                        "cadence: {prev}s → {current}s (max session {max_pct:.1}%, \
+                         trigger {trigger:.0}%) event=cadence prev={prev}s new={current}s \
+                         max_pct={max_pct:.1} trigger={trigger:.0}"
                     ));
                 }
             }

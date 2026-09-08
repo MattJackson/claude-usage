@@ -111,25 +111,32 @@ impl SecretStore for MacOsSecrets {
             .args(["find-generic-password", "-s", service, "-a", account, "-w"])
             .output()
             .context("running `security find-generic-password`")?;
-        if !out.status.success() {
+        let result = if !out.status.success() {
             match out.status.code() {
-                Some(44) => return Ok(None),
+                Some(44) => Ok(None),
                 other => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    bail!(
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    Err(anyhow::anyhow!(
                         "`security find-generic-password` failed \
-                         (exit {other:?}) for service={service} account={account}: {}",
-                        stderr.trim(),
-                    );
+                         (exit {other:?}) for service={service} account={account}: {stderr}",
+                    ))
                 }
             }
-        }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() {
-            Ok(None)
         } else {
-            Ok(Some(s))
-        }
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Ok(if s.is_empty() { None } else { Some(s) })
+        };
+        // Belt-and-suspenders: log every keychain touch so a bug that leaves
+        // nothing else logged still shows up here (M4-audit finding).
+        crate::logging::log(&format!(
+            "event=keychain_read svc={service} acct={account} result={}",
+            match &result {
+                Ok(Some(_)) => "ok".to_string(),
+                Ok(None) => "not_found".to_string(),
+                Err(e) => format!("err:{e:#}"),
+            }
+        ));
+        result
     }
 
     fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
@@ -140,23 +147,56 @@ impl SecretStore for MacOsSecrets {
         // "always allow?" keychain prompts on every launch of an unsigned
         // brew-installed binary (see header comment at the top of this file).
         // Kept as-is; documented as SEC-2 in security posture notes.
-        let status = Command::new("security")
-            .args([
-                "add-generic-password",
-                "-U",
-                "-s",
-                service,
-                "-a",
-                account,
-                "-w",
-                secret,
-            ])
-            .status()
-            .context("running `security add-generic-password`")?;
-        if !status.success() {
-            bail!("`security add-generic-password` failed for service={service} account={account}");
-        }
-        Ok(())
+        //
+        // M4-audit finding: `add-generic-password -U` (update-in-place)
+        // triggers a SecurityAgent "Keychain Not Found"/"always allow?"
+        // prompt when the existing item's ACL doesn't already list this
+        // (unsigned) binary — e.g. an item Claude Code itself created. Delete
+        // the item first (ignoring "not found", exit 44) and add it fresh
+        // WITHOUT `-U`, so the new item's ACL only ever contains usagio and
+        // no update-ACL negotiation with a differently-ACL'd existing item
+        // ever happens.
+        let result = (|| -> Result<()> {
+            let del = Command::new("security")
+                .args(["delete-generic-password", "-s", service, "-a", account])
+                .output()
+                .context("running `security delete-generic-password` (pre-set)")?;
+            if !del.status.success() && del.status.code() != Some(44) {
+                let stderr = String::from_utf8_lossy(&del.stderr);
+                bail!(
+                    "`security delete-generic-password` (pre-set) failed \
+                     (exit {:?}) for service={service} account={account}: {}",
+                    del.status.code(),
+                    stderr.trim(),
+                );
+            }
+            let status = Command::new("security")
+                .args([
+                    "add-generic-password",
+                    "-s",
+                    service,
+                    "-a",
+                    account,
+                    "-w",
+                    secret,
+                ])
+                .status()
+                .context("running `security add-generic-password`")?;
+            if !status.success() {
+                bail!(
+                    "`security add-generic-password` failed for service={service} account={account}"
+                );
+            }
+            Ok(())
+        })();
+        crate::logging::log(&format!(
+            "event=keychain_write svc={service} acct={account} result={}",
+            match &result {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("err:{e:#}"),
+            }
+        ));
+        result
     }
 
     fn delete(&self, service: &str, account: &str) -> Result<()> {
@@ -375,5 +415,81 @@ mod tests {
         ss.delete(&service, account).expect("delete");
         let after = ss.get(&service, account).expect("get after delete");
         assert!(after.is_none(), "secret still present after delete");
+    }
+
+    /// M4-audit: `set` must delete-then-add rather than `add-generic-password
+    /// -U`, so the second `set` doesn't hit the "-U update" ACL-negotiation
+    /// path that can prompt SecurityAgent. Calling `set` twice in a row (the
+    /// exact CAS-write pattern) must succeed both times and leave the LATEST
+    /// value in place. `#[ignore]`d for the same reason as
+    /// `secret_store_roundtrip` — touches the real login keychain.
+    #[test]
+    #[ignore = "touches the real login keychain; run with --ignored"]
+    fn macos_secrets_set_deletes_then_adds() {
+        let service = format!("usagio-platform-test-cas-{}", std::process::id());
+        let account = "cas-write";
+        let ss = MacOsSecrets;
+        let _ = ss.delete(&service, account);
+
+        ss.set(&service, account, "generation-1")
+            .expect("first set");
+        assert_eq!(
+            ss.get(&service, account).unwrap().as_deref(),
+            Some("generation-1")
+        );
+
+        // The second `set` is the one that would have hit `-U`'s "update an
+        // existing item" path under the old implementation. It must succeed
+        // cleanly and leave the newest value in place.
+        ss.set(&service, account, "generation-2")
+            .expect("second set");
+        assert_eq!(
+            ss.get(&service, account).unwrap().as_deref(),
+            Some("generation-2")
+        );
+
+        ss.delete(&service, account).expect("cleanup delete");
+    }
+
+    /// M4-audit: `set` must succeed even when an item under the same
+    /// service/account already exists and was created by a DIFFERENT
+    /// process/tool (simulated here by seeding with a raw `security`
+    /// invocation rather than going through `MacOsSecrets`) — this is exactly
+    /// the "Claude Code already wrote this keychain item" scenario the
+    /// delete-then-add rewrite exists to handle without an `-U` ACL prompt.
+    #[test]
+    #[ignore = "touches the real login keychain; run with --ignored"]
+    fn macos_secrets_set_after_existing_item_created_by_another_process() {
+        let service = format!("usagio-platform-test-foreign-{}", std::process::id());
+        let account = "foreign-owner";
+        let _ = Command::new("security")
+            .args(["delete-generic-password", "-s", &service, "-a", account])
+            .output();
+
+        // Seed as a plain (non-`-U`) item, standing in for "some other tool
+        // created this keychain entry".
+        let seed = Command::new("security")
+            .args([
+                "add-generic-password",
+                "-s",
+                &service,
+                "-a",
+                account,
+                "-w",
+                "seeded-by-another-process",
+            ])
+            .status()
+            .expect("seed add-generic-password");
+        assert!(seed.success(), "failed to seed the foreign-owned item");
+
+        let ss = MacOsSecrets;
+        ss.set(&service, account, "usagio-owned-now")
+            .expect("set must succeed over a foreign-created item");
+        assert_eq!(
+            ss.get(&service, account).unwrap().as_deref(),
+            Some("usagio-owned-now")
+        );
+
+        ss.delete(&service, account).expect("cleanup delete");
     }
 }
