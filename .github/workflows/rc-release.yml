@@ -257,10 +257,41 @@ jobs:
           sha256sum "${BIN}-${version}-x86_64-pc-windows-msvc.zip" \
             > "${BIN}-${version}-x86_64-pc-windows-msvc.zip.sha256"
 
+      - name: Install NSIS
+        shell: bash
+        run: |
+          choco install nsis -y
+          echo "C:\Program Files (x86)\NSIS" >> "$GITHUB_PATH"
+
+      - name: Build NSIS installer (.exe)
+        # Mirrors the equivalent step in release.yml — lets an RC tag be
+        # smoke-tested with the real installer UX before cutting a stable
+        # tag. Note the RC tag itself carries a `-rcN` suffix; the
+        # installer's own VERSION define uses the Cargo.toml base version
+        # (already verified to match above), not the full RC tag, so the
+        # installer's Add/Remove Programs version string stays a plain
+        # x.y.z like a real release would ship.
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"     # e.g. 0.5.0-rc1
+          ver="${tag%%-rc*}"                   # e.g. 0.5.0
+          stage="$(mktemp -d)"
+          cp "target/x86_64-pc-windows-msvc/release/${BIN}.exe" "$stage/${BIN}.exe"
+          cp packaging/windows/usagio.ico "$stage/usagio.ico"
+          cp packaging/windows/installer.nsi "$stage/installer.nsi"
+          (cd "$stage" && makensis "-DVERSION=${ver}" installer.nsi)
+          mv "$stage/${BIN}-v${ver}-x86_64-pc-windows-msvc-setup.exe" \
+            "dist/${BIN}-v${tag}-x86_64-pc-windows-msvc-setup.exe"
+          cd dist
+          sha256sum "${BIN}-v${tag}-x86_64-pc-windows-msvc-setup.exe" \
+            > "${BIN}-v${tag}-x86_64-pc-windows-msvc-setup.exe.sha256"
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: 'dist/*.zip'
+          subject-path: |
+            dist/*.zip
+            dist/*setup.exe
 
       - name: Publish GitHub Release asset
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
@@ -271,4 +302,5 @@ jobs:
           prerelease: true
           files: |
             dist/*.zip
+            dist/*setup.exe
             dist/*.sha256
