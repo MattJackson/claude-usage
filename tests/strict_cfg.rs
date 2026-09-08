@@ -58,33 +58,36 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("src/menubar.rs", 29),
     // src/menubar.rs — `pub fn run()`, non-macOS branch: dispatches to
     // `cross_platform::run` (the `platform::MenuBackend`-based renderer).
-    ("src/menubar.rs", 585),
+    ("src/menubar.rs", 610),
     // src/menubar.rs — `pub fn run()`, macOS branch: the native
     // `NSApplication` run loop.
-    ("src/menubar.rs", 590),
+    ("src/menubar.rs", 615),
     // src/menubar.rs — `build_menu`: builds a native `tray_icon::menu::Menu`
     // for the macOS `apply_menu_styles` NSMenu walk to mutate in place.
     // Linux/Windows build the equivalent `platform::MenuTree` via
     // `cross_platform::menu_tree_from_snapshot`.
-    ("src/menubar.rs", 1321),
-    // src/menubar.rs — `build_account_block`: macOS-only counterpart to
-    // `cross_platform::build_account_block_items`.
-    ("src/menubar.rs", 1599),
+    ("src/menubar.rs", 1367),
+    // src/menubar.rs — `build_provider_group`: macOS-only counterpart to
+    // `cross_platform::build_provider_group_item` (v0.5.3 menu redesign).
+    ("src/menubar.rs", 1641),
+    // src/menubar.rs — `build_account_submenu`: macOS-only counterpart to
+    // `cross_platform::build_account_submenu_item` (v0.5.3 menu redesign).
+    ("src/menubar.rs", 1669),
     // src/menubar.rs — `mod mac_style`: the NSMenu attributedTitle styling
     // walk (`install_menu`/`color_for`/`attributed`/`apply_menu_styles`) plus
     // the `objc2*` imports it needs. Grouped into one module so this whole
     // cluster needs exactly one cfg site instead of one per function.
-    ("src/menubar.rs", 1730),
-    // src/menubar.rs — `add`: `build_menu`/`build_account_block` helper
-    // (native `tray_icon::menu::Menu::append`).
-    ("src/menubar.rs", 2176),
+    ("src/menubar.rs", 1766),
+    // src/menubar.rs — `add`: `build_menu`/`build_provider_group`/
+    // `build_account_submenu` helper (native `tray_icon::menu::Menu::append`).
+    ("src/menubar.rs", 2212),
     // src/menubar.rs — `mod cross_platform`: the Linux/Windows renderer
     // (`platform::MenuBackend`-based). Never compiled alongside `mac_style`.
-    ("src/menubar.rs", 2739),
+    ("src/menubar.rs", 2775),
     // src/menubar.rs — `tests::mac_style_tests`: exercises
     // `mac_style::attributed` (NSAttributedString attribute inspection)
     // directly; needs the same `objc2*` crates as `mac_style` itself.
-    ("src/menubar.rs", 4527),
+    ("src/menubar.rs", 4678),
 ];
 
 fn src_root() -> PathBuf {

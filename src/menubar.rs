@@ -487,19 +487,27 @@ fn trailing_for_account(
     }
 }
 
-/// v0.5.2 menu redesign: the header row of one account's BLOCK — `{provider}
-/// · {email}\t<trailing>` where `<trailing>` is whatever
-/// `trailing_for_account` decides (locked countdown, locked-session-with-
-/// weekly-headroom, stale-after-reset placeholder, or plain `sa / sb`).
-/// Provider grouping is no longer a separate visual concept (no section
-/// header, no per-provider HR) — each account is its own top-level block,
-/// separated from its neighbors by `PredefinedMenuItem::separator()` (see
-/// `build_menu`), so the provider name has to live INSIDE this row instead of
-/// a shared header above a group of rows. Same `TabX::MenuRight`
-/// participation as the Quit row (so the trailing column lines up via
+/// Indent applied to each account row so it visually reads as sitting under
+/// its provider-group header row (`provider_group_header_row`). Two spaces
+/// works well with menu-font kerning and keeps the trailing tab column aligned
+/// across every provider. v0.5.3 menu redesign — provider grouping is BACK,
+/// so the account row no longer carries `{provider} · ` and instead sits
+/// under a bold header row.
+const ACCOUNT_INDENT: &str = "  ";
+
+/// v0.5.3 menu redesign: the row for one account — `<indent><email>\t<trailing>`
+/// where `<trailing>` is whatever `trailing_for_account` decides (locked
+/// countdown, locked-session-with-weekly-headroom, stale-after-reset
+/// placeholder, or plain `sa / sb`). Provider grouping is BACK as a visual
+/// concept: this row now sits under a bold `provider_group_header_row` and
+/// no longer prefixes `{provider} · ` — the group header carries the provider.
+/// The row itself is also the LABEL of a submenu (see `build_menu` /
+/// `menu_tree_from_snapshot`) whose children are the details + action rows
+/// the flat v0.5.2 shape used to inline. Same `TabX::MenuRight` participation
+/// as the Quit row (so the trailing column lines up via
 /// `mac_style::compute_menu_right_x`).
 fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
-    let label = format!("{} · {}", sec.display_name, a.display);
+    let label = format!("{ACCOUNT_INDENT}{}", a.display);
     let base = u16len(&label) + 1; // + '\t'
     let (trailing, rel_colors) = trailing_for_account(a, sec.severity_bands, now_utc());
     let plain = format!("{label}\t{trailing}");
@@ -516,6 +524,25 @@ fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
     }
 }
 
+/// v0.5.3 menu redesign: the bold provider-group header row that precedes a
+/// provider's account rows. Plain title is just the provider's display name
+/// (e.g. "Claude"), bold, disabled (`enabled: false` at the muda layer so it
+/// reads as a group heading, not a click target), and carries the per-provider
+/// 16px icon — moved off the individual account rows in this release because
+/// the icon now belongs to the GROUP, not to each account inside it. When the
+/// provider's env override is active, this row also hosts the "env override
+/// active — swap disabled" child (see `build_menu` / `menu_tree_from_snapshot`)
+/// so a provider-wide fact renders once at the group level instead of on every
+/// affected account (v0.5.2 attached it per-account).
+fn provider_group_header_row(sec: &ProviderSection) -> RowStyle {
+    RowStyle {
+        bold: true,
+        section_header: true,
+        icon_slug: Some(sec.provider_id),
+        ..RowStyle::plain_row(sec.display_name.to_string())
+    }
+}
+
 /// All styling directives for the current menu, derived from the same snapshot
 /// `build_menu` renders. The native walk applies each by matching `.plain`.
 /// Plain title used both when we build the Quit row and when the style
@@ -529,20 +556,18 @@ fn quit_row_plain() -> String {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
     let mut styles = Vec::new();
-    // v0.5.0: the top "resets in X" header rows are gone (item 1 of the menu
-    // redesign) and there's no separate disabled provider-header row either —
-    // the provider name now lives inline in each account's own block header
-    // (see `account_header_row`, v0.5.2). Every row carries its provider's
-    // 16px icon (looked up by slug in `crate::icons::png16_for`; a missing
-    // PNG is a no-op).
-    for sec in &snap.sections {
+    // v0.5.3: provider grouping is back — each provider contributes one bold
+    // header row carrying the 16px icon, then one row per account (compact,
+    // NO `{provider} · ` prefix). The account row is the label of a submenu
+    // holding the reset windows, burn-rate/cost, "updated …" and action rows
+    // (Switch/Launch/Remove). Info-row styles inside the submenu still get
+    // the `disabled_but_white` treatment so they read as normal (not muda's
+    // greyed-out disabled look).
+    for (si, _) in provider_grouped_order(snap) {
+        let sec = &snap.sections[si];
+        styles.push(provider_group_header_row(sec));
         for a in &sec.accounts {
-            let mut style = account_header_row(sec, a);
-            style.icon_slug = Some(sec.provider_id);
-            styles.push(style);
-            // Submenu info rows (reset windows, burn-rate/cost, "updated …")
-            // render enabled but must read as normal (not disabled-grey)
-            // text — see `disabled_but_white` and `submenu_info_rows`.
+            styles.push(account_header_row(sec, a));
             for row in submenu_info_rows(sec, a) {
                 styles.push(RowStyle {
                     disabled_but_white: true,
@@ -1009,6 +1034,27 @@ fn flat_account_order(sections: &[ProviderSection], now: DateTime<Utc>) -> Vec<(
     order.into_iter().map(|i| idx[i]).collect()
 }
 
+/// v0.5.3 menu redesign: partition `snap.account_order` by provider,
+/// preserving the within-provider order the global comparator produced, then
+/// sort provider groups alphabetically by display name so a two-provider menu
+/// always reads Claude → Codex regardless of `providers::all()` registration
+/// order. The `account_order` global sort still decides who comes first WITHIN
+/// a provider (soonest-reset first, locked-inactive sinks, etc.) — this
+/// grouping just brackets those runs by provider so each block sits under one
+/// bold `provider_group_header_row`.
+fn provider_grouped_order(snap: &Snapshot) -> Vec<(usize, Vec<usize>)> {
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for &(si, ai) in &snap.account_order {
+        if let Some(entry) = groups.iter_mut().find(|(s, _)| *s == si) {
+            entry.1.push(ai);
+        } else {
+            groups.push((si, vec![ai]));
+        }
+    }
+    groups.sort_by_key(|(si, _)| snap.sections[*si].display_name);
+    groups
+}
+
 /// Build one account's rendered view from a v1 `Row`. v1 state only has
 /// Claude accounts, so the window set is fixed (session / weekly / opus); the
 /// window IDs come from `provider.window_order()` so this is trivially
@@ -1331,29 +1377,30 @@ fn build_menu(snap: &Snapshot) -> Menu {
         );
     }
 
-    // Main list: each CAPTURED ACCOUNT is its own top-level BLOCK (header +
-    // usage-context rows + action rows), separated from its neighbor by a
-    // menu HR — v0.5.2 menu redesign (item 1). Provider grouping is no
-    // longer a visual concept at all: there's no per-provider header and no
-    // "only between providers" HR placement anymore, just a flat sequence of
-    // account blocks with a separator between EVERY one of them (the
-    // provider name lives inline in each block's own header row — see
-    // `account_header_row` — so a single-account provider still reads
-    // clearly). Render order is `snap.account_order` — a single
-    // soonest-expiring/priority comparator spanning ALL providers (see
-    // `flat_account_order`), NOT provider-declaration order; providers only
-    // contribute blocks when they have at least one captured account (the
-    // "no header, no rows" rule survives — there's simply no separate header
-    // to omit anymore).
-    let mut first_block = true;
-    for &(si, ai) in &snap.account_order {
-        let sec = &snap.sections[si];
-        let a = &sec.accounts[ai];
-        if !first_block {
+    // v0.5.3 menu redesign: provider grouping is BACK. Each provider that has
+    // captured accounts contributes one bold header row (or a submenu with the
+    // env-override marker child, when its env override is active) followed by
+    // one submenu-labelled row per account — the submenu's label IS the
+    // account row, its children are the details + action rows the flat
+    // v0.5.2 shape used to inline. A `PredefinedMenuItem::separator()` sits
+    // BETWEEN provider groups (not between individual accounts). Within-
+    // provider account order still comes from `snap.account_order` (the same
+    // soonest-expiring / priority global comparator); provider groups are
+    // sorted alphabetically by display name for stability (see
+    // `provider_grouped_order`).
+    let groups = provider_grouped_order(snap);
+    let mut first_group = true;
+    for (si, account_idxs) in &groups {
+        let sec = &snap.sections[*si];
+        if !first_group {
             let _ = menu.append(&PredefinedMenuItem::separator());
         }
-        first_block = false;
-        build_account_block(&menu, sec, a);
+        first_group = false;
+        build_provider_group(&menu, sec);
+        for ai in account_idxs {
+            let a = &sec.accounts[*ai];
+            build_account_submenu(&menu, sec, a);
+        }
     }
     let _ = menu.append(&PredefinedMenuItem::separator());
 
@@ -1583,36 +1630,58 @@ fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRo
     }
 }
 
-/// Build one account's BLOCK directly into the top-level menu (v0.5.2 menu
-/// redesign, item 1): a header row (`account_header_row` — provider · email,
-/// right-aligned stats/countdown), its usage-context info rows (reset
-/// countdowns, burn rate, cost estimate, "updated Xm ago" — enabled but
-/// non-clickable), then its action rows (Switch/Active, Launch, Remove, and
-/// the env-override marker if this account's provider currently has one
-/// active). Before this, each account was its OWN top-level `Submenu` the
-/// user had to open to see any of this; now every row is visible directly in
-/// the main list, and `PredefinedMenuItem::separator()` between accounts
-/// (see `build_menu`) delimits one block from the next instead of a submenu
-/// boundary. macOS-only counterpart to `build_menu` above — see its doc
-/// comment. Linux/Windows build the same rows via
-/// `cross_platform::build_account_block_items`.
+/// v0.5.3 menu redesign: emit the bold provider-group header row (see
+/// `provider_group_header_row`). When the provider's env override is active,
+/// the header becomes a `Submenu` whose single child is the "env override
+/// active — swap disabled" marker (from `section_headline_rows`), so the
+/// provider-wide fact renders once at the group level instead of on every
+/// account. Otherwise the header is a plain disabled `MenuItem` — the bold /
+/// icon styling is applied by the native attributedTitle walker matching on
+/// `provider_group_header_row`'s plain title.
 #[cfg(target_os = "macos")]
-fn build_account_block(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
-    let head = account_header_row(sec, a).plain;
-    add(menu, MenuItem::with_id("noop", head, true, None));
-
-    // v0.5.0 (item 3): these rows are informational, not disabled — enabled:
-    // true so `apply_menu_styles`'s `disabled_but_white` can paint them in
-    // the normal (white/black) text color instead of muda's greyed
-    // "disabled" look, while a click still routes to the `noop` no-op.
-    for row in submenu_info_rows(sec, a) {
-        add(menu, MenuItem::with_id("noop", row, true, None));
+fn build_provider_group(menu: &Menu, sec: &ProviderSection) {
+    let head = provider_group_header_row(sec).plain;
+    let headlines = section_headline_rows(sec);
+    if headlines.is_empty() {
+        add(menu, MenuItem::with_id("noop", head, false, None));
+        return;
     }
-    // Burn-rate + cost estimator rows sit under the raw window stats, above
-    // the "updated" footer. Cheap best-effort reads against the usage log —
-    // if we don't have enough samples yet the rows are simply skipped. Not
-    // part of `submenu_info_rows` (which `menu_styles` also calls, and must
-    // stay disk-I/O-free) since these touch `crate::usage_log` on disk.
+    // Env-override present: expose the marker as the sole child of a submenu
+    // whose title is the provider name.
+    let sub = Submenu::with_id(format!("provider:{}", sec.provider_id), head, true);
+    for title in headlines {
+        let _ = sub.append(&MenuItem::with_id(
+            format!("envoverride:{}", sec.provider_id),
+            title,
+            false,
+            None,
+        ));
+    }
+    let _ = menu.append(&sub);
+}
+
+/// v0.5.3 menu redesign: each account becomes a `Submenu` whose title is the
+/// compact `account_header_row` (indented `<email>\t<trailing>`) and whose
+/// children are the details + action rows the flat v0.5.2 shape used to
+/// inline directly in the top-level menu (reset countdowns, burn rate, cost,
+/// "updated Xm ago", then Switch/Active, Launch, Remove). Cross-platform
+/// counterpart: `cross_platform::build_account_submenu_item`.
+#[cfg(target_os = "macos")]
+fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
+    let head = account_header_row(sec, a).plain;
+    // Submenu id is intentionally `noop` so a click on the LABEL (which on
+    // some platforms fires as an event too) is a no-op — the actual actions
+    // live on the children below.
+    let sub = Submenu::with_id("noop", head, true);
+
+    for row in submenu_info_rows(sec, a) {
+        let _ = sub.append(&MenuItem::with_id("noop", row, true, None));
+    }
+    // Burn-rate + cost estimator rows: cheap best-effort reads against the
+    // usage log; if we don't have enough samples yet the rows are simply
+    // skipped. Not part of `submenu_info_rows` (which `menu_styles` also
+    // calls, and must stay disk-I/O-free) since these touch
+    // `crate::usage_log` on disk.
     if sec.supports_usage && a.has_data && !a.windows.is_empty() {
         let account_key =
             crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
@@ -1622,102 +1691,69 @@ fn build_account_block(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
             Utc::now(),
         ) {
             if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
-                add(
-                    menu,
-                    MenuItem::with_id("noop", crate::burn_rate::format_menu_row(&est), true, None),
-                );
+                let _ = sub.append(&MenuItem::with_id(
+                    "noop",
+                    crate::burn_rate::format_menu_row(&est),
+                    true,
+                    None,
+                ));
             }
         }
         if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
             &account_key,
             crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
         ) {
-            add(
-                menu,
-                MenuItem::with_id(
-                    "noop",
-                    format!("~${:.2} this cycle (est)", cost.estimated_usd),
-                    true,
-                    None,
-                ),
-            );
+            let _ = sub.append(&MenuItem::with_id(
+                "noop",
+                format!("~${:.2} this cycle (est)", cost.estimated_usd),
+                true,
+                None,
+            ));
         }
-        add(
-            menu,
-            MenuItem::with_id("noop", format!("updated {}", a.updated), true, None),
-        );
+        let _ = sub.append(&MenuItem::with_id(
+            "noop",
+            format!("updated {}", a.updated),
+            true,
+            None,
+        ));
     }
 
-    // Action rows: Switch/Active, Launch, Remove, then the env-override
-    // marker. Env override used to be a once-per-provider row prepended
-    // before a provider's whole section; with provider grouping gone as a
-    // visual concept (v0.5.2), it now surfaces on every affected account's
-    // own block instead — still driven by the same `section_headline_rows`
-    // (a provider-wide fact, just rendered per-account now).
+    // Action rows: Switch/Active, Launch, Remove. Gated per H3 (v0.5.0
+    // codeaudit) — see `account_submenu_rows`.
     let rows = account_submenu_rows(sec, a);
+    let _ = sub.append(&PredefinedMenuItem::separator());
     match rows.switch_row {
         Some(true) => {
-            add(menu, MenuItem::with_id("noop", "✓ Active", false, None));
+            let _ = sub.append(&MenuItem::with_id("noop", "✓ Active", false, None));
         }
         Some(false) => {
-            add(
-                menu,
-                MenuItem::with_id(
-                    format!("switch:{}:{}", sec.provider_id, a.key),
-                    "Switch to this account",
-                    true,
-                    None,
-                ),
-            );
+            let _ = sub.append(&MenuItem::with_id(
+                format!("switch:{}:{}", sec.provider_id, a.key),
+                "Switch to this account",
+                true,
+                None,
+            ));
         }
         None => {}
     }
-    // "Launch" is gated on `supports_launch`, NOT `supports_switching` (H3,
-    // v0.5.0 codeaudit): the two are independent — a provider can have
-    // `write_active_account` wired (switching) without `launch_client` wired
-    // (spawning the vendor CLI), and vice versa. Building this row off
-    // `supports_switching` used to expose a "Launch client" row for any
-    // switching-capable provider even when its `launch_client` was still the
-    // `Unsupported` trait default, so every click errored.
     if rows.launch_row {
-        add(
-            menu,
-            MenuItem::with_id(
-                format!("launch:{}:{}", sec.provider_id, a.key),
-                "Launch client",
-                true,
-                None,
-            ),
-        );
+        let _ = sub.append(&MenuItem::with_id(
+            format!("launch:{}:{}", sec.provider_id, a.key),
+            "Launch client",
+            true,
+            None,
+        ));
     }
-    // "Remove…" is gated on `supports_remove` (H3, v0.5.0 codeaudit): the
-    // row used to be built unconditionally regardless of what the provider
-    // actually supports. Every current provider sets `supports_remove:
-    // true`, so this is not a behavior change today, but it stops a future
-    // provider that needs `supports_remove: false` from getting a row that
-    // silently does nothing useful.
     if rows.remove_row {
-        add(
-            menu,
-            MenuItem::with_id(
-                format!("remove:{}:{}", sec.provider_id, a.key),
-                "Remove…",
-                true,
-                None,
-            ),
-        );
+        let _ = sub.append(&MenuItem::with_id(
+            format!("remove:{}:{}", sec.provider_id, a.key),
+            "Remove…",
+            true,
+            None,
+        ));
     }
-    for title in section_headline_rows(sec) {
-        add(
-            menu,
-            MenuItem::with_id(
-                format!("envoverride:{}", sec.provider_id),
-                title,
-                false,
-                None,
-            ),
-        );
-    }
+
+    let _ = menu.append(&sub);
 }
 
 /// macOS-only NSMenu attributedTitle styling. Grouped into one module (rather
@@ -2794,16 +2830,13 @@ mod cross_platform {
         }
     }
 
-    /// Cross-platform counterpart to `build_account_block` — same rows
-    /// (header + usage-context + action rows), same click ids, appended
-    /// flat into the top-level item list instead of nested inside a
-    /// `PMenuItem::Submenu` (v0.5.2 menu redesign, item 1: provider grouping
-    /// AND per-account submenu nesting are both gone as visual concepts —
-    /// see `menu_tree_from_snapshot`'s doc for how the blocks it returns
-    /// each of these for get separated).
-    fn build_account_block_items(sec: &ProviderSection, a: &AcctView) -> Vec<PMenuItem> {
+    /// Cross-platform counterpart to `build_account_submenu` — one
+    /// `PMenuItem::Submenu` whose label is the compact account row and whose
+    /// children are the details + action rows the flat v0.5.2 shape used to
+    /// inline. v0.5.3 menu redesign — provider grouping is back and each
+    /// account is a submenu again.
+    fn build_account_submenu_item(sec: &ProviderSection, a: &AcctView) -> PMenuItem {
         let mut items = Vec::new();
-        items.push(noop_action(plain_text(&account_header_row(sec, a))));
         for row in submenu_info_rows(sec, a) {
             items.push(noop_action(row));
         }
@@ -2830,15 +2863,10 @@ mod cross_platform {
             }
             items.push(noop_action(format!("updated {}", a.updated)));
         }
-        // Action rows: Switch/Active, Launch, Remove, then the env-override
-        // marker — same order and gating as `build_account_block`'s macOS
-        // counterpart.
+        // Action rows: Switch/Active, Launch, Remove.
         let rows = account_submenu_rows(sec, a);
+        items.push(PMenuItem::Separator);
         match rows.switch_row {
-            // Matches the macOS renderer: this row is informational (disabled),
-            // not clickable — unlike the burn-rate/cost/reset-window `noop`
-            // rows above, which stay `enabled: true` so they don't render
-            // muda's greyed-out "disabled" look.
             Some(true) => items.push(action("noop", "✓ Active", false)),
             Some(false) => items.push(action(
                 format!("switch:{}:{}", sec.provider_id, a.key),
@@ -2861,41 +2889,61 @@ mod cross_platform {
                 true,
             ));
         }
-        for title in section_headline_rows(sec) {
-            items.push(action(
-                format!("envoverride:{}", sec.provider_id),
-                title,
-                false,
-            ));
+        PMenuItem::Submenu {
+            label: plain_text(&account_header_row(sec, a)),
+            icon_png: None,
+            items,
         }
-        items
+    }
+
+    /// Cross-platform counterpart to `build_provider_group` — one static (or
+    /// submenu-when-env-overridden) row carrying the provider's display name.
+    fn build_provider_group_item(sec: &ProviderSection) -> PMenuItem {
+        let headlines = section_headline_rows(sec);
+        if headlines.is_empty() {
+            return PMenuItem::Static {
+                label: sec.display_name.to_string(),
+                icon_png: None,
+            };
+        }
+        let children: Vec<PMenuItem> = headlines
+            .into_iter()
+            .map(|title| action(format!("envoverride:{}", sec.provider_id), title, false))
+            .collect();
+        PMenuItem::Submenu {
+            label: sec.display_name.to_string(),
+            icon_png: None,
+            items: children,
+        }
     }
 
     /// Cross-platform counterpart to `build_menu` — same structure, same
     /// click ids (`handle_click` doesn't care which renderer produced them),
     /// generic `platform::MenuTree` shape instead of a native
-    /// `tray_icon::menu::Menu`. v0.5.2 menu redesign (item 1): each captured
-    /// account is its own flat block of items (see
-    /// `build_account_block_items`) — no per-provider grouping, no
-    /// per-account submenu — separated from its neighbor by
-    /// `PMenuItem::Separator`, mirroring the macOS `mac_style` renderer's
-    /// `PredefinedMenuItem::separator()` between blocks.
+    /// `tray_icon::menu::Menu`. v0.5.3 menu redesign: provider grouping is
+    /// back. Each provider that has captured accounts contributes a static
+    /// (or env-override submenu) header row, followed by one
+    /// `PMenuItem::Submenu` per account whose children are the details +
+    /// action rows. `PMenuItem::Separator` sits between provider groups,
+    /// not between individual accounts.
     fn menu_tree_from_snapshot(snap: &Snapshot) -> MenuTree {
         let mut items = Vec::new();
         if snap.sections.is_empty() {
             items.push(action("none", "Capture a login below to begin", false));
         }
-        // Render order is `snap.account_order` — see `flat_account_order` and
-        // the macOS `build_menu`'s matching doc comment.
-        let mut first_block = true;
-        for &(si, ai) in &snap.account_order {
-            let sec = &snap.sections[si];
-            let a = &sec.accounts[ai];
-            if !first_block {
+        let groups = provider_grouped_order(snap);
+        let mut first_group = true;
+        for (si, account_idxs) in &groups {
+            let sec = &snap.sections[*si];
+            if !first_group {
                 items.push(PMenuItem::Separator);
             }
-            first_block = false;
-            items.extend(build_account_block_items(sec, a));
+            first_group = false;
+            items.push(build_provider_group_item(sec));
+            for ai in account_idxs {
+                let a = &sec.accounts[*ai];
+                items.push(build_account_submenu_item(sec, a));
+            }
         }
         items.push(PMenuItem::Separator);
 
@@ -3818,7 +3866,7 @@ mod tests {
         let sec = header_test_section("Claude");
         let a = acct("you@work.com", Some(42.0), Some(61.0), false);
         let r = account_header_row(&sec, &a);
-        assert_eq!(r.plain, "Claude · you@work.com\t42% / 61%");
+        assert_eq!(r.plain, "  you@work.com\t42% / 61%");
         assert!(!r.checkmark, "inactive row: no leading checkmark");
         assert_eq!(r.tab_x_kind, Some(TabX::MenuRight));
     }
@@ -3841,7 +3889,7 @@ mod tests {
             // Session-locked + weekly-healthy nuance (v0.5.2 addendum #7):
             // trailing = "<countdown> / <weekly%>" so the user can still see
             // the healthy weekly headroom while the session countdown ticks.
-            assert_eq!(r.plain, "Claude · matt@example.com\t1h 30m / 20%");
+            assert_eq!(r.plain, "  matt@example.com\t1h 30m / 20%");
             assert!(r.bold, "active locked row is still bold");
             assert!(r.checkmark, "active row gets a leading checkmark");
             // countdown is red; weekly=20 sits below the severity bands so it
@@ -3860,7 +3908,7 @@ mod tests {
         let sec = header_test_section("Codex");
         let a = acct("hot@x.com", Some(96.0), Some(10.0), false);
         let r = account_header_row(&sec, &a);
-        assert_eq!(r.plain, "Codex · hot@x.com\t96% / 10%");
+        assert_eq!(r.plain, "  hot@x.com\t96% / 10%");
         assert_eq!(r.colors.len(), 1, "only the 96% session run is colored");
         let (off, len, sev) = r.colors[0];
         assert_eq!(sev, Severity::Red);
@@ -4084,19 +4132,117 @@ mod tests {
     }
 
     #[test]
-    fn menu_styles_attaches_icon_slug_to_every_main_row() {
-        // v0.5.0 dropped the separate disabled provider-header row — each
-        // account's own flat main-list row now carries `icon_slug` so the
-        // native walk `setImage:`s a bundled 16px PNG directly on it.
+    fn provider_group_header_row_is_bold_plain_display_name_with_icon() {
+        // v0.5.3: the bold provider-group header row that precedes a
+        // provider's account rows carries the display name verbatim, bold,
+        // and the provider's 16px icon slug. No tab stop, no checkmark, no
+        // color spans — a header, not a data row.
+        let sec = header_test_section("Claude");
+        let row = provider_group_header_row(&sec);
+        assert_eq!(row.plain, "Claude");
+        assert!(row.bold, "group header is bold");
+        assert!(row.section_header, "marked as a section header");
+        assert_eq!(row.icon_slug, Some("claude"));
+        assert!(row.tab_x_kind.is_none(), "no tab stop");
+        assert!(!row.checkmark);
+        assert!(row.colors.is_empty());
+    }
+
+    #[test]
+    fn provider_grouped_order_partitions_and_sorts_alphabetically() {
+        // v0.5.3 menu redesign: two providers with two accounts each, given
+        // in Codex → Claude order — grouping must partition by provider AND
+        // sort provider groups alphabetically by display name so a two-
+        // provider menu always reads Claude → Codex. Within-provider order
+        // is preserved from `snap.account_order`.
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let a1 = acct_with_resets(
+            "a@claude.com",
+            Some(10.0),
+            Some(10.0),
+            false,
+            None,
+            Some(now + chrono::Duration::hours(6)),
+        );
+        let a2 = acct_with_resets(
+            "b@claude.com",
+            Some(10.0),
+            Some(10.0),
+            false,
+            None,
+            Some(now + chrono::Duration::days(2)),
+        );
+        let mut c1 = acct_with_resets(
+            "a@codex.com",
+            Some(10.0),
+            Some(10.0),
+            false,
+            None,
+            Some(now + chrono::Duration::hours(12)),
+        );
+        c1.provider_id = "codex";
+        let mut c2 = acct_with_resets(
+            "b@codex.com",
+            Some(10.0),
+            Some(10.0),
+            false,
+            None,
+            Some(now + chrono::Duration::days(1)),
+        );
+        c2.provider_id = "codex";
+        // Sections registered in reverse-alpha order — grouped_order must
+        // still return Claude before Codex.
+        let sections = vec![
+            section_with("codex", "Codex", vec![c1, c2]),
+            section_with(CLAUDE_SLUG, "Claude", vec![a1, a2]),
+        ];
+        let account_order = flat_account_order(&sections, now);
+        let snap = Snapshot {
+            sections,
+            account_order,
+            capture_creds: Vec::new(),
+            capture_api_key: Vec::new(),
+            autoswap: false,
+            threshold: 95.0,
+            notification_config: crate::notifications::NotificationConfig::default(),
+        };
+        let groups = provider_grouped_order(&snap);
+        assert_eq!(groups.len(), 2, "one entry per provider");
+        // Claude first (alphabetical by display name), then Codex.
+        assert_eq!(snap.sections[groups[0].0].display_name, "Claude");
+        assert_eq!(snap.sections[groups[1].0].display_name, "Codex");
+        // Within-provider account order preserved.
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].1.len(), 2);
+    }
+
+    #[test]
+    fn menu_styles_attaches_icon_slug_to_the_provider_group_header() {
+        // v0.5.3 restored provider grouping: the 16px icon moves from every
+        // account row onto the provider-group header row (bold, disabled,
+        // plain title = display name). No account row carries an icon
+        // anymore; the group header is the sole icon carrier.
         let snap = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
         let styles = menu_styles(&snap);
-        let main_style = styles
+        let header_style = styles
             .iter()
-            .find(|s| s.tab_x_kind.is_some())
-            .expect("main-list row present");
-        assert_eq!(main_style.icon_slug, Some(CLAUDE_SLUG));
-        // The submenu info rows (no tab stop) carry no icon.
-        for s in styles.iter().filter(|s| s.tab_x_kind.is_none()) {
+            .find(|s| s.plain == "Claude")
+            .expect("provider-group header row present");
+        assert_eq!(header_style.icon_slug, Some(CLAUDE_SLUG));
+        assert!(header_style.bold, "group header is bold");
+        // Account rows (the ones with a tab stop) must NOT carry an icon.
+        for s in styles.iter().filter(|s| s.tab_x_kind.is_some()) {
+            assert!(
+                s.icon_slug.is_none(),
+                "account row must not carry an icon: {}",
+                s.plain,
+            );
+        }
+        // The submenu info rows (no tab stop) also carry no icon.
+        for s in styles
+            .iter()
+            .filter(|s| s.tab_x_kind.is_none() && s.plain != "Claude")
+        {
             assert!(
                 s.icon_slug.is_none(),
                 "unexpected icon on non-main row: {}",
