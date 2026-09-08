@@ -347,6 +347,24 @@ pub trait Provider: Send + Sync + 'static {
         Err(ProviderError::Unsupported)
     }
 
+    /// Whether this provider's refresh grant is fully programmatic (a plain
+    /// HTTPS POST `usagio` can issue itself, with no vendor CLI / browser
+    /// step required) and therefore safe to drive proactively — including,
+    /// for providers whose active-login store is a single file (no separate
+    /// keychain/identity-file layer), refreshing the ACTIVE account under a
+    /// compare-and-swap on that file (see `codex::oauth::active_refresh_cas`
+    /// for the reference implementation and its doc comment for why Codex's
+    /// CAS is simpler than a keychain-backed provider's).
+    ///
+    /// Deliberately a trait method with a `false` default rather than a
+    /// `Capabilities` field: `Capabilities` is a plain struct literal
+    /// constructed by every provider, so adding a required field there would
+    /// force an unrelated edit onto every other provider module. A method
+    /// with a default impl lets Codex opt in without touching anyone else.
+    fn supports_active_refresh(&self) -> bool {
+        false
+    }
+
     // --- Usage ---
 
     /// Call the provider's usage endpoint with the given access token.
