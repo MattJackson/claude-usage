@@ -324,6 +324,22 @@ impl Provider for CodexProvider {
     // (capture_current_login already covers that), and no wired-up client
     // launch yet.
 
+    /// Overridden rather than inherited: the trait default routes through
+    /// `read_active_identity()?`, which is the `Unsupported` trait default
+    /// here (see above) and would make every mirror attempt fail. Codex has
+    /// exactly one `auth.json` per machine with no separate identity file to
+    /// gate on — `write_active_account` already ignores its `identity`
+    /// argument entirely — so mirror unconditionally with a placeholder.
+    fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
+        let placeholder = IdentitySnapshot {
+            email: None,
+            uuid: None,
+            display_name: None,
+            native_blob: serde_json::Value::Null,
+        };
+        self.write_active_account(blob, &placeholder)
+    }
+
     // --- Credential sync ---------------------------------------------------
 
     fn credential_paths(&self) -> Vec<PathBuf> {
@@ -603,6 +619,20 @@ mod tests {
             let bad_blob = serde_json::json!({ "tokens": { "refresh_token": "rt" } }).to_string();
             assert!(p.write_active_account(&bad_blob, &id).is_err());
             assert!(!dir.path().join("auth.json").exists());
+        });
+    }
+
+    #[test]
+    fn mirror_rotated_token_writes_the_blob_where_the_vendor_reads_it() {
+        let p = CodexProvider;
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join("codex-home");
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(codex_home.to_str().unwrap()), || {
+            let blob = make_blob("rotated@example.com", Utc::now().timestamp() + 3600);
+            p.mirror_rotated_token(&blob).unwrap();
+            let auth_path = codex_home.join("auth.json");
+            let on_disk = std::fs::read_to_string(&auth_path).unwrap();
+            assert_eq!(on_disk, blob);
         });
     }
 

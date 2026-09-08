@@ -376,6 +376,29 @@ pub trait Provider: Send + Sync + 'static {
         Err(ProviderError::Unsupported)
     }
 
+    /// Persist `blob` to the vendor CLI's OS-native credential storage for
+    /// wherever `read_active_identity` would report as the current login.
+    ///
+    /// Called ONLY after usagio refreshes an INACTIVE account's token
+    /// server-side (see `credentials::refresh_inactive_if_stale`) — never for
+    /// the active account, which the vendor CLI itself owns rotation for.
+    /// Without this mirror step, state.json would race ahead of whatever
+    /// on-disk / keychain blob the vendor CLI reads on its next invocation,
+    /// silently reintroducing the "never re-login" regression this exists to
+    /// close.
+    ///
+    /// The default impl delegates to `write_active_account` using the
+    /// current identity — providers with no switching support (whose
+    /// `read_active_identity` is still the `Unsupported` trait default)
+    /// inherit `Unsupported` transitively, which is the correct behavior:
+    /// there's nowhere vendor-native to mirror to yet.
+    fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
+        match self.read_active_identity()? {
+            Some(id) => self.write_active_account(blob, &id),
+            None => Err(ProviderError::NotLoggedIn),
+        }
+    }
+
     // --- Credential sync (fsnotify + proactive refresh + last-chance fallback) ---
 
     /// On-disk paths where the vendor CLI may write this provider's
