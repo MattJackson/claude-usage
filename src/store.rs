@@ -379,7 +379,12 @@ pub fn config_dir() -> Result<PathBuf> {
     }
 
     if let Some(home) = home_override() {
-        return Ok(home.join(".config").join(crate::APP_SLUG));
+        let p = home.join(".config").join(crate::APP_SLUG);
+        // security-01 (v0.5.2 audit): harden the top-level config dir itself,
+        // not just `backups/` beneath it — see the non-override branch below
+        // for the full rationale.
+        let _ = ensure_dir_0700(&p);
+        return Ok(p);
     }
 
     let p = crate::platform().paths().config_dir(crate::APP_SLUG);
@@ -393,6 +398,16 @@ pub fn config_dir() -> Result<PathBuf> {
              (is $HOME set?)"
         );
     }
+    // security-01 (v0.5.2 audit): `backups/` under this dir was hardened to
+    // 0700 (`ensure_dir_0700`) but the parent `~/.config/usagio` itself was
+    // never chmod'd — it's created ad hoc by whichever caller happens to
+    // `create_dir_all` it first (e.g. `with_state_lock`'s lock file,
+    // `save_state_safe`'s state.json), under the process umask, so it can
+    // land world-readable (0755) and expose account emails / metadata (not
+    // token bytes, those live only in 0600 files, but still directory
+    // listing + timestamps) to other local users. Best-effort: a chmod
+    // failure here must not break every caller of `config_dir()`.
+    let _ = ensure_dir_0700(&p);
     Ok(p)
 }
 

@@ -124,7 +124,8 @@ fn token_url() -> String {
 }
 
 fn post_token(body: &serde_json::Value) -> Result<TokenResponse, RefreshError> {
-    let resp = ureq::post(&token_url())
+    let resp = super::http_agent()
+        .post(&token_url())
         .set("Content-Type", "application/json")
         .set("anthropic-beta", config::OAUTH_BETA)
         .send_json(body.clone());

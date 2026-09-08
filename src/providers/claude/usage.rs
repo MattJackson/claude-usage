@@ -79,7 +79,8 @@ fn usage_url() -> String {
 }
 
 pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
-    let resp = ureq::get(&usage_url())
+    let resp = super::http_agent()
+        .get(&usage_url())
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
         .set("anthropic-version", "2023-06-01")
@@ -114,7 +115,8 @@ pub fn fetch_email(access_token: &str) -> Option<String> {
     struct Profile {
         account: Option<Account>,
     }
-    let resp = ureq::get(config::PROFILE_URL)
+    let resp = super::http_agent()
+        .get(config::PROFILE_URL)
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
         .set("anthropic-version", "2023-06-01")
@@ -127,7 +129,8 @@ pub fn fetch_email(access_token: &str) -> Option<String> {
 
 /// Fetch the raw profile JSON (`account`, `organization`, ...).
 pub fn fetch_profile(access_token: &str) -> Option<serde_json::Value> {
-    ureq::get(config::PROFILE_URL)
+    super::http_agent()
+        .get(config::PROFILE_URL)
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
         .set("anthropic-version", "2023-06-01")

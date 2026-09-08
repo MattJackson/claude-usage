@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-08
+
+Robustness + hardening round: background-thread panic supervision, HTTP
+timeouts on every provider call, several concurrency/state-merge fixes, and
+a menu-UX pass grouping accounts into HR-separated blocks.
+
+### Added
+- **`poll_loop` panic supervisor.** The menu-bar background polling thread
+  is now respawned automatically if it panics, instead of silently dying
+  and leaving the app un-updating for the rest of the session.
+- **fsnotify credential-watcher panic supervisor.** The credential-file
+  watcher thread gets the same panic-catch-and-respawn treatment.
+
+### Changed
+- **HTTP read+write timeouts on all provider calls.** `ureq` requests for
+  Claude usage, Claude OAuth, and Codex OAuth now carry explicit
+  read/write timeouts, so a stalled proxy or unresponsive endpoint can no
+  longer hang the poll thread indefinitely.
+- **Shared `SwapGuard` for manual refresh.** `poll_loop` and
+  `handle_refresh_now` now share the same `SwapGuard`, so a manual
+  "Refresh usage now" click honors the same anti-thrash cooldown/no-return
+  windows as the background poller.
+- **Menu UX: account blocks separated by HR.** Accounts now render as
+  visually distinct blocks separated by a horizontal rule, replacing the
+  previous per-account single-line rows grouped by provider.
+- **`usagio install` purges legacy System Events login items.** Previously
+  only `uninstall` did this; brew-upgrade users could end up with a
+  duplicate stale autostart entry.
+- **`LinuxAutostart::restart()` quote-aware path splitting.** Paths
+  containing spaces (e.g. `~/My Apps/usagio`) are now handled correctly.
+- **`~/.config/usagio/` hardened to 0700.** Previously created at the
+  process's default umask.
+- **`usagio.log` opened at mode 0600.** Previously created at 0644 under
+  default umask.
+
+### Fixed
+- **`refresh_usage_cache` merge no longer clobbers `needs_relogin`.** A
+  concurrently-set `needs_relogin=true` flag could be overwritten back to
+  `false` by an in-flight merge; the merge now preserves it.
+- **`context_ledger::mcp::read_line_with_timeout` enforces a real
+  wall-clock timeout**, regardless of whether the child process ever
+  writes anything.
+
+### Removed
+- Dead `Provider::list_accounts` default implementation deleted.
+- `main.rs::capture_current` deleted — Claude now shares
+  `capture_current_generic` with every other provider. Stale doc-comment
+  references to the removed path were cleaned up alongside it.
+
+### Performance
+- Four hot-path efficiency fixes from the post-0.5.1 audit: dropped a
+  redundant `state.json` read+parse on every poll cycle and every
+  credential fsnotify event (the computed `active_email_hint` was unused
+  by the callee); skipped the `refresh_usage_cache` merge+save entirely
+  when no account actually changed that cycle, avoiding a needless
+  read-diff-backup-rotate-write; de-duplicated the per-account history-
+  window filtering shared by `burn_rate` and `cost_tracking` in the menu
+  rebuild; and throttled `cached_state()`'s `metadata()` stat call on the
+  macOS main-thread 0.75s timer tick, matching the existing throttle
+  already applied to `maybe_relaunch_after_upgrade`'s `canonicalize()`
+  call.
+
 ## [0.5.1] - 2026-09-08
 
 Audit-fix + UX round following the v0.5.0 release: a menu-bar readability

@@ -28,7 +28,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::providers::trait_def::{
@@ -36,6 +36,29 @@ use crate::providers::trait_def::{
     LaunchMode, PResult, Provider, ProviderError, SecretBackend, TokenGrant, UsageSnapshot,
     UsageWindow,
 };
+
+/// Read/write timeout applied to every outbound HTTP call this provider
+/// makes. The default `ureq::Agent` only bounds the TCP *connect* (30s); a
+/// server or proxy that accepts the connection but then stalls mid-response
+/// (or mid-request-write) would otherwise hang `menubar::poll_loop`'s
+/// network thread forever with no diagnostics. 15s is generous for a
+/// legitimate slow response but tight enough to fail fast and let the next
+/// poll tick retry.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+
+static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+/// Shared `ureq::Agent` for every Claude HTTP call site (token refresh, usage
+/// fetch, profile fetch), built once with [`HTTP_TIMEOUT`] applied to both
+/// read and write.
+pub(crate) fn http_agent() -> &'static ureq::Agent {
+    HTTP_AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_read(HTTP_TIMEOUT)
+            .timeout_write(HTTP_TIMEOUT)
+            .build()
+    })
+}
 
 /// Keychain generic-password service Claude Code writes to. Duplicated from
 /// `main.rs` so this module has no dependency on the legacy CLI internals;
@@ -219,7 +242,8 @@ impl Provider for ClaudeProvider {
             "refresh_token": refresh,
             "client_id": config::CLIENT_ID,
         });
-        let resp = ureq::post(config::TOKEN_URL)
+        let resp = http_agent()
+            .post(config::TOKEN_URL)
             .set("Content-Type", "application/json")
             .set("anthropic-beta", config::OAUTH_BETA)
             .send_json(body);

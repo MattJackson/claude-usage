@@ -629,6 +629,65 @@ fn next_interval_tightens_to_backstop_at_or_above_trigger() {
     );
 }
 
+// --- peak_max_pct (v0.5.2 item 3: weekly-aware adaptive cadence) ---
+
+#[test]
+fn peak_max_pct_folds_weekly_not_just_session() {
+    // Regression case from the addendum: session=0%, weekly=99%, trigger=95%
+    // must fold to Some(99.0) — a weekly-only approach to the trigger used to
+    // be invisible to the old session-only fold (`max_session_pct`), leaving
+    // the daemon at BASE cadence right as an account was about to lock.
+    let rows = vec![row(Some(0.0), Some(99.0))];
+    assert_eq!(peak_max_pct(&rows), Some(99.0));
+    assert_eq!(
+        next_interval(150, 150, false, peak_max_pct(&rows), TRIGGER_FOR_TESTS),
+        10,
+        "session=0/weekly=99 at trigger=95 must hit BACKSTOP cadence"
+    );
+}
+
+#[test]
+fn peak_max_pct_ignores_rows_without_data() {
+    let mut no_data = row(Some(80.0), Some(80.0));
+    no_data.fetched_at = None;
+    assert_eq!(peak_max_pct(&[no_data]), None);
+}
+
+#[test]
+fn peak_max_pct_takes_the_max_across_accounts() {
+    let rows = vec![row(Some(10.0), Some(20.0)), row(Some(50.0), Some(96.0))];
+    assert_eq!(peak_max_pct(&rows), Some(96.0));
+}
+
+// --- cap_sleep_to_reset_boundary (v0.5.2 item 4: wake right after a reset) ---
+
+#[test]
+fn cap_sleep_to_reset_boundary_wakes_early_for_an_imminent_reset() {
+    let now = Utc::now();
+    let mut r = row(Some(50.0), Some(60.0));
+    r.session.resets_at = Some(now + Duration::seconds(10));
+    // Planned cadence is 150s, but the session resets in 10s — should cap to
+    // 10s + the 2s buffer = 12s.
+    assert_eq!(cap_sleep_to_reset_boundary(&[r], now, 150), 12);
+}
+
+#[test]
+fn cap_sleep_to_reset_boundary_leaves_planned_alone_when_nothing_imminent() {
+    let now = Utc::now();
+    let mut r = row(Some(50.0), Some(60.0));
+    r.weekly.resets_at = Some(now + Duration::days(3));
+    assert_eq!(cap_sleep_to_reset_boundary(&[r], now, 150), 150);
+}
+
+#[test]
+fn cap_sleep_to_reset_boundary_never_exceeds_planned() {
+    // A reset 40s out is outside the 30s horizon — planned wins.
+    let now = Utc::now();
+    let mut r = row(Some(50.0), Some(60.0));
+    r.session.resets_at = Some(now + Duration::seconds(40));
+    assert_eq!(cap_sleep_to_reset_boundary(&[r], now, 150), 150);
+}
+
 // --- identity_matches (keychain adoption gate) ---
 
 #[test]

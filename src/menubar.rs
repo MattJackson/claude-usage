@@ -23,7 +23,7 @@ use chrono::{DateTime, Utc};
 // this group needs real `#[cfg(target_os = "macos")]`, not just an
 // unused-import allow. `tray_icon::menu`/`TrayIconBuilder` compile
 // everywhere (top-level dep) but are grouped in here too since they're only
-// used by the macOS-only `run`/`build_menu`/`build_account_submenu`/
+// used by the macOS-only `run`/`build_menu`/`build_account_block`/
 // `install_menu` below — Linux/Windows render through `platform::MenuTree`
 // instead (see the `cross_platform` module near the end of this file).
 #[cfg(target_os = "macos")]
@@ -85,6 +85,11 @@ struct AcctView {
     /// to reason about the future.
     session_reset_at: Option<DateTime<Utc>>,
     weekly_reset_at: Option<DateTime<Utc>>,
+    /// When this account's cached usage was fetched. Threaded through to
+    /// `countdown::compute_display` so it can distinguish a genuinely fresh
+    /// post-reset reading from a stale pre-reset one still sitting in the
+    /// cache (`DisplayState::StaleAfterReset` — see `trailing_for_account`).
+    fetched_at: Option<DateTime<Utc>>,
 }
 
 /// One provider's block in the menu. Rendered only if `accounts` is non-empty
@@ -113,20 +118,17 @@ pub(crate) struct ProviderSection {
     accounts: Vec<AcctView>,
 }
 
-/// One row in the "Capture current login ▸" submenu (or its "Paste API key ▸"
-/// sub-submenu). `installed` is a best-effort probe used to grey out rows
-/// whose credential store isn't present on this host; the row stays clickable
-/// so errors surface honestly. `capture_mode` decides which bucket the row
-/// belongs to — filtered upstream by `capture_menu_providers`.
+/// One row directly under "Capture current login ▸" (v0.5.2 item 8 flattened
+/// the old "Paste API key ▸" sub-submenu API-key providers used to render
+/// under). `installed` is a best-effort probe used to grey out rows whose
+/// credential store isn't present on this host; the row stays clickable so
+/// errors surface honestly. `capture_mode` decides the click-id prefix
+/// (`capture:` vs `apikey:`) that routes to the right handler in
+/// `handle_click`, and orders creds-on-disk providers before API-key ones.
 struct RegisteredProvider {
     provider_id: &'static str,
     display_name: &'static str,
     installed: bool,
-    /// Kept for click-handling code that will need to route API-key rows to
-    /// the paste-a-key prompt instead of `Provider::capture_current_login`.
-    /// Also lets the redraw signature distinguish a provider whose capture
-    /// mode changed even if its slug and display name didn't.
-    #[allow(dead_code)]
     capture_mode: CaptureMode,
 }
 
@@ -134,11 +136,21 @@ struct RegisteredProvider {
 #[derive(Default)]
 struct Snapshot {
     sections: Vec<ProviderSection>,
+    /// Render order for the flat main-list block sequence: `(section index,
+    /// account index within that section)` pairs, spanning ALL providers —
+    /// see `flat_account_order`'s doc for the sort. `build_menu` /
+    /// `menu_tree_from_snapshot` iterate this instead of nesting
+    /// `for sec in sections { for a in sec.accounts }`, which used to
+    /// silently re-impose provider-declaration order on top of any
+    /// per-account priority (the "account order keeps changing" report).
+    account_order: Vec<(usize, usize)>,
     /// Providers whose `capture_mode == CredsOnDisk` and `supports_usage == true`:
     /// rendered directly under "Capture current login ▸".
     capture_creds: Vec<RegisteredProvider>,
     /// Providers whose `capture_mode == ApiKey` and `supports_usage == true`:
-    /// rendered under the "Paste API key ▸" sub-submenu of "Capture current login ▸".
+    /// rendered directly under "Capture current login ▸", after
+    /// `capture_creds` (v0.5.2 item 8 flattened the "Paste API key ▸"
+    /// sub-submenu these used to live under).
     capture_api_key: Vec<RegisteredProvider>,
     autoswap: bool,
     threshold: f64,
@@ -289,18 +301,22 @@ fn account_usage_for(a: &AcctView) -> AccountUsage {
         session_reset: a.session_reset_at,
         weekly_pct: wp,
         weekly_reset: a.weekly_reset_at,
+        fetched_at: a.fetched_at,
     }
 }
 
 /// If the account is "locked" (session or weekly at ≥99.5% with a
 /// still-future reset), return the human countdown string — the piece that
-/// swaps in for `S% / W%` in the row title. `None` otherwise.
+/// swaps in for `S% / W%` in the row title. `None` otherwise (including the
+/// `StaleAfterReset` case — a stale-but-past-reset cache isn't "locked", it's
+/// just waiting on a fresh poll; see `trailing_for_account` for how that
+/// state renders instead).
 fn locked_countdown_for(a: &AcctView, now: DateTime<Utc>) -> Option<(String, BlockingWindow)> {
     match countdown::compute_display(&account_usage_for(a), now) {
         DisplayState::Locked { until, window } => {
             Some((countdown::format_countdown(until - now), window))
         }
-        DisplayState::Usage { .. } => None,
+        DisplayState::Usage { .. } | DisplayState::StaleAfterReset { .. } => None,
     }
 }
 
@@ -319,6 +335,7 @@ fn now_utc() -> DateTime<Utc> {
 /// Left column width (chars) the provider name is padded to in the flat main
 /// list row, so every account's email starts at the same x regardless of
 /// provider-name length ("Claude" vs "Codex").
+#[allow(dead_code)] // kept for `main_row`'s tests — see its doc comment.
 const PROVIDER_COL: usize = 10;
 
 /// v0.5.0 flat main-list row: `{provider}    {email}\t{n}% / {n}%`, bold +
@@ -326,10 +343,17 @@ const PROVIDER_COL: usize = 10;
 /// severity bands. When the account is fully consumed
 /// (`countdown::compute_display` → Locked), the `n% / n%` run is swapped
 /// for `locked · <countdown>` and colored red — the user is being told *when*
-/// the account is next usable, not *how used* it is. This same string is both
-/// the row's `RowStyle` (for `apply_menu_styles`) and the plain title of the
-/// top-level `Submenu` `build_account_submenu` builds for the account (the
-/// row IS the submenu trigger — there's no separate provider header row).
+/// the account is next usable, not *how used* it is.
+///
+/// v0.5.2: no longer called by any production render path — `build_menu`/
+/// `menu_tree_from_snapshot` now use `account_header_row`'s `{provider} ·
+/// {email}` block-header format instead of this padded flat-list format (the
+/// per-account BLOCK redesign, item 1). Kept `#[allow(dead_code)]` rather
+/// than deleted: it's a well-tested pure function capturing the padded
+/// single-row format from the v0.5.0/v0.5.1 flat/grouped list, which a future
+/// "compact mode" could plausibly reuse, and deleting it would mean deleting
+/// or rewriting its whole existing test suite for zero behavior change.
+#[allow(dead_code)]
 fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowStyle {
     let label = format!("{provider_display:<PROVIDER_COL$}{}", a.display);
     let base = u16len(&label) + 1; // + '\t'
@@ -376,6 +400,122 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
     }
 }
 
+/// v0.5.2 menu redesign: the header row of one account's BLOCK — `{provider}
+/// · {email}\t{sa} / {sb}` (or `\t<locked countdown>` when the account is
+/// fully consumed, same rule `main_row` uses). Provider grouping is no longer
+/// a separate visual concept (no section header, no per-provider HR) — each
+/// account is its own top-level block, separated from its neighbors by
+/// `PredefinedMenuItem::separator()` (see `build_menu`), so the provider name
+/// has to live INSIDE this row instead of a shared header above a group of
+/// rows. Otherwise identical to `main_row`: same locked/colored/bold/
+/// checkmark rules, same `TabX::MenuRight` participation (so the block
+/// headers and the Quit row all share one right-aligned column via
+/// `mac_style::compute_menu_right_x`) — just a different label format
+/// (`main_row`'s padded `{provider:<10}{email}` was designed for a flat list
+/// where the provider name was the ONLY thing distinguishing rows at a
+/// glance; the block header can afford the more readable `·` separator since
+/// it's the sole row establishing "whose account is this" for everything
+/// beneath it).
+/// The trailing run (after the `\t`) for an account's block header, plus its
+/// color spans RELATIVE to the start of that trailing run (the caller adds
+/// its own label-length offset). v0.5.2 item 7 nuance, built directly off
+/// `countdown::compute_display` so the three states it can report each get
+/// their own trailing shape instead of the old binary
+/// "locked countdown OR `sa / sb`" split:
+///   * `Locked` on the WEEKLY window → the countdown ALONE, no slash — a
+///     locked weekly is the harder wall (session will free up on its own
+///     schedule regardless), so showing a session percentage next to it
+///     would be a healthy-looking number the user could still stall on for
+///     up to a week.
+///   * `Locked` on the SESSION window → `<countdown> / <weekly%>` — the
+///     weekly window still has headroom (a session lock can't win the
+///     `compute_display` tie-break over a simultaneously-locked weekly), so
+///     surfacing it tells the user there's still runway on this account via
+///     a different window.
+///   * `StaleAfterReset` → `-% / -%`, a deliberate "don't know yet"
+///     placeholder rather than re-rendering the cached (typically ~100%)
+///     reading, which would misreport an account that just reset as still
+///     maxed out until the next poll refreshes it (item 4).
+///   * `Usage` → the existing `sa / sb`, colored per the provider's bands.
+fn trailing_for_account(
+    a: &AcctView,
+    bands: SeverityBands,
+    now: DateTime<Utc>,
+) -> (String, Vec<(usize, usize, Severity)>) {
+    match countdown::compute_display(&account_usage_for(a), now) {
+        DisplayState::Locked {
+            until,
+            window: BlockingWindow::Weekly,
+        } => {
+            let cd = countdown::format_countdown(until - now);
+            let len = u16len(&cd);
+            (cd, vec![(0, len, Severity::Red)])
+        }
+        DisplayState::Locked {
+            until,
+            window: BlockingWindow::Session,
+        } => {
+            let cd = countdown::format_countdown(until - now);
+            let (_, wp) = summary_pcts(a);
+            let wb = pct(wp);
+            let trailing = format!("{cd} / {wb}");
+            let mut colors = vec![(0, u16len(&cd), Severity::Red)];
+            let w_off = u16len(&cd) + u16len(" / ");
+            if let Some(sev) = severity_with(wp, bands) {
+                colors.push((w_off, u16len(&wb), sev));
+            }
+            (trailing, colors)
+        }
+        DisplayState::StaleAfterReset { .. } => ("-% / -%".to_string(), Vec::new()),
+        DisplayState::Usage {
+            session_pct,
+            weekly_pct,
+        } => {
+            let sa = pct(session_pct);
+            let sb = pct(weekly_pct);
+            let trailing = format!("{sa} / {sb}");
+            let mut colors = Vec::new();
+            if let Some(sev) = severity_with(session_pct, bands) {
+                colors.push((0, u16len(&sa), sev));
+            }
+            let w_off = u16len(&sa) + u16len(" / ");
+            if let Some(sev) = severity_with(weekly_pct, bands) {
+                colors.push((w_off, u16len(&sb), sev));
+            }
+            (trailing, colors)
+        }
+    }
+}
+
+/// v0.5.2 menu redesign: the header row of one account's BLOCK — `{provider}
+/// · {email}\t<trailing>` where `<trailing>` is whatever
+/// `trailing_for_account` decides (locked countdown, locked-session-with-
+/// weekly-headroom, stale-after-reset placeholder, or plain `sa / sb`).
+/// Provider grouping is no longer a separate visual concept (no section
+/// header, no per-provider HR) — each account is its own top-level block,
+/// separated from its neighbors by `PredefinedMenuItem::separator()` (see
+/// `build_menu`), so the provider name has to live INSIDE this row instead of
+/// a shared header above a group of rows. Same `TabX::MenuRight`
+/// participation as the Quit row (so the trailing column lines up via
+/// `mac_style::compute_menu_right_x`).
+fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
+    let label = format!("{} · {}", sec.display_name, a.display);
+    let base = u16len(&label) + 1; // + '\t'
+    let (trailing, rel_colors) = trailing_for_account(a, sec.severity_bands, now_utc());
+    let plain = format!("{label}\t{trailing}");
+    let colors = rel_colors
+        .into_iter()
+        .map(|(off, len, sev)| (base + off, len, sev))
+        .collect();
+    RowStyle {
+        bold: a.active,
+        colors,
+        tab_x_kind: Some(TabX::MenuRight),
+        checkmark: a.active,
+        ..RowStyle::plain_row(plain)
+    }
+}
+
 /// All styling directives for the current menu, derived from the same snapshot
 /// `build_menu` renders. The native walk applies each by matching `.plain`.
 /// Plain title used both when we build the Quit row and when the style
@@ -391,12 +531,13 @@ fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
     let mut styles = Vec::new();
     // v0.5.0: the top "resets in X" header rows are gone (item 1 of the menu
     // redesign) and there's no separate disabled provider-header row either —
-    // the provider name now lives inline in each account's own row (see
-    // `main_row`). Every row carries its provider's 16px icon (looked up by
-    // slug in `crate::icons::png16_for`; a missing PNG is a no-op).
+    // the provider name now lives inline in each account's own block header
+    // (see `account_header_row`, v0.5.2). Every row carries its provider's
+    // 16px icon (looked up by slug in `crate::icons::png16_for`; a missing
+    // PNG is a no-op).
     for sec in &snap.sections {
         for a in &sec.accounts {
-            let mut style = main_row(sec.display_name, a, sec.severity_bands);
+            let mut style = account_header_row(sec, a);
             style.icon_slug = Some(sec.provider_id);
             styles.push(style);
             // Submenu info rows (reset windows, burn-rate/cost, "updated …")
@@ -458,9 +599,10 @@ pub fn run() -> Result<()> {
     // Background (menu-bar-only) app: no Dock icon, even as the bare binary.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    // Poll + auto-swap on a background thread. It writes cached usage to
+    // Poll + auto-swap on a background thread, supervised against panics
+    // (see `poll_loop_supervisor`'s doc). It writes cached usage to
     // state.json; the main-thread timer reads it back to render.
-    std::thread::spawn(poll_loop);
+    std::thread::spawn(poll_loop_supervisor);
 
     // Remember the binary we launched from so the timer can notice a `brew
     // upgrade` replacing it and relaunch into the new version.
@@ -521,27 +663,116 @@ pub fn run() -> Result<()> {
 // Poller thread
 // ---------------------------------------------------------------------------
 
+/// The `SwapGuard` shared by every in-process caller of `run_cycle` — the
+/// long-lived poller (`poll_loop`) and the one-off "Refresh usage now" click
+/// (`handle_refresh_now`) — so anti-thrash cooldown/no-return windows apply
+/// to BOTH, not just poll-triggered swaps (concurrency-04, v0.5.2 codeaudit).
+/// Before this, `handle_refresh_now` spawned its own throwaway
+/// `SwapGuard::default()`: a manual click could swap right past a cooldown
+/// the poller had just started, or bounce straight back into an account the
+/// poller had just left inside its no-return window. `Arc<Mutex<_>>` (rather
+/// than splitting the struct's fields into separate atomics) keeps
+/// `SwapGuard`'s existing `&mut self` API — `left_at`'s `HashMap` and
+/// `stuck_notified`'s bookkeeping aren't lock-free-friendly, and the guard is
+/// only ever held for the duration of one `run_cycle` call, so a `Mutex`
+/// contends at most twice a poll interval.
+fn shared_swap_guard() -> std::sync::Arc<std::sync::Mutex<SwapGuard>> {
+    static GUARD: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<SwapGuard>>> =
+        std::sync::OnceLock::new();
+    GUARD
+        .get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(SwapGuard::default())))
+        .clone()
+}
+
 fn poll_loop() {
-    let mut guard = SwapGuard::default();
+    let guard = shared_swap_guard();
     let base = WATCH_INTERVAL_SECS;
     let mut current = base;
     loop {
         // Fetch usage + auto-swap; this writes cached usage to state.json, which
         // the main-thread timer reads back to render. This is the ONLY thing that
         // hits the network, so ordinary use can never rate-limit.
-        let (rate_limited, max_session_pct, trigger) = run_cycle(&mut guard);
+        let (rate_limited, max_pct_opt, trigger) = {
+            let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
+            run_cycle(&mut g)
+        };
         let prev = current;
-        current = next_interval(current, base, rate_limited, max_session_pct, trigger);
+        current = next_interval(current, base, rate_limited, max_pct_opt, trigger);
         if rate_limited {
             crate::logging::log(&format!("rate limited; backing off to {current}s"));
         } else if current != prev && current < base {
-            let max_pct = max_session_pct.unwrap_or(0.0);
+            let max_pct = max_pct_opt.unwrap_or(0.0);
             crate::logging::log(&format!(
-                "cadence: {prev}s → {current}s (max session {max_pct:.1}%, trigger {trigger:.0}%) \
+                "cadence: {prev}s → {current}s (max {max_pct:.1}%, trigger {trigger:.0}%) \
                  event=cadence prev={prev}s new={current}s max_pct={max_pct:.1} trigger={trigger:.0}"
             ));
         }
         std::thread::sleep(Duration::from_secs(current));
+    }
+}
+
+/// Max panic-and-respawn cycles tolerated in `PANIC_LOOP_WINDOW_SECS` before
+/// `poll_loop_supervisor` gives up self-healing and hard-exits (letting
+/// launchd's `KeepAlive`/restart policy bring the whole process back up
+/// clean) — a backstop against a genuine crash-loop rather than a transient
+/// one-off panic.
+const MAX_PANICS_PER_WINDOW: usize = 10;
+const PANIC_LOOP_WINDOW_SECS: u64 = 60;
+/// Backoff between a `poll_loop` panic and respawning it.
+const PANIC_RESPAWN_BACKOFF_SECS: u64 = 5;
+
+/// Best-effort human string for a `catch_unwind` payload (usually a `&str` or
+/// `String` from a `panic!`/`unwrap`/`expect` message; anything else — a
+/// custom payload type — falls back to a fixed string rather than failing to
+/// log at all).
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Supervises `poll_loop`: if ANY unwind (an unwrap/expect/index-panic
+/// anywhere in `run_cycle`/`refresh_usage_cache`/`active_refresh_cas`/…)
+/// escapes it, the bare `std::thread::spawn(poll_loop)` this replaces would
+/// let the whole background thread die silently — permanently disabling
+/// polling, auto-swap, notifications, and credential sync for the rest of
+/// the app's lifetime (errors-02, v0.5.2 codeaudit) with no user-visible
+/// symptom beyond stale menu numbers. Instead: log the panic, back off, and
+/// respawn — self-healing by default. Only a genuine panic-loop (more than
+/// `MAX_PANICS_PER_WINDOW` in `PANIC_LOOP_WINDOW_SECS`) falls through to a
+/// hard process exit, which launchd's LaunchAgent restarts into a clean
+/// process (see `AUTOSTART_LABEL`/`cmd_install`).
+fn poll_loop_supervisor() {
+    let mut panics: Vec<std::time::Instant> = Vec::new();
+    loop {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll_loop));
+        // `poll_loop` is an infinite `loop {}` — reaching here at all means it
+        // either panicked (Err) or, in principle, returned (Ok), which it
+        // never does today but respawning either way is strictly safer than
+        // silently exiting the supervisor thread.
+        let reason = match outcome {
+            Err(payload) => panic_payload_message(&*payload),
+            Ok(()) => "poll_loop returned without panicking (unexpected)".to_string(),
+        };
+        crate::logging::log(&format!(
+            "event=poll_loop_panic reason={reason} ; respawning"
+        ));
+
+        let now = std::time::Instant::now();
+        panics.retain(|t| now.duration_since(*t).as_secs() < PANIC_LOOP_WINDOW_SECS);
+        panics.push(now);
+        if panics.len() > MAX_PANICS_PER_WINDOW {
+            crate::logging::log(&format!(
+                "event=poll_loop_panic_loop reason=\"more than {MAX_PANICS_PER_WINDOW} panics in \
+                 {PANIC_LOOP_WINDOW_SECS}s\" ; exiting for launchd to restart us clean"
+            ));
+            std::process::exit(1);
+        }
+        std::thread::sleep(Duration::from_secs(PANIC_RESPAWN_BACKOFF_SECS));
     }
 }
 
@@ -679,11 +910,10 @@ fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
 }
 
 /// Run one poll+auto-swap cycle; returns whether it was rate limited.
-/// Runs one poll cycle and returns `(rate_limited, max_session_pct, trigger)`
-/// so the caller's adaptive-cadence math has everything it needs. The
-/// menubar poller uses the trigger the user actually configured (via
-/// `Settings ▸ Auto-swap threshold`), matching what `watch_cycle` itself
-/// dispatched on.
+/// Runs one poll cycle and returns `(rate_limited, max_pct, trigger)` so the
+/// caller's adaptive-cadence math has everything it needs. The menubar
+/// poller uses the trigger the user actually configured (via `Settings ▸
+/// Auto-swap`), matching what `watch_cycle` itself dispatched on.
 fn run_cycle(guard: &mut SwapGuard) -> (bool, Option<f64>, f64) {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
@@ -691,7 +921,7 @@ fn run_cycle(guard: &mut SwapGuard) -> (bool, Option<f64>, f64) {
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
     match watch_cycle(trigger, TARGET_CEILING_PCT, guard) {
-        Ok(o) => (o.rate_limited, o.max_session_pct, trigger),
+        Ok(o) => (o.rate_limited, o.max_pct, trigger),
         Err(e) => {
             crate::logging::log(&format!("menubar poll failed: {e}"));
             (false, None, trigger)
@@ -715,6 +945,68 @@ fn sort_by_expiration(a: &AcctView, b: &AcctView) -> std::cmp::Ordering {
     let ka = a.weekly_reset_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
     let kb = b.weekly_reset_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
     ka.cmp(&kb)
+}
+
+/// Global soonest-expiring / priority order for the flat main-list block
+/// sequence, spanning ALL providers — not grouped by provider (v0.5.2 fix for
+/// the "account order keeps changing" report: `sections` were previously
+/// rendered in fixed `providers::all()` order with only a per-section
+/// re-sort, so an account's position could jump around relative to another
+/// provider's account for no reason a user could predict). Four-level
+/// comparator, in priority order:
+///   1. Locked-and-not-active sinks to the very bottom — it isn't a usable
+///      swap target regardless of how soon its reset is. An account that's
+///      BOTH locked and currently active stays in normal rotation (rank 0)
+///      so the user can still see it and its countdown up top.
+///   2. Soonest of `{session_reset, weekly_reset}` ascending — the account
+///      about to reset (and therefore about to free up quota) surfaces
+///      first; no known reset sorts last within its rank.
+///   3. More headroom (`100 - max(session%, weekly%)`) first — the better
+///      auto-swap candidate wins a tie on reset time.
+///   4. Email, ascending — final deterministic tie-break so two accounts
+///      that are identical on 1–3 always render in the same order.
+fn flat_account_order(sections: &[ProviderSection], now: DateTime<Utc>) -> Vec<(usize, usize)> {
+    struct Key {
+        sink: bool,
+        soonest: DateTime<Utc>,
+        headroom: f64,
+        email: String,
+    }
+    let mut idx: Vec<(usize, usize)> = Vec::new();
+    let mut keys: Vec<Key> = Vec::new();
+    for (si, sec) in sections.iter().enumerate() {
+        for (ai, a) in sec.accounts.iter().enumerate() {
+            let locked = locked_countdown_for(a, now).is_some();
+            let soonest = [a.session_reset_at, a.weekly_reset_at]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+            let (sp, wp) = summary_pcts(a);
+            let headroom = 100.0 - sp.unwrap_or(0.0).max(wp.unwrap_or(0.0));
+            idx.push((si, ai));
+            keys.push(Key {
+                sink: locked && !a.active,
+                soonest,
+                headroom,
+                email: a.key.clone(),
+            });
+        }
+    }
+    let mut order: Vec<usize> = (0..idx.len()).collect();
+    order.sort_by(|&x, &y| {
+        let (kx, ky) = (&keys[x], &keys[y]);
+        kx.sink
+            .cmp(&ky.sink)
+            .then(kx.soonest.cmp(&ky.soonest))
+            .then(
+                ky.headroom
+                    .partial_cmp(&kx.headroom)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(kx.email.cmp(&ky.email))
+    });
+    order.into_iter().map(|i| idx[i]).collect()
 }
 
 /// Build one account's rendered view from a v1 `Row`. v1 state only has
@@ -769,6 +1061,9 @@ fn acctview_from_row(
         has_data: r.has_data(),
         session_reset_at: r.session.resets_at,
         weekly_reset_at: r.weekly.resets_at,
+        fetched_at: r
+            .fetched_at
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
     }
 }
 
@@ -849,11 +1144,14 @@ fn build_snapshot() -> Snapshot {
     // The capture submenu lists every registered provider that CAN capture a
     // login on this host — filtered by `capture_menu_providers` so stub
     // providers (`supports_usage == false`) don't clutter the onboarding UX.
-    // Providers with `capture_mode == ApiKey` go into the "Paste API key ▸"
-    // sub-submenu instead of the main list — UNLESS they already have a
-    // captured account (i.e. a section above), in which case that account now
-    // renders in the main list and "Paste API key ▸" stops offering it (item
-    // 9 of the redesign: capture is for NEW accounts only once one exists).
+    // `capture_creds`/`capture_api_key` still separate creds-on-disk from
+    // API-key providers (the click-id prefix differs), but v0.5.2 item 8
+    // flattened their RENDERING into one direct child list under "Capture
+    // current login ▸" (creds first, then API-key) instead of an API-key-only
+    // "Paste API key ▸" sub-submenu. Either way, a provider stops appearing
+    // here once it has a captured account (i.e. a section above) — that
+    // account now renders in the main list instead (item 9 of the original
+    // redesign: capture is for NEW accounts only once one exists).
     let captured_provider_ids: Vec<&str> = sections.iter().map(|s| s.provider_id).collect();
     let (creds_providers, api_key_providers) = capture_menu_providers(&captured_provider_ids);
     let capture_creds: Vec<RegisteredProvider> =
@@ -863,8 +1161,11 @@ fn build_snapshot() -> Snapshot {
         .map(register_provider)
         .collect();
 
+    let account_order = flat_account_order(&sections, now_utc());
+
     Snapshot {
         sections,
+        account_order,
         capture_creds,
         capture_api_key,
         autoswap,
@@ -1030,51 +1331,39 @@ fn build_menu(snap: &Snapshot) -> Menu {
         );
     }
 
-    // Main list: rows grouped per provider, separated by a menu HR so the
-    // user can tell at a glance which accounts belong to which vendor
-    // (v0.5.1 UX fix — the v0.5.0 flat list was too busy with multiple
-    // providers). The provider name still appears on each row (main_row)
-    // for accessibility / when a section has only one account. Providers
-    // only contribute rows when they have at least one captured account
-    // (the "no header, no rows" rule survives).
-    for (idx, sec) in snap.sections.iter().enumerate() {
-        if idx > 0 {
+    // Main list: each CAPTURED ACCOUNT is its own top-level BLOCK (header +
+    // usage-context rows + action rows), separated from its neighbor by a
+    // menu HR — v0.5.2 menu redesign (item 1). Provider grouping is no
+    // longer a visual concept at all: there's no per-provider header and no
+    // "only between providers" HR placement anymore, just a flat sequence of
+    // account blocks with a separator between EVERY one of them (the
+    // provider name lives inline in each block's own header row — see
+    // `account_header_row` — so a single-account provider still reads
+    // clearly). Render order is `snap.account_order` — a single
+    // soonest-expiring/priority comparator spanning ALL providers (see
+    // `flat_account_order`), NOT provider-declaration order; providers only
+    // contribute blocks when they have at least one captured account (the
+    // "no header, no rows" rule survives — there's simply no separate header
+    // to omit anymore).
+    let mut first_block = true;
+    for &(si, ai) in &snap.account_order {
+        let sec = &snap.sections[si];
+        let a = &sec.accounts[ai];
+        if !first_block {
             let _ = menu.append(&PredefinedMenuItem::separator());
         }
-        for title in section_headline_rows(sec) {
-            add(
-                &menu,
-                MenuItem::with_id(
-                    format!("envoverride:{}", sec.provider_id),
-                    title,
-                    false,
-                    None,
-                ),
-            );
-        }
-        for a in &sec.accounts {
-            build_account_submenu(&menu, sec, a);
-        }
+        first_block = false;
+        build_account_block(&menu, sec, a);
     }
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    // Auto-swap: a single top-level checkbox now (item 4 of the target tree).
-    // The Off/90/95/98/"switch now" picker moves under Settings ▸ Auto-swap
-    // threshold ▸ below.
-    let _ = menu.append(&CheckMenuItem::with_id(
-        "autoswap:toggle",
-        "Auto-swap enabled",
-        true,
-        snap.autoswap,
-        None,
-    ));
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
-    // Capture current login ▸ FIRST, then Settings ▸ — the redesign reorders
-    // these (item 4). Creds-on-disk providers render directly; API-key
-    // providers roll up under a "Paste API key ▸" sub-submenu, but ONLY while
-    // they have no captured account yet (item 9) — once captured, the
-    // account itself renders in the main list above instead.
+    // Capture current login ▸ FIRST, then Settings ▸. Every registered
+    // provider that can still capture a new login renders as a DIRECT child
+    // — creds-on-disk providers first, then API-key providers (v0.5.2 item 8
+    // flattened the "Paste API key ▸" sub-submenu these used to live under).
+    // A provider stops appearing here once it has a captured account (item
+    // 9 of the original redesign: capture is for NEW accounts only) — that
+    // account renders in the main list above instead.
     let capture = Submenu::with_id("capture", "Capture current login", true);
     if snap.capture_creds.is_empty() && snap.capture_api_key.is_empty() {
         let _ = capture.append(&MenuItem::with_id(
@@ -1084,46 +1373,80 @@ fn build_menu(snap: &Snapshot) -> Menu {
             None,
         ));
     } else {
-        for reg in &snap.capture_creds {
+        for reg in snap.capture_creds.iter().chain(snap.capture_api_key.iter()) {
             let title = if reg.installed {
                 reg.display_name.to_string()
             } else {
                 format!("{} (not installed)", reg.display_name)
             };
             // Row stays clickable even when we think it's not installed —
-            // the actual `capture_current_login` call surfaces the real error.
+            // the actual capture call surfaces the real error. Click id
+            // prefix ("capture:" vs "apikey:") is what routes to the right
+            // handler — see `handle_click` — not menu position.
+            let prefix = match reg.capture_mode {
+                CaptureMode::CredsOnDisk => "capture",
+                CaptureMode::ApiKey => "apikey",
+            };
             let _ = capture.append(&MenuItem::with_id(
-                format!("capture:{}", reg.provider_id),
+                format!("{prefix}:{}", reg.provider_id),
                 title,
                 true,
                 None,
             ));
         }
-        if !snap.capture_api_key.is_empty() {
-            if !snap.capture_creds.is_empty() {
-                let _ = capture.append(&PredefinedMenuItem::separator());
-            }
-            let paste = Submenu::with_id("capture:apikey", "Paste API key", true);
-            for reg in &snap.capture_api_key {
-                let title = if reg.installed {
-                    reg.display_name.to_string()
-                } else {
-                    format!("{} (not installed)", reg.display_name)
-                };
-                let _ = paste.append(&MenuItem::with_id(
-                    format!("apikey:{}", reg.provider_id),
-                    title,
-                    true,
-                    None,
-                ));
-            }
-            let _ = capture.append(&paste);
-        }
     }
     let _ = menu.append(&capture);
 
-    // Settings ▸ Notifications ▸ / Auto-swap threshold ▸ / Advanced ▸.
+    // Settings ▸: "Refresh usage now" first, then a separator, then
+    // everything else alphabetical by display label (v0.5.2 item 9 —
+    // flattens the old "Advanced ▸" grouping; Backups moves up to a direct
+    // Settings child alongside Auto-swap and Notifications).
     let settings = Submenu::with_id("settings", "Settings", true);
+    let _ = settings.append(&MenuItem::with_id(
+        "refresh:now",
+        "Refresh usage now",
+        true,
+        None,
+    ));
+    let _ = settings.append(&PredefinedMenuItem::separator());
+
+    // Auto-swap ▸ (item 5 consolidation): the top-level "Auto-swap enabled"
+    // checkbox is gone — Off doubles as disable, and picking a threshold
+    // enables auto-swap AND sets it, so this one submenu is the sole control
+    // surface.
+    let cur = if snap.autoswap {
+        snap.threshold.round() as i32
+    } else {
+        0
+    };
+    let autoswap_menu = Submenu::with_id("settings:autoswap", "Auto-swap", true);
+    let _ = autoswap_menu.append(&CheckMenuItem::with_id(
+        "autoswap:off",
+        "Off",
+        true,
+        cur == 0,
+        None,
+    ));
+    for t in [70i32, 85, 95, 98] {
+        let _ = autoswap_menu.append(&CheckMenuItem::with_id(
+            format!("autoswap:{t}"),
+            format!("{t}%"),
+            true,
+            cur == t,
+            None,
+        ));
+    }
+    let _ = autoswap_menu.append(&PredefinedMenuItem::separator());
+    let _ = autoswap_menu.append(&MenuItem::with_id(
+        "autoswap:now",
+        "Switch to best account now",
+        true,
+        None,
+    ));
+
+    let backups = Submenu::with_id("settings:backups", "Backups", true);
+    let _ = backups.append(&MenuItem::with_id("backup:save", "Save…", true, None));
+    let _ = backups.append(&MenuItem::with_id("backup:restore", "Restore…", true, None));
 
     let notifications = Submenu::with_id("settings:notifications", "Notifications", true);
     let _ = notifications.append(&CheckMenuItem::with_id(
@@ -1147,54 +1470,11 @@ fn build_menu(snap: &Snapshot) -> Menu {
         snap.notification_config.pace_enabled,
         None,
     ));
+
+    // Alphabetical: Auto-swap, Backups, Notifications.
+    let _ = settings.append(&autoswap_menu);
+    let _ = settings.append(&backups);
     let _ = settings.append(&notifications);
-
-    // Auto-swap threshold ▸ — moved wholesale from the old top-level submenu.
-    let cur = if snap.autoswap {
-        snap.threshold.round() as i32
-    } else {
-        0
-    };
-    let threshold = Submenu::with_id("settings:autoswap-threshold", "Auto-swap threshold", true);
-    let _ = threshold.append(&CheckMenuItem::with_id(
-        "autoswap:off",
-        "Off",
-        true,
-        cur == 0,
-        None,
-    ));
-    for t in [90i32, 95, 98] {
-        let _ = threshold.append(&CheckMenuItem::with_id(
-            format!("autoswap:{t}"),
-            format!("{t}%"),
-            true,
-            cur == t,
-            None,
-        ));
-    }
-    let _ = threshold.append(&PredefinedMenuItem::separator());
-    let _ = threshold.append(&MenuItem::with_id(
-        "autoswap:now",
-        "Switch to best account now",
-        true,
-        None,
-    ));
-    let _ = settings.append(&threshold);
-
-    // Advanced ▸ Backups ▸ (Save… / Restore… via native file panels) and
-    // Refresh usage now (items 5, 6, 7).
-    let advanced = Submenu::with_id("settings:advanced", "Advanced", true);
-    let backups = Submenu::with_id("settings:advanced:backups", "Backups", true);
-    let _ = backups.append(&MenuItem::with_id("backup:save", "Save…", true, None));
-    let _ = backups.append(&MenuItem::with_id("backup:restore", "Restore…", true, None));
-    let _ = advanced.append(&backups);
-    let _ = advanced.append(&MenuItem::with_id(
-        "refresh:now",
-        "Refresh usage now",
-        true,
-        None,
-    ));
-    let _ = settings.append(&advanced);
 
     let _ = menu.append(&settings);
 
@@ -1249,7 +1529,7 @@ fn window_reset_row(w: &WindowView) -> String {
 /// Non-clickable informational rows shown inside an account submenu — reset
 /// windows, burn-rate / cost estimates, and the "updated Xm ago" footer (or
 /// the has_data / no-usage-endpoint fallbacks). Shared by
-/// `build_account_submenu` (which renders each as an `enabled: true` `noop`
+/// `build_account_block` (which renders each as an `enabled: true` `noop`
 /// item so it reads as normal text rather than muda's greyed-out disabled
 /// look) and `menu_styles` (which marks each `disabled_but_white` so the
 /// native walk explicitly paints `NSColor::labelColor()`) — pulling this out
@@ -1257,7 +1537,7 @@ fn window_reset_row(w: &WindowView) -> String {
 /// uses for the Quit row.
 ///
 /// Deliberately excludes the burn-rate / cost-estimate / "updated" footer
-/// rows (`build_account_submenu` appends those separately): those touch the
+/// rows (`build_account_block` appends those separately): those touch the
 /// on-disk usage log via `crate::usage_log`, and `menu_styles` — the other
 /// caller of this function — must stay pure (no disk I/O) so it's safe to
 /// call from a unit test without a `ScopedConfigDir`.
@@ -1277,7 +1557,7 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     rows
 }
 
-/// Which optional rows `build_account_submenu` should append for `sec`'s
+/// Which optional rows `build_account_block` should append for `sec`'s
 /// account `a`. Pure over `ProviderSection`/`AcctView` fields, with no
 /// `muda`/`tray_icon` types involved, so this decision is unit-testable
 /// without a live main-thread `NSApplication` (a bare `muda::Menu` can only
@@ -1303,39 +1583,30 @@ fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRo
     }
 }
 
-/// Build one account's submenu inside a provider section. Splits Switch /
-/// reset-info / Launch / Remove; the pieces vary by capability so a
-/// reporting-only provider drops the Switch item and a no-usage provider
-/// swaps the info block for a `(no usage endpoint — headers only)` row.
-/// macOS-only counterpart to `build_menu` above — see its doc comment.
-/// Linux/Windows build the same rows via
-/// `cross_platform::build_account_submenu_items`.
+/// Build one account's BLOCK directly into the top-level menu (v0.5.2 menu
+/// redesign, item 1): a header row (`account_header_row` — provider · email,
+/// right-aligned stats/countdown), its usage-context info rows (reset
+/// countdowns, burn rate, cost estimate, "updated Xm ago" — enabled but
+/// non-clickable), then its action rows (Switch/Active, Launch, Remove, and
+/// the env-override marker if this account's provider currently has one
+/// active). Before this, each account was its OWN top-level `Submenu` the
+/// user had to open to see any of this; now every row is visible directly in
+/// the main list, and `PredefinedMenuItem::separator()` between accounts
+/// (see `build_menu`) delimits one block from the next instead of a submenu
+/// boundary. macOS-only counterpart to `build_menu` above — see its doc
+/// comment. Linux/Windows build the same rows via
+/// `cross_platform::build_account_block_items`.
 #[cfg(target_os = "macos")]
-fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
-    let head = main_row(sec.display_name, a, sec.severity_bands).plain;
-    let sub = Submenu::with_id(format!("sub:{}:{}", sec.provider_id, a.key), head, true);
-    let rows = account_submenu_rows(sec, a);
-    match rows.switch_row {
-        Some(true) => {
-            let _ = sub.append(&MenuItem::with_id("noop", "✓ Active", false, None));
-        }
-        Some(false) => {
-            let _ = sub.append(&MenuItem::with_id(
-                format!("switch:{}:{}", sec.provider_id, a.key),
-                "Switch to this account",
-                true,
-                None,
-            ));
-        }
-        None => {}
-    }
-    let _ = sub.append(&PredefinedMenuItem::separator());
+fn build_account_block(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
+    let head = account_header_row(sec, a).plain;
+    add(menu, MenuItem::with_id("noop", head, true, None));
+
     // v0.5.0 (item 3): these rows are informational, not disabled — enabled:
     // true so `apply_menu_styles`'s `disabled_but_white` can paint them in
     // the normal (white/black) text color instead of muda's greyed
     // "disabled" look, while a click still routes to the `noop` no-op.
     for row in submenu_info_rows(sec, a) {
-        let _ = sub.append(&MenuItem::with_id("noop", row, true, None));
+        add(menu, MenuItem::with_id("noop", row, true, None));
     }
     // Burn-rate + cost estimator rows sit under the raw window stats, above
     // the "updated" footer. Cheap best-effort reads against the usage log —
@@ -1351,33 +1622,56 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
             Utc::now(),
         ) {
             if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
-                let _ = sub.append(&MenuItem::with_id(
-                    "noop",
-                    crate::burn_rate::format_menu_row(&est),
-                    true,
-                    None,
-                ));
+                add(
+                    menu,
+                    MenuItem::with_id("noop", crate::burn_rate::format_menu_row(&est), true, None),
+                );
             }
         }
         if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
             &account_key,
             crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
         ) {
-            let _ = sub.append(&MenuItem::with_id(
-                "noop",
-                format!("~${:.2} this cycle (est)", cost.estimated_usd),
-                true,
-                None,
-            ));
+            add(
+                menu,
+                MenuItem::with_id(
+                    "noop",
+                    format!("~${:.2} this cycle (est)", cost.estimated_usd),
+                    true,
+                    None,
+                ),
+            );
         }
-        let _ = sub.append(&MenuItem::with_id(
-            "noop",
-            format!("updated {}", a.updated),
-            true,
-            None,
-        ));
+        add(
+            menu,
+            MenuItem::with_id("noop", format!("updated {}", a.updated), true, None),
+        );
     }
-    let _ = sub.append(&PredefinedMenuItem::separator());
+
+    // Action rows: Switch/Active, Launch, Remove, then the env-override
+    // marker. Env override used to be a once-per-provider row prepended
+    // before a provider's whole section; with provider grouping gone as a
+    // visual concept (v0.5.2), it now surfaces on every affected account's
+    // own block instead — still driven by the same `section_headline_rows`
+    // (a provider-wide fact, just rendered per-account now).
+    let rows = account_submenu_rows(sec, a);
+    match rows.switch_row {
+        Some(true) => {
+            add(menu, MenuItem::with_id("noop", "✓ Active", false, None));
+        }
+        Some(false) => {
+            add(
+                menu,
+                MenuItem::with_id(
+                    format!("switch:{}:{}", sec.provider_id, a.key),
+                    "Switch to this account",
+                    true,
+                    None,
+                ),
+            );
+        }
+        None => {}
+    }
     // "Launch" is gated on `supports_launch`, NOT `supports_switching` (H3,
     // v0.5.0 codeaudit): the two are independent — a provider can have
     // `write_active_account` wired (switching) without `launch_client` wired
@@ -1386,12 +1680,15 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
     // switching-capable provider even when its `launch_client` was still the
     // `Unsupported` trait default, so every click errored.
     if rows.launch_row {
-        let _ = sub.append(&MenuItem::with_id(
-            format!("launch:{}:{}", sec.provider_id, a.key),
-            "Launch client",
-            true,
-            None,
-        ));
+        add(
+            menu,
+            MenuItem::with_id(
+                format!("launch:{}:{}", sec.provider_id, a.key),
+                "Launch client",
+                true,
+                None,
+            ),
+        );
     }
     // "Remove…" is gated on `supports_remove` (H3, v0.5.0 codeaudit): the
     // row used to be built unconditionally regardless of what the provider
@@ -1400,14 +1697,27 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
     // provider that needs `supports_remove: false` from getting a row that
     // silently does nothing useful.
     if rows.remove_row {
-        let _ = sub.append(&MenuItem::with_id(
-            format!("remove:{}:{}", sec.provider_id, a.key),
-            "Remove…",
-            true,
-            None,
-        ));
+        add(
+            menu,
+            MenuItem::with_id(
+                format!("remove:{}:{}", sec.provider_id, a.key),
+                "Remove…",
+                true,
+                None,
+            ),
+        );
     }
-    let _ = menu.append(&sub);
+    for title in section_headline_rows(sec) {
+        add(
+            menu,
+            MenuItem::with_id(
+                format!("envoverride:{}", sec.provider_id),
+                title,
+                false,
+                None,
+            ),
+        );
+    }
 }
 
 /// macOS-only NSMenu attributedTitle styling. Grouped into one module (rather
@@ -1436,7 +1746,7 @@ mod mac_style {
         };
         tray.set_menu(Some(Box::new(menu)));
         let styles = menu_styles(snap);
-        let menu_right_x = compute_menu_right_x(&styles);
+        let menu_right_x = compute_menu_right_x(ns_menu, &styles);
         apply_menu_styles(ns_menu, &styles, menu_right_x);
     }
 
@@ -1461,10 +1771,20 @@ mod mac_style {
         }
     }
 
-    /// Extra padding (points) added beyond the widest row's measured natural
-    /// width so the right-aligned trailing run never sits flush against the
-    /// menu's own edge inset.
-    const RIGHT_ALIGN_PAD: f64 = 20.0;
+    /// Extra padding (points) added beyond the widest measured content width
+    /// before resolving the right-align tab stop. `NSAttributedString::size()`
+    /// measures glyph runs only — it knows nothing about the icon column,
+    /// checkmark/state column, or submenu-arrow column AppKit reserves — so a
+    /// positive pad here was meant to compensate. In practice the v0.5.1
+    /// value (28pt) overcompensated: it pushed the tab stop past the menu's
+    /// actual content edge, leaving a visible dead-space gap after the
+    /// trailing run on every row, worst on the un-inset Quit row ("Quit gaps
+    /// to the end", v0.5.2 item 2). Zero — i.e. trust `widest` (already
+    /// floored by the widest plain top-level row below) as the edge itself —
+    /// is what actually flushes right; a future report of text running too
+    /// close to the edge should look at raising this again, not assume the
+    /// old 28pt value was ever correct.
+    const RIGHT_ALIGN_PAD: f64 = 0.0;
 
     /// The natural (unwrapped, single-line) width in points of `s` rendered
     /// in `font`. Empty strings measure 0 without round-tripping through
@@ -1499,7 +1819,26 @@ mod mac_style {
     /// (`boldSystemFontOfSize` for bold/active rows, `menuFontOfSize`
     /// otherwise) since bold glyphs are wider. No `MenuRight` rows → 0.0 (an
     /// arbitrary, harmless x — nothing reads it).
-    fn compute_menu_right_x(styles: &[RowStyle]) -> f64 {
+    ///
+    /// v0.5.2 item 2: `RIGHT_ALIGN_PAD` used to be 28pt, which reliably
+    /// undershot the true content edge and produced a visible gap after the
+    /// right-aligned column (worst offender: the Quit row, "flush right"
+    /// only in name). Rather than re-guessing a bigger magic constant, the
+    /// pad is now 0 — `widest` itself (measured content width, floored by
+    /// the widest plain top-level row below) IS the target x.
+    ///
+    /// Also floors the result at the widest PLAIN (non-tab) top-level item's
+    /// measured width (v0.5.2 fix for the v0.5.1 "Quit gaps to the end"
+    /// report): if some other top-level row — a checkbox, a `Settings ▸`
+    /// submenu title, the per-account env-override marker, an account
+    /// block's info row, … — is wider than every `MenuRight` row's own
+    /// label+trailing, THAT row is what actually determines the menu's
+    /// rendered width, and our right-aligned trailing text would land short
+    /// of the true right edge no matter how the tab-row math above comes
+    /// out. `ns_menu` is the same live pointer `apply_menu_styles` walks;
+    /// this call happens before that walk sets any attributed titles, so
+    /// every item's `.title()` is still its plain string.
+    fn compute_menu_right_x(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) -> f64 {
         let mut widest = 0.0_f64;
         for style in styles {
             if style.tab_x_kind != Some(TabX::MenuRight) {
@@ -1516,6 +1855,23 @@ mod mac_style {
             let w = measured_width(label, &font) + measured_width(trailing, &font);
             if w > widest {
                 widest = w;
+            }
+        }
+        if !ns_menu.is_null() {
+            // SAFETY: called only on the main thread with a live NSMenu
+            // pointer from muda's ns_menu(), which the tray keeps retained —
+            // same precondition `apply_menu_styles` documents below.
+            let menu: &NSMenu = unsafe { &*(ns_menu as *const NSMenu) };
+            let font = NSFont::menuFontOfSize(0.0);
+            for item in menu.itemArray().iter() {
+                let title = item.title().to_string();
+                if title.contains('\t') {
+                    continue; // already covered by the tab-row loop above
+                }
+                let w = measured_width(&title, &font);
+                if w > widest {
+                    widest = w;
+                }
             }
         }
         widest + RIGHT_ALIGN_PAD
@@ -1770,6 +2126,9 @@ fn menu_signature(snap: &Snapshot) -> String {
                     format!("L=W|cd={}", countdown::format_countdown(until - now))
                 }
                 DisplayState::Usage { .. } => "L=0".to_string(),
+                DisplayState::StaleAfterReset { window, reset } => {
+                    format!("L=SA|w={window:?}|r={}", reset.to_rfc3339())
+                }
             };
             s.push_str(&format!(
                 "{}@{}/{}|{}|{}|sr={}|wr={}|{}|",
@@ -1889,7 +2248,6 @@ fn handle_click(id: &str) {
     match (c.action, c.slug, c.key) {
         ("quit", _, _) => std::process::exit(0),
         ("noop", _, _) => {}
-        ("autoswap", Some("toggle"), None) => toggle_autoswap(),
         ("autoswap", Some("off"), None) => set_autoswap(false),
         ("autoswap", Some("now"), None) => match optimize_now() {
             Ok(Some(email)) => notify(&format!("Switched to {email}")),
@@ -2078,10 +2436,17 @@ static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// still running notifies instead of spawning another thread. See
 /// `try_start_refresh` for the testable core.
 fn handle_refresh_now() {
-    try_start_refresh(|| {
-        std::thread::spawn(|| {
-            let mut guard = SwapGuard::default();
-            let (rate_limited, _max_pct, _trigger) = run_cycle(&mut guard);
+    // Shares `poll_loop`'s `SwapGuard` (concurrency-04, v0.5.2 codeaudit)
+    // instead of a throwaway `SwapGuard::default()` — see
+    // `shared_swap_guard`'s doc for why a manual click and the background
+    // poller must never reason about anti-thrash cooldown independently.
+    let guard = shared_swap_guard();
+    try_start_refresh(move || {
+        std::thread::spawn(move || {
+            let (rate_limited, _max_pct, _trigger) = {
+                let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
+                run_cycle(&mut g)
+            };
             REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
             if rate_limited {
                 notify("Refresh: rate limited, backing off");
@@ -2185,7 +2550,7 @@ fn handle_switch(slug: &str, key: &str) {
     // State v2 (codex-switch-e2e): dispatch by provider slug instead of
     // hard-gating on Claude — `capabilities().supports_switching` already
     // keeps the "Switch to this account" row from being built for a
-    // non-switching provider (`build_account_submenu`, H3 in the v0.5.0
+    // non-switching provider (`build_account_block`, H3 in the v0.5.0
     // codeaudit), and `switch_to_provider_account` itself re-checks that
     // capability as belt-and-suspenders against a stray/future click id
     // shaped like `switch:<slug>:<key>` reaching this function directly.
@@ -2290,30 +2655,6 @@ fn set_autoswap(enabled: bool) {
     let r = with_state_lock(|| {
         let mut st = State::load()?;
         st.autoswap_disabled = !enabled;
-        st.save()
-    });
-    if let Err(e) = r {
-        notify(&format!("Could not save auto-swap setting: {e}"));
-    }
-}
-
-/// The top-level "☑ Auto-swap enabled" checkbox click: flips whatever the
-/// on-disk state currently says, rather than assuming a fixed target — so a
-/// stale menu (built just before an external `usagio` CLI toggle) can't
-/// un-toggle a setting it never actually observed.
-///
-/// Read-modify-write happens entirely INSIDE `with_state_lock`, atomic with
-/// respect to other in-process AND cross-process writers (the CLI `usagio`
-/// binary and the menu-bar app both take the same advisory file lock — see
-/// `with_state_lock`). A previous version read the current value with a
-/// separate `State::load()` call *outside* the lock, decided the new bool
-/// from that stale read, and only entered the lock to write it — a
-/// concurrent writer between the read and the write could have its own
-/// toggle silently lost ("toggle lost" under contention).
-fn toggle_autoswap() {
-    let r = with_state_lock(|| {
-        let mut st = State::load()?;
-        st.autoswap_disabled = !st.autoswap_disabled;
         st.save()
     });
     if let Err(e) = r {
@@ -2453,26 +2794,16 @@ mod cross_platform {
         }
     }
 
-    /// Cross-platform counterpart to `build_account_submenu` — same rows,
-    /// same click ids, generic `platform::MenuItem` shape instead of a
-    /// native `tray_icon::menu::Submenu`.
-    fn build_account_submenu_items(sec: &ProviderSection, a: &AcctView) -> Vec<PMenuItem> {
+    /// Cross-platform counterpart to `build_account_block` — same rows
+    /// (header + usage-context + action rows), same click ids, appended
+    /// flat into the top-level item list instead of nested inside a
+    /// `PMenuItem::Submenu` (v0.5.2 menu redesign, item 1: provider grouping
+    /// AND per-account submenu nesting are both gone as visual concepts —
+    /// see `menu_tree_from_snapshot`'s doc for how the blocks it returns
+    /// each of these for get separated).
+    fn build_account_block_items(sec: &ProviderSection, a: &AcctView) -> Vec<PMenuItem> {
         let mut items = Vec::new();
-        let rows = account_submenu_rows(sec, a);
-        match rows.switch_row {
-            // Matches the macOS renderer: this row is informational (disabled),
-            // not clickable — unlike the burn-rate/cost/reset-window `noop`
-            // rows below, which stay `enabled: true` so they don't render
-            // muda's greyed-out "disabled" look.
-            Some(true) => items.push(action("noop", "✓ Active", false)),
-            Some(false) => items.push(action(
-                format!("switch:{}:{}", sec.provider_id, a.key),
-                "Switch to this account",
-                true,
-            )),
-            None => {}
-        }
-        items.push(PMenuItem::Separator);
+        items.push(noop_action(plain_text(&account_header_row(sec, a))));
         for row in submenu_info_rows(sec, a) {
             items.push(noop_action(row));
         }
@@ -2499,7 +2830,23 @@ mod cross_platform {
             }
             items.push(noop_action(format!("updated {}", a.updated)));
         }
-        items.push(PMenuItem::Separator);
+        // Action rows: Switch/Active, Launch, Remove, then the env-override
+        // marker — same order and gating as `build_account_block`'s macOS
+        // counterpart.
+        let rows = account_submenu_rows(sec, a);
+        match rows.switch_row {
+            // Matches the macOS renderer: this row is informational (disabled),
+            // not clickable — unlike the burn-rate/cost/reset-window `noop`
+            // rows above, which stay `enabled: true` so they don't render
+            // muda's greyed-out "disabled" look.
+            Some(true) => items.push(action("noop", "✓ Active", false)),
+            Some(false) => items.push(action(
+                format!("switch:{}:{}", sec.provider_id, a.key),
+                "Switch to this account",
+                true,
+            )),
+            None => {}
+        }
         if rows.launch_row {
             items.push(action(
                 format!("launch:{}:{}", sec.provider_id, a.key),
@@ -2514,77 +2861,62 @@ mod cross_platform {
                 true,
             ));
         }
+        for title in section_headline_rows(sec) {
+            items.push(action(
+                format!("envoverride:{}", sec.provider_id),
+                title,
+                false,
+            ));
+        }
         items
     }
 
     /// Cross-platform counterpart to `build_menu` — same structure, same
     /// click ids (`handle_click` doesn't care which renderer produced them),
     /// generic `platform::MenuTree` shape instead of a native
-    /// `tray_icon::menu::Menu`.
+    /// `tray_icon::menu::Menu`. v0.5.2 menu redesign (item 1): each captured
+    /// account is its own flat block of items (see
+    /// `build_account_block_items`) — no per-provider grouping, no
+    /// per-account submenu — separated from its neighbor by
+    /// `PMenuItem::Separator`, mirroring the macOS `mac_style` renderer's
+    /// `PredefinedMenuItem::separator()` between blocks.
     fn menu_tree_from_snapshot(snap: &Snapshot) -> MenuTree {
         let mut items = Vec::new();
         if snap.sections.is_empty() {
             items.push(action("none", "Capture a login below to begin", false));
         }
-        for (idx, sec) in snap.sections.iter().enumerate() {
-            if idx > 0 {
+        // Render order is `snap.account_order` — see `flat_account_order` and
+        // the macOS `build_menu`'s matching doc comment.
+        let mut first_block = true;
+        for &(si, ai) in &snap.account_order {
+            let sec = &snap.sections[si];
+            let a = &sec.accounts[ai];
+            if !first_block {
                 items.push(PMenuItem::Separator);
             }
-            for title in section_headline_rows(sec) {
-                items.push(action(
-                    format!("envoverride:{}", sec.provider_id),
-                    title,
-                    false,
-                ));
-            }
-            for a in &sec.accounts {
-                let head = plain_text(&main_row(sec.display_name, a, sec.severity_bands));
-                items.push(PMenuItem::Submenu {
-                    label: head,
-                    icon_png: crate::icons::png16_for(sec.provider_id).map(|b| b.to_vec()),
-                    items: build_account_submenu_items(sec, a),
-                });
-            }
+            first_block = false;
+            items.extend(build_account_block_items(sec, a));
         }
         items.push(PMenuItem::Separator);
-        items.push(checkbox(
-            "autoswap:toggle",
-            "Auto-swap enabled",
-            true,
-            snap.autoswap,
-        ));
-        items.push(PMenuItem::Separator);
 
+        // Capture current login ▸ — creds-on-disk providers first, then
+        // API-key providers, both as DIRECT children (item 8 flattened the
+        // "Paste API key ▸" sub-submenu).
         let mut capture_items = Vec::new();
         if snap.capture_creds.is_empty() && snap.capture_api_key.is_empty() {
             capture_items.push(action("noop", "(no providers registered)", false));
         } else {
-            for reg in &snap.capture_creds {
+            for reg in snap.capture_creds.iter().chain(snap.capture_api_key.iter()) {
                 let title = if reg.installed {
                     reg.display_name.to_string()
                 } else {
                     format!("{} (not installed)", reg.display_name)
                 };
-                capture_items.push(action(format!("capture:{}", reg.provider_id), title, true));
-            }
-            if !snap.capture_api_key.is_empty() {
-                if !snap.capture_creds.is_empty() {
-                    capture_items.push(PMenuItem::Separator);
-                }
-                let mut paste_items = Vec::new();
-                for reg in &snap.capture_api_key {
-                    let title = if reg.installed {
-                        reg.display_name.to_string()
-                    } else {
-                        format!("{} (not installed)", reg.display_name)
-                    };
-                    paste_items.push(action(format!("apikey:{}", reg.provider_id), title, true));
-                }
-                capture_items.push(PMenuItem::Submenu {
-                    label: "Paste API key".to_string(),
-                    icon_png: None,
-                    items: paste_items,
-                });
+                let prefix = match reg.capture_mode {
+                    CaptureMode::CredsOnDisk => "capture",
+                    CaptureMode::ApiKey => "apikey",
+                };
+                capture_items.push(action(format!("{prefix}:{}", reg.provider_id), title, true));
             }
         }
         items.push(PMenuItem::Submenu {
@@ -2593,7 +2925,10 @@ mod cross_platform {
             items: capture_items,
         });
 
-        // Settings ▸ Notifications ▸ / Auto-swap threshold ▸ / Advanced ▸.
+        // Settings ▸: Refresh usage now, then a separator, then everything
+        // else alphabetical (Auto-swap, Backups, Notifications) — item 9
+        // flattened the old "Advanced ▸" grouping and item 5 folded the
+        // top-level auto-swap checkbox into the Auto-swap ▸ submenu.
         let notifications = vec![
             checkbox(
                 "notifications:threshold",
@@ -2620,46 +2955,40 @@ mod cross_platform {
         } else {
             0
         };
-        let mut threshold_items = vec![checkbox("autoswap:off", "Off", true, cur == 0)];
-        for t in [90i32, 95, 98] {
-            threshold_items.push(checkbox(
+        let mut autoswap_items = vec![checkbox("autoswap:off", "Off", true, cur == 0)];
+        for t in [70i32, 85, 95, 98] {
+            autoswap_items.push(checkbox(
                 format!("autoswap:{t}"),
                 format!("{t}%"),
                 true,
                 cur == t,
             ));
         }
-        threshold_items.push(PMenuItem::Separator);
-        threshold_items.push(action("autoswap:now", "Switch to best account now", true));
+        autoswap_items.push(PMenuItem::Separator);
+        autoswap_items.push(action("autoswap:now", "Switch to best account now", true));
 
         let backups = vec![
             action("backup:save", "Save…", true),
             action("backup:restore", "Restore…", true),
         ];
-        let advanced = vec![
+
+        let settings_items = vec![
+            action("refresh:now", "Refresh usage now", true),
+            PMenuItem::Separator,
+            PMenuItem::Submenu {
+                label: "Auto-swap".to_string(),
+                icon_png: None,
+                items: autoswap_items,
+            },
             PMenuItem::Submenu {
                 label: "Backups".to_string(),
                 icon_png: None,
                 items: backups,
             },
-            action("refresh:now", "Refresh usage now", true),
-        ];
-
-        let settings_items = vec![
             PMenuItem::Submenu {
                 label: "Notifications".to_string(),
                 icon_png: None,
                 items: notifications,
-            },
-            PMenuItem::Submenu {
-                label: "Auto-swap threshold".to_string(),
-                icon_png: None,
-                items: threshold_items,
-            },
-            PMenuItem::Submenu {
-                label: "Advanced".to_string(),
-                icon_png: None,
-                items: advanced,
             },
         ];
         items.push(PMenuItem::Submenu {
@@ -2735,10 +3064,11 @@ mod cross_platform {
         handle.set_menu(menu_tree_from_snapshot(&initial))?;
         let _ = handle.set_title(&title_for(&initial));
 
-        // Poll + auto-swap on a background thread — same `poll_loop` the
+        // Poll + auto-swap on a background thread — same `poll_loop`
+        // (supervised against panics; see `poll_loop_supervisor`'s doc) the
         // macOS `run` above uses (writes cached usage to state.json; nothing
         // here calls into the native tray, so it's safe off-thread).
-        std::thread::spawn(poll_loop);
+        std::thread::spawn(poll_loop_supervisor);
         // Redraw ticker on its own background thread (see `redraw_loop`'s
         // doc for why it can't be the main thread here).
         std::thread::spawn(move || redraw_loop(handle, initial));
@@ -2813,6 +3143,10 @@ mod tests {
             // set these explicitly.
             session_reset_at: None,
             weekly_reset_at: None,
+            // `None` → `is_stale_after_reset` short-circuits on `fetched_at?`,
+            // so the default fixture never accidentally lands in
+            // `StaleAfterReset`. Tests exercising that state set it directly.
+            fetched_at: None,
         }
     }
 
@@ -2829,6 +3163,7 @@ mod tests {
                 env_override_active: false,
                 accounts: vec![a],
             }],
+            account_order: vec![(0, 0)],
             capture_creds: vec![RegisteredProvider {
                 provider_id: CLAUDE_SLUG,
                 display_name: "Claude",
@@ -2877,12 +3212,66 @@ mod tests {
     }
 
     #[test]
-    fn toggle_autoswap_read_modify_write_is_atomic_under_contention() {
+    fn shared_swap_guard_returns_the_same_arc_every_call() {
+        // concurrency-04 (v0.5.2 codeaudit): `poll_loop` and
+        // `handle_refresh_now` must reason about anti-thrash cooldown/
+        // no-return through ONE `SwapGuard`, not a throwaway
+        // `SwapGuard::default()` per call site. `Arc::ptr_eq` pins that both
+        // callers observe the identical process-wide instance.
+        let a = shared_swap_guard();
+        let b = shared_swap_guard();
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "shared_swap_guard must return the same Arc every call"
+        );
+        // And it's actually usable as a `&mut SwapGuard` through the lock,
+        // same as every `run_cycle` call site needs — `SwapGuard`'s fields
+        // are private but visible here since `menubar` is a descendant of
+        // the crate-root module that declares the struct (same access
+        // `run_cycle`'s callers already rely on for `&mut SwapGuard`).
+        {
+            let mut g = a.lock().unwrap();
+            g.stuck_notified = true;
+        }
+        assert!(
+            b.lock().unwrap().stuck_notified,
+            "mutation through one handle must be visible through the other"
+        );
+    }
+
+    #[test]
+    fn panic_payload_message_handles_str_string_and_other() {
+        // `poll_loop_supervisor` (errors-02, v0.5.2 codeaudit) logs whatever
+        // `catch_unwind` hands back — almost always a `&str` (`panic!("...")`)
+        // or `String` (`format!(...)`-built panic message), but a custom
+        // payload type must still produce SOME loggable string instead of
+        // panicking the supervisor itself.
+        let str_payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_payload_message(&*str_payload), "boom");
+
+        let string_payload: Box<dyn std::any::Any + Send> = Box::new(String::from("kaboom"));
+        assert_eq!(panic_payload_message(&*string_payload), "kaboom");
+
+        let other_payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        assert_eq!(
+            panic_payload_message(&*other_payload),
+            "non-string panic payload"
+        );
+    }
+
+    #[test]
+    fn toggle_notification_trigger_read_modify_write_is_atomic_under_contention() {
+        // v0.5.2 item 5 removed the top-level "Auto-swap enabled" checkbox
+        // (and `toggle_autoswap` with it — Off/threshold picks in Settings ▸
+        // Auto-swap ▸ replace it, and those write a fixed target rather than
+        // flipping a bool). `toggle_notification_trigger` is still a genuine
+        // read-modify-write click handler, so it inherits this contention
+        // regression test in `toggle_autoswap`'s place.
         let g = crate::store::ScopedConfigDir::new();
         let home = g.home();
 
         State::default().save().expect("seed initial state");
-        let initial = State::load().unwrap().autoswap_disabled;
+        let initial = State::load().unwrap().notification_config.threshold_enabled;
 
         const ITERATIONS: usize = 100;
         let handles: Vec<_> = (0..2)
@@ -2894,7 +3283,7 @@ mod tests {
                     // the parent test set up.
                     crate::store::set_home_override(Some(home));
                     for _ in 0..ITERATIONS {
-                        toggle_autoswap();
+                        toggle_notification_trigger("threshold");
                     }
                 })
             })
@@ -2911,7 +3300,7 @@ mod tests {
         };
         let final_state = State::load().unwrap();
         assert_eq!(
-            final_state.autoswap_disabled, expected,
+            final_state.notification_config.threshold_enabled, expected,
             "final parity must match initial XOR (total_toggles % 2 == 1); a lost \
              toggle under contention would flip this"
         );
@@ -3203,6 +3592,7 @@ mod tests {
                     accounts: vec![b],
                 },
             ],
+            account_order: vec![(0, 0), (1, 0)],
             capture_creds: Vec::new(),
             capture_api_key: Vec::new(),
             autoswap: false,
@@ -3402,6 +3792,77 @@ mod tests {
         });
     }
 
+    /// Minimal `ProviderSection` for `account_header_row` tests — only
+    /// `display_name`/`severity_bands` matter to that function; the rest are
+    /// filled with harmless defaults.
+    fn header_test_section(display_name: &'static str) -> ProviderSection {
+        ProviderSection {
+            provider_id: "claude",
+            display_name,
+            supports_switching: true,
+            supports_launch: true,
+            supports_remove: true,
+            supports_usage: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![],
+        }
+    }
+
+    #[test]
+    fn account_header_row_flat_shape_matches_spec_when_not_locked() {
+        // v0.5.2 per-account BLOCK header: "{provider} · {email}\t{n}% / {n}%"
+        // — replaces `main_row`'s padded flat-list format as the string every
+        // production render path (`build_menu`/`menu_tree_from_snapshot`) now
+        // uses for a block's first row.
+        let sec = header_test_section("Claude");
+        let a = acct("you@work.com", Some(42.0), Some(61.0), false);
+        let r = account_header_row(&sec, &a);
+        assert_eq!(r.plain, "Claude · you@work.com\t42% / 61%");
+        assert!(!r.checkmark, "inactive row: no leading checkmark");
+        assert_eq!(r.tab_x_kind, Some(TabX::MenuRight));
+    }
+
+    #[test]
+    fn account_header_row_switches_to_locked_countdown_when_over_threshold() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let reset = now + chrono::Duration::minutes(90);
+        with_now(now, || {
+            let sec = header_test_section("Claude");
+            let a = acct_with_resets(
+                "matt@example.com",
+                Some(100.0),
+                Some(20.0),
+                true,
+                Some(reset),
+                None,
+            );
+            let r = account_header_row(&sec, &a);
+            assert_eq!(r.plain, "Claude · matt@example.com\t1h 30m");
+            assert!(r.bold, "active locked row is still bold");
+            assert!(r.checkmark, "active row gets a leading checkmark");
+            assert_eq!(r.colors.len(), 1);
+            let (_, _, sev) = r.colors[0];
+            assert_eq!(sev, Severity::Red);
+        });
+    }
+
+    #[test]
+    fn account_header_row_colors_high_percentages_per_provider_bands() {
+        // Same severity-band contract `main_row` has always had, just on the
+        // new label format — a regression guard against the block-redesign
+        // refactor accidentally dropping the color computation.
+        let sec = header_test_section("Codex");
+        let a = acct("hot@x.com", Some(96.0), Some(10.0), false);
+        let r = account_header_row(&sec, &a);
+        assert_eq!(r.plain, "Codex · hot@x.com\t96% / 10%");
+        assert_eq!(r.colors.len(), 1, "only the 96% session run is colored");
+        let (off, len, sev) = r.colors[0];
+        assert_eq!(sev, Severity::Red);
+        let picked: String = r.plain.chars().skip(off).take(len).collect();
+        assert_eq!(picked, "96%");
+    }
+
     #[test]
     fn sort_by_expiration_orders_accounts_soonest_first() {
         // Regression test for the user-reported bug: newly-added accounts land
@@ -3442,6 +3903,159 @@ mod tests {
         accounts.sort_by(sort_by_expiration);
         let keys: Vec<&str> = accounts.iter().map(|a| a.key.as_str()).collect();
         assert_eq!(keys, vec!["data@x.com", "nodata@x.com"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // flat_account_order (v0.5.2: cross-provider account order regression)
+    // -----------------------------------------------------------------------
+
+    fn section_with(
+        provider_id: &'static str,
+        display_name: &'static str,
+        accounts: Vec<AcctView>,
+    ) -> ProviderSection {
+        ProviderSection {
+            provider_id,
+            display_name,
+            supports_switching: true,
+            supports_usage: true,
+            supports_launch: true,
+            supports_remove: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts,
+        }
+    }
+
+    #[test]
+    fn flat_account_order_sorts_by_soonest_reset_across_providers() {
+        // Given 3 accounts with resets in [+3d, +6h, +2d]: order should be
+        // [+6h_first, +2d, +3d] — a single global comparator spanning ALL
+        // providers, not a per-provider re-sort.
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let a_3d = acct_with_resets(
+            "three-day@x.com",
+            Some(10.0),
+            Some(10.0),
+            false,
+            None,
+            Some(now + chrono::Duration::days(3)),
+        );
+        let a_6h = acct_with_resets(
+            "six-hour@x.com",
+            Some(10.0),
+            Some(10.0),
+            false,
+            None,
+            Some(now + chrono::Duration::hours(6)),
+        );
+        let mut a_2d = acct_with_resets(
+            "two-day@x.com",
+            Some(10.0),
+            Some(10.0),
+            false,
+            None,
+            Some(now + chrono::Duration::days(2)),
+        );
+        a_2d.provider_id = "codex";
+        let sections = vec![
+            section_with(CLAUDE_SLUG, "Claude", vec![a_3d, a_6h]),
+            section_with("codex", "Codex", vec![a_2d]),
+        ];
+        let order = flat_account_order(&sections, now);
+        let keys: Vec<&str> = order
+            .iter()
+            .map(|&(si, ai)| sections[si].accounts[ai].key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["six-hour@x.com", "two-day@x.com", "three-day@x.com"]
+        );
+    }
+
+    #[test]
+    fn flat_account_order_sinks_locked_and_inactive_accounts() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        // Locked (session at 100%, reset still future) and NOT active — must
+        // sink below a healthy account even though its own reset is sooner.
+        let locked = acct_with_resets(
+            "locked@x.com",
+            Some(100.0),
+            Some(10.0),
+            false,
+            Some(now + chrono::Duration::minutes(30)),
+            None,
+        );
+        let healthy = acct_with_resets(
+            "healthy@x.com",
+            Some(10.0),
+            Some(10.0),
+            false,
+            None,
+            Some(now + chrono::Duration::days(5)),
+        );
+        let sections = vec![section_with(CLAUDE_SLUG, "Claude", vec![locked, healthy])];
+        let order = flat_account_order(&sections, now);
+        let keys: Vec<&str> = order
+            .iter()
+            .map(|&(si, ai)| sections[si].accounts[ai].key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["healthy@x.com", "locked@x.com"]);
+    }
+
+    #[test]
+    fn flat_account_order_keeps_active_locked_account_in_normal_rotation() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        // Locked AND active — must NOT sink; it still sorts by its own reset
+        // like anyone else, so the user can see its countdown up top.
+        let locked_active = acct_with_resets(
+            "locked-active@x.com",
+            Some(100.0),
+            Some(10.0),
+            true,
+            Some(now + chrono::Duration::minutes(30)),
+            None,
+        );
+        let healthy = acct_with_resets(
+            "healthy@x.com",
+            Some(10.0),
+            Some(10.0),
+            false,
+            None,
+            Some(now + chrono::Duration::days(5)),
+        );
+        let sections = vec![section_with(
+            CLAUDE_SLUG,
+            "Claude",
+            vec![healthy, locked_active],
+        )];
+        let order = flat_account_order(&sections, now);
+        let keys: Vec<&str> = order
+            .iter()
+            .map(|&(si, ai)| sections[si].accounts[ai].key.as_str())
+            .collect();
+        // locked_active's soonest reset (+30m) is sooner than healthy's (+5d).
+        assert_eq!(keys, vec!["locked-active@x.com", "healthy@x.com"]);
+    }
+
+    #[test]
+    fn flat_account_order_tie_breaks_by_headroom_then_email() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        // Same reset instant: more headroom (lower max_pct) sorts first.
+        let reset = Some(now + chrono::Duration::days(1));
+        let more_headroom = acct_with_resets("b@x.com", Some(10.0), Some(10.0), false, None, reset);
+        let less_headroom = acct_with_resets("a@x.com", Some(50.0), Some(50.0), false, None, reset);
+        let sections = vec![section_with(
+            CLAUDE_SLUG,
+            "Claude",
+            vec![less_headroom, more_headroom],
+        )];
+        let order = flat_account_order(&sections, now);
+        let keys: Vec<&str> = order
+            .iter()
+            .map(|&(si, ai)| sections[si].accounts[ai].key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["b@x.com", "a@x.com"]);
     }
 
     #[test]
@@ -3515,6 +4129,7 @@ mod tests {
                 env_override_active: false,
                 accounts: vec![long, short],
             }],
+            account_order: vec![(0, 0), (0, 1)],
             capture_creds: Vec::new(),
             capture_api_key: Vec::new(),
             autoswap: false,
@@ -3556,6 +4171,7 @@ mod tests {
                 env_override_active: false,
                 accounts: vec![active, inactive],
             }],
+            account_order: vec![(0, 0), (0, 1)],
             capture_creds: Vec::new(),
             capture_api_key: Vec::new(),
             autoswap: false,

@@ -567,6 +567,113 @@ fn refresh_inactive_if_stale_considers_every_account_from_one_snapshot() {
 }
 
 // -----------------------------------------------------------------------------
+// errors-03 (v0.5.2 audit): the fsnotify watcher's processing loop must
+// survive a panic inside a provider call (or `refresh_inactive_if_stale`)
+// instead of silently dying and degrading real-time credential absorption to
+// the slow poll path for the rest of the process's life.
+// -----------------------------------------------------------------------------
+
+/// Provider whose `credential_paths()` panics on its first invocation only,
+/// so the test can assert the supervisor both catches that panic AND keeps
+/// calling the provider afterward (proving the thread is still alive, not
+/// just that it didn't immediately crash the test process).
+struct PanicOnceProvider {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Provider for PanicOnceProvider {
+    fn provider_id(&self) -> &'static str {
+        "panic-once"
+    }
+    fn display_name(&self) -> &'static str {
+        "PanicOnce"
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            supports_usage: false,
+            supports_switching: false,
+            supports_launch: false,
+            supports_remove: true,
+            supports_email_capture: false,
+            secret_backend: SecretBackend::File,
+            capture_mode: CaptureMode::CredsOnDisk,
+        }
+    }
+    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
+        Ok(None)
+    }
+    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
+        Err(ProviderError::Unsupported)
+    }
+    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
+        Err(ProviderError::Unsupported)
+    }
+    fn credential_paths(&self) -> Vec<PathBuf> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            panic!("simulated provider panic on first call");
+        }
+        Vec::new()
+    }
+    fn identify_credential(&self, _blob: &str) -> Option<AccountKey> {
+        None
+    }
+    fn credential_freshness(&self, _blob: &str) -> CredentialFreshness {
+        CredentialFreshness::Unknown
+    }
+    fn absorb_credential(&self, _account: &AccountKey, _blob: &str) -> PResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn fsnotify_watcher_supervisor_recovers_from_panic_and_keeps_processing() {
+    with_isolated_home(|| {
+        let home_path =
+            crate::store::home_override().expect("with_isolated_home installs HOME_OVERRIDE");
+        let prov: &'static PanicOnceProvider = Box::leak(Box::new(PanicOnceProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let (tx, rx) = std::sync::mpsc::channel::<notify::Event>();
+        let handle = std::thread::spawn(move || {
+            // Thread-local HOME_OVERRIDE doesn't cross std::thread::spawn —
+            // reinstall it so refresh_inactive_if_stale's State::load() (via
+            // config_dir()'s cfg(test) tripwire) doesn't panic on ITS OWN
+            // account, which would confound this test's panic-recovery
+            // assertion with an unrelated one.
+            crate::store::set_home_override(Some(home_path));
+            fsnotify_watcher_supervisor(rx, vec![prov as &'static dyn Provider]);
+        });
+
+        // First event: credential_paths() panics (call #0). The supervisor
+        // must catch it, log, back off, and resume listening rather than
+        // letting the thread die.
+        tx.send(notify::Event::default()).unwrap();
+        std::thread::sleep(WATCHER_PANIC_BACKOFF + Duration::from_millis(300));
+        assert_eq!(
+            prov.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "provider should have been called once (and panicked) after the first event"
+        );
+
+        // Second event: proves the thread is still alive and listening —
+        // credential_paths() is called again (call #1, which doesn't panic).
+        tx.send(notify::Event::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            prov.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "supervisor must keep processing events after recovering from a panic"
+        );
+
+        drop(tx); // closes the channel -> rx.recv() errs -> thread exits.
+        handle
+            .join()
+            .expect("supervisor thread must not panic itself");
+    });
+}
+
+// -----------------------------------------------------------------------------
 // Silence the unused-import warning on `Value` — kept around for future test
 // growth and to document that fixtures traffic in raw JSON strings, not
 // pre-parsed structures (the sync layer only ever sees blobs).

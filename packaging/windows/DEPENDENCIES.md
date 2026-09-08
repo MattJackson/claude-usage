@@ -6,6 +6,15 @@
   ```
   rustup target add x86_64-pc-windows-msvc
   ```
+- NSIS (`makensis`) to build the `.exe` installer:
+  ```
+  choco install nsis -y
+  ```
+  CI (`.github/workflows/release.yml` / `rc-release.yml`) installs this on
+  the `windows-latest` runner and adds `C:\Program Files (x86)\NSIS` to
+  `$GITHUB_PATH` before invoking `makensis packaging/windows/installer.nsi`.
+  Not required for a plain `cargo build` — only for producing the
+  installer asset below.
 - Windows SDK — comes with the **Visual Studio Build Tools** ("Desktop
   development with C++" workload), which also supplies the MSVC linker
   (`link.exe`) `rustc` needs for this target. `ring` (pulled in transitively
@@ -54,6 +63,25 @@ None — no separate runtime install is required.
   supported Windows version.
 
 Everything else statically links into the single `usagio.exe`.
+
+## Distribution: installer vs. zip
+
+Each Windows release ships two assets:
+
+- `usagio-<version>-x86_64-pc-windows-msvc-setup.exe` -- an NSIS installer
+  (see `packaging/windows/installer.nsi`). It installs `usagio.exe` to
+  `%ProgramFiles%\usagio\`, adds that directory to the system `Path`,
+  creates a Start Menu shortcut (using the same `usagio.ico` the zip
+  ships), registers a standard Add/Remove Programs entry with an NSIS
+  uninstaller, and runs `usagio install` at the end -- so, like the
+  Homebrew formula's `post_install`, "install means install" without a
+  separate manual step. Supports silent/unattended install:
+  `usagio-setup.exe /S`. `usagio uninstall` (or Add/Remove Programs) undoes
+  it.
+- `usagio-<version>-x86_64-pc-windows-msvc.zip` -- the existing portable
+  distributable (bare binary + `.ico` + `Create-Shortcut.ps1`), kept for
+  power users who prefer an unzip-and-run install with no registry/PATH
+  changes.
 
 ## Known first-run friction: Windows Defender
 
