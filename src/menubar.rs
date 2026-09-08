@@ -478,10 +478,17 @@ fn poll_loop() {
         // Fetch usage + auto-swap; this writes cached usage to state.json, which
         // the main-thread timer reads back to render. This is the ONLY thing that
         // hits the network, so ordinary use can never rate-limit.
-        let rate_limited = run_cycle(&mut guard);
-        current = next_interval(current, base, rate_limited);
+        let (rate_limited, max_session_pct, trigger) = run_cycle(&mut guard);
+        let prev = current;
+        current = next_interval(current, base, rate_limited, max_session_pct, trigger);
         if rate_limited {
             crate::logging::log(&format!("rate limited; backing off to {current}s"));
+        } else if current != prev && current < base {
+            crate::logging::log(&format!(
+                "cadence: {prev}s → {current}s (max session {:.1}%, trigger {:.0}%)",
+                max_session_pct.unwrap_or(0.0),
+                trigger
+            ));
         }
         std::thread::sleep(Duration::from_secs(current));
     }
@@ -583,17 +590,22 @@ fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
 }
 
 /// Run one poll+auto-swap cycle; returns whether it was rate limited.
-fn run_cycle(guard: &mut SwapGuard) -> bool {
+/// Runs one poll cycle and returns `(rate_limited, max_session_pct, trigger)`
+/// so the caller's adaptive-cadence math has everything it needs. The
+/// menubar poller uses the trigger the user actually configured (via
+/// `Settings ▸ Auto-swap threshold`), matching what `watch_cycle` itself
+/// dispatched on.
+fn run_cycle(guard: &mut SwapGuard) -> (bool, Option<f64>, f64) {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
     match watch_cycle(trigger, TARGET_CEILING_PCT, guard) {
-        Ok(o) => o.rate_limited,
+        Ok(o) => (o.rate_limited, o.max_session_pct, trigger),
         Err(e) => {
             crate::logging::log(&format!("menubar poll failed: {e}"));
-            false
+            (false, None, trigger)
         }
     }
 }
@@ -1853,7 +1865,7 @@ fn handle_refresh_now() {
     try_start_refresh(|| {
         std::thread::spawn(|| {
             let mut guard = SwapGuard::default();
-            let rate_limited = run_cycle(&mut guard);
+            let (rate_limited, _max_pct, _trigger) = run_cycle(&mut guard);
             REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
             if rate_limited {
                 notify("Refresh: rate limited, backing off");
