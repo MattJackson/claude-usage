@@ -109,6 +109,73 @@ pub struct MacOsSecrets;
 // (`platform().secrets()`).
 // ---------------------------------------------------------------------------
 
+// ---- security(1) hang guard (robustness-01) ------------------------------
+//
+// A locked keychain, or a SecurityAgent "Allow/Deny" dialog with no
+// interactive user around to dismiss it (the common case: usagio runs as a
+// headless menu-bar poller), makes `security(1)` block indefinitely. Every
+// `Command::new("security")` invocation in this module is routed through
+// `security_command` below, which wraps it in `timeout(1) SECURITY_TIMEOUT_SECS`
+// so the poll thread can never hang forever on a keychain call. `security(1)`
+// normally completes in well under 100ms; 5s is generous headroom while still
+// bounding the worst case.
+const SECURITY_TIMEOUT_SECS: &str = "5";
+
+/// Exit code `timeout(1)` uses (GNU coreutils convention) to signal "the
+/// wrapped command was killed because it exceeded the deadline".
+const TIMEOUT_EXIT_CODE: i32 = 124;
+
+static TIMEOUT_BINARY_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static TIMEOUT_FALLBACK_LOGGED: std::sync::Once = std::sync::Once::new();
+
+/// Probes for a `timeout` binary on PATH (cached for the process lifetime).
+/// macOS does not ship `/usr/bin/timeout` — it's only present if coreutils
+/// was brew-installed (unprefixed, i.e. `brew install coreutils
+/// --with-default-names`, or a PATH that resolves `timeout` to `gtimeout`
+/// some other way).
+fn timeout_binary_available() -> bool {
+    *TIMEOUT_BINARY_AVAILABLE.get_or_init(|| {
+        Command::new("timeout")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Build a `security(1)` invocation. Wraps it in `timeout(1)
+/// SECURITY_TIMEOUT_SECS` when available so a locked keychain or an
+/// unattended SecurityAgent dialog can't hang the poll thread forever. Falls
+/// back to a bare `security` command (no hang guard) if `timeout` isn't on
+/// PATH — logs once at the first fallback use, then silently falls through
+/// on every subsequent call.
+fn security_command(args: &[&str]) -> Command {
+    if timeout_binary_available() {
+        let mut cmd = Command::new("timeout");
+        cmd.arg(SECURITY_TIMEOUT_SECS);
+        cmd.arg("security");
+        cmd.args(args);
+        cmd
+    } else {
+        TIMEOUT_FALLBACK_LOGGED.call_once(|| {
+            crate::logging::log(
+                "event=keychain_timeout_unavailable msg=\"'timeout' binary not on PATH; \
+                 security(1) calls run WITHOUT a hang guard\"",
+            );
+        });
+        let mut cmd = Command::new("security");
+        cmd.args(args);
+        cmd
+    }
+}
+
+/// True if `status` represents a `timeout(1)`-enforced kill (exit 124).
+/// Only meaningful when the command was actually run via `security_command`
+/// with the `timeout` wrapper in effect (see `timeout_binary_available`).
+fn is_timeout_exit(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(TIMEOUT_EXIT_CODE)
+}
+
 fn real_get(service: &str, account: &str) -> Result<Option<String>> {
     // Only exit code 44 ("SecItem not found" per <Security/SecBase.h> /
     // `security(1)` conventions) is a genuine "not present". Any other
@@ -117,11 +184,20 @@ fn real_get(service: &str, account: &str) -> Result<Option<String>> {
     // it as "don't touch anything" rather than "assume gone" (which
     // would let a subsequent switch overwrite a still-valid token).
     // See H7 in the round-1 codeaudit findings.
-    let out = Command::new("security")
-        .args(["find-generic-password", "-s", service, "-a", account, "-w"])
+    let out = security_command(&["find-generic-password", "-s", service, "-a", account, "-w"])
         .output()
         .context("running `security find-generic-password`")?;
-    let result = if !out.status.success() {
+    let timed_out = is_timeout_exit(&out.status);
+    let result = if timed_out {
+        // robustness-01: locked keychain / unattended SecurityAgent dialog.
+        // Distinct error branch, but still just an Err to the caller — same
+        // "don't touch anything" treatment as any other failure above.
+        Err(anyhow::anyhow!(
+            "`security find-generic-password` timed out after {SECURITY_TIMEOUT_SECS}s \
+             (locked keychain or an unattended SecurityAgent dialog) for \
+             service={service} account={account}",
+        ))
+    } else if !out.status.success() {
         match out.status.code() {
             Some(44) => Ok(None),
             other => {
@@ -139,7 +215,12 @@ fn real_get(service: &str, account: &str) -> Result<Option<String>> {
     // Belt-and-suspenders: log every keychain touch so a bug that leaves
     // nothing else logged still shows up here (M4-audit finding).
     crate::logging::log(&format!(
-        "event=keychain_read svc={service} acct={account} result={}",
+        "event={} svc={service} acct={account} result={}",
+        if timed_out {
+            "keychain_read_timeout"
+        } else {
+            "keychain_read"
+        },
         match &result {
             Ok(Some(_)) => "ok".to_string(),
             Ok(None) => "not_found".to_string(),
@@ -165,11 +246,19 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
     // "not found", exit 44) and add it fresh WITHOUT `-U`, so the new item's
     // ACL only ever contains usagio and no update-ACL negotiation with a
     // differently-ACL'd existing item ever happens.
+    let mut timed_out = false;
     let result = (|| -> Result<()> {
-        let del = Command::new("security")
-            .args(["delete-generic-password", "-s", service, "-a", account])
+        let del = security_command(&["delete-generic-password", "-s", service, "-a", account])
             .output()
             .context("running `security delete-generic-password` (pre-set)")?;
+        if is_timeout_exit(&del.status) {
+            timed_out = true;
+            bail!(
+                "`security delete-generic-password` (pre-set) timed out after \
+                 {SECURITY_TIMEOUT_SECS}s (locked keychain or an unattended SecurityAgent \
+                 dialog) for service={service} account={account}",
+            );
+        }
         if !del.status.success() && del.status.code() != Some(44) {
             let stderr = String::from_utf8_lossy(&del.stderr);
             bail!(
@@ -179,25 +268,37 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
                 stderr.trim(),
             );
         }
-        let status = Command::new("security")
-            .args([
-                "add-generic-password",
-                "-s",
-                service,
-                "-a",
-                account,
-                "-w",
-                secret,
-            ])
-            .status()
-            .context("running `security add-generic-password`")?;
-        if !status.success() {
+        let out = security_command(&[
+            "add-generic-password",
+            "-s",
+            service,
+            "-a",
+            account,
+            "-w",
+            secret,
+        ])
+        .output()
+        .context("running `security add-generic-password`")?;
+        if is_timeout_exit(&out.status) {
+            timed_out = true;
+            bail!(
+                "`security add-generic-password` timed out after {SECURITY_TIMEOUT_SECS}s \
+                 (locked keychain or an unattended SecurityAgent dialog) for \
+                 service={service} account={account}",
+            );
+        }
+        if !out.status.success() {
             bail!("`security add-generic-password` failed for service={service} account={account}");
         }
         Ok(())
     })();
     crate::logging::log(&format!(
-        "event=keychain_write svc={service} acct={account} result={}",
+        "event={} svc={service} acct={account} result={}",
+        if timed_out {
+            "keychain_write_timeout"
+        } else {
+            "keychain_write"
+        },
         match &result {
             Ok(()) => "ok".to_string(),
             Err(e) => format!("err:{e:#}"),
@@ -211,10 +312,20 @@ fn real_delete(service: &str, account: &str) -> Result<()> {
     // (exit 44, benign) from every other failure. Collapsing all non-zero
     // to Ok(()) masked keychain-locked / permission errors, which then
     // let callers assume the delete "succeeded" and move on.
-    let out = Command::new("security")
-        .args(["delete-generic-password", "-s", service, "-a", account])
+    let out = security_command(&["delete-generic-password", "-s", service, "-a", account])
         .output()
         .context("running `security delete-generic-password`")?;
+    if is_timeout_exit(&out.status) {
+        // robustness-01: same hang guard as real_get/real_set.
+        crate::logging::log(&format!(
+            "event=keychain_delete_timeout svc={service} acct={account}"
+        ));
+        bail!(
+            "`security delete-generic-password` timed out after {SECURITY_TIMEOUT_SECS}s \
+             (locked keychain or an unattended SecurityAgent dialog) for \
+             service={service} account={account}",
+        );
+    }
     if !out.status.success() {
         match out.status.code() {
             Some(44) => return Ok(()),
@@ -504,6 +615,54 @@ mod tests {
                 std::path::PathBuf::from("/tmp/platform-test-home/Library/Caches/usagio")
             );
         });
+    }
+
+    /// robustness-01: `security_command` must actually wrap the invocation in
+    /// `timeout(1) SECURITY_TIMEOUT_SECS security <args...>` — never invokes
+    /// the real keychain (no `security` process launched or asserted on;
+    /// this only inspects the `std::process::Command` we're about to run).
+    #[test]
+    fn security_command_wraps_with_timeout_when_available() {
+        // Skip (rather than fail) on a machine with no `timeout` on PATH —
+        // in that mode `security_command` deliberately falls back to a bare
+        // `security` invocation, which is covered by the test below.
+        if !timeout_binary_available() {
+            eprintln!("skipping: no `timeout` binary on PATH in this test environment");
+            return;
+        }
+        let cmd = security_command(&["find-generic-password", "-s", "svc", "-a", "acct", "-w"]);
+        assert_eq!(cmd.get_program(), "timeout");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                SECURITY_TIMEOUT_SECS.to_string(),
+                "security".to_string(),
+                "find-generic-password".to_string(),
+                "-s".to_string(),
+                "svc".to_string(),
+                "-a".to_string(),
+                "acct".to_string(),
+                "-w".to_string(),
+            ]
+        );
+    }
+
+    /// robustness-01: `is_timeout_exit` must key off exit code 124 (the
+    /// `timeout(1)` convention) specifically, and not treat every non-zero
+    /// exit — e.g. `security`'s own "not found" code 44 — as a timeout.
+    #[test]
+    fn is_timeout_exit_matches_only_exit_124() {
+        use std::os::unix::process::ExitStatusExt;
+        let timed_out = std::process::ExitStatus::from_raw(124 << 8);
+        let not_found = std::process::ExitStatus::from_raw(44 << 8);
+        let success = std::process::ExitStatus::from_raw(0);
+        assert!(is_timeout_exit(&timed_out));
+        assert!(!is_timeout_exit(&not_found));
+        assert!(!is_timeout_exit(&success));
     }
 
     /// SecretStore round-trip against the real login keychain. `#[ignore]`d by

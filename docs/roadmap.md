@@ -10,7 +10,16 @@
 - **`dev`** — v0.5.0 line. Features + refactors. Bugs cherry-picked from
   release/0.4.x on merge.
 
-## v0.5.0 scope (feature line)
+## v0.5.0 scope (feature line) — done, shipped 2026-09-07
+
+## v0.5.1 (audit-fix + UX round) — done
+
+Follow-up pass after the v0.5.0 release audit: per-provider menu grouping,
+right-aligned version row (dropped the S/W status prefix), the
+`use_default` install-dialog fix routed through `lsregister`, a
+concurrency-01 lock fix, robustness-01 through 05, efficiency-01, and a
+concurrency-03 narrowing. See `CHANGELOG.md`'s `[0.5.1]` section for the
+full list.
 
 ### Menu-bar redesign (multi-provider prep)
 

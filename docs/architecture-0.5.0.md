@@ -44,14 +44,12 @@ through `/login`. That regression is what "never re-login" means to close.
      tokens matching what's actually on disk — the invariant holds whether
      usagio won the race, lost it, or bowed out.
 
-`[TBD: verify against CAS PR]` — the CAS active-refresh path (the
-read/compare/write-back loop above, and the three `active_refresh_cas_*` log
-events) is being built on a branch in flight at the time of writing; the
-mechanics described here are the agreed design, not yet a merged
-implementation. What *is* merged as of this writing is the first half: usagio
-no longer touches the active account's tokens at all in the background
-(`refresh_usage_cache` skips it outright). The CAS rotation is the next
-increment on top of that.
+The CAS active-refresh path (the read/compare/write-back loop above, and the
+three `active_refresh_cas_*` log events) has landed on `dev` — see
+`src/main.rs` around the `active_refresh_cas_won` / `active_refresh_cas_lost`
+log lines. `refresh_usage_cache` continues to skip `ensure_fresh` for
+`state.active` as described above; CAS is the mechanism that replaces the
+unconditional-overwrite behavior that skip left a gap for.
 
 ## The trait: `Provider::mirror_rotated_token`
 
@@ -100,15 +98,14 @@ rather than linking Security.framework directly, specifically to sidestep
 the "always allow?" SecurityAgent prompt that framework calls trigger for
 unsigned, brew-installed binaries.
 
-`[TBD: verify against CAS PR]` — as merged today, `set` calls
-`security add-generic-password -U …`, which updates the existing item in
-place. The CAS design being built calls for replacing `-U` with an explicit
+As merged, `set` (`real_set` in `src/platform/macos.rs`) does an explicit
 **delete-then-add**: `security delete-generic-password` followed by a plain
-`security add-generic-password` (no `-U`). The stated reason is that `-U`
-still occasionally re-triggers the cross-app ACL prompt when a *different*
-process (Claude Code itself, mid-rotation) owns the keychain item's ACL —
-delete-then-add creates a fresh item under usagio's own ACL every time,
-avoiding the prompt path entirely. The full CAS cycle is:
+`security add-generic-password` (no `-U`), rather than `-U`'s
+update-in-place. The reason: `-U` still occasionally re-triggers the
+cross-app ACL prompt when a *different* process (Claude Code itself,
+mid-rotation) owns the keychain item's ACL — delete-then-add creates a fresh
+item under usagio's own ACL every time, avoiding the prompt path entirely.
+The full CAS cycle is:
 
 1. **before-read** — read the keychain blob, this is the CAS "compare"
    baseline.
@@ -121,22 +118,26 @@ avoiding the prompt path entirely. The full CAS cycle is:
 4. **delete-then-add** — only if the after-read still matches the baseline:
    delete the existing item, then add the new blob as a fresh item.
 
-## What's gone
+## What's still around (not removed)
 
-~1,400 lines of pre-0.5.0 machinery that existed to paper over the
-active/inactive race are removed or being removed on the CAS branch, now
-that the CAS design closes the race directly instead of working around it:
+CAS closes the active/inactive race directly, which made a chunk of
+pre-0.5.0 fallback machinery redundant in principle — but as of this
+writing that machinery has **not** been removed, and it is still called
+from production code, not just tests:
 
-- `absorb_all_lagging`
-- `last_chance_fallback`
-- `ensure_fresh_with_fallback`
-- fsnotify-based credential-file watching
-- the reentrant lock that coordinated all of the above
+- `absorb_all_lagging` (`src/credentials.rs`) — still invoked from
+  `absorb_before_switch` (pre-switch, to catch a still-running vendor CLI's
+  last rotation before usagio overwrites its credential path) and from the
+  fsnotify credential-watcher thread's debounced absorb pass.
+- `last_chance_fallback` (`src/credentials.rs`) — still invoked from
+  `refresh_inactive_if_stale`'s `InvalidGrant` branch, as a retry before
+  flagging an account `needs_relogin`.
 
-These are deferred to a v0.5.1 cleanup pass once CAS is proven in
-production — `[TBD: verify against CAS PR]` on exact removal scope; as of
-this writing `absorb_all_lagging` and `last_chance_fallback` are still
-present in `src/credentials.rs` pending that cleanup.
+Removing these (and the fsnotify-based credential-file watching / reentrant
+lock they coordinate with) is deferred to a future cleanup pass once CAS has
+enough production soak time to be trusted as the sole mechanism — do not
+assume this code is dead or safe to delete based on the CAS design doc
+alone; check `src/credentials.rs` call sites first.
 
 ## Adding OS #4
 
