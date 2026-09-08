@@ -1067,3 +1067,116 @@ fn run_dispatch_prefers_an_explicit_arg_over_bundle_detection() {
     let args = vec!["list".to_string()];
     assert_eq!(effective_first_arg(&args, &bundle_exe), Some("list"));
 }
+
+// ---------------------------------------------------------------------------
+// "usagio never refreshes the ACTIVE account" — refresh_usage_cache must
+// never POST /token for whichever account state.active names, only for
+// inactive ones. Proven with a tiny in-process HTTP server standing in for
+// the OAuth token endpoint, so we can count exactly how many POSTs land per
+// account rather than trusting the code not to call out.
+// ---------------------------------------------------------------------------
+
+/// Minimal single-threaded mock token endpoint: accepts TCP connections,
+/// reads (and discards) the request, and replies with a fixed valid
+/// refresh-grant JSON body. Returns (base_url, hits) where `hits` is bumped
+/// once per accepted connection.
+fn spawn_mock_token_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock token server");
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_thread = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            // Read the request line so we can tell a /token POST apart from
+            // a usage GET; everything after it (headers/body) is discarded.
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let is_token_post = request.starts_with("POST");
+            let body = if is_token_post {
+                hits_thread.fetch_add(1, Ordering::SeqCst);
+                serde_json::json!({
+                    "access_token": "mock-refreshed-access-token",
+                    "refresh_token": "mock-refreshed-refresh-token",
+                    "expires_in": 3600,
+                })
+                .to_string()
+            } else {
+                // Usage GET — any well-formed empty snapshot avoids a parse
+                // error; this test doesn't assert on usage contents.
+                serde_json::json!({
+                    "five_hour": null,
+                    "seven_day": null,
+                    "seven_day_opus": null,
+                })
+                .to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+#[test]
+fn refresh_usage_cache_does_not_touch_the_active_account() {
+    use crate::providers::claude::{oauth, usage};
+    use crate::store::{Account, ScopedConfigDir};
+
+    let _g = ScopedConfigDir::new();
+    let (base_url, hits) = spawn_mock_token_server();
+    oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+    usage::set_usage_url_override(Some(&format!("{base_url}/api/oauth/usage")));
+
+    // Both accounts are already expired, so `ensure_fresh` would attempt a
+    // refresh for either one if it were called.
+    let expired = Utc::now().timestamp_millis() - 1_000;
+    let mut active = Account::from_keychain_blob(&format!(
+        r#"{{"claudeAiOauth":{{"accessToken":"active-at","refreshToken":"active-rt","expiresAt":{expired}}}}}"#
+    ))
+    .unwrap();
+    active.email = Some("active@example.com".into());
+    let mut inactive = Account::from_keychain_blob(&format!(
+        r#"{{"claudeAiOauth":{{"accessToken":"inactive-at","refreshToken":"inactive-rt","expiresAt":{expired}}}}}"#
+    ))
+    .unwrap();
+    inactive.email = Some("inactive@example.com".into());
+
+    let mut seed = State::default();
+    seed.accounts.push(active);
+    seed.accounts.push(inactive);
+    seed.active = Some("active@example.com".into());
+    seed.save().unwrap();
+
+    refresh_usage_cache();
+    oauth::set_token_url_override(None);
+    usage::set_usage_url_override(None);
+
+    // Exactly one POST landed — for the inactive account. The active
+    // account's stored refresh token must be byte-for-byte unchanged: if
+    // `refresh_usage_cache` had called `ensure_fresh` on it, the mock server
+    // would have rotated it to "mock-refreshed-refresh-token".
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "expected exactly one /token POST (for the inactive account only)"
+    );
+    let after = State::load().unwrap();
+    let active_after = after.find("active@example.com").unwrap();
+    assert_eq!(active_after.access_token, "active-at");
+    assert_eq!(active_after.refresh_token, "active-rt");
+    let inactive_after = after.find("inactive@example.com").unwrap();
+    assert_eq!(inactive_after.access_token, "mock-refreshed-access-token");
+    assert_eq!(inactive_after.refresh_token, "mock-refreshed-refresh-token");
+}

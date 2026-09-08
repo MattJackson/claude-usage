@@ -1427,29 +1427,19 @@ fn refresh_usage_cache() -> RefreshOutcome {
         if acct.needs_relogin {
             continue;
         }
-        match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
-            Ok(_) => {}
-            Err(oauth::RefreshError::InvalidGrant) => {
-                // Last-chance disk fallback: a rotation may have landed on
-                // disk (from `claude` or another usagio process) DURING this
-                // refresh cycle — after the pre-cycle absorb_all_lagging ran
-                // — so re-scan credential paths for this account and retry
-                // once with the freshly-adopted grant before flagging. This
-                // closes the mid-loop race the pre-cycle absorb can't cover.
-                let key = crate::providers::trait_def::AccountKey::new(CLAUDE_SLUG, email);
-                let adopted = credentials::last_chance_fallback(provider, &key);
-                let recovered = if adopted {
-                    match State::load().ok().and_then(|s| s.find(email).cloned()) {
-                        Some(fresh) => {
-                            acct = fresh;
-                            oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS).is_ok()
-                        }
-                        None => false,
-                    }
-                } else {
-                    false
-                };
-                if !recovered {
+        // usagio NEVER refreshes the ACTIVE account. Claude Code owns
+        // rotation for it — its refresh_token is single-use, and Anthropic
+        // invalidates it server-side the instant either side rotates, so a
+        // concurrent usagio refresh would race Claude Code's own and one of
+        // the two processes would end up holding a dead refresh_token. Use
+        // whatever access token is on disk right now; if it's stale, wait for
+        // Claude Code to rotate it on its own next invocation rather than
+        // POSTing /token ourselves.
+        let is_active = state.active.as_deref() == Some(email.as_str());
+        if !is_active {
+            match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
+                Ok(_) => {}
+                Err(oauth::RefreshError::InvalidGrant) => {
                     logging::log(&format!(
                         "token refresh permanently rejected for {email} (invalid_grant); \
                          flagging for re-login"
@@ -1461,12 +1451,12 @@ fn refresh_usage_cache() -> RefreshOutcome {
                     updates.push((email.clone(), acct, None, None));
                     continue;
                 }
-            }
-            Err(e) => {
-                logging::log(&format!(
-                    "token refresh failed for {email}: {e} (keeping cache)"
-                ));
-                continue;
+                Err(e) => {
+                    logging::log(&format!(
+                        "token refresh failed for {email}: {e} (keeping cache)"
+                    ));
+                    continue;
+                }
             }
         }
         let cu = match usage::fetch(&acct.access_token) {
@@ -1475,6 +1465,17 @@ fn refresh_usage_cache() -> RefreshOutcome {
                 rate_limited = true;
                 logging::log(&format!("usage 429 for {email}; keeping cache"));
                 None
+            }
+            Err(usage::FetchError::Auth) if is_active => {
+                // The active account's token was invalidated (most likely
+                // Claude Code rotated it and we're holding the stale side of
+                // that single-use pair). Not ours to fix — skip this account
+                // for the cycle and let the next `sync_active_from_keychain`
+                // pick up Claude Code's rotation.
+                logging::log(&format!(
+                    "active account token invalidated for {email}; waiting for Claude Code to rotate"
+                ));
+                continue;
             }
             Err(e) => {
                 logging::log(&format!("usage error for {email}: {e}; keeping cache"));
