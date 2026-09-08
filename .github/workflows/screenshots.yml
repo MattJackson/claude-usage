@@ -1,0 +1,105 @@
+name: Hero screenshots
+
+# Renders "hero" screenshots of usagio's menu bar / tray icon on all three
+# OSes, using a fixed mocked account fixture (packaging/screenshots/demo-state.json:
+# 2 Claude accounts + 3 Codex accounts, fixed percentages) so the images
+# look the same regardless of the developer's real account state.
+#
+# Triggered on every push to `qa` (the pre-release staging branch), plus
+# manual dispatch for one-off re-renders. Does NOT run on `dev`/`main`
+# pushes or on pull requests — this is a release-asset job, not part of the
+# fast CI lane in ci.yml.
+#
+# See packaging/screenshots/README.md for the full explanation of the
+# per-OS capture approach (menu-visible vs. full dropdown) and the honest
+# limitations of headless CI capture on each platform.
+on:
+  push:
+    branches: [qa]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: screenshots-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  capture:
+    name: capture hero screenshot (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Same Linux build deps as ci.yml, plus the capture-time deps
+      # (Xvfb, xdotool, ImageMagick, stalonetray) documented in
+      # packaging/screenshots/README.md.
+      - name: Install Linux system deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libssl-dev pkg-config libsecret-1-dev \
+            xvfb xdotool imagemagick stalonetray
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: cargo build --release
+        run: cargo build --release --all-features
+
+      - name: Capture hero screenshot (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          chmod +x packaging/screenshots/capture-macos.sh
+          packaging/screenshots/capture-macos.sh "$RUNNER_TEMP/hero"
+
+      - name: Capture hero screenshot (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          chmod +x packaging/screenshots/capture-linux.sh
+          packaging/screenshots/capture-linux.sh "$RUNNER_TEMP/hero"
+
+      - name: Capture hero screenshot (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          packaging/screenshots/capture-windows.ps1 -OutDir "$env:RUNNER_TEMP/hero"
+
+      - name: Determine artifact name
+        id: os_slug
+        shell: bash
+        run: |
+          case "${{ matrix.os }}" in
+            macos-latest) echo "slug=macos" >> "$GITHUB_OUTPUT" ;;
+            ubuntu-latest) echo "slug=linux" >> "$GITHUB_OUTPUT" ;;
+            windows-latest) echo "slug=windows" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Upload hero screenshot artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hero-${{ steps.os_slug.outputs.slug }}
+          path: |
+            ${{ runner.temp }}/hero/hero-*.png
+          if-no-files-found: error
+          retention-days: 30
+
+      # Artifact-only by design (no auto-commit back to `qa` or `web/`):
+      # a bot commit into the website tree is a meaningful, visible change
+      # to a separate concern (the website repo/tree is explicitly out of
+      # scope for this workflow — see packaging/screenshots/README.md).
+      # Download the artifact from this run and commit it manually once
+      # you've confirmed it actually looks right — headless capture quality
+      # varies a lot per OS (see README "Reality check").

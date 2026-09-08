@@ -1,0 +1,127 @@
+{
+  "schema_version": 2,
+  "accounts": [
+    {
+      "email": "demo1@example.com",
+      "access_token": "demo-claude-access-token-1",
+      "refresh_token": "demo-claude-refresh-token-1",
+      "expires_at": 4102444800000,
+      "keychain_blob": "{\"claudeAiOauth\":{\"accessToken\":\"demo-claude-access-token-1\",\"refreshToken\":\"demo-claude-refresh-token-1\",\"expiresAt\":4102444800000,\"scopes\":[\"user:inference\"],\"subscriptionType\":\"max\"}}",
+      "oauth_account": {
+        "accountUuid": "00000000-0000-4000-8000-000000000001",
+        "emailAddress": "demo1@example.com"
+      },
+      "user_id": "demo-user-id-1",
+      "cached_usage": {
+        "session_pct": 47.0,
+        "weekly_pct": 89.0,
+        "session_reset": "2026-12-31T18:00:00Z",
+        "weekly_reset": "2027-01-04T00:00:00Z",
+        "opus_pct": 12.0,
+        "opus_reset": "2027-01-04T00:00:00Z",
+        "fetched_at": 4102358400
+      },
+      "notif_state": {},
+      "needs_relogin": false
+    },
+    {
+      "email": "dev@example.com",
+      "access_token": "demo-claude-access-token-2",
+      "refresh_token": "demo-claude-refresh-token-2",
+      "expires_at": 4102444800000,
+      "keychain_blob": "{\"claudeAiOauth\":{\"accessToken\":\"demo-claude-access-token-2\",\"refreshToken\":\"demo-claude-refresh-token-2\",\"expiresAt\":4102444800000,\"scopes\":[\"user:inference\"],\"subscriptionType\":\"pro\"}}",
+      "oauth_account": {
+        "accountUuid": "00000000-0000-4000-8000-000000000002",
+        "emailAddress": "dev@example.com"
+      },
+      "user_id": "demo-user-id-2",
+      "cached_usage": {
+        "session_pct": 2.0,
+        "weekly_pct": 98.0,
+        "session_reset": "2026-12-31T20:00:00Z",
+        "weekly_reset": "2027-01-04T00:00:00Z",
+        "opus_pct": 0.0,
+        "opus_reset": "2027-01-04T00:00:00Z",
+        "fetched_at": 4102358400
+      },
+      "notif_state": {},
+      "needs_relogin": false
+    }
+  ],
+  "active": "demo1@example.com",
+  "providers": {
+    "codex": {
+      "accounts": [
+        {
+          "key": "alice@codex.example",
+          "secret_blob": "{\"OPENAI_API_KEY\":null,\"tokens\":{\"access_token\":\"demo-codex-access-token-1\",\"refresh_token\":\"demo-codex-refresh-token-1\",\"account_id\":\"demo-codex-account-1\"}}",
+          "access_token": "demo-codex-access-token-1",
+          "refresh_token": "demo-codex-refresh-token-1",
+          "expires_at": 4102444800,
+          "identity_email": "alice@codex.example",
+          "identity_uuid": "10000000-0000-4000-8000-000000000001",
+          "identity_display_name": "Alice (Demo)",
+          "identity_native_blob": {},
+          "cached_usage": {
+            "session_pct": 33.0,
+            "weekly_pct": 61.0,
+            "session_reset": "2026-12-31T19:00:00Z",
+            "weekly_reset": "2027-01-04T00:00:00Z",
+            "opus_pct": null,
+            "opus_reset": null,
+            "fetched_at": 4102358400
+          },
+          "notif_state": {},
+          "needs_relogin": false
+        },
+        {
+          "key": "bob@codex.example",
+          "secret_blob": "{\"OPENAI_API_KEY\":null,\"tokens\":{\"access_token\":\"demo-codex-access-token-2\",\"refresh_token\":\"demo-codex-refresh-token-2\",\"account_id\":\"demo-codex-account-2\"}}",
+          "access_token": "demo-codex-access-token-2",
+          "refresh_token": "demo-codex-refresh-token-2",
+          "expires_at": 4102444800,
+          "identity_email": "bob@codex.example",
+          "identity_uuid": "10000000-0000-4000-8000-000000000002",
+          "identity_display_name": "Bob (Demo)",
+          "identity_native_blob": {},
+          "cached_usage": {
+            "session_pct": 8.0,
+            "weekly_pct": 15.0,
+            "session_reset": "2026-12-31T21:00:00Z",
+            "weekly_reset": "2027-01-04T00:00:00Z",
+            "opus_pct": null,
+            "opus_reset": null,
+            "fetched_at": 4102358400
+          },
+          "notif_state": {},
+          "needs_relogin": false
+        },
+        {
+          "key": "carol.locked@codex.example",
+          "secret_blob": "{\"OPENAI_API_KEY\":null,\"tokens\":{\"access_token\":\"demo-codex-access-token-3\",\"refresh_token\":\"demo-codex-refresh-token-3-invalid\",\"account_id\":\"demo-codex-account-3\"}}",
+          "access_token": "demo-codex-access-token-3",
+          "refresh_token": "demo-codex-refresh-token-3-invalid",
+          "expires_at": 4102444800,
+          "identity_email": "carol.locked@codex.example",
+          "identity_uuid": "10000000-0000-4000-8000-000000000003",
+          "identity_display_name": "Carol (Demo, locked)",
+          "identity_native_blob": {},
+          "cached_usage": {
+            "session_pct": 100.0,
+            "weekly_pct": 100.0,
+            "session_reset": "2026-12-31T23:00:00Z",
+            "weekly_reset": "2027-01-04T00:00:00Z",
+            "opus_pct": null,
+            "opus_reset": null,
+            "fetched_at": 4102358400
+          },
+          "notif_state": {},
+          "needs_relogin": true
+        }
+      ],
+      "active": "alice@codex.example"
+    }
+  },
+  "autoswap_disabled": false,
+  "trigger_pct": 95.0
+}
