@@ -1009,12 +1009,17 @@ fn build_menu(snap: &Snapshot) -> Menu {
         );
     }
 
-    // Flat main list: one top-level Submenu row per (provider, account), no
-    // separate provider-header row and no separator between providers — the
-    // provider name is folded into each row by `main_row` (item 2). Providers
-    // still only contribute rows when they have at least one captured
-    // account (the "no header, no rows" rule survives the redesign).
-    for sec in &snap.sections {
+    // Main list: rows grouped per provider, separated by a menu HR so the
+    // user can tell at a glance which accounts belong to which vendor
+    // (v0.5.1 UX fix — the v0.5.0 flat list was too busy with multiple
+    // providers). The provider name still appears on each row (main_row)
+    // for accessibility / when a section has only one account. Providers
+    // only contribute rows when they have at least one captured account
+    // (the "no header, no rows" rule survives).
+    for (idx, sec) in snap.sections.iter().enumerate() {
+        if idx > 0 {
+            let _ = menu.append(&PredefinedMenuItem::separator());
+        }
         for title in section_headline_rows(sec) {
             add(
                 &menu,
@@ -2425,7 +2430,10 @@ mod cross_platform {
         if snap.sections.is_empty() {
             items.push(action("none", "Capture a login below to begin", false));
         }
-        for sec in &snap.sections {
+        for (idx, sec) in snap.sections.iter().enumerate() {
+            if idx > 0 {
+                items.push(PMenuItem::Separator);
+            }
             for title in section_headline_rows(sec) {
                 items.push(action(
                     format!("envoverride:{}", sec.provider_id),
