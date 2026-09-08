@@ -130,10 +130,30 @@ jobs:
         with:
           subject-path: 'dist/*.tar.gz'
 
+      - name: Resolve release-notes body path
+        # Prefer a hand-drafted packaging/release-notes-<VERSION>.md (see
+        # packaging/release-notes-0.5.0.md) so the release description reads
+        # as curated notes rather than GitHub's raw commit-log
+        # auto-generation. Falls back to generate_release_notes when no
+        # drafted file exists for this version yet.
+        id: notes
+        run: |
+          ver="${GITHUB_REF#refs/tags/v}"
+          notes_file="packaging/release-notes-${ver}.md"
+          if [ -f "$notes_file" ]; then
+            echo "path=${notes_file}" >> "$GITHUB_OUTPUT"
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::${notes_file} not found — falling back to generate_release_notes"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: ${{ steps.notes.outputs.generate == 'true' }}
           files: |
             dist/*.tar.gz
             dist/*.sha256
@@ -187,6 +207,33 @@ jobs:
           fi
           if ! grep -q 'def install' "$f" || ! grep -q 'bin.install "usagio"' "$f"; then
             echo "::error::$f is missing the expected install block after the rewrite — aborting before push"
+            cat "$f"
+            exit 1
+          fi
+
+          # The `sed` field rewrites above are anchored on the formula's
+          # current line format (`^  url `, `^  version `, `^  sha256 `). If
+          # that format ever drifts (rewrap, extra indent, multi-line url,
+          # etc.) `sed` finds no match and silently no-ops for that field —
+          # `ruby -c` and the structural `install`-block checks above still
+          # pass because the rest of the file is untouched, so the workflow
+          # would happily commit (or, worse, see no diff, print "formula
+          # already up to date", and skip the push entirely) a formula still
+          # pointing at the OLD url/version/sha256 while the job reports
+          # success. Verify each field actually landed on its new value
+          # before trusting the file.
+          if ! grep -qF "  url \"${url}\"" "$f"; then
+            echo "::error::$f url line was not updated to ${url} — sed pattern likely no longer matches the formula's format; aborting before push"
+            cat "$f"
+            exit 1
+          fi
+          if ! grep -qF "  version \"${ver}\"" "$f"; then
+            echo "::error::$f version line was not updated to ${ver} — sed pattern likely no longer matches the formula's format; aborting before push"
+            cat "$f"
+            exit 1
+          fi
+          if ! grep -qF "  sha256 \"${sum}\"" "$f"; then
+            echo "::error::$f sha256 line was not updated to ${sum} — sed pattern likely no longer matches the formula's format; aborting before push"
             cat "$f"
             exit 1
           fi
