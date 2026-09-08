@@ -190,21 +190,22 @@ jobs:
           # at it for a real Login Items icon.
           perl -0777 -pi -e 's/def install\n(?:.*\n)*?  end\n/def install\n    bin.install "usagio"\n    prefix.install "usagio.app"\n  end\n/' "$f"
 
-          # v0.5.3: use `post_install_steps` (the current, non-deprecated
-          # Homebrew hook). `post_install` was deprecated upstream and
-          # prints a warning on every `brew install`. Strip any existing
-          # `post_install` OR `post_install_steps` block first (idempotent
-          # — reruns on later releases must not stack duplicate method
-          # defs OR leave a deprecated `post_install` alongside the new
-          # form), then insert a fresh `post_install_steps` right after
-          # `install`. "install means install": `brew install`/`brew
-          # upgrade` should register the LaunchAgent and start the menu
-          # bar without a second manual `usagio install` step, matching
-          # the NSIS installer's equivalent auto-run on Windows (see
+          # v0.5.4 walk-back: `post_install_steps` (attempted in v0.5.3 to
+          # silence the deprecation warning) is NOT a real Homebrew method
+          # and silently no-ops — the tap-side fix at commit 6461d87
+          # reverted to `def post_install`. Keep the deprecated name; the
+          # warning is fine, a silently-broken hook is not. Strip either
+          # form first (idempotent — reruns must not stack duplicate defs
+          # OR leave a stale `post_install_steps` behind), then insert a
+          # fresh `post_install` right after `install`. "install means
+          # install": `brew install`/`brew upgrade` should register the
+          # LaunchAgent and start the menu bar without a second manual
+          # `usagio install` step, matching the NSIS installer's
+          # equivalent auto-run on Windows (see
           # packaging/windows/installer.nsi).
-          perl -0777 -pi -e 's/\n  def post_install\n(?:.*\n)*?  end\n//' "$f"
           perl -0777 -pi -e 's/\n  def post_install_steps\n(?:.*\n)*?  end\n//' "$f"
-          perl -0777 -pi -e 's/(def install\n(?:.*\n)*?  end\n)/$1\n  def post_install_steps\n    system bin\/"usagio", "install"\n  end\n/' "$f"
+          perl -0777 -pi -e 's/\n  def post_install\n(?:.*\n)*?  end\n//' "$f"
+          perl -0777 -pi -e 's/(def install\n(?:.*\n)*?  end\n)/$1\n  def post_install\n    system bin\/"usagio", "install"\n  end\n/' "$f"
 
           # Caveats block: also strip-then-reinsert (always current, not
           # "add once") so the wording keeps up with what post_install now
@@ -227,13 +228,13 @@ jobs:
             cat "$f"
             exit 1
           fi
-          # The old `post_install` and the new `post_install_steps` both
-          # start with `def post_install`, so `grep -c 'def post_install'`
-          # is the union count. We want exactly ONE such definition AND it
-          # must be the new `post_install_steps` form (v0.5.3: `post_install`
-          # is deprecated and warns on every `brew install`).
-          if [ "$(grep -c 'def post_install' "$f")" != "1" ] || ! grep -q 'def post_install_steps' "$f" || ! grep -qF 'system bin/"usagio", "install"' "$f"; then
-            echo "::error::$f is missing (or has duplicate) the expected post_install_steps block after the rewrite — aborting before push"
+          # v0.5.4: assert exactly ONE `def post_install` (not `_steps`),
+          # matching the real Homebrew hook name. `grep -c 'def
+          # post_install'` alone would count both variants; add an
+          # explicit reject for `post_install_steps` so a stray reintro
+          # (which silently no-ops on the user side) fails CI here.
+          if [ "$(grep -c 'def post_install' "$f")" != "1" ] || grep -q 'def post_install_steps' "$f" || ! grep -qF 'system bin/"usagio", "install"' "$f"; then
+            echo "::error::$f is missing (or has duplicate) the expected post_install block after the rewrite — aborting before push"
             cat "$f"
             exit 1
           fi

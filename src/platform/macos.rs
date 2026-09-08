@@ -527,40 +527,77 @@ pub(crate) fn launchctl_bootout_argv(uid: u32, label: &str) -> Vec<String> {
     vec!["bootout".to_string(), format!("gui/{uid}/{label}")]
 }
 
-/// Load a plist via `launchctl bootstrap` (modern macOS 10.10+ form), falling
-/// back to `launchctl load -w` on failure — some older macOS point releases
-/// still expect the legacy form, and the fallback is cheap. Emits a structured
-/// token-lifecycle log line for both success and failure paths so a broken
-/// post-brew autostart shows up in `usagio-log`.
+/// Max attempts and backoff for the v0.5.4 bootstrap retry loop below.
+/// v0.5.3 shipped a single-shot `launchctl bootstrap`; on a fresh
+/// `brew install`, brew's `def post_install` invokes `system bin/"usagio",
+/// "install"` BEFORE the keg is linked to `/opt/homebrew/opt/usagio`, so the
+/// plist's `ProgramArguments[0]` path (which points at the opt symlink) does
+/// not yet exist. launchd silently declines to register a plist whose target
+/// binary is missing, and by the time the user's next shell notices, the
+/// menu bar app isn't running. Retry with a brief backoff so the link-then-
+/// post-install ordering has time to catch up — version-agnostic, cheap.
+#[cfg(unix)]
+const BOOTSTRAP_MAX_ATTEMPTS: u32 = 5;
+#[cfg(unix)]
+const BOOTSTRAP_BACKOFF_MS: u64 = 300;
+
+/// Load a plist via `launchctl bootstrap` (modern macOS 10.10+ form). Retries
+/// up to `BOOTSTRAP_MAX_ATTEMPTS` with a short backoff between attempts —
+/// during a `brew install` the keg link into `/opt/homebrew/opt/usagio` isn't
+/// yet in place when `post_install` runs, so a first bootstrap can fail with
+/// the plist target missing (v0.5.4). Falls back to `launchctl load -w` on
+/// persistent failure — some older macOS point releases still expect the
+/// legacy form, and the fallback is cheap. Emits a structured token-lifecycle
+/// log line for every attempt so a broken post-brew autostart shows up in
+/// `usagio-log`.
 #[cfg(unix)]
 fn launchctl_bootstrap(plist_path: &Path) -> Result<()> {
     let uid = unsafe { libc::getuid() };
     let argv = launchctl_bootstrap_argv(uid, plist_path);
-    let bootstrap = Command::new("launchctl").args(&argv).output();
-    match bootstrap {
-        Ok(o) if o.status.success() => {
-            crate::logging::log(&format!(
-                "event=launchagent_bootstrap result=ok uid={uid} plist={}",
-                plist_path.display(),
-            ));
-            return Ok(());
+    let mut last_exit: Option<i32> = None;
+    let mut last_stderr = String::new();
+    for attempt in 1..=BOOTSTRAP_MAX_ATTEMPTS {
+        let out = Command::new("launchctl").args(&argv).output();
+        match out {
+            Ok(o) if o.status.success() => {
+                crate::logging::log(&format!(
+                    "event=launchagent_bootstrap result=ok uid={uid} attempt={attempt} plist={}",
+                    plist_path.display(),
+                ));
+                return Ok(());
+            }
+            Ok(o) => {
+                last_exit = o.status.code();
+                last_stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                crate::logging::log(&format!(
+                    "event=launchagent_bootstrap result=retry uid={uid} attempt={attempt}/{max} \
+                     plist={} exit={:?} stderr={:?}",
+                    plist_path.display(),
+                    last_exit,
+                    last_stderr,
+                    max = BOOTSTRAP_MAX_ATTEMPTS,
+                ));
+            }
+            Err(e) => {
+                last_stderr = format!("spawn error: {e}");
+                crate::logging::log(&format!(
+                    "event=launchagent_bootstrap result=retry uid={uid} attempt={attempt}/{max} \
+                     plist={} err={e}",
+                    plist_path.display(),
+                    max = BOOTSTRAP_MAX_ATTEMPTS,
+                ));
+            }
         }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            crate::logging::log(&format!(
-                "event=launchagent_bootstrap result=fallback_to_load uid={uid} plist={} \
-                 exit={:?} stderr={stderr:?}",
-                plist_path.display(),
-                o.status.code(),
-            ));
-        }
-        Err(e) => {
-            crate::logging::log(&format!(
-                "event=launchagent_bootstrap result=fallback_to_load uid={uid} plist={} err={e}",
-                plist_path.display(),
-            ));
+        if attempt < BOOTSTRAP_MAX_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(BOOTSTRAP_BACKOFF_MS));
         }
     }
+    crate::logging::log(&format!(
+        "event=launchagent_bootstrap result=fallback_to_load uid={uid} plist={} \
+         final_exit={:?} final_stderr={last_stderr:?}",
+        plist_path.display(),
+        last_exit,
+    ));
     // Legacy fallback.
     let load = Command::new("launchctl")
         .args(["load", "-w", &plist_path.to_string_lossy()])
@@ -573,7 +610,7 @@ fn launchctl_bootstrap(plist_path: &Path) -> Result<()> {
             load.code(),
         ));
         bail!(
-            "launchctl bootstrap AND launchctl load both failed for {}",
+            "launchctl bootstrap (x{BOOTSTRAP_MAX_ATTEMPTS}) AND launchctl load both failed for {}",
             plist_path.display()
         );
     }

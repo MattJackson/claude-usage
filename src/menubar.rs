@@ -1822,6 +1822,39 @@ mod mac_style {
     /// old 28pt value was ever correct.
     const RIGHT_ALIGN_PAD: f64 = 0.0;
 
+    /// v0.5.4 defect 1: minimum gap (points) between the widest label's
+    /// right edge and its row's trailing run's left edge. Without this the
+    /// tab stop could land right at the widest email's right edge, so a row
+    /// with a near-widest email (e.g. `matthew@getbusbar.com`) rendered with
+    /// ZERO space between the email and the `S% / W%` trailing. Two
+    /// menu-font space-widths (~12pt) reads as an obvious column gap without
+    /// blowing out the menu width on narrow menus.
+    pub(super) const MIN_LABEL_TRAILING_GAP: f64 = 12.0;
+
+    /// v0.5.4 defect 2: AppKit reserves ~14pt at the right edge of every
+    /// NSMenu that contains any submenu item, for the disclosure chevron.
+    /// Rows WITH a submenu render their trailing text flush against the tab
+    /// stop and the chevron sits in that reserved column; rows WITHOUT a
+    /// submenu render their trailing text at the same tab stop, leaving a
+    /// chevron-column-sized whitespace between their trailing and the
+    /// menu's true right edge — "text is not fully right aligned if the row
+    /// doesnt have a submenu" per the user report. `effective_tab_x` pushes
+    /// non-submenu rows' tab stop right by this width so both types
+    /// terminate at the same visual X. Empirically 14pt on macOS 14/15.
+    pub(super) const CHEVRON_COLUMN_WIDTH: f64 = 14.0;
+
+    /// Resolve the right-align tab stop for one row, adjusting for whether
+    /// AppKit will draw a disclosure chevron to the right of its trailing
+    /// run. See `CHEVRON_COLUMN_WIDTH`. Kept pure (no AppKit types) so
+    /// `#[cfg(test)]` can pin the arithmetic without touching NSMenu.
+    pub(super) fn effective_tab_x(base_x: f64, has_submenu: bool) -> f64 {
+        if has_submenu {
+            base_x
+        } else {
+            base_x + CHEVRON_COLUMN_WIDTH
+        }
+    }
+
     /// The natural (unwrapped, single-line) width in points of `s` rendered
     /// in `font`. Empty strings measure 0 without round-tripping through
     /// AppKit. Uses `NSAttributedString::size()` — the `NSStringDrawing`
@@ -1888,7 +1921,12 @@ mod mac_style {
             } else {
                 NSFont::menuFontOfSize(0.0)
             };
-            let w = measured_width(label, &font) + measured_width(trailing, &font);
+            // v0.5.4 defect 1: enforce MIN_LABEL_TRAILING_GAP between the
+            // label's right edge and the trailing's left edge for EVERY row
+            // (not just where they happen to sum wider than a plain row).
+            let w = measured_width(label, &font)
+                + MIN_LABEL_TRAILING_GAP
+                + measured_width(trailing, &font);
             if w > widest {
                 widest = w;
             }
@@ -2067,7 +2105,16 @@ mod mac_style {
                     .iter()
                     .find(|s| s.plain == title && (top_level || !s.section_header))
                 {
-                    let resolved_tab_x = style.tab_x_kind.map(|_| menu_right_x);
+                    // v0.5.4 defect 2: non-submenu rows (Quit, disabled
+                    // provider headers without env-override, etc.) need
+                    // their tab stop pushed right by the chevron column
+                    // width so their trailing text terminates at the same
+                    // visual X as the submenu-row trailing (which currently
+                    // sits flush against the chevron reserved column).
+                    let has_submenu = item.submenu().is_some();
+                    let resolved_tab_x = style
+                        .tab_x_kind
+                        .map(|_| effective_tab_x(menu_right_x, has_submenu));
                     item.setAttributedTitle(Some(&attributed(style, resolved_tab_x)));
                     // Per-provider 16px icon on section header rows. Look up by
                     // slug; a missing PNG (or an unknown slug like `vertex-ai`) is
@@ -4705,6 +4752,95 @@ mod tests {
                 effective,
                 objc2_foundation::NSRange::new(0, full_len),
                 "labelColor must span the whole row",
+            );
+        }
+
+        /// v0.5.4 defect 2: `effective_tab_x` MUST push non-submenu rows'
+        /// tab stop right by the chevron column width so their trailing
+        /// text terminates at the same visual X as a submenu row's. Pure
+        /// arithmetic — no AppKit round-trip needed.
+        #[test]
+        fn effective_tab_x_pushes_non_submenu_rows_right_by_chevron_width() {
+            let base = 200.0;
+            assert_eq!(mac_style::effective_tab_x(base, true), base);
+            assert_eq!(
+                mac_style::effective_tab_x(base, false),
+                base + mac_style::CHEVRON_COLUMN_WIDTH,
+            );
+            // Non-zero chevron adjustment — a defensive check so a future
+            // "chevron is 0pt on this platform" refactor can't silently
+            // reintroduce the user-visible short-right-alignment bug.
+            const _: () = assert!(mac_style::CHEVRON_COLUMN_WIDTH > 0.0);
+        }
+
+        /// v0.5.4 defect 1: `attributed` must produce a paragraph-style
+        /// right-align tab stop whose location is at least `label_width +
+        /// MIN_LABEL_TRAILING_GAP` past the label's right edge, so a near-
+        /// widest email row never renders with zero gap between the email
+        /// and its trailing `S% / W%`. Measures the actual label width in
+        /// the menu font and inspects the tab stop the style produced.
+        #[test]
+        fn attributed_row_has_a_minimum_gap_between_label_and_tab_stop() {
+            use objc2_app_kit::{NSFont, NSParagraphStyleAttributeName};
+            use objc2_foundation::NSRange;
+
+            let label = "  matthew@getbusbar.com";
+            let plain = format!("{label}\t47% / 89%");
+            let style = RowStyle {
+                tab_x_kind: Some(TabX::MenuRight),
+                ..RowStyle::plain_row(plain.clone())
+            };
+            let font = NSFont::menuFontOfSize(0.0);
+            // Test hook: pass a tab_x already at least MIN_GAP past the
+            // label's right edge (that is the invariant callers rely on;
+            // production computes it via `compute_menu_right_x` which now
+            // folds MIN_GAP into `widest`).
+            // Simulate what `compute_menu_right_x` would produce for a
+            // one-row menu with this row: label_width + MIN_GAP + trailing.
+            // Then assert the tab stop is at least label_width + MIN_GAP.
+            fn measured(s: &str, f: &objc2_app_kit::NSFont) -> f64 {
+                use objc2::AllocAnyThread;
+                use objc2_app_kit::{NSAttributedStringNSStringDrawing, NSFontAttributeName};
+                use objc2_foundation::{NSAttributedString, NSMutableAttributedString, NSString};
+                let s = NSString::from_str(s);
+                let attr = NSMutableAttributedString::initWithString(
+                    NSMutableAttributedString::alloc(),
+                    &s,
+                );
+                unsafe {
+                    attr.addAttribute_value_range(
+                        NSFontAttributeName,
+                        f,
+                        NSRange::new(0, s.length()),
+                    );
+                }
+                let attr: objc2::rc::Retained<NSAttributedString> =
+                    objc2::rc::Retained::into_super(attr);
+                attr.size().width
+            }
+            let label_w = measured(label, &font);
+            let trailing_w = measured("47% / 89%", &font);
+            let tab_x = label_w + mac_style::MIN_LABEL_TRAILING_GAP + trailing_w;
+
+            let attr = mac_style::attributed(&style, Some(tab_x));
+            let mut effective = NSRange::new(0, 0);
+            let value = unsafe {
+                attr.attribute_atIndex_effectiveRange(
+                    NSParagraphStyleAttributeName,
+                    0,
+                    &mut effective,
+                )
+            };
+            let obj = value.expect("expected a paragraph-style attribute");
+            let para: &objc2_app_kit::NSParagraphStyle =
+                unsafe { &*(objc2::rc::Retained::as_ptr(&obj) as *const _) };
+            let tabs = para.tabStops();
+            assert!(!tabs.is_empty(), "paragraph style must carry a tab stop");
+            let stop_loc = tabs.iter().next().unwrap().location();
+            assert!(
+                stop_loc >= label_w + mac_style::MIN_LABEL_TRAILING_GAP,
+                "tab stop {stop_loc} must be at least {}pt past label right edge {label_w}",
+                mac_style::MIN_LABEL_TRAILING_GAP,
             );
         }
 
