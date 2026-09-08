@@ -334,6 +334,50 @@ impl MacOsAutostart {
             .join("LaunchAgents")
             .join(format!("{label}.plist")))
     }
+
+    /// Best-effort `lsregister -f -R -trusted <app.app>` so Launch Services
+    /// knows about a freshly-installed bundle before anything (notably the
+    /// first notification) tries to resolve it. `binary` is expected to be
+    /// `<app>.app/Contents/MacOS/<name>`; walk up three levels to the `.app`
+    /// directory. A from-source / bare-binary install has no such bundle —
+    /// `parent()` chains bottom out to `None` (or the resolved dir doesn't
+    /// end in `.app`) and this is a silent no-op, same as any other failure
+    /// here (wrong lsregister path across macOS versions, missing bundle,
+    /// etc.) — never fatal to `install`.
+    fn register_with_launch_services(binary: &Path) {
+        const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+
+        let Some(app_bundle) = binary
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+        else {
+            return;
+        };
+        if app_bundle.extension().and_then(|e| e.to_str()) != Some("app") {
+            return;
+        }
+        if !Path::new(LSREGISTER).is_file() {
+            crate::logging::log(&format!(
+                "lsregister not found at {LSREGISTER}; skipping Launch Services registration"
+            ));
+            return;
+        }
+        match Command::new(LSREGISTER)
+            .args(["-f", "-R", "-trusted"])
+            .arg(app_bundle)
+            .status()
+        {
+            Ok(s) if s.success() => {
+                crate::logging::log(&format!(
+                    "registered {} with Launch Services",
+                    app_bundle.display()
+                ));
+            }
+            Ok(s) => crate::logging::log(&format!("lsregister exited with {s}")),
+            Err(e) => crate::logging::log(&format!("lsregister could not run: {e}")),
+        }
+    }
 }
 
 /// XML-escape the five reserved chars so a label / path / arg containing
@@ -383,6 +427,19 @@ impl Autostart for MacOsAutostart {
             std::fs::create_dir_all(p)?;
         }
         std::fs::write(&path, plist).context("writing LaunchAgent plist")?;
+
+        // Register the app bundle with Launch Services before the LaunchAgent
+        // starts it. Without this, a freshly-installed `.app` (from `usagio
+        // install`) is unknown to LS, and the first `notify-rust` call (via
+        // `mac-notification-sys`, whose sound-name literal is `"use_default"`)
+        // pops a "Where is use_default?" Choose Application dialog instead of
+        // sending the notification — LS is trying to resolve a bundle
+        // identifier it's never seen. Best-effort: `lsregister`'s path can
+        // move across macOS versions, and a from-source install's `binary`
+        // isn't inside a `.app` at all, so any failure here just leaves the
+        // (also best-effort) notification path unregistered — never fatal to
+        // `install`.
+        Self::register_with_launch_services(binary);
 
         // Unload first to allow reload without a stale process holding the label.
         let _ = Command::new("launchctl")

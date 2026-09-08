@@ -228,10 +228,14 @@ impl RowStyle {
     }
 }
 
-/// Fixed x (points) for the right-aligned trailing `S% / W%`. The menu font is
-/// proportional, so this must clear the widest email; the menu auto-widens to
-/// fit, so over-provisioning only adds a little slack on the right.
-const TAB_X: f64 = 260.0;
+/// Fixed x (points) for the right-aligned trailing `n% / n%`. NSMenu's
+/// right-tab alignment right-aligns the trailing run at this x, so it needs
+/// to clear the widest possible label for the tab to actually land at the
+/// menu's right edge rather than mid-row. 260 was too small once the menu
+/// widened past that (long emails, wide provider names) — bumped to 420 so
+/// it reliably exceeds the widest label; the menu auto-widens to fit, so
+/// over-provisioning only adds a little slack on the right.
+const TAB_X: f64 = 420.0;
 
 /// Length of a string in UTF-16 code units (the unit `NSRange` counts in).
 fn u16len(s: &str) -> usize {
@@ -303,10 +307,10 @@ fn now_utc() -> DateTime<Utc> {
 /// provider-name length ("Claude" vs "Codex").
 const PROVIDER_COL: usize = 10;
 
-/// v0.5.0 flat main-list row: `{provider}    {email}\tS {n}%  W {n}%`, bold +
+/// v0.5.0 flat main-list row: `{provider}    {email}\t{n}% / {n}%`, bold +
 /// checkmarked if active, high percentages colored per the provider's
 /// severity bands. When the account is fully consumed
-/// (`countdown::compute_display` → Locked), the `S n%  W n%` run is swapped
+/// (`countdown::compute_display` → Locked), the `n% / n%` run is swapped
 /// for `locked · <countdown>` and colored red — the user is being told *when*
 /// the account is next usable, not *how used* it is. This same string is both
 /// the row's `RowStyle` (for `apply_menu_styles`) and the plain title of the
@@ -319,7 +323,7 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
         // UX (v0.5.0): drop the "locked · " prefix — the trailing run is
         // rendered in red (visually implying locked) and the payload is a
         // time-until-reset instead of a percentage (structurally implying
-        // locked, since a healthy row shows "S n%  W n%"). The old
+        // locked, since a healthy row shows "n% / n%"). The old
         // "locked · Xh Ym" wording repeated the same fact three ways.
         let trailing = cd.clone();
         let plain = format!("{label}\t{trailing}");
@@ -336,14 +340,16 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
     let (pa, pb) = summary_pcts(a);
     let sa = pct(pa);
     let sb = pct(pb);
-    let trailing = format!("S {sa}  W {sb}");
+    // v0.5.1: drop the "S "/"W " label prefixes — "47% / 89%" is
+    // self-explanatory without them (item raised post-v0.5.0 UX pass).
+    let trailing = format!("{sa} / {sb}");
     let plain = format!("{label}\t{trailing}");
     let mut colors = Vec::new();
-    let s_off = base + u16len("S ");
+    let s_off = base;
     if let Some(sev) = severity_with(pa, bands) {
         colors.push((s_off, u16len(&sa), sev));
     }
-    let w_off = s_off + u16len(&sa) + u16len("  W ");
+    let w_off = s_off + u16len(&sa) + u16len(" / ");
     if let Some(sev) = severity_with(pb, bands) {
         colors.push((w_off, u16len(&sb), sev));
     }
@@ -2867,7 +2873,7 @@ mod tests {
     fn main_row_colors_land_on_percentages() {
         let a = acct("you@work.com", Some(82.0), Some(96.0), true);
         let r = main_row("Claude", &a, bands());
-        assert_eq!(r.plain, "Claude    you@work.com\tS 82%  W 96%");
+        assert_eq!(r.plain, "Claude    you@work.com\t82% / 96%");
         assert!(r.bold, "active account is bold");
         assert_eq!(r.tab_x, Some(TAB_X), "trailing run is right-aligned");
         assert_eq!(r.colors.len(), 2);
@@ -2900,7 +2906,7 @@ mod tests {
     #[test]
     fn main_row_includes_provider_name_padded() {
         // Item 2 of the redesign: the provider name gets its own column-like
-        // padding, then the email, then the tab-stopped `S n%  W n%` run.
+        // padding, then the email, then the tab-stopped `n% / n%` run.
         let claude = main_row(
             "Claude",
             &acct("a@x.com", Some(1.0), Some(2.0), false),
@@ -3246,14 +3252,14 @@ mod tests {
 
     #[test]
     fn main_row_flat_shape_matches_spec_when_not_locked() {
-        // "{provider}    {email}\tS {n}%  W {n}%" per the v0.5.0 redesign —
-        // the crate's variant uses a TAB between the label and trailing run
-        // so AppKit right-aligns it. The important structural invariants are:
-        // provider, then email, one TAB, then "S n%  W n%". Any change to
-        // that layout will fail this assertion — a wall against silent drift.
+        // "{provider}    {email}\t{n}% / {n}%" per the v0.5.1 UX pass — the
+        // crate's variant uses a TAB between the label and trailing run so
+        // AppKit right-aligns it. The important structural invariants are:
+        // provider, then email, one TAB, then "n% / n%". Any change to that
+        // layout will fail this assertion — a wall against silent drift.
         let a = acct("you@work.com", Some(42.0), Some(61.0), false);
         let r = main_row("Claude", &a, bands());
-        assert_eq!(r.plain, "Claude    you@work.com\tS 42%  W 61%");
+        assert_eq!(r.plain, "Claude    you@work.com\t42% / 61%");
         assert!(!r.checkmark, "inactive row: no leading checkmark");
     }
 
@@ -3297,7 +3303,7 @@ mod tests {
         with_now(now, || {
             let a = acct_with_resets("dev@x.com", Some(100.0), None, false, Some(past), None);
             let r = main_row("Claude", &a, bands());
-            assert_eq!(r.plain, "Claude    dev@x.com\tS 100%  W —");
+            assert_eq!(r.plain, "Claude    dev@x.com\t100% / —");
             assert!(!r.plain.contains("locked"));
         });
     }
@@ -3382,6 +3388,52 @@ mod tests {
                 s.icon_slug.is_none(),
                 "unexpected icon on non-main row: {}",
                 s.plain,
+            );
+        }
+    }
+
+    #[test]
+    fn menu_styles_tab_stop_is_uniform_across_a_section() {
+        // v0.5.1: TAB_X is a fixed right-align tab stop, not computed per row
+        // — so every main-list row in a section (and the Quit row) must
+        // carry the exact same `tab_x`, or the S%/W% columns wouldn't line
+        // up vertically. Vary email length across rows to prove the
+        // constant doesn't drift with content width.
+        let short = acct("a@x.com", Some(10.0), Some(20.0), false);
+        let long = acct(
+            "a.very.long.email.address@example.com",
+            Some(30.0),
+            Some(40.0),
+            true,
+        );
+        let snap = Snapshot {
+            sections: vec![ProviderSection {
+                provider_id: CLAUDE_SLUG,
+                display_name: "Claude",
+                supports_switching: true,
+                supports_usage: true,
+                supports_launch: true,
+                supports_remove: true,
+                severity_bands: bands(),
+                env_override_active: false,
+                accounts: vec![long, short],
+            }],
+            capture_creds: Vec::new(),
+            capture_api_key: Vec::new(),
+            autoswap: false,
+            threshold: 95.0,
+            notification_config: crate::notifications::NotificationConfig::default(),
+        };
+        let styles = menu_styles(&snap);
+        let tab_stops: Vec<f64> = styles.iter().filter_map(|s| s.tab_x).collect();
+        assert!(
+            tab_stops.len() >= 2,
+            "expected a tab stop on every main row plus Quit"
+        );
+        for x in &tab_stops {
+            assert_eq!(
+                *x, TAB_X,
+                "every row's tab stop must match the shared constant"
             );
         }
     }
@@ -3614,7 +3666,7 @@ mod tests {
     #[test]
     fn main_row_locked_shape_swaps_only_the_trailing_run() {
         // The locked row keeps the "{provider label}\t…" tab structure so
-        // right-alignment still works — only the trailing "S n%  W n%" run
+        // right-alignment still works — only the trailing "n% / n%" run
         // becomes "locked · <countdown>". A test that pins the structure so
         // a future refactor can't accidentally lose the tab.
         let now = Utc.timestamp_opt(4_000_000, 0).unwrap();
