@@ -1183,7 +1183,10 @@ fn active_refresh_cas_won_writes_keychain_and_state() {
 
     oauth::set_token_url_override(None);
 
-    assert!(matches!(outcome, ActiveRefreshOutcome::CasWon), "outcome={outcome:?}");
+    assert!(
+        matches!(outcome, ActiveRefreshOutcome::CasWon),
+        "outcome={outcome:?}"
+    );
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(acct.access_token, "mock-refreshed-access-token");
     assert_eq!(acct.refresh_token, "mock-refreshed-refresh-token");
