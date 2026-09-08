@@ -170,15 +170,68 @@ jobs:
           set -euo pipefail
           mkdir -p web/public/screenshots
           variants="tray menu-healthy menu-locked menu-session-locked menu-mixed settings"
+
+          # v0.5.4: the previous run committed 5 byte-identical solid-black
+          # macOS PNGs and 6 byte-identical Windows PNGs (headless capture
+          # falling through the accessibility-permission gate, so every
+          # variant rendered the same not-a-menu frame under a different
+          # name). Two strict gates now stand between a bad capture leg and
+          # `main`: MIN_PNG_BYTES rejects a blank/solid-color frame (any
+          # real menu screenshot is >20KB PNG), and within-OS SHA256
+          # uniqueness rejects the "same frame copied under N names" class
+          # of script bug. Better a red CI run than a green run committing
+          # garbage that the site then serves as the hero image.
+          MIN_PNG_BYTES=20000
+
+          fail=0
           for os in macos linux windows; do
+            declare -A seen_hashes=()
             for variant in $variants; do
               src="/tmp/screenshot-artifacts/screenshots-${os}/${os}-${variant}.png"
               if [[ ! -f "$src" ]]; then
-                echo "error: expected $src from the screenshots-${os} artifact but it's missing" >&2
-                exit 1
+                echo "::error::expected $src from the screenshots-${os} artifact but it's missing"
+                fail=1
+                continue
               fi
+              size=$(wc -c < "$src")
+              if (( size < MIN_PNG_BYTES )); then
+                echo "::error::${os}-${variant}.png is only $size bytes (< ${MIN_PNG_BYTES}) — probably a blank/solid-color capture"
+                fail=1
+                continue
+              fi
+              hash=$(sha256sum "$src" | awk '{print $1}')
+              if [[ -n "${seen_hashes[$hash]:-}" ]]; then
+                echo "::error::${os}-${variant}.png is byte-identical to ${os}-${seen_hashes[$hash]}.png (sha256=$hash) — capture loop is emitting the same frame under multiple names"
+                fail=1
+                continue
+              fi
+              seen_hashes[$hash]="$variant"
               cp "$src" "web/public/screenshots/${os}-${variant}.png"
             done
+            unset seen_hashes
+          done
+
+          if (( fail != 0 )); then
+            echo "::error::one or more capture legs produced invalid PNGs — refusing to commit"
+            exit 1
+          fi
+
+      - name: Refresh hero-<os>.png from menu-healthy variant
+        # v0.5.4: the site's rotating hero (referenced by web/src/*) reads
+        # web/public/hero-<os>.png. Point it at the OS's `menu-healthy`
+        # capture — the most product-representative variant — so a
+        # successful CI run automatically replaces the placeholder heroes
+        # that shipped before real captures existed. The per-variant files
+        # under web/public/screenshots/ stay in place for FAQ/tour pages.
+        run: |
+          set -euo pipefail
+          for os in macos linux windows; do
+            src="web/public/screenshots/${os}-menu-healthy.png"
+            if [[ -f "$src" ]]; then
+              cp "$src" "web/public/hero-${os}.png"
+            else
+              echo "::warning::no ${os}-menu-healthy.png landed this run; leaving hero-${os}.png untouched"
+            fi
           done
 
       - name: Commit and push as github-actions[bot]
@@ -186,7 +239,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add web/public/screenshots/*.png
+          git add web/public/screenshots/*.png web/public/hero-*.png
 
           # Idempotence: skip the commit+push entirely if the captured PNGs
           # are byte-identical to what's already on `main` (the fixtures
@@ -197,7 +250,7 @@ jobs:
           # commits while still leaving a normal "nothing to do" line in
           # the Actions log for every run, so the pipeline stays visibly
           # auditable.
-          if git diff --cached --quiet -- web/public/screenshots; then
+          if git diff --cached --quiet -- web/public/screenshots web/public/hero-macos.png web/public/hero-linux.png web/public/hero-windows.png; then
             echo "no image change; skipping commit"
             exit 0
           fi
