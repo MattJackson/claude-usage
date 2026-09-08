@@ -30,7 +30,7 @@ mod usage_log;
 use providers::claude::{oauth, usage};
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use providers::trait_def::TokenGrant;
 use providers::Provider;
@@ -2287,6 +2287,53 @@ fn refresh_usage_cache() -> RefreshOutcome {
 // watch — auto-swap daemon
 // ---------------------------------------------------------------------------
 
+/// Fold a `Row`'s cached usage into `countdown::AccountUsage` so
+/// `countdown::any_reset_within` can reason about its reset instants — used
+/// by `cap_sleep_to_reset_boundary` (v0.5.2 item 4).
+fn row_to_account_usage(r: &Row) -> countdown::AccountUsage {
+    countdown::AccountUsage {
+        session_pct: r.session.pct,
+        session_reset: r.session.resets_at,
+        weekly_pct: r.weekly.pct,
+        weekly_reset: r.weekly.resets_at,
+        fetched_at: r.fetched_at.and_then(|t| DateTime::from_timestamp(t, 0)),
+    }
+}
+
+/// Horizon (seconds) within which an imminent reset is worth waking early
+/// for, and the buffer added past the reset instant so the wake lands just
+/// AFTER it (not exactly on it, where clock skew could still read stale).
+const RESET_WAKE_HORIZON_SECS: i64 = 30;
+const RESET_WAKE_BUFFER_SECS: i64 = 2;
+
+/// v0.5.2 item 4: if any Claude account has a session/weekly reset within
+/// `RESET_WAKE_HORIZON_SECS` of `now`, cap `planned` so the loop wakes right
+/// after it instead of riding out the whole adaptive-cadence interval — a
+/// stale locked/100% reading would otherwise survive up to a full cadence
+/// window past its own reset, and the very next loop iteration runs a FULL
+/// `watch_cycle` (refresh + swap re-evaluation), not just a display patch.
+/// Falls back to `planned` unchanged when nothing is imminent. Pure over
+/// already-loaded rows + `now` so it's unit-testable without a live clock.
+fn cap_sleep_to_reset_boundary(rows: &[Row], now: DateTime<Utc>, planned: u64) -> u64 {
+    let soonest = rows
+        .iter()
+        .filter_map(|r| {
+            countdown::any_reset_within(
+                &row_to_account_usage(r),
+                now,
+                Duration::seconds(RESET_WAKE_HORIZON_SECS),
+            )
+        })
+        .min();
+    match soonest {
+        Some(reset_at) => {
+            let secs = ((reset_at - now).num_seconds() + RESET_WAKE_BUFFER_SECS).max(1) as u64;
+            secs.min(planned)
+        }
+        None => planned,
+    }
+}
+
 fn cmd_watch(args: &[String]) -> Result<()> {
     let mut interval = WATCH_INTERVAL_SECS;
     let mut trigger = TRIGGER_PCT;
@@ -2317,7 +2364,7 @@ fn cmd_watch(args: &[String]) -> Result<()> {
                     current,
                     base,
                     outcome.rate_limited,
-                    outcome.max_session_pct,
+                    outcome.max_pct,
                     trigger,
                 );
                 if outcome.rate_limited {
@@ -2325,9 +2372,9 @@ fn cmd_watch(args: &[String]) -> Result<()> {
                 } else if current != prev && current < base {
                     // Log cadence tightening so a user chasing a missed swap can
                     // see the daemon was polling faster on approach.
-                    let max_pct = outcome.max_session_pct.unwrap_or(0.0);
+                    let max_pct = outcome.max_pct.unwrap_or(0.0);
                     logging::log(&format!(
-                        "cadence: {prev}s → {current}s (max session {max_pct:.1}%, \
+                        "cadence: {prev}s → {current}s (max {max_pct:.1}%, \
                          trigger {trigger:.0}%) event=cadence prev={prev}s new={current}s \
                          max_pct={max_pct:.1} trigger={trigger:.0}"
                     ));
@@ -2335,8 +2382,36 @@ fn cmd_watch(args: &[String]) -> Result<()> {
             }
             Err(e) => eprintln!("watch cycle error: {e:#}"),
         }
-        std::thread::sleep(std::time::Duration::from_secs(current));
+        // v0.5.2 item 4: if a Claude account's session/weekly reset falls
+        // within the next `current` seconds, wake right after it (+2s
+        // buffer) instead of riding out the whole cadence window — the next
+        // loop iteration's `watch_cycle` does a full refresh + swap
+        // re-evaluation, not just a display patch, so a stale locked/100%
+        // reading can't survive past its own reset for up to a full cadence
+        // interval. Best-effort: falls back to `current` unchanged on any
+        // load failure or when nothing is imminent.
+        let wake_rows: Vec<Row> = State::load()
+            .map(|s| s.accounts.iter().map(row_from_account).collect())
+            .unwrap_or_default();
+        let sleep_secs = cap_sleep_to_reset_boundary(&wake_rows, Utc::now(), current);
+        std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
     }
+}
+
+/// Peak `Row::max_pct()` (session OR weekly, whichever is tighter) across all
+/// `rows` with data, or `None` if none have any yet — feeds `next_interval`'s
+/// adaptive cadence. v0.5.2 item 3: renamed from folding `session.pct` alone
+/// (`max_session_pct`) to folding `max_pct()`, so a weekly-only approach to
+/// the trigger tightens cadence exactly like a session-only one always did.
+/// Regression case: session=0%, weekly=99%, trigger=95% must fold to
+/// `Some(99.0)` (and thus BACKSTOP cadence), not `Some(0.0)` (BASE cadence).
+fn peak_max_pct(rows: &[Row]) -> Option<f64> {
+    rows.iter()
+        .filter(|r| r.has_data())
+        .fold(None::<f64>, |acc, r| {
+            let p = r.max_pct();
+            Some(acc.map_or(p, |a| a.max(p)))
+        })
 }
 
 /// Threshold band widths for `next_interval`'s adaptive cadence.
@@ -2365,17 +2440,23 @@ const WATCH_BACKSTOP_INTERVAL_SECS: u64 = 10;
 ///      point within ~30s regardless of usage-fetch jitter.
 ///   4. Everyone comfortably below → BASE (whatever `--interval` was set
 ///      to, default WATCH_INTERVAL_SECS = 150s).
+///
+/// `max_pct` (v0.5.2 item 3, renamed from `max_session_pct`) is the peak of
+/// `Row::max_pct()` — i.e. `max(session%, weekly%)` — across all accounts,
+/// NOT session-only. A weekly window pinned at 99% with a healthy session is
+/// just as "about to lock" as the reverse, so folding session alone used to
+/// let a weekly-only approach ride out the full base cadence.
 fn next_interval(
     current: u64,
     base: u64,
     rate_limited: bool,
-    max_session_pct: Option<f64>,
+    max_pct: Option<f64>,
     trigger: f64,
 ) -> u64 {
     if rate_limited {
         return (current.max(base) * 2).min(WATCH_MAX_INTERVAL_SECS);
     }
-    let Some(pct) = max_session_pct else {
+    let Some(pct) = max_pct else {
         return base;
     };
     if pct >= trigger {
@@ -2403,15 +2484,17 @@ fn prune_swap_guard(guard: &mut SwapGuard) {
         .retain(|_, t| t.elapsed().as_secs() < NO_RETURN_SECS);
 }
 
-/// Result of one poll: the swap it made (if any), the rate-limited flag,
-/// and the peak session-% across all accounts this cycle (used by
-/// `next_interval` to tighten the poll cadence on approach to the trigger
-/// threshold — see the user-reported miss where 94% + 150s wait produced
-/// a lock before the next poll).
+/// Result of one poll: the swap it made (if any), the rate-limited flag, and
+/// the peak `Row::max_pct()` (session OR weekly, whichever is tighter) across
+/// all accounts this cycle (used by `next_interval` to tighten the poll
+/// cadence on approach to the trigger threshold — see the user-reported miss
+/// where 94% + 150s wait produced a lock before the next poll). Renamed from
+/// `max_session_pct` (v0.5.2 item 3): folding session alone missed a
+/// weekly-only approach to the trigger.
 pub(crate) struct CycleOutcome {
     pub swapped: Option<(String, String)>,
     pub rate_limited: bool,
-    pub max_session_pct: Option<f64>,
+    pub max_pct: Option<f64>,
 }
 
 /// True if `cand` is a strictly better place to be than the healthy `act`:
@@ -2436,6 +2519,14 @@ fn worth_returning_to(cand: &Row, act: &Row) -> bool {
 /// healthy, but a better account has since freed up (e.g. its 5h session reset),
 /// so flip back to it. The proactive path additionally requires the candidate to
 /// be `worth_returning_to` the active account, so we don't swap sideways.
+///
+/// `watch_cycle` itself calls `evaluate_swap` directly (v0.5.2 item 6 needs
+/// the extra cooldown/no-eligible-target detail for its structured decision
+/// logging); this thin `.target`-only wrapper survives purely because the
+/// existing test suite calls it by this name — `#[cfg(test)]` rather than
+/// deleting it keeps that coverage without carrying dead code into release
+/// builds.
+#[cfg(test)]
 fn choose_swap_target(
     rows: &[Row],
     active: &str,
@@ -2443,22 +2534,53 @@ fn choose_swap_target(
     ceiling: f64,
     guard: &SwapGuard,
 ) -> Option<String> {
-    let act = rows.iter().find(|r| r.email == active)?;
+    evaluate_swap(rows, active, trigger, ceiling, guard).target
+}
+
+/// Extended swap-target inspection shared by `choose_swap_target` (the actual
+/// decision consulted for swapping) and `watch_cycle`'s structured
+/// `event=swap_decision` logging (v0.5.2 item 6) — the two must agree on what
+/// "would swap if not for cooldown" means, so a "blocked" log line names the
+/// SAME target `choose_swap_target` would have picked once the cooldown
+/// clears.
+struct SwapEval {
+    /// The account to switch to right now, if any (cooldown/no-return/
+    /// eligibility have all already been consulted).
+    target: Option<String>,
+    /// True if an active cooldown window is the ONLY reason `target` is
+    /// `None` — i.e. ignoring cooldown, there IS an eligible + genuinely
+    /// better candidate (`target_ignoring_cooldown`).
+    blocked_by_cooldown: bool,
+    /// The best eligible candidate ignoring the cooldown gate, whether or not
+    /// cooldown ends up blocking it. `None` when there's no eligible
+    /// candidate at all (or the active account isn't in trouble and no
+    /// candidate is `worth_returning_to` it).
+    target_ignoring_cooldown: Option<String>,
+}
+
+fn evaluate_swap(
+    rows: &[Row],
+    active: &str,
+    trigger: f64,
+    ceiling: f64,
+    guard: &SwapGuard,
+) -> SwapEval {
+    let none = SwapEval {
+        target: None,
+        blocked_by_cooldown: false,
+        target_ignoring_cooldown: None,
+    };
+    let Some(act) = rows.iter().find(|r| r.email == active) else {
+        return none;
+    };
     if !act.has_data() {
-        return None;
+        return none;
     }
     // If the active account's provider has its env-override active, the CLI
     // ignores whatever token we install into the keychain — swapping is a
     // no-op. Bail before we churn the state file.
     if env_override_active(&act.provider_id) {
-        return None;
-    }
-    if guard
-        .last_swap
-        .map(|t| t.elapsed().as_secs() < SWAP_COOLDOWN_SECS)
-        .unwrap_or(false)
-    {
-        return None;
+        return none;
     }
     let mut candidates: Vec<&Row> = rows
         .iter()
@@ -2485,16 +2607,31 @@ fn choose_swap_target(
         })
         .collect();
     if candidates.is_empty() {
-        return None;
+        return none;
     }
     candidates.sort_by(|a, b| candidate_order(a, b));
     let best = candidates[0];
     // Active in trouble → move to the best candidate. Active still healthy →
     // only move if the best candidate is genuinely a better place to be.
-    if act.max_pct() >= trigger || worth_returning_to(best, act) {
-        Some(best.email.clone())
+    if !(act.max_pct() >= trigger || worth_returning_to(best, act)) {
+        return none;
+    }
+    let cooldown_active = guard
+        .last_swap
+        .map(|t| t.elapsed().as_secs() < SWAP_COOLDOWN_SECS)
+        .unwrap_or(false);
+    if cooldown_active {
+        SwapEval {
+            target: None,
+            blocked_by_cooldown: true,
+            target_ignoring_cooldown: Some(best.email.clone()),
+        }
     } else {
-        None
+        SwapEval {
+            target: Some(best.email.clone()),
+            blocked_by_cooldown: false,
+            target_ignoring_cooldown: Some(best.email.clone()),
+        }
     }
 }
 
@@ -2528,42 +2665,51 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
         return Ok(CycleOutcome {
             swapped: None,
             rate_limited: refresh.rate_limited,
-            max_session_pct: None,
+            max_pct: None,
         });
     }
     let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
-    // Peak session-% across all accounts (ignoring rows with no data yet)
-    // — used by `next_interval` to tighten cadence on approach to trigger.
-    let max_session_pct = rows
-        .iter()
-        .filter_map(|r| r.session.pct)
-        .fold(None::<f64>, |acc, p| Some(acc.map_or(p, |a| a.max(p))));
+    let max_pct = peak_max_pct(&rows);
     append_history(&rows, state.active.as_deref());
 
     let active = state.active.clone();
     let mut swapped = None;
 
     if let Some(active_email) = active.clone() {
-        match choose_swap_target(&rows, &active_email, trigger, ceiling, guard) {
+        let eval = evaluate_swap(&rows, &active_email, trigger, ceiling, guard);
+        // v0.5.2 item 6: structured decision logging (+ a "stayed" notification)
+        // fires every cycle the active account is at/above trigger, regardless
+        // of what happens next — a swap, a cooldown-blocked would-be swap, or
+        // genuinely nothing eligible.
+        let act_row = rows.iter().find(|r| r.email == active_email);
+        let act_over = act_row
+            .map(|r| r.has_data() && r.max_pct() >= trigger)
+            .unwrap_or(false);
+        let active_pct = act_row.map(|r| r.max_pct()).unwrap_or(0.0);
+
+        match eval.target {
             Some(target) => {
                 let target_row = rows
                     .iter()
                     .find(|r| r.email == target)
-                    .expect("choose_swap_target returned an email absent from `rows`");
+                    .expect("evaluate_swap returned an email absent from `rows`");
                 let (pick_s, pick_w) = (
                     target_row.session.pct.unwrap_or(0.0),
                     target_row.weekly.pct.unwrap_or(0.0),
                 );
                 // Proactive flip-back if the account we're leaving wasn't itself
                 // over the trigger — a better account simply freed up.
-                let proactive = rows
-                    .iter()
-                    .find(|r| r.email == active_email)
-                    .map(|r| r.max_pct() < trigger)
-                    .unwrap_or(false);
-                // Resolve the target row's provider. `choose_swap_target`
-                // already filtered on `provider_supports_swap`, so this must
-                // succeed for any row it returned; a mismatch is a bug.
+                let proactive = !act_over;
+                if act_over {
+                    logging::log(&format!(
+                        "event=swap_decision active={active_email} active_pct={active_pct:.0}% \
+                         target={target} target_pct={:.0}% action=switching",
+                        target_row.max_pct()
+                    ));
+                }
+                // Resolve the target row's provider. `evaluate_swap` already
+                // filtered on `provider_supports_swap`, so this must succeed
+                // for any row it returned; a mismatch is a bug.
                 let target_provider = match provider_by_slug(&target_row.provider_id) {
                     Ok(p) => p,
                     Err(e) => {
@@ -2573,19 +2719,19 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                         return Ok(CycleOutcome {
                             swapped: None,
                             rate_limited: refresh.rate_limited,
-                            max_session_pct,
+                            max_pct,
                         });
                     }
                 };
                 // Compare-and-set on the active account: if a manual switch landed
-                // since choose_swap_target read the snapshot, skip this swap.
+                // since evaluate_swap read the snapshot, skip this swap.
                 let Some(label) =
                     switch_to_if_still_active(target_provider, &target, &active_email)?
                 else {
                     return Ok(CycleOutcome {
                         swapped: None,
                         rate_limited: refresh.rate_limited,
-                        max_session_pct,
+                        max_pct,
                     });
                 };
                 guard
@@ -2612,29 +2758,40 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                 swapped = Some((active_email, target));
             }
             None => {
-                // If the active account is over trigger but nothing is eligible,
-                // notify once that we're stuck.
-                let act_over = rows
-                    .iter()
-                    .find(|r| r.email == active_email)
-                    .map(|r| r.has_data() && r.max_pct() >= trigger)
-                    .unwrap_or(false);
-                if act_over && !guard.stuck_notified {
-                    // Pick the soonest reset by TIMESTAMP, then humanize — taking
-                    // min() of humanized strings sorts lexicographically ("3d 12h"
-                    // < "3d 9h"), which is not chronological.
-                    let soonest = rows
-                        .iter()
-                        .filter(|r| r.has_data())
-                        .filter_map(|r| r.weekly.resets_at)
-                        .min()
-                        .map(humanize_until)
-                        .unwrap_or_else(|| "unknown".to_string());
-                    notify(&format!(
-                        "All accounts high — staying on {active_email}, soonest reset in {soonest}"
-                    ));
-                    guard.stuck_notified = true;
-                } else if !act_over {
+                if act_over {
+                    if eval.blocked_by_cooldown {
+                        if let Some(target) = &eval.target_ignoring_cooldown {
+                            logging::log(&format!(
+                                "event=swap_decision active={active_email} \
+                                 active_pct={active_pct:.0}% target={target} action=blocked \
+                                 reason=cooldown"
+                            ));
+                        }
+                    } else {
+                        logging::log(&format!(
+                            "event=swap_decision active={active_email} action=stayed \
+                             reason=no_eligible_target"
+                        ));
+                        if !guard.stuck_notified {
+                            // Pick the soonest reset by TIMESTAMP, then humanize —
+                            // taking min() of humanized strings sorts
+                            // lexicographically ("3d 12h" < "3d 9h"), which is not
+                            // chronological.
+                            let soonest = rows
+                                .iter()
+                                .filter(|r| r.has_data())
+                                .filter_map(|r| r.weekly.resets_at)
+                                .min()
+                                .map(humanize_until)
+                                .unwrap_or_else(|| "unknown".to_string());
+                            notify(&format!(
+                                "staying on {active_email} — no better target available \
+                                 (soonest reset in {soonest})"
+                            ));
+                            guard.stuck_notified = true;
+                        }
+                    }
+                } else {
                     guard.stuck_notified = false;
                 }
             }
@@ -2644,7 +2801,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
     Ok(CycleOutcome {
         swapped,
         rate_limited: refresh.rate_limited,
-        max_session_pct,
+        max_pct,
     })
 }
 
