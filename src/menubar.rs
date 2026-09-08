@@ -12,6 +12,7 @@
 //! shows, with one row per REGISTERED provider (installed or not).
 
 use anyhow::Result;
+#[cfg(target_os = "macos")]
 use std::cell::RefCell;
 use std::time::Duration;
 
@@ -169,6 +170,7 @@ fn severity_with(p: Option<f64>, bands: SeverityBands) -> Option<Severity> {
 /// `attributedTitle` on the rows named here. Offsets are **UTF-16 code units**
 /// (what `NSRange` uses); all our runs are ASCII so char == utf16 in practice,
 /// but the helpers stay correct if an email ever isn't.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct RowStyle {
     /// The exact plain title set on the item; used to find it in the menu.
     plain: String,
@@ -364,6 +366,7 @@ fn quit_row_plain() -> String {
     format!("Quit\tusagio v{}", env!("CARGO_PKG_VERSION"))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
     let mut styles = Vec::new();
     // v0.5.0: the top "resets in X" header rows are gone (item 1 of the menu
@@ -568,6 +571,7 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
 }
 
 /// Outcome of attempting a launchd-driven restart.
+#[cfg_attr(not(unix), allow(dead_code))]
 enum LaunchdRestart {
     /// kickstart succeeded — the caller should wait to be replaced.
     Issued,
@@ -1715,6 +1719,7 @@ fn title_for(snap: &Snapshot) -> String {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn tooltip_for(snap: &Snapshot) -> String {
     match active_account(snap) {
         // Preserve the v1 tooltip format verbatim: `email — session X, weekly Y`.
