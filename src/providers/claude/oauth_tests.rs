@@ -67,6 +67,40 @@ fn refresh_error_display_carries_variant() {
     assert!(s.contains("boom"));
 }
 
+/// robustness-01: a server that accepts the TCP connection but never writes a
+/// response must not hang the caller forever. Before the shared
+/// `http_agent()` (with `.timeout_read()` set) existed, the default
+/// `ureq::Agent` only bounded the TCP *connect*, so this exact scenario
+/// (connection accepted, response withheld) would block indefinitely.
+#[test]
+fn post_token_read_timeout_fails_fast_not_forever() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stalling server");
+    let addr = listener.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        // Accept the connection and hold it open well past the client's read
+        // timeout without ever writing a response byte.
+        if let Ok((stream, _)) = listener.accept() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            drop(stream);
+        }
+    });
+    let url = format!("http://{addr}/oauth/token");
+    set_token_url_override(Some(&url));
+    let start = std::time::Instant::now();
+    let mut a = acct_expiring_at(0);
+    let err = refresh(&mut a).expect_err("stalled server must not succeed");
+    let elapsed = start.elapsed();
+    set_token_url_override(None);
+    assert!(
+        matches!(err, RefreshError::Transient(_)),
+        "expected a transient (timeout) error, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "expected the read timeout to fire well under 20s, took {elapsed:?}"
+    );
+}
+
 #[test]
 fn token_response_allows_missing_refresh_token() {
     // RFC 6749 §6: refresh_token is OPTIONAL in a refresh-grant response.

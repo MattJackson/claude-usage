@@ -461,3 +461,37 @@ fn apply_grant_to_blob_preserves_unrelated_fields_and_updates_id_token() {
     assert_eq!(v["tokens"]["account_id"], "acc-1");
     assert!(v["last_refresh"].as_str().is_some());
 }
+
+/// robustness-01: a server that accepts the TCP connection but never writes a
+/// response must not hang the caller forever. Before the shared
+/// `http_agent()` (with `.timeout_read()` set) existed, the default
+/// `ureq::Agent` only bounded the TCP *connect*, so this exact scenario
+/// (connection accepted, response withheld) would block indefinitely.
+#[test]
+fn refresh_token_grant_read_timeout_fails_fast_not_forever() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalling server");
+    let addr = listener.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        // Accept the connection and hold it open well past the client's read
+        // timeout without ever writing a response byte — the connection is
+        // live, the server just never answers.
+        if let Ok((stream, _)) = listener.accept() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            drop(stream);
+        }
+    });
+    let url = format!("http://{addr}/oauth/token");
+    crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
+        let start = std::time::Instant::now();
+        let err = refresh_token_grant("rt").expect_err("stalled server must not succeed");
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(err, RefreshError::Transient(_)),
+            "expected a transient (timeout) error, got {err:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "expected the read timeout to fire well under 20s, took {elapsed:?}"
+        );
+    });
+}

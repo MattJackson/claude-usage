@@ -176,7 +176,8 @@ pub fn refresh_token_grant(refresh_token: &str) -> Result<CodexRefreshGrant, Ref
         grant_type: "refresh_token",
         refresh_token,
     };
-    let resp = ureq::post(&token_url())
+    let resp = super::http_agent()
+        .post(&token_url())
         .set("Content-Type", "application/json")
         .send_json(
             serde_json::to_value(&body).map_err(|e| RefreshError::Transient(e.to_string()))?,
