@@ -7,7 +7,7 @@
 //! Renamed from `claude-usage` in v0.4.0. Config dir, launchd label, and
 //! Login Items entry migrate transparently on first run; the macOS Keychain
 //! service string is intentionally frozen at "claude-usage" to preserve
-//! existing tokens (see `providers/state.rs`).
+//! existing tokens (see `providers/claude/mod.rs`).
 
 mod burn_rate;
 mod context_ledger;
@@ -316,29 +316,50 @@ fn cmd_capture() -> Result<()> {
 
 /// Capture the account currently in the keychain, keyed by its email. Returns
 /// (email, existed_already). Shared by the CLI and the menu bar.
+///
+/// Delegates identity resolution (email lookup + `~/.claude.json` snapshot)
+/// to `providers::claude`'s `Provider::capture_current_login` — the same
+/// logic every other provider's capture path (`capture_current_generic`)
+/// already dispatches through — instead of re-deriving it inline (v0.5.2
+/// simplification-02). Persistence still targets `state.accounts` (the
+/// dedicated Claude bucket, epoch-MILLIS `expires_at`) rather than
+/// `state.providers["claude"]` (the generic v2 slot, epoch-SECONDS
+/// `expires_at`): those are different on-disk shapes, and Claude's rows are
+/// read from `state.accounts` everywhere else (`build_snapshot`, `switch_to`,
+/// `remove_account`, …), so routing storage through
+/// `capture_current_generic` as well would silently split a Claude account
+/// across two incompatible buckets.
 pub(crate) fn capture_current() -> Result<(String, bool)> {
-    let blob = keychain_read()
-        .context("no claude.ai login found in the keychain — run `claude` and /login first")?;
-    let mut acct = Account::from_keychain_blob(&blob)?;
-    // Snapshot the account identity Claude stores in ~/.claude.json, so a later
-    // switch can restore it (the keychain token alone doesn't set the account).
-    let (oauth_account, user_id) = read_claude_identity();
-    // Resolve the email (the identity key): prefer the profile API, fall back to
-    // the identity object we just read from ~/.claude.json.
-    let email = usage::fetch_email(&acct.access_token)
-        .or_else(|| {
-            oauth_account
-                .as_ref()
-                .and_then(|o| o.get("emailAddress"))
-                .and_then(|x| x.as_str())
-                .map(String::from)
-        })
-        .context(
-            "could not determine this account's email (offline?) — connect and try `capture` again",
-        )?;
+    let provider = provider_by_slug(CLAUDE_SLUG)?;
+    let captured = provider
+        .capture_current_login()
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow!("no claude.ai login found in the keychain — run `claude` and /login first")
+        })?;
+    // `Account::from_keychain_blob` parses `expires_at` (epoch millis) out of
+    // the verbatim blob exactly as before — reusing it here keeps this an
+    // identity-resolution dedup, not a token-parsing rewrite.
+    let mut acct = Account::from_keychain_blob(&captured.secret_blob)?;
+    let email = captured.identity.email.clone().context(
+        "could not determine this account's email (offline?) — connect and try `capture` again",
+    )?;
     acct.email = Some(email.clone());
-    acct.oauth_account = oauth_account;
-    acct.user_id = user_id;
+    // `capture_current_login` packs both fields into one native_blob (see its
+    // doc comment in `providers/claude/mod.rs`); unpack them back into
+    // `Account`'s dedicated fields.
+    acct.oauth_account = captured
+        .identity
+        .native_blob
+        .get("oauthAccount")
+        .cloned()
+        .filter(|v| !v.is_null());
+    acct.user_id = captured
+        .identity
+        .native_blob
+        .get("userID")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     let (at_prefix, rt_prefix, expires_at) = (
         logging::tok_prefix(&acct.access_token),
@@ -2233,10 +2254,17 @@ fn refresh_usage_cache() -> RefreshOutcome {
                     acct.refresh_token.clone(),
                     acct.expires_at,
                 );
-                // Propagate the flag from the phase-1 snapshot to the locked
-                // state. `set_tokens_if_newer` only writes on a real refresh,
-                // so we mirror this bit explicitly here.
-                a.needs_relogin = acct.needs_relogin;
+                // Propagate the flag from the phase-1/2 snapshot to the
+                // locked state. `set_tokens_if_newer` only writes on a real
+                // refresh, so we mirror this bit explicitly here — but only
+                // ever OR it in. A plain overwrite (`a.needs_relogin =
+                // acct.needs_relogin`) could silently clobber `true` back to
+                // `false` if a concurrent path (switch, capture,
+                // `flag_needs_relogin`) set the flag on the locked state
+                // between our phase-1 snapshot and this merge (errors-01,
+                // v0.5.2 codeaudit) — a re-login that genuinely IS needed
+                // would stop being shown.
+                a.needs_relogin = a.needs_relogin || acct.needs_relogin;
                 if let Some(cu) = cu {
                     a.cached_usage = Some(cu.clone());
                 }
@@ -3123,6 +3151,13 @@ fn cmd_install() -> Result<()> {
     // menu bar. Best-effort — a failed unload (e.g. label not loaded)
     // is fine; only the file-remove failure is worth surfacing.
     migrate_launchd_if_needed();
+    // Also purge any legacy System Events login item (contract-01, v0.5.2
+    // codeaudit). `MacOsAutostart::uninstall` already does this, but a
+    // `brew upgrade` user who installed under a pre-v0.4.3 build and never
+    // ran `usagio uninstall` keeps that stale entry forever — `install`
+    // itself must clean it up too, since it's the path every upgrade
+    // actually runs through.
+    purge_legacy_login_items();
 
     let exe = launch_agent_exe_path();
     platform()
@@ -3222,6 +3257,42 @@ fn migrate_launchd_if_needed() {
                 e
             );
         }
+    }
+}
+
+/// Purge any legacy System Events login item a pre-v0.4.3 usagio (or its
+/// `claude-usage` predecessor) registered via the now-removed "Launch at
+/// login" menu toggle (contract-01, v0.5.2 codeaudit). Left in place, macOS
+/// re-launches the stale binary at every login even after the launchd plist
+/// is gone/never installed. `MacOsAutostart::uninstall`
+/// (`src/platform/macos.rs`) already runs this exact purge on `usagio
+/// uninstall`; this is a `main.rs`-local copy so `cmd_install` can run it too
+/// without editing `src/platform/**` (out of scope for this pass — a later
+/// pass should hoist both call sites onto one shared helper there instead of
+/// keeping this duplicate in sync by hand).
+///
+/// Best-effort everywhere it's called from (`cmd_install`, which today only
+/// runs meaningfully on macOS — `platform().autostart()` is the thing that's
+/// actually OS-gated, via the `Platform` trait in `src/platform/`). No
+/// `#[cfg(target_os)]` here on purpose: `tests/strict_cfg.rs` restricts that
+/// attribute to `src/platform/*`, and spawning a nonexistent `timeout`/
+/// `osascript` binary on a non-macOS host is already a silent, swallowed
+/// `Err` — `Command::spawn`'s ordinary "not found" failure mode — so the
+/// unconditional call is a no-op there without needing an explicit gate.
+/// Also a no-op if the login item is already absent on macOS — `osascript`
+/// exiting non-zero in that case is the expected, swallowed outcome.
+fn purge_legacy_login_items() {
+    for name in ["usagio", "claude-usage"] {
+        let _ = std::process::Command::new("timeout")
+            .args([
+                "3",
+                "osascript",
+                "-e",
+                &format!("tell application \"System Events\" to delete login item \"{name}\""),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 }
 
