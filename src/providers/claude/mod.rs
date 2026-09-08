@@ -1030,12 +1030,20 @@ mod tests {
             // would deadlock, per that helper's own non-reentrancy doc.
             let ba = blob_a.clone();
             let bb = blob_b.clone();
+            // HOME_OVERRIDE is thread-local; the ScopedConfigDir on the test
+            // thread doesn't propagate to spawned workers, so `config_dir()`'s
+            // tripwire (via `mirror_rotated_token` → `logging::log`) would
+            // panic there. Install the same override on each worker up-front.
+            let home_for_t1 = dir.clone();
+            let home_for_t2 = dir.clone();
             let t1 = std::thread::spawn(move || {
+                crate::store::set_home_override(Some(home_for_t1));
                 for _ in 0..20 {
                     let _ = ClaudeProvider.mirror_rotated_token(&ba);
                 }
             });
             let t2 = std::thread::spawn(move || {
+                crate::store::set_home_override(Some(home_for_t2));
                 for _ in 0..20 {
                     let _ = ClaudeProvider.mirror_rotated_token(&bb);
                 }
