@@ -658,8 +658,16 @@ fn fsnotify_watcher_supervisor_recovers_from_panic_and_keeps_processing() {
 
         // Second event: proves the thread is still alive and listening —
         // credential_paths() is called again (call #1, which doesn't panic).
+        // Poll rather than a fixed sleep — macOS CI runners are slower than
+        // the developer laptop this was tuned against and a bare 300ms sleep
+        // false-negatives frequently.
         tx.send(notify::Event::default()).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while prov.calls.load(std::sync::atomic::Ordering::SeqCst) < 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert_eq!(
             prov.calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
