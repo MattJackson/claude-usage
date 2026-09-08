@@ -79,6 +79,16 @@ pub(crate) struct ProviderSection {
     provider_id: &'static str,
     display_name: &'static str,
     supports_switching: bool,
+    /// Gates the "Launch client" row (H3, v0.5.0 codeaudit). Independent of
+    /// `supports_switching` — a provider can have one wired without the
+    /// other; the row must not appear (and error on click) for a provider
+    /// whose `launch_client` is still the `Unsupported` trait default.
+    supports_launch: bool,
+    /// Gates the "Remove…" row (H3, v0.5.0 codeaudit). Defaults `true` for
+    /// every current provider — removing a captured account is a generic
+    /// state.json operation — but stays explicit so a provider needing extra
+    /// cleanup can opt out until that's wired.
+    supports_remove: bool,
     supports_usage: bool,
     severity_bands: SeverityBands,
     /// True when the provider's OAuth env-override is set on this process's
@@ -290,7 +300,12 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
     let label = format!("{provider_display:<PROVIDER_COL$}{}", a.display);
     let base = u16len(&label) + 1; // + '\t'
     if let Some((cd, _win)) = locked_countdown_for(a, now_utc()) {
-        let trailing = format!("locked · {cd}");
+        // UX (v0.5.0): drop the "locked · " prefix — the trailing run is
+        // rendered in red (visually implying locked) and the payload is a
+        // time-until-reset instead of a percentage (structurally implying
+        // locked, since a healthy row shows "S n%  W n%"). The old
+        // "locked · Xh Ym" wording repeated the same fact three ways.
+        let trailing = cd.clone();
         let plain = format!("{label}\t{trailing}");
         // A "locked" account is by definition red — no need to consult bands.
         let colors = vec![(base, u16len(&trailing), Severity::Red)];
@@ -463,10 +478,17 @@ fn poll_loop() {
         // Fetch usage + auto-swap; this writes cached usage to state.json, which
         // the main-thread timer reads back to render. This is the ONLY thing that
         // hits the network, so ordinary use can never rate-limit.
-        let rate_limited = run_cycle(&mut guard);
-        current = next_interval(current, base, rate_limited);
+        let (rate_limited, max_session_pct, trigger) = run_cycle(&mut guard);
+        let prev = current;
+        current = next_interval(current, base, rate_limited, max_session_pct, trigger);
         if rate_limited {
             crate::logging::log(&format!("rate limited; backing off to {current}s"));
+        } else if current != prev && current < base {
+            crate::logging::log(&format!(
+                "cadence: {prev}s → {current}s (max session {:.1}%, trigger {:.0}%)",
+                max_session_pct.unwrap_or(0.0),
+                trigger
+            ));
         }
         std::thread::sleep(Duration::from_secs(current));
     }
@@ -568,17 +590,22 @@ fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
 }
 
 /// Run one poll+auto-swap cycle; returns whether it was rate limited.
-fn run_cycle(guard: &mut SwapGuard) -> bool {
+/// Runs one poll cycle and returns `(rate_limited, max_session_pct, trigger)`
+/// so the caller's adaptive-cadence math has everything it needs. The
+/// menubar poller uses the trigger the user actually configured (via
+/// `Settings ▸ Auto-swap threshold`), matching what `watch_cycle` itself
+/// dispatched on.
+fn run_cycle(guard: &mut SwapGuard) -> (bool, Option<f64>, f64) {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
     match watch_cycle(trigger, TARGET_CEILING_PCT, guard) {
-        Ok(o) => o.rate_limited,
+        Ok(o) => (o.rate_limited, o.max_session_pct, trigger),
         Err(e) => {
             crate::logging::log(&format!("menubar poll failed: {e}"));
-            false
+            (false, None, trigger)
         }
     }
 }
@@ -706,6 +733,8 @@ fn build_snapshot() -> Snapshot {
             provider_id: slug,
             display_name: provider.display_name(),
             supports_switching: caps.supports_switching,
+            supports_launch: caps.supports_launch,
+            supports_remove: caps.supports_remove,
             supports_usage: caps.supports_usage,
             severity_bands: provider.severity_bands(),
             env_override_active: env_override_for(slug),
@@ -1133,6 +1162,32 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     rows
 }
 
+/// Which optional rows `build_account_submenu` should append for `sec`'s
+/// account `a`. Pure over `ProviderSection`/`AcctView` fields, with no
+/// `muda`/`tray_icon` types involved, so this decision is unit-testable
+/// without a live main-thread `NSApplication` (a bare `muda::Menu` can only
+/// be constructed on the main thread, which `cargo test`'s worker threads
+/// aren't). H3, v0.5.0 codeaudit: `supports_switching` used to be the only
+/// gate consulted, for BOTH the Switch and Launch rows, and Remove had no
+/// gate at all.
+#[derive(Debug, PartialEq, Eq)]
+struct AccountSubmenuRows {
+    /// `Some(true)` → render "✓ Active" (this account is the active one).
+    /// `Some(false)` → render a clickable "Switch to this account" row.
+    /// `None` → the provider doesn't support switching; render neither.
+    switch_row: Option<bool>,
+    launch_row: bool,
+    remove_row: bool,
+}
+
+fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRows {
+    AccountSubmenuRows {
+        switch_row: sec.supports_switching.then_some(a.active),
+        launch_row: sec.supports_launch,
+        remove_row: sec.supports_remove,
+    }
+}
+
 /// Build one account's submenu inside a provider section. Splits Switch /
 /// reset-info / Launch / Remove; the pieces vary by capability so a
 /// reporting-only provider drops the Switch item and a no-usage provider
@@ -1140,10 +1195,12 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
 fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
     let head = main_row(sec.display_name, a, sec.severity_bands).plain;
     let sub = Submenu::with_id(format!("sub:{}:{}", sec.provider_id, a.key), head, true);
-    if sec.supports_switching {
-        if a.active {
+    let rows = account_submenu_rows(sec, a);
+    match rows.switch_row {
+        Some(true) => {
             let _ = sub.append(&MenuItem::with_id("noop", "✓ Active", false, None));
-        } else {
+        }
+        Some(false) => {
             let _ = sub.append(&MenuItem::with_id(
                 format!("switch:{}:{}", sec.provider_id, a.key),
                 "Switch to this account",
@@ -1151,6 +1208,7 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
                 None,
             ));
         }
+        None => {}
     }
     let _ = sub.append(&PredefinedMenuItem::separator());
     // v0.5.0 (item 3): these rows are informational, not disabled — enabled:
@@ -1201,11 +1259,14 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
         ));
     }
     let _ = sub.append(&PredefinedMenuItem::separator());
-    // "Launch" only exposed for providers that both switch and know how to
-    // spawn their client. The trait's default `launch_client` returns
-    // `Unsupported`, so a click on this for a stub provider surfaces a
-    // real error rather than doing nothing.
-    if sec.supports_switching {
+    // "Launch" is gated on `supports_launch`, NOT `supports_switching` (H3,
+    // v0.5.0 codeaudit): the two are independent — a provider can have
+    // `write_active_account` wired (switching) without `launch_client` wired
+    // (spawning the vendor CLI), and vice versa. Building this row off
+    // `supports_switching` used to expose a "Launch client" row for any
+    // switching-capable provider even when its `launch_client` was still the
+    // `Unsupported` trait default, so every click errored.
+    if rows.launch_row {
         let _ = sub.append(&MenuItem::with_id(
             format!("launch:{}:{}", sec.provider_id, a.key),
             "Launch client",
@@ -1213,12 +1274,20 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
             None,
         ));
     }
-    let _ = sub.append(&MenuItem::with_id(
-        format!("remove:{}:{}", sec.provider_id, a.key),
-        "Remove…",
-        true,
-        None,
-    ));
+    // "Remove…" is gated on `supports_remove` (H3, v0.5.0 codeaudit): the
+    // row used to be built unconditionally regardless of what the provider
+    // actually supports. Every current provider sets `supports_remove:
+    // true`, so this is not a behavior change today, but it stops a future
+    // provider that needs `supports_remove: false` from getting a row that
+    // silently does nothing useful.
+    if rows.remove_row {
+        let _ = sub.append(&MenuItem::with_id(
+            format!("remove:{}:{}", sec.provider_id, a.key),
+            "Remove…",
+            true,
+            None,
+        ));
+    }
     let _ = menu.append(&sub);
 }
 
@@ -1638,8 +1707,9 @@ fn handle_click(id: &str) {
 // Settings ▸ Advanced ▸ Backups ▸ handlers (native Save…/Restore… panels)
 // ---------------------------------------------------------------------------
 
-/// "Save…" click: opens a native SAVE panel (`rfd::FileDialog::save_file`)
-/// defaulting to `~/Downloads/usagio-state-{timestamp}.json`, then writes a
+/// "Save…" click: opens a native SAVE panel (via
+/// `Platform::file_dialog().save_file(...)`) defaulting to
+/// `~/Downloads/usagio-state-{timestamp}.json`, then writes a
 /// REDACTED (token-free) dump of the current state to the chosen path with
 /// mode 0600. This is a portable diagnostics/config snapshot — the same
 /// shape `redact_state_for_dump` already produces for the "REFUSED save"
@@ -1648,15 +1718,19 @@ fn handle_click(id: &str) {
 /// real `state.json` save; see `write_rolling_backup`) are what "Restore…"
 /// below defaults its file panel to.
 fn handle_backup_save() {
+    handle_backup_save_with(crate::platform().file_dialog());
+}
+
+/// Testable core of the Save… click: takes the `FileDialog` as a parameter
+/// so `#[cfg(test)]` can pass a `platform::MockFileDialog` instead of
+/// popping a real native panel. See `platform::Platform::file_dialog`.
+fn handle_backup_save_with(dialog: &dyn crate::platform::FileDialog) {
     let default_name = format!(
         "usagio-state-{}.json",
         chrono::Utc::now().format("%Y%m%d-%H%M%S")
     );
-    let mut dialog = rfd::FileDialog::new().set_file_name(&default_name);
-    if let Some(dir) = dirs::download_dir() {
-        dialog = dialog.set_directory(dir);
-    }
-    let Some(path) = dialog.save_file() else {
+    let default_dir = dirs::download_dir();
+    let Some(path) = dialog.save_file(&default_name, default_dir.as_deref()) else {
         return; // user cancelled
     };
     let st = match State::load() {
@@ -1681,25 +1755,49 @@ fn handle_backup_save() {
     notify(&format!("Saved to {}", path.display()));
 }
 
-/// "Restore…" click: opens a native OPEN panel (`rfd::FileDialog::pick_file`)
-/// defaulting to the automatic rolling-backups directory, validates the
-/// chosen file is state-shaped, warns before a restore would drop accounts
-/// (a "downgrade"), then atomically replaces `state.json`. The rolling
-/// backups already snapshot the pre-restore state on every ordinary save, but
-/// we ALSO stash the live file to a `/tmp` sidecar right before overwriting
-/// it, so the restore itself is reversible even if the user picked a very old
-/// backup.
+/// "Restore…" click: opens a native OPEN panel (via
+/// `Platform::file_dialog().pick_file(...)`) defaulting to the automatic
+/// rolling-backups directory, validates the chosen file is state-shaped,
+/// warns — by NAME, not just count — before a restore would drop accounts,
+/// then replaces `state.json` through the same `save_state_safe`
+/// drop-protection every other write goes through. The rolling backups
+/// already snapshot the pre-restore state on every ordinary save, but we
+/// ALSO stash the live file to `<config_dir>/backups/` right before
+/// overwriting it, so the restore itself is reversible even if the user
+/// picked a very old backup.
+///
+/// H2 (v0.5.0 codeaudit): this used to (1) stash the live state — full OAuth
+/// tokens, non-redacted — to a `/tmp` sidecar, a world-writable shared
+/// directory, and (2) bypass `save_state_safe`'s drop-protection guard and
+/// the cross-process state lock entirely, gating the write on nothing but an
+/// account *count* comparison (same-count-different-accounts sailed through
+/// with zero confirmation). Both are fixed here: the stash moves under
+/// `config_dir()/backups/` (owner-only permissions), and the whole
+/// read-confirm-write sequence runs under `with_state_lock` with the actual
+/// write routed through `store::save_state_restore` (a thin, explicitly-
+/// authorized wrapper around `save_state_safe`). Note: the M2 concern
+/// (`State::load()` failure silently becoming "0 accounts") is subsumed by
+/// this restructure — `accounts_dropped_by(&new_state)?` bubbles the load
+/// error up out of `with_state_lock`, and the `Err(e) => notify(...)` arm
+/// below surfaces it, so the drop-warning path can't be silently skipped.
 fn handle_backup_restore_dialog() {
-    let mut dialog = rfd::FileDialog::new().add_filter("usagio state (*.json)", &["json"]);
+    handle_backup_restore_dialog_with(crate::platform().file_dialog());
+}
+
+/// Testable core of the Restore… click: takes the `FileDialog` as a
+/// parameter so `#[cfg(test)]` can pass a `platform::MockFileDialog` instead
+/// of popping a real native panel. See `platform::Platform::file_dialog`.
+fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
+    let mut default_dir = None;
     if let Ok(p) = crate::store::state_json_path() {
         let backups_dir = p.parent().map(|d| d.join("backups"));
         if let Some(dir) = backups_dir {
             if dir.is_dir() {
-                dialog = dialog.set_directory(&dir);
+                default_dir = Some(dir);
             }
         }
     }
-    let Some(path) = dialog.pick_file() else {
+    let Some(path) = dialog.pick_file(default_dir.as_deref()) else {
         return; // user cancelled
     };
     let bytes = match std::fs::read(&path) {
@@ -1716,63 +1814,83 @@ fn handle_backup_restore_dialog() {
             return;
         }
     };
-    let Some(new_accounts) = value.get("accounts").and_then(|a| a.as_array()) else {
+    if value.get("accounts").is_none() {
         notify("Restore failed: not a usagio state file (missing 'accounts')");
         return;
-    };
-    let new_count = new_accounts.len();
-    let old_count = State::load().unwrap_or_default().accounts.len();
-    if new_count < old_count {
-        let question = format!(
-            "Selected file has {new_count} account(s); current state has {old_count}. \
-             Restoring will drop {} account(s). Continue?",
-            old_count - new_count
-        );
-        if !confirm(&question) {
-            return;
+    }
+    let new_state = State::from_value(&value);
+
+    let outcome = with_state_lock(|| -> Result<bool> {
+        let dropped = crate::store::accounts_dropped_by(&new_state)?;
+        if !dropped.is_empty() && !confirm(&restore_drop_confirmation(&dropped)) {
+            return Ok(false); // user declined; not an error
         }
+        let dir = crate::store::config_dir()?;
+        crate::store::stash_pre_restore(&dir)?;
+        crate::store::save_state_restore(new_state.clone())?;
+        Ok(true)
+    });
+
+    match outcome {
+        Ok(true) => notify(&format!("Restored state from {}", path.display())),
+        Ok(false) => {} // user declined the drop confirmation; no-op
+        Err(e) => notify(&format!("Restore failed: {e}")),
     }
-    if let Err(e) = atomic_replace_state_bytes(&bytes) {
-        notify(&format!("Restore failed: {e}"));
-        return;
-    }
-    notify(&format!("Restored state from {}", path.display()));
 }
 
-/// Move the live `state.json` to a `pre-restore` sidecar under `/tmp` (best
-/// effort — a missing live file is not an error, there's simply nothing to
-/// preserve), then write `new_bytes` into place with mode 0600. Bypasses
-/// `State::save`'s overwrite-protection guard deliberately: THIS is the
-/// user-confirmed, explicit "replace everything" path that guard exists to
-/// gate everywhere else.
-fn atomic_replace_state_bytes(new_bytes: &[u8]) -> Result<(), String> {
-    let live = crate::store::state_json_path().map_err(|e| e.to_string())?;
-    if live.exists() {
-        let ts = chrono::Utc::now().timestamp();
-        let pre_restore =
-            std::path::PathBuf::from(format!("/tmp/usagio-state-pre-restore-{ts}.json"));
-        if std::fs::rename(&live, &pre_restore).is_err() {
-            std::fs::copy(&live, &pre_restore)
-                .and_then(|_| std::fs::remove_file(&live))
-                .map_err(|e| format!("while moving current state: {e}"))?;
-        }
-    }
-    crate::store::write_private(&live, new_bytes).map_err(|e| e.to_string())
+/// Build the confirmation question shown before a restore that would drop
+/// accounts. Names the specific dropped emails (H2, v0.5.0 codeaudit — the
+/// prior wording was "will drop 2 account(s)", which told the user nothing
+/// about *which* accounts they were about to lose).
+fn restore_drop_confirmation(dropped: &[String]) -> String {
+    format!("Restoring will drop {}. Continue?", dropped.join(", "))
 }
+
+/// Guards against piling up blocked threads when "Refresh usage now" is
+/// clicked repeatedly: a stalled network call (see `run_cycle`) means each
+/// new click would otherwise stack up its own throwaway `SwapGuard` and
+/// thread. `false` = no refresh in flight; CAS to `true` before spawning,
+/// reset to `false` when the spawned thread's cycle completes.
+static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// "Refresh usage now" click (Settings ▸ Advanced ▸). Runs one poll +
 /// auto-swap cycle on a background thread — same `run_cycle` the poll loop
 /// calls every `WATCH_INTERVAL_SECS` — so the menu never blocks on network
 /// I/O. The main-thread timer picks up the refreshed cache on its next tick.
+///
+/// De-duplicated via `REFRESH_IN_FLIGHT`: a second click while a refresh is
+/// still running notifies instead of spawning another thread. See
+/// `try_start_refresh` for the testable core.
 fn handle_refresh_now() {
-    std::thread::spawn(|| {
-        let mut guard = SwapGuard::default();
-        if run_cycle(&mut guard) {
-            notify("Refresh: rate limited, backing off");
-        } else {
-            notify("Usage refreshed");
-        }
-    });
+    try_start_refresh(|| {
+        std::thread::spawn(|| {
+            let mut guard = SwapGuard::default();
+            let (rate_limited, _max_pct, _trigger) = run_cycle(&mut guard);
+            REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            if rate_limited {
+                notify("Refresh: rate limited, backing off");
+            } else {
+                notify("Usage refreshed");
+            }
+        });
+    })
+}
+
+/// CAS `REFRESH_IN_FLIGHT` from `false` to `true`; if it was already `true`
+/// (a refresh is still running), notify and return without calling `spawn`.
+/// Factored out from `handle_refresh_now` so a test can inject a counting
+/// closure in place of a real `std::thread::spawn` and assert the second of
+/// two rapid calls never invokes it.
+fn try_start_refresh(spawn: impl FnOnce()) {
+    use std::sync::atomic::Ordering;
+    if REFRESH_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        notify("Refresh already running");
+        return;
+    }
+    spawn();
 }
 
 /// Capture the current login for `slug`. For Claude, use the full v1 flow
@@ -1830,7 +1948,13 @@ fn switch_target_lock_countdown(st: &State, slug: &str, key: &str) -> Option<Str
 fn handle_switch(slug: &str, key: &str) {
     // v1 state only knows Claude accounts; a switch on any other slug can't
     // be persisted yet, so gate on Claude and route to the shared free
-    // function that already knows the v1 identity/keychain dance.
+    // function that already knows the v1 identity/keychain dance. This is
+    // belt-and-suspenders with `capabilities().supports_switching` (which
+    // already keeps the "Switch to this account" row from being built for a
+    // non-switching provider — see `build_account_submenu`, H3 in the
+    // v0.5.0 codeaudit): the click-id dispatch table is a single flat match
+    // in `handle_click`, so nothing stops a stray/future id shaped like
+    // `switch:<other-slug>:<key>` from reaching this function directly.
     if slug != CLAUDE_SLUG {
         notify(&format!("Switching is not yet supported for {slug}"));
         return;
@@ -1950,9 +2074,24 @@ fn set_autoswap(enabled: bool) {
 /// on-disk state currently says, rather than assuming a fixed target — so a
 /// stale menu (built just before an external `usagio` CLI toggle) can't
 /// un-toggle a setting it never actually observed.
+///
+/// Read-modify-write happens entirely INSIDE `with_state_lock`, atomic with
+/// respect to other in-process AND cross-process writers (the CLI `usagio`
+/// binary and the menu-bar app both take the same advisory file lock — see
+/// `with_state_lock`). A previous version read the current value with a
+/// separate `State::load()` call *outside* the lock, decided the new bool
+/// from that stale read, and only entered the lock to write it — a
+/// concurrent writer between the read and the write could have its own
+/// toggle silently lost ("toggle lost" under contention).
 fn toggle_autoswap() {
-    let currently_enabled = !State::load().unwrap_or_default().autoswap_disabled;
-    set_autoswap(!currently_enabled);
+    let r = with_state_lock(|| {
+        let mut st = State::load()?;
+        st.autoswap_disabled = !st.autoswap_disabled;
+        st.save()
+    });
+    if let Err(e) = r {
+        notify(&format!("Could not save auto-swap setting: {e}"));
+    }
 }
 
 /// Flip one Settings ▸ Notifications ▸ per-trigger checkbox. `trigger` is one
@@ -2087,6 +2226,8 @@ mod tests {
                 display_name: "Claude",
                 supports_switching: true,
                 supports_usage: true,
+                supports_launch: true,
+                supports_remove: true,
                 severity_bands: bands(),
                 env_override_active: false,
                 accounts: vec![a],
@@ -2103,6 +2244,89 @@ mod tests {
             notification_config: crate::notifications::NotificationConfig::default(),
         }
     }
+
+    #[test]
+    fn try_start_refresh_dedupes_rapid_clicks() {
+        // Reset in case a prior test in this binary left it set (best-effort
+        // — tests run with --test-threads=1 so no other test races us here).
+        REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let spawn_count = std::rc::Rc::new(StdCell::new(0u32));
+        let c1 = spawn_count.clone();
+        try_start_refresh(move || {
+            c1.set(c1.get() + 1);
+            // Deliberately do NOT reset REFRESH_IN_FLIGHT here — this stands
+            // in for "the background thread is still running" so the second
+            // click below is the one under test.
+        });
+        assert_eq!(spawn_count.get(), 1, "first click must spawn");
+
+        let c2 = spawn_count.clone();
+        try_start_refresh(move || {
+            c2.set(c2.get() + 1);
+        });
+        assert_eq!(
+            spawn_count.get(),
+            1,
+            "second rapid click must NOT spawn a second refresh"
+        );
+
+        // Clean up so later tests in this binary see the flag cleared.
+        REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn toggle_autoswap_read_modify_write_is_atomic_under_contention() {
+        let g = crate::store::ScopedConfigDir::new();
+        let home = g.home();
+
+        State::default().save().expect("seed initial state");
+        let initial = State::load().unwrap().autoswap_disabled;
+
+        const ITERATIONS: usize = 100;
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let home = home.clone();
+                std::thread::spawn(move || {
+                    // HOME_OVERRIDE is thread-local (see store::ScopedConfigDir);
+                    // each worker thread must repoint it at the same tempdir
+                    // the parent test set up.
+                    crate::store::set_home_override(Some(home));
+                    for _ in 0..ITERATIONS {
+                        toggle_autoswap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let total_toggles = 2 * ITERATIONS;
+        let expected = if total_toggles % 2 == 1 {
+            !initial
+        } else {
+            initial
+        };
+        let final_state = State::load().unwrap();
+        assert_eq!(
+            final_state.autoswap_disabled, expected,
+            "final parity must match initial XOR (total_toggles % 2 == 1); a lost \
+             toggle under contention would flip this"
+        );
+
+        drop(g);
+    }
+
+    // NOTE: M2's `restore_old_account_count` helper + its two tests were
+    // deleted at aggregation time. The M2 concern (State::load failure
+    // silently becoming "0 accounts" and skipping the drop-warning prompt)
+    // is fully subsumed by H2's restructure: the new Restore flow runs
+    // under `with_state_lock`, delegates the drop-detection to
+    // `crate::store::accounts_dropped_by(&new_state)` (which propagates
+    // load errors via `?`), and the outer `Err(e) => notify(...)` arm
+    // surfaces the abort message to the user. Tests for the H2 path live
+    // in store_tests.rs and menubar's Restore… test block above.
 
     #[test]
     fn severity_bands_defaults() {
@@ -2201,6 +2425,8 @@ mod tests {
             display_name: "Claude",
             supports_switching: true,
             supports_usage: true,
+            supports_launch: true,
+            supports_remove: true,
             severity_bands: bands(),
             env_override_active: false,
             accounts: vec![],
@@ -2354,6 +2580,8 @@ mod tests {
                     display_name: "Claude",
                     supports_switching: true,
                     supports_usage: true,
+                    supports_launch: true,
+                    supports_remove: true,
                     severity_bands: bands(),
                     env_override_active: false,
                     accounts: vec![a],
@@ -2363,6 +2591,8 @@ mod tests {
                     display_name: "Codex",
                     supports_switching: true,
                     supports_usage: true,
+                    supports_launch: true,
+                    supports_remove: true,
                     severity_bands: bands(),
                     env_override_active: false,
                     accounts: vec![b],
@@ -2402,6 +2632,8 @@ mod tests {
             providers::Capabilities {
                 supports_usage: self.supports_usage,
                 supports_switching: false,
+                supports_launch: false,
+                supports_remove: true,
                 supports_email_capture: false,
                 secret_backend: providers::SecretBackend::File,
                 capture_mode: self.capture_mode,
@@ -2537,15 +2769,17 @@ mod tests {
                 None,
             );
             let r = main_row("Claude", &a, bands());
-            assert_eq!(r.plain, "Claude    matt@example.com\tlocked · 1h 30m");
+            // v0.5.0 UX: no "locked · " prefix — red color + a time (not a
+            // percent) is the affordance. See main_row's locked-branch comment.
+            assert_eq!(r.plain, "Claude    matt@example.com\t1h 30m");
             assert!(r.bold, "active locked row is still bold");
             assert!(r.checkmark, "active row gets a leading checkmark");
-            // Exactly one colored span, red-tinted, covering the "locked · …" run.
+            // Exactly one colored span, red-tinted, covering the countdown run.
             assert_eq!(r.colors.len(), 1);
             let (off, len, sev) = r.colors[0];
             assert_eq!(sev, Severity::Red);
             let picked: String = r.plain.chars().skip(off).take(len).collect();
-            assert_eq!(picked, "locked · 1h 30m");
+            assert_eq!(picked, "1h 30m");
         });
     }
 
@@ -2661,6 +2895,8 @@ mod tests {
                 display_name: "Claude",
                 supports_switching: true,
                 supports_usage: true,
+                supports_launch: true,
+                supports_remove: true,
                 severity_bands: bands(),
                 env_override_active: false,
                 accounts: vec![active, inactive],
@@ -2704,6 +2940,111 @@ mod tests {
             snap.sections.is_empty(),
             "empty snapshot has no sections — a provider with zero rows must never emit one",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // H3 (v0.5.0 codeaudit) — capability-gated menu rows. `supports_switching`
+    // used to be the sole gate for BOTH the "Switch to this account" row AND
+    // the "Launch client" row, and "Remove…" had no gate at all. A provider
+    // like Codex (usage-only, no switching, no launch wired) would still get
+    // a "Launch client" row that always errored on click.
+    // -----------------------------------------------------------------------
+
+    fn section_with_caps(
+        supports_switching: bool,
+        supports_launch: bool,
+        supports_remove: bool,
+    ) -> ProviderSection {
+        ProviderSection {
+            provider_id: "codex",
+            display_name: "Codex",
+            supports_switching,
+            supports_launch,
+            supports_remove,
+            supports_usage: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![],
+        }
+    }
+
+    #[test]
+    fn submenu_rows_omit_launch_when_supports_launch_is_false() {
+        // Codex today: supports_switching == false AND supports_launch ==
+        // false. Neither the Switch nor the Launch row may appear.
+        let sec = section_with_caps(false, false, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        let rows = account_submenu_rows(&sec, &a);
+        assert_eq!(rows.switch_row, None, "no switch row: {rows:?}");
+        assert!(!rows.launch_row, "no launch row: {rows:?}");
+    }
+
+    #[test]
+    fn submenu_rows_can_omit_launch_even_when_switching_is_supported() {
+        // The two capabilities are independent: a provider could (in
+        // principle) support switching without a wired client launcher.
+        // supports_launch alone must gate the Launch row.
+        let sec = section_with_caps(true, false, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        let rows = account_submenu_rows(&sec, &a);
+        assert_eq!(
+            rows.switch_row,
+            Some(false),
+            "clickable switch row present: {rows:?}"
+        );
+        assert!(
+            !rows.launch_row,
+            "launch row absent even though switching is supported: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn submenu_rows_include_launch_when_supports_launch_is_true() {
+        let sec = section_with_caps(true, true, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        assert!(account_submenu_rows(&sec, &a).launch_row);
+    }
+
+    #[test]
+    fn submenu_rows_marks_active_account_instead_of_a_clickable_switch_row() {
+        let sec = section_with_caps(true, true, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), true);
+        assert_eq!(account_submenu_rows(&sec, &a).switch_row, Some(true));
+    }
+
+    #[test]
+    fn submenu_rows_omit_remove_when_supports_remove_is_false() {
+        let sec = section_with_caps(false, false, false);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        assert!(!account_submenu_rows(&sec, &a).remove_row);
+    }
+
+    #[test]
+    fn submenu_rows_include_remove_when_supports_remove_is_true() {
+        let sec = section_with_caps(false, false, true);
+        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
+        assert!(account_submenu_rows(&sec, &a).remove_row);
+    }
+
+    #[test]
+    fn codex_capabilities_do_not_advertise_switching_or_launch() {
+        // Locks in the H3 downgrade at the real provider boundary (not just
+        // the ProviderSection fixture above): CodexProvider's actual
+        // capabilities() must not claim switching or launch support until
+        // state v2 gives it somewhere to persist a second account.
+        let caps = crate::providers::codex::CodexProvider.capabilities();
+        assert!(!caps.supports_switching);
+        assert!(!caps.supports_launch);
+        assert!(caps.supports_remove);
+    }
+
+    #[test]
+    fn claude_capabilities_advertise_launch_support() {
+        // Claude is the only provider with a wired `launch_client`.
+        let caps = crate::providers::claude::ClaudeProvider.capabilities();
+        assert!(caps.supports_switching);
+        assert!(caps.supports_launch);
+        assert!(caps.supports_remove);
     }
 
     #[test]
@@ -2782,7 +3123,9 @@ mod tests {
             let r = main_row("Claude", &a, bands());
             let (label, trailing) = r.plain.split_once('\t').expect("tab preserved");
             assert_eq!(label, "Claude    matt@example.com");
-            assert_eq!(trailing, "locked · 23h 52m");
+            // No "locked · " prefix — red color + a time (not a percent) is
+            // the affordance now. See main_row's locked-branch comment.
+            assert_eq!(trailing, "23h 52m");
             assert_eq!(r.tab_x, Some(TAB_X), "right-align tab-stop preserved");
         });
     }
@@ -2938,5 +3281,126 @@ mod tests {
             value.is_none(),
             "a plain row must not carry a forced foreground color",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Backups Save…/Restore… ▸ FileDialog trait routing
+    //
+    // These assert the click handlers call `FileDialog` with the expected
+    // arguments WITHOUT ever popping a real native panel — the mock's
+    // `save_file`/`pick_file` return `None` by default, so each handler
+    // returns right after recording the call (the "user cancelled" path).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn backup_save_click_calls_file_dialog_with_default_name_and_downloads_dir() {
+        let dialog = crate::platform::MockFileDialog::default();
+        handle_backup_save_with(&dialog);
+
+        let calls = dialog.save_file_calls.borrow();
+        assert_eq!(calls.len(), 1, "expected exactly one save_file() call");
+        let (default_name, default_dir) = &calls[0];
+        assert!(
+            default_name.starts_with("usagio-state-") && default_name.ends_with(".json"),
+            "unexpected default file name: {default_name}"
+        );
+        assert_eq!(default_dir.as_deref(), dirs::download_dir().as_deref());
+    }
+
+    #[test]
+    fn backup_restore_click_calls_file_dialog_pick_file_once() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let dialog = crate::platform::MockFileDialog::default();
+        handle_backup_restore_dialog_with(&dialog);
+
+        let calls = dialog.pick_file_calls.borrow();
+        assert_eq!(calls.len(), 1, "expected exactly one pick_file() call");
+    }
+
+    // -----------------------------------------------------------------------
+    // H2 (v0.5.0 codeaudit) — Restore… drop-confirmation wording + store-level
+    // wiring. `handle_backup_restore_dialog` itself opens a native file panel
+    // and shells out to osascript for confirmation, neither of which is
+    // unit-testable; these tests cover the pure logic it's built from.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn restore_drop_confirmation_names_dropped_emails_not_just_a_count() {
+        let msg = super::restore_drop_confirmation(&[
+            "dev@getbusbar.com".to_string(),
+            "matthew@pq.io".to_string(),
+        ]);
+        assert_eq!(
+            msg,
+            "Restoring will drop dev@getbusbar.com, matthew@pq.io. Continue?"
+        );
+    }
+
+    /// Minimal restore-test account.
+    fn restore_test_acct(email: &str) -> crate::store::Account {
+        let blob = serde_json::json!({
+            "claudeAiOauth": { "accessToken": "at", "refreshToken": "rt", "expiresAt": 0 }
+        })
+        .to_string();
+        let mut a = crate::store::Account::from_keychain_blob(&blob).unwrap();
+        a.email = Some(email.to_string());
+        a
+    }
+
+    #[test]
+    fn restore_that_only_adds_an_account_reports_no_drops() {
+        use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
+        let _g = ScopedConfigDir::new();
+        let mut current = State::default();
+        current.accounts.push(restore_test_acct("a@e.com"));
+        current.save().unwrap();
+
+        let mut restore_target = State::load().unwrap();
+        restore_target.accounts.push(restore_test_acct("b@e.com"));
+
+        let dropped = accounts_dropped_by(&restore_target).unwrap();
+        assert!(
+            dropped.is_empty(),
+            "adding an account must not be reported as a drop"
+        );
+    }
+
+    #[test]
+    fn restore_that_drops_an_account_reports_exactly_that_email() {
+        use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
+        let _g = ScopedConfigDir::new();
+        let mut current = State::default();
+        for email in ["dev@getbusbar.com", "matthew@pq.io"] {
+            current.accounts.push(restore_test_acct(email));
+        }
+        current.save().unwrap();
+
+        let mut restore_target = State::default();
+        restore_target
+            .accounts
+            .push(restore_test_acct("dev@getbusbar.com"));
+
+        let dropped = accounts_dropped_by(&restore_target).unwrap();
+        assert_eq!(dropped, vec!["matthew@pq.io".to_string()]);
+        assert_eq!(
+            restore_drop_confirmation(&dropped),
+            "Restoring will drop matthew@pq.io. Continue?"
+        );
+    }
+
+    #[test]
+    fn pre_restore_stash_lands_under_config_backups_not_tmp() {
+        use crate::store::{config_dir, stash_pre_restore, ScopedConfigDir, State};
+        let g = ScopedConfigDir::new();
+        let mut current = State::default();
+        current.accounts.push(restore_test_acct("a@e.com"));
+        current.save().unwrap();
+
+        let dir = config_dir().unwrap();
+        let stash = stash_pre_restore(&dir)
+            .unwrap()
+            .expect("live state existed");
+        assert!(stash.starts_with(g.home().join(".config/usagio/backups")));
+        assert!(!stash.starts_with("/tmp"));
     }
 }

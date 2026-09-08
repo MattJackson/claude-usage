@@ -115,6 +115,31 @@ fn main() {
     }
 }
 
+/// True if `exe` looks like it was launched from inside a macOS `.app`
+/// bundle (a Finder double-click), as opposed to a bare CLI invocation
+/// (`/opt/homebrew/bin/usagio`, or a shell alias). Checked by path shape
+/// only — no `cfg(target_os)` needed, since `.app/Contents/MacOS/` simply
+/// never appears in a non-bundle exe path on any OS. Mirrors the same
+/// pattern `launch_agent_exe_path` already checks for the install path.
+fn is_app_bundle_launch(exe: &std::path::Path) -> bool {
+    exe.to_string_lossy().contains(".app/Contents/MacOS/")
+}
+
+/// Resolve the effective "first CLI argument" `run()`'s dispatch match
+/// switches on: the real first arg if one was given, otherwise `"menubar"`
+/// when we were launched from a `.app` bundle (so double-clicking
+/// usagio.app in Finder starts the menu bar, not a one-shot `list` that
+/// prints to a terminal nobody's watching), otherwise `None` (the bare
+/// binary's existing default: `cmd_list`).
+///
+/// Pure function of `args`/`exe` so a test can inject both without touching
+/// real argv or a real bundle.
+fn effective_first_arg<'a>(args: &'a [String], exe: &std::path::Path) -> Option<&'a str> {
+    args.first()
+        .map(String::as_str)
+        .or_else(|| is_app_bundle_launch(exe).then_some("menubar"))
+}
+
 fn run() -> Result<()> {
     // One-shot rename migration: if `~/.config/claude-usage/` still exists
     // and `~/.config/usagio/` doesn't, atomically move it (with a
@@ -199,7 +224,8 @@ fn run() -> Result<()> {
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
+    let exe = std::env::current_exe().unwrap_or_default();
+    match effective_first_arg(&args, &exe) {
         None => cmd_list(&[]),
         Some("list") | Some("ls") => cmd_list(&args[1..]),
         Some("capture") | Some("add") => cmd_capture(),
@@ -217,6 +243,8 @@ fn run() -> Result<()> {
         Some("install") => cmd_install(),
         Some("uninstall") => cmd_uninstall(),
         Some("rm") | Some("remove") => cmd_rm(args.get(1).map(String::as_str)),
+        // Internal, undocumented — see `cmd_secrets_selftest` doc comment.
+        Some("__secrets_selftest") => cmd_secrets_selftest(&args[1..]),
         Some("-h") | Some("--help") | Some("help") => {
             print_help();
             Ok(())
@@ -1180,6 +1208,53 @@ fn keychain_write(blob: &str) -> Result<()> {
         .set(KEYCHAIN_SERVICE, &keychain_account(), blob)
 }
 
+/// Internal, undocumented CLI hook used ONLY by
+/// `tests/integration_linux_secrets.rs` (and any equivalent test on other
+/// OSes) to round-trip `Platform::secrets()` against whatever the real
+/// backend is on this machine — the real D-Bus Secret Service daemon on
+/// Linux CI, Keychain on macOS, Credential Manager on Windows. This crate
+/// has no `[lib]` target, so an integration test can't call `LinuxSecrets`
+/// directly the way a unit test in `src/platform/linux.rs` can; this
+/// subcommand is the black-box seam (same shape as every other
+/// `tests/cli.rs` test driving the compiled binary as a subprocess).
+///
+/// Deliberately not listed in `print_help` — it exists purely as a test
+/// fixture, not a user-facing feature. Round-trips a caller-supplied
+/// `(service, account, secret)` through delete → get(None) → set →
+/// get(Some) → delete → get(None), printing `OK` and exiting 0 on success,
+/// or returning an `Err` (non-zero exit, message on stderr) describing
+/// exactly which step diverged.
+///
+/// Usage: `usagio __secrets_selftest <service> <account> <secret>`
+fn cmd_secrets_selftest(args: &[String]) -> Result<()> {
+    let (service, account, secret) = match args {
+        [service, account, secret] => (service.as_str(), account.as_str(), secret.as_str()),
+        _ => bail!("usage: usagio __secrets_selftest <service> <account> <secret>"),
+    };
+    let store = platform().secrets();
+
+    // Start from a clean slate in case a previous run crashed mid-round-trip
+    // and left a stale entry behind under this test-scoped service name.
+    let _ = store.delete(service, account);
+    if store.get(service, account)?.is_some() {
+        bail!("secrets_selftest: secret unexpectedly present before set()");
+    }
+
+    store.set(service, account, secret)?;
+    let got = store.get(service, account)?;
+    if got.as_deref() != Some(secret) {
+        bail!("secrets_selftest: get() after set() returned {got:?}, expected Some({secret:?})");
+    }
+
+    store.delete(service, account)?;
+    if store.get(service, account)?.is_some() {
+        bail!("secrets_selftest: secret still present after delete()");
+    }
+
+    println!("OK");
+    Ok(())
+}
+
 fn claude_json_path() -> Result<std::path::PathBuf> {
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     Ok(std::path::PathBuf::from(home).join(".claude.json"))
@@ -1514,9 +1589,24 @@ fn cmd_watch(args: &[String]) -> Result<()> {
                 if let Some((from, to)) = outcome.swapped {
                     eprintln!("[{}] swapped {from} -> {to}", Utc::now().to_rfc3339());
                 }
-                current = next_interval(current, base, outcome.rate_limited);
+                let prev = current;
+                current = next_interval(
+                    current,
+                    base,
+                    outcome.rate_limited,
+                    outcome.max_session_pct,
+                    trigger,
+                );
                 if outcome.rate_limited {
                     logging::log(&format!("rate limited; backing off to {current}s"));
+                } else if current != prev && current < base {
+                    // Log cadence tightening so a user chasing a missed swap can
+                    // see the daemon was polling faster on approach.
+                    logging::log(&format!(
+                        "cadence: {prev}s → {current}s (max session {:.1}%, trigger {:.0}%)",
+                        outcome.max_session_pct.unwrap_or(0.0),
+                        trigger
+                    ));
                 }
             }
             Err(e) => eprintln!("watch cycle error: {e:#}"),
@@ -1525,11 +1615,49 @@ fn cmd_watch(args: &[String]) -> Result<()> {
     }
 }
 
-/// Compute the next poll interval: exponential backoff (doubling, capped) after
-/// a rate limit, reset to the base cadence on a clean cycle.
-fn next_interval(current: u64, base: u64, rate_limited: bool) -> u64 {
+/// Threshold band widths for `next_interval`'s adaptive cadence.
+///
+/// Rationale for these values, from a real user-reported prod miss on
+/// v0.4.3: fixed 150s cadence caught an account at 94%, waited the full
+/// 150s to the next poll, and the account was at 99-100% by then — lock,
+/// swap missed. Below the warning band we stay at the full base cadence
+/// (cheap, ordinary case); inside the warning band we tighten to WARNING
+/// so we can't miss more than ~30s of runway; above the trigger threshold
+/// (the auto-swap should already have fired, but if it hasn't for any
+/// reason — network flap, keychain unlocked mid-cycle — the backstop
+/// makes sure the next attempt is 10s away, not 150s).
+const WATCH_WARNING_BAND: f64 = 15.0;
+const WATCH_WARNING_INTERVAL_SECS: u64 = 30;
+const WATCH_BACKSTOP_INTERVAL_SECS: u64 = 10;
+
+/// Compute the next poll interval. Priority order:
+///   1. Rate-limited from Anthropic → exponential backoff (doubling,
+///      capped at WATCH_MAX_INTERVAL_SECS). Overrides everything below.
+///   2. Any account at or above the trigger threshold → BACKSTOP (10s).
+///      The auto-swap should already have fired; this makes sure a
+///      transient failure doesn't leave us blind for a full base cycle.
+///   3. Any account inside the warning band (trigger - 15% ≤ pct <
+///      trigger) → WARNING (30s). Tight enough to catch the trigger
+///      point within ~30s regardless of usage-fetch jitter.
+///   4. Everyone comfortably below → BASE (whatever `--interval` was set
+///      to, default WATCH_INTERVAL_SECS = 150s).
+fn next_interval(
+    current: u64,
+    base: u64,
+    rate_limited: bool,
+    max_session_pct: Option<f64>,
+    trigger: f64,
+) -> u64 {
     if rate_limited {
-        (current.max(base) * 2).min(WATCH_MAX_INTERVAL_SECS)
+        return (current.max(base) * 2).min(WATCH_MAX_INTERVAL_SECS);
+    }
+    let Some(pct) = max_session_pct else {
+        return base;
+    };
+    if pct >= trigger {
+        WATCH_BACKSTOP_INTERVAL_SECS
+    } else if pct >= trigger - WATCH_WARNING_BAND {
+        WATCH_WARNING_INTERVAL_SECS
     } else {
         base
     }
@@ -1551,10 +1679,15 @@ fn prune_swap_guard(guard: &mut SwapGuard) {
         .retain(|_, t| t.elapsed().as_secs() < NO_RETURN_SECS);
 }
 
-/// Result of one poll: the swap it made (if any) and the rate-limited flag.
+/// Result of one poll: the swap it made (if any), the rate-limited flag,
+/// and the peak session-% across all accounts this cycle (used by
+/// `next_interval` to tighten the poll cadence on approach to the trigger
+/// threshold — see the user-reported miss where 94% + 150s wait produced
+/// a lock before the next poll).
 pub(crate) struct CycleOutcome {
     pub swapped: Option<(String, String)>,
     pub rate_limited: bool,
+    pub max_session_pct: Option<f64>,
 }
 
 /// True if `cand` is a strictly better place to be than the healthy `act`:
@@ -1661,9 +1794,16 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
         return Ok(CycleOutcome {
             swapped: None,
             rate_limited: refresh.rate_limited,
+            max_session_pct: None,
         });
     }
     let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
+    // Peak session-% across all accounts (ignoring rows with no data yet)
+    // — used by `next_interval` to tighten cadence on approach to trigger.
+    let max_session_pct = rows
+        .iter()
+        .filter_map(|r| r.session.pct)
+        .fold(None::<f64>, |acc, p| Some(acc.map_or(p, |a| a.max(p))));
     append_history(&rows, state.active.as_deref());
 
     let active = state.active.clone();
@@ -1699,6 +1839,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                         return Ok(CycleOutcome {
                             swapped: None,
                             rate_limited: refresh.rate_limited,
+                            max_session_pct,
                         });
                     }
                 };
@@ -1710,6 +1851,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                     return Ok(CycleOutcome {
                         swapped: None,
                         rate_limited: refresh.rate_limited,
+                        max_session_pct,
                     });
                 };
                 guard
@@ -1768,6 +1910,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
     Ok(CycleOutcome {
         swapped,
         rate_limited: refresh.rate_limited,
+        max_session_pct,
     })
 }
 

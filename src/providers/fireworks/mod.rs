@@ -40,6 +40,8 @@ impl Provider for FireworksProvider {
         Capabilities {
             supports_usage: true,
             supports_switching: false,
+            supports_launch: false,
+            supports_remove: true,
             supports_email_capture: true,
             secret_backend: SecretBackend::Keychain,
             capture_mode: CaptureMode::ApiKey,

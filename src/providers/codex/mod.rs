@@ -27,6 +27,20 @@
 //! identity file to touch (unlike `~/.claude.json`), so the auth.json write
 //! *is* the entire switch. `launch_client` remains unimplemented
 //! (`ProviderError::Unsupported`) — a future phase may shell out to `codex`.
+//!
+//! TODO(v0.5.x, H3 — v0.5.0 codeaudit): `write_active_account` above is a
+//! complete, tested implementation of the auth.json-rewrite half of
+//! switching. `capabilities().supports_switching` is nonetheless `false`,
+//! because v1's `State` (see `crate::store`) has no bucket for non-Claude
+//! accounts at all — there is nowhere to persist a *second* Codex account's
+//! secret blob to switch *to*, so `main.rs::switch_to` / `menubar.rs`'s
+//! click dispatchers are hardcoded to the Claude slug and have no code path
+//! that would ever call `write_active_account` today. Advertising
+//! `supports_switching: true` here (as v0.5.0 originally shipped) built a
+//! "Switch to this account" row that could never succeed. Flip this back to
+//! `true` only once state v2 gives Codex accounts a real slot AND
+//! `main.rs`/`menubar.rs` dispatch switches by provider instead of assuming
+//! Claude.
 
 #![allow(dead_code)]
 
@@ -67,7 +81,14 @@ impl Provider for CodexProvider {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             supports_usage: true,
-            supports_switching: true,
+            // See the module doc TODO: `write_active_account` below is fully
+            // implemented and tested, but nothing can call it yet because v1
+            // state has no slot to store a second Codex account in. Keep
+            // this `false` (and therefore the "Switch to this account" menu
+            // row hidden) until that changes (H3, v0.5.0 codeaudit).
+            supports_switching: false,
+            supports_launch: false,
+            supports_remove: true,
             supports_email_capture: true,
             secret_backend: SecretBackend::File,
             capture_mode: CaptureMode::CredsOnDisk,
@@ -416,20 +437,46 @@ fn auth_json_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".codex").join("auth.json"))
 }
 
+/// Map a filesystem `io::Result` into `PResult`, naming the operation and
+/// path on failure. A bare `?` on `create_dir_all` / `set_permissions` /
+/// `write` / `rename` collapses into `ProviderError::Io`, which `Display`s as
+/// just `"io: <message>"` — no indication of which of the 4 operations, or
+/// which path, actually failed. `ProviderError::Other` carries the full
+/// annotated string instead.
+fn fs_ctx<T>(r: std::io::Result<T>, op: &str, path: &std::path::Path) -> PResult<T> {
+    r.map_err(|e| ProviderError::Other(format!("while {op} on {}: {e}", path.display())))
+}
+
 /// Write `contents` to `path` atomically (tmp file in the same directory +
 /// rename), matching the permissions the `codex` CLI itself uses: parent
 /// directory `0700` (created if missing), file `0600`. Rename is atomic on
 /// the same filesystem, so a concurrent reader never observes a partial
 /// write.
+///
+/// H1 (v0.5.0 codeaudit): the tmp file is created with `create_new` +
+/// `mode(0o600)` in a single `open()` call — never `std::fs::write` followed
+/// by a separate `set_permissions`. That two-step sequence has a TOCTOU
+/// window where the file exists at the umask-default mode (typically 0644)
+/// before the chmod lands, during which another local user could read the
+/// OAuth tokens. Mirrors `crate::store::write_private`.
+///
+/// Any failure between creating the tmp file and the final rename removes
+/// the tmp file so a secret-bearing orphan never survives (H4 finding from
+/// the same audit).
 #[cfg(unix)]
 fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let dir = path
         .parent()
         .ok_or_else(|| ProviderError::Other("auth.json path has no parent directory".into()))?;
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    fs_ctx(std::fs::create_dir_all(dir), "create_dir_all", dir)?;
+    fs_ctx(
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)),
+        "set_permissions",
+        dir,
+    )?;
 
     // Tmp file lives in the same directory as the target so the rename below
     // is guaranteed to be on the same filesystem (atomic).
@@ -438,9 +485,30 @@ fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
-    std::fs::write(&tmp_path, contents)?;
-    std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp_path, path)?;
+
+    // H1 (security codeaudit) + M9 (errors codeaudit) combined: create the
+    // tmp file with mode 0600 via `OpenOptions::create_new(true).mode(0o600)`
+    // in one syscall so no TOCTOU window exposes tokens to other local
+    // users, and wrap the fs ops with `fs_ctx` so a failure reports which
+    // operation on which path (not just "io: <msg>"). Clean up the tmp
+    // file on any failure so a partial write doesn't leave a
+    // secret-bearing orphan.
+    let create_and_write = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(contents.as_bytes())
+    })();
+    if let Err(e) = fs_ctx(create_and_write, "open/write", &tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    if let Err(e) = fs_ctx(std::fs::rename(&tmp_path, path), "rename", &tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -449,14 +517,14 @@ fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult
     let dir = path
         .parent()
         .ok_or_else(|| ProviderError::Other("auth.json path has no parent directory".into()))?;
-    std::fs::create_dir_all(dir)?;
+    fs_ctx(std::fs::create_dir_all(dir), "create_dir_all", dir)?;
     let tmp_path = dir.join(format!(
         ".auth.json.tmp.{}.{}",
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
-    std::fs::write(&tmp_path, contents)?;
-    std::fs::rename(&tmp_path, path)?;
+    fs_ctx(std::fs::write(&tmp_path, contents), "write", &tmp_path)?;
+    fs_ctx(std::fs::rename(&tmp_path, path), "rename", &tmp_path)?;
     Ok(())
 }
 
@@ -494,7 +562,14 @@ mod tests {
         assert_eq!(p.display_name(), "Codex");
         let caps = p.capabilities();
         assert!(caps.supports_usage);
-        assert!(caps.supports_switching);
+        // H3 (v0.5.0 codeaudit): `write_active_account` below is a real,
+        // tested implementation, but `supports_switching` stays `false`
+        // until state v2 gives Codex a place to store a second account to
+        // switch to — see the module doc TODO. Advertising `true` here
+        // built a menu row that could never succeed.
+        assert!(!caps.supports_switching);
+        assert!(!caps.supports_launch);
+        assert!(caps.supports_remove);
         assert!(caps.supports_email_capture);
         assert_eq!(caps.secret_backend, SecretBackend::File);
         assert_eq!(caps.capture_mode, CaptureMode::CredsOnDisk);
@@ -563,6 +638,43 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn write_auth_json_atomically_names_the_failing_operation() {
+        // Skip under root (e.g. some CI containers): root ignores the 0o000
+        // permission bit this test relies on to force create_dir_all to fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, permission bits are not enforced");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let readonly = base.path().join("readonly-parent");
+        std::fs::create_dir(&readonly).unwrap();
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // `dir` (readonly-parent/subdir) doesn't exist yet, and its parent
+        // has no write permission, so `create_dir_all` must fail here.
+        let target = readonly.join("subdir").join("auth.json");
+        let err = write_auth_json_atomically(&target, "{}")
+            .expect_err("create_dir_all under a read-only parent must fail");
+        let msg = err.to_string();
+
+        // Restore permissions so the tempdir can be cleaned up regardless of
+        // the assertion outcome below.
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            msg.contains("create_dir_all"),
+            "error should name the failing operation: {msg}"
+        );
+        assert!(
+            msg.contains("subdir"),
+            "error should include the failing path: {msg}"
+        );
+    }
+
+    #[test]
     fn switch_account_round_trips_through_absorb() {
         // Switch to A, absorb() the file we just wrote → identify_credential
         // reports A. Switch to B, absorb again → reports B. This is the
@@ -596,6 +708,53 @@ mod tests {
             let key_b = p.identify_credential(&on_disk_b).unwrap();
             assert_eq!(key_b, AccountKey::new("codex", "b@example.com"));
         });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_auth_json_creates_with_mode_0600_atomically() {
+        // H1: the file must never be observable at the umask-default mode —
+        // it must be created 0600 in the same syscall that creates it, not
+        // written then chmod'd afterwards.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        write_auth_json_atomically(&path, r#"{"tokens":{"access_token":"at"}}"#).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_auth_json_cleans_up_tmp_file_on_rename_failure() {
+        // H1/H4: if the final rename fails (simulated here by pointing the
+        // target at a path whose parent doesn't exist so create_dir_all
+        // succeeds but we then swap the target to a directory, forcing
+        // rename() to fail with EISDIR), the tmp file must not survive.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        // Make the rename destination itself a non-empty directory so
+        // std::fs::rename(file -> dir) fails.
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keepme"), b"x").unwrap();
+
+        let result = write_auth_json_atomically(&target, r#"{"tokens":{"access_token":"at"}}"#);
+        assert!(result.is_err());
+
+        // No leftover `.auth.json.tmp.*` files in the directory.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".auth.json.tmp.")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "orphaned tmp file(s) left behind: {leftovers:?}"
+        );
     }
 
     #[test]

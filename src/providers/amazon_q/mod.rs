@@ -39,6 +39,8 @@ impl Provider for AmazonQProvider {
         Capabilities {
             supports_usage: false,
             supports_switching: false,
+            supports_launch: false,
+            supports_remove: true,
             supports_email_capture: false,
             secret_backend: SecretBackend::Sqlite,
             capture_mode: CaptureMode::CredsOnDisk,

@@ -67,6 +67,61 @@ jobs:
         # `cfg(target_os = ...)` as example text — false positives).
         run: cargo test --tests --all-features -- --test-threads=1
 
+      # Windows-only: real side-effect tests — Credential Manager round-trip
+      # (M4 fix, WindowsSecrets) + HKCU Run key round-trip (autostart) are
+      # `#[ignore]`d in the default run so `cargo test` stays hermetic on
+      # every OS/dev machine. Run them for real here, on the one OS that has
+      # a Credential Manager / registry. Safe: windows-latest runners are
+      # disposable per-job VMs. Closes gap 3 of the v0.5.0 CI matrix.
+      - name: cargo test --ignored (Windows-only side-effect tests)
+        if: matrix.os == 'windows-latest'
+        run: cargo test --all-features -- --ignored --test-threads=1
+
+      # Ubuntu-only GUI smoke test: proves the real tray backend actually
+      # initializes at runtime (GTK starts, libayatana-appindicator3 links,
+      # tray_icon::TrayIcon can be built/mutated/dropped) — not just
+      # compiles. xvfb-run supplies a virtual X server for headless CI.
+      - name: Install xvfb
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y xvfb
+
+      - name: Linux tray init smoke test (xvfb-run)
+        if: matrix.os == 'ubuntu-latest'
+        run: xvfb-run --auto-servernum cargo test --test integration_tray --all-features -- --ignored --test-threads=1
+
+      # Ubuntu-only: proves the Secret Service D-Bus path in LinuxSecrets
+      # actually works against a real daemon (not just the offline-file
+      # fallback every unit test exercises). dbus-run-session spins up a
+      # throwaway session bus; gnome-keyring-daemon --unlock with an empty
+      # stdin password creates an unlocked default keyring.
+      - name: Install Secret Service daemon deps
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y gnome-keyring dbus-x11
+
+      - name: Linux Secret Service integration test (real D-Bus daemon)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          dbus-run-session -- bash -c '
+            set -euo pipefail
+            echo -n "" | gnome-keyring-daemon --unlock --components=secrets
+            eval "$(echo -n "" | gnome-keyring-daemon --start --components=secrets)"
+            export GNOME_KEYRING_CONTROL
+            cargo test --test integration_linux_secrets --all-features -- --ignored --test-threads=1
+          '
+
+      # H4 (v0.5.0 codeaudit): release.yml's macOS build job calls
+      # packaging/macos/generate-icns.sh, which shells out to `rsvg-convert`
+      # (from librsvg) and dies loudly if missing. Verify locally on every
+      # push so a missing dep doesn't only surface at release-tag time.
+      - name: Install librsvg for icon generation
+        if: matrix.os == 'macos-latest'
+        run: brew install librsvg
+
+      - name: Verify packaging/macos/generate-icns.sh runs end-to-end
+        if: matrix.os == 'macos-latest'
+        run: packaging/macos/generate-icns.sh
+
+
   # Full lane — release build, only on the qa and main branches.
   build:
     name: release build

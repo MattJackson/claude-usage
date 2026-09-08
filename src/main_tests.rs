@@ -536,25 +536,96 @@ fn env_override_active_reads_shared_slug_map() {
     assert!(!env_override_active(CLAUDE_SLUG));
 }
 
-// --- next_interval (backoff) ---
+// --- next_interval (backoff + adaptive cadence) ---
+
+const TRIGGER_FOR_TESTS: f64 = 95.0;
 
 #[test]
-fn next_interval_resets_to_base_when_not_limited() {
-    // A clean cycle always returns to the base cadence, even from a backed-off value.
-    assert_eq!(next_interval(600, 60, false), 60);
-    assert_eq!(next_interval(60, 60, false), 60);
+fn next_interval_resets_to_base_when_not_limited_and_far_from_trigger() {
+    // A clean cycle with everyone comfortably below the warning band
+    // returns to the base cadence, even from a backed-off value.
+    assert_eq!(
+        next_interval(600, 60, false, Some(50.0), TRIGGER_FOR_TESTS),
+        60
+    );
+    assert_eq!(
+        next_interval(60, 60, false, Some(50.0), TRIGGER_FOR_TESTS),
+        60
+    );
+    // No usage data yet → also base cadence.
+    assert_eq!(next_interval(60, 60, false, None, TRIGGER_FOR_TESTS), 60);
 }
 
 #[test]
 fn next_interval_doubles_on_rate_limit_capped() {
-    // Doubles on a rate limit…
-    assert_eq!(next_interval(60, 60, true), 120);
-    // …never below base even if `current` was stale-small…
-    assert_eq!(next_interval(1, 60, true), 120);
-    // …and is capped at the max.
+    // Rate-limit override wins over adaptive cadence.
     assert_eq!(
-        next_interval(WATCH_MAX_INTERVAL_SECS, 60, true),
+        next_interval(60, 60, true, Some(50.0), TRIGGER_FOR_TESTS),
+        120
+    );
+    // Never below base even if `current` was stale-small.
+    assert_eq!(
+        next_interval(1, 60, true, Some(50.0), TRIGGER_FOR_TESTS),
+        120
+    );
+    // Capped at the max.
+    assert_eq!(
+        next_interval(
+            WATCH_MAX_INTERVAL_SECS,
+            60,
+            true,
+            Some(99.0),
+            TRIGGER_FOR_TESTS
+        ),
         WATCH_MAX_INTERVAL_SECS
+    );
+}
+
+#[test]
+fn next_interval_tightens_to_warning_inside_the_band() {
+    // Inside [trigger - 15, trigger): 30s WARNING cadence, regardless of
+    // the current `current` — this is exactly the case that let the user's
+    // 94% + 150s wait miss the swap on v0.4.3.
+    assert_eq!(
+        next_interval(150, 150, false, Some(94.9), TRIGGER_FOR_TESTS),
+        30
+    );
+    assert_eq!(
+        next_interval(150, 150, false, Some(85.0), TRIGGER_FOR_TESTS),
+        30
+    );
+    assert_eq!(
+        next_interval(150, 150, false, Some(80.001), TRIGGER_FOR_TESTS),
+        30
+    );
+    // Exactly at the band-lower edge (trigger - 15 = 80.0) still tightens.
+    assert_eq!(
+        next_interval(150, 150, false, Some(80.0), TRIGGER_FOR_TESTS),
+        30
+    );
+    // 1 tick below the band — back to base.
+    assert_eq!(
+        next_interval(150, 150, false, Some(79.9), TRIGGER_FOR_TESTS),
+        150
+    );
+}
+
+#[test]
+fn next_interval_tightens_to_backstop_at_or_above_trigger() {
+    // At or above the trigger: 10s BACKSTOP cadence. The auto-swap should
+    // already have fired; this makes sure a transient failure doesn't
+    // leave us blind for a full base cycle.
+    assert_eq!(
+        next_interval(150, 150, false, Some(95.0), TRIGGER_FOR_TESTS),
+        10
+    );
+    assert_eq!(
+        next_interval(150, 150, false, Some(99.9), TRIGGER_FOR_TESTS),
+        10
+    );
+    assert_eq!(
+        next_interval(150, 150, false, Some(100.0), TRIGGER_FOR_TESTS),
+        10
     );
 }
 
@@ -966,4 +1037,33 @@ fn usagio_install_prefers_app_bundle_path_when_available() {
     });
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// M12 — .app bundle direct-launch (Finder double-click) must default to the
+// menu bar, not the one-shot `list` a bare CLI invocation defaults to.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn run_dispatch_defaults_to_menubar_when_invoked_from_app_bundle() {
+    let bundle_exe = std::path::PathBuf::from("/Applications/usagio.app/Contents/MacOS/usagio");
+    assert_eq!(effective_first_arg(&[], &bundle_exe), Some("menubar"));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_dispatch_defaults_to_list_for_bare_binary() {
+    let bare_exe = std::path::PathBuf::from("/opt/homebrew/bin/usagio");
+    assert_eq!(effective_first_arg(&[], &bare_exe), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_dispatch_prefers_an_explicit_arg_over_bundle_detection() {
+    // Even when launched from inside a bundle, an explicit argument (e.g.
+    // `usagio list` run via Terminal against the bundled binary) wins.
+    let bundle_exe = std::path::PathBuf::from("/Applications/usagio.app/Contents/MacOS/usagio");
+    let args = vec!["list".to_string()];
+    assert_eq!(effective_first_arg(&args, &bundle_exe), Some("list"));
 }

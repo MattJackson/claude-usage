@@ -539,3 +539,177 @@ fn reconciler_never_persists_silent_account_drop() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// H2 (v0.5.0 codeaudit) — restore flow: accounts_dropped_by / save_state_restore
+// / stash_pre_restore. Exercises the store-level building blocks that
+// `menubar::handle_backup_restore_dialog` composes; the dialog itself opens a
+// native file picker + osascript confirm, so it isn't unit-testable, but its
+// entire safety-relevant behaviour lives in these three functions.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn accounts_dropped_by_reports_specific_emails_not_just_a_count() {
+    let _g = ScopedConfigDir::new();
+    make_state_with(&["dev@getbusbar.com", "matthew@pq.io"])
+        .save()
+        .unwrap();
+
+    let restore_target = make_state_with(&["dev@getbusbar.com"]);
+    let dropped = accounts_dropped_by(&restore_target).unwrap();
+    assert_eq!(dropped, vec!["matthew@pq.io".to_string()]);
+}
+
+#[test]
+fn accounts_dropped_by_is_empty_when_restore_only_adds_accounts() {
+    let _g = ScopedConfigDir::new();
+    make_state_with(&["a@e.com"]).save().unwrap();
+
+    // Restoring a file with a SUPERSET of the current accounts must report no
+    // drops — this is the "restore adds an account" case, which must succeed
+    // with no confirmation prompt at all.
+    let restore_target = make_state_with(&["a@e.com", "b@e.com"]);
+    let dropped = accounts_dropped_by(&restore_target).unwrap();
+    assert!(dropped.is_empty());
+}
+
+#[test]
+fn accounts_dropped_by_empty_when_no_live_state_on_disk() {
+    let _g = ScopedConfigDir::new();
+    // No prior save() at all — a first-ever restore has nothing to drop.
+    let restore_target = make_state_with(&["a@e.com"]);
+    let dropped = accounts_dropped_by(&restore_target).unwrap();
+    assert!(dropped.is_empty());
+}
+
+#[test]
+fn save_state_restore_succeeds_when_only_adding_accounts() {
+    let _g = ScopedConfigDir::new();
+    make_state_with(&["a@e.com"]).save().unwrap();
+
+    // Unlike a bare `State::save()` (which would REFUSE this because
+    // pending_removals is empty and nothing was dropped — but here nothing
+    // WAS dropped, so a plain save would also succeed). The point of this
+    // test is that adding an account via restore never needs a
+    // confirmation / never gets refused.
+    let restore_target = make_state_with(&["a@e.com", "b@e.com"]);
+    save_state_restore(restore_target).expect("restore that only adds accounts must succeed");
+
+    let on_disk = State::load().unwrap();
+    let keys: Vec<String> = on_disk
+        .accounts
+        .iter()
+        .map(|a| a.key().to_string())
+        .collect();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains(&"a@e.com".to_string()));
+    assert!(keys.contains(&"b@e.com".to_string()));
+}
+
+#[test]
+fn save_state_restore_authorizes_drops_that_a_plain_save_would_refuse() {
+    let _g = ScopedConfigDir::new();
+    make_state_with(&["a@e.com", "b@e.com"]).save().unwrap();
+
+    // A restore to a file with fewer accounts must NOT hit save_state_safe's
+    // drop-protection refusal — save_state_restore is the explicitly-
+    // authorized path (the caller — the Restore… dialog — already confirmed
+    // the drop with the user by the time this is called).
+    let restore_target = make_state_with(&["a@e.com"]);
+    save_state_restore(restore_target).expect("save_state_restore must authorize the drop");
+
+    let on_disk = State::load().unwrap();
+    let keys: Vec<String> = on_disk
+        .accounts
+        .iter()
+        .map(|a| a.key().to_string())
+        .collect();
+    assert_eq!(keys, vec!["a@e.com".to_string()]);
+}
+
+#[test]
+fn stash_pre_restore_lands_under_config_backups_not_tmp() {
+    // H2: the pre-restore stash must never touch /tmp — it must land in
+    // config_dir()/backups/pre-restore-<ts>.json, owner-only.
+    let g = ScopedConfigDir::new();
+    make_state_with(&["a@e.com"]).save().unwrap();
+
+    let dir = config_dir().unwrap();
+    let stash_path = stash_pre_restore(&dir)
+        .unwrap()
+        .expect("live state existed to stash");
+
+    assert!(
+        stash_path.starts_with(g.home().join(".config/usagio/backups")),
+        "stash must live under config_dir/backups, not /tmp: {}",
+        stash_path.display()
+    );
+    assert!(
+        stash_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("pre-restore-"),
+        "stash filename: {}",
+        stash_path.display()
+    );
+    assert!(!stash_path.starts_with("/tmp"));
+
+    // The live state.json is gone (moved), and the stash carries its bytes.
+    assert!(!config_dir().unwrap().join("state.json").exists());
+    let stashed = std::fs::read_to_string(&stash_path).unwrap();
+    assert!(stashed.contains("a@e.com"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&stash_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "pre-restore stash must be owner-only");
+    }
+}
+
+#[test]
+fn stash_pre_restore_is_noop_when_no_live_state() {
+    let _g = ScopedConfigDir::new();
+    let dir = config_dir().unwrap();
+    assert!(stash_pre_restore(&dir).unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// M1 — notification_config parse failures must not be silent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn corrupt_notification_config_falls_back_to_default_and_logs() {
+    let g = ScopedConfigDir::new();
+
+    // Seed state.json with a notification_config shape that can never
+    // deserialize (a string where an object/array is expected).
+    let dir = config_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = serde_json::json!({
+        "accounts": {},
+        "active": null,
+        "notification_config": "this-is-not-a-valid-config-shape",
+    });
+    std::fs::write(dir.join("state.json"), serde_json::to_vec(&bad).unwrap()).unwrap();
+
+    // Loading must still succeed with defaulted notification_config.
+    let loaded = State::load().expect("load must succeed despite corrupt field");
+    assert_eq!(loaded.notification_config, Default::default());
+
+    // A discoverable log line must exist mentioning the failure.
+    let log_path = dir.join("usagio.log");
+    let contents = std::fs::read_to_string(&log_path)
+        .expect("log file should exist after a logged parse failure");
+    assert!(
+        contents.contains("notification_config"),
+        "log should mention notification_config: {contents}"
+    );
+    assert!(
+        contents.to_lowercase().contains("parse"),
+        "log should mention parse failure: {contents}"
+    );
+
+    drop(g);
+}
