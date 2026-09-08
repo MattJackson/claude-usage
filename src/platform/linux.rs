@@ -304,15 +304,36 @@ fn fallback_load(dir: &Path) -> Result<Map<String, Value>> {
     }
 }
 
+/// robustness-03 (v0.5.1 audit): write the whole fallback secrets map
+/// atomically — tmp file at final mode 0600 from creation (no umask window),
+/// then `rename` into place — mirroring `store::write_private` /
+/// `codex::write_auth_json_atomically`. Previously this was a plain
+/// `std::fs::write` followed by a SEPARATE `chmod`, unlike every other
+/// secret-bearing file in the crate: a crash, kill, or disk-full mid-write
+/// could leave a truncated/corrupt `secrets.json` that then fails to parse
+/// on the very next `fallback_load`, breaking read/write access for every
+/// account captured through this fallback, not just the one being written.
 fn fallback_write(dir: &Path, map: &Map<String, Value>) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = fallback_path(dir);
     let body = serde_json::to_vec_pretty(map).context("serializing secrets.json fallback")?;
-    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-    let mut perms = std::fs::metadata(&path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(&path, perms)
-        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    let tmp_path = dir.join(format!(
+        ".secrets.json.tmp.{}.{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    if let Err(e) =
+        crate::store::write_private(&tmp_path, &body).with_context(|| "writing tmp secrets.json")
+    {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &path)
+        .with_context(|| format!("renaming into {}", path.display()))
+    {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -1001,6 +1022,44 @@ mod tests {
         assert!(
             after.is_none(),
             "secret still present after fallback delete"
+        );
+    }
+
+    /// robustness-03 (v0.5.1 audit): `fallback_write` must go through a
+    /// tmp-file + rename, like every other secret-bearing file in the crate
+    /// — never leaving a `.secrets.json.tmp.*` orphan behind, and never a
+    /// half-written `secrets.json` an interrupted write could produce.
+    #[test]
+    fn fallback_write_is_atomic_and_leaves_no_tmp_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut map = Map::new();
+        map.insert(
+            fallback_key("claude-usage", "matt@example.com"),
+            Value::String("s3cret-token".into()),
+        );
+
+        fallback_write(tmp.path(), &map).expect("fallback_write");
+
+        let path = fallback_path(tmp.path());
+        assert!(path.exists());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "final file must be owner-only");
+
+        let reloaded = fallback_load(tmp.path()).unwrap();
+        assert_eq!(reloaded, map);
+
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".secrets.json.tmp.")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "orphaned tmp file(s) left behind: {leftovers:?}"
         );
     }
 

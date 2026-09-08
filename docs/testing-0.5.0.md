@@ -4,11 +4,10 @@ Audience: Matthew, running this by hand on macOS today, and on Linux/Windows
 once those machines are available. For the design these tests are checking,
 see `docs/architecture-0.5.0.md`.
 
-`[TBD: verify against CAS PR]` marks anything below that depends on the CAS
-active-refresh work still in flight at time of writing — the log event names
-and exact wording may shift slightly before it merges. Everything else
-(capture, switch, auto-swap, adaptive cadence, backups) is grounded in code
-already on `dev`/`feat/v0.5.0`.
+The CAS active-refresh work has landed on `dev`/`feat/v0.5.0` — every test
+below, including the CAS-specific ones (T3, T6), is grounded in merged code
+and the log event names/fields shown are the actual ones emitted by
+`src/main.rs`.
 
 ## Prerequisites
 
@@ -47,15 +46,10 @@ escape hatch.
 3. Verify:
    - `~/.config/usagio/state.json` gained (or refreshed) an entry for that
      account's email, and `active` in state.json now names it.
-   - The log contains a line for this capture. `[TBD: verify against CAS
-     PR]` — expected format is a structured `event=capture ...` line (e.g.
-     `event=capture account=<email> existed=<true|false>`); the capture path
-     currently prints a human-readable confirmation
-     (`Captured <email> — it's the active login.` /
-     `Refreshed <email> — it's the active login.`) to stdout but the
-     equivalent structured log line may not have landed yet — if you don't
-     see `event=capture` in the log, that's expected pre-CAS-merge, not a
-     failure of T1 itself. Confirm state.json changed either way.
+   - The log contains a structured `event=capture account=<email>
+     existed=<true|false> at_prefix=<...> ...` line, in addition to the
+     human-readable stdout confirmation (`Captured <email> — it's the active
+     login.` / `Refreshed <email> — it's the active login.`).
 
 ### T2 — Never-re-login soak (24h)
 
@@ -78,7 +72,7 @@ escape hatch.
      and the same access token that `usagio list --refresh` last fetched
      usage with.
 
-### T3 — Active-account CAS refresh (the v0.5.0 design) `[TBD: verify against CAS PR]`
+### T3 — Active-account CAS refresh (the v0.5.0 design)
 
 This is the test that exercises the actual mechanism the release is named
 for — everything else is either supporting infrastructure or unaffected by
@@ -113,10 +107,9 @@ the change.
      running `claude`) uses the new account — confirm via `/status` in
      Claude Code or by checking which account's usage ticks up.
    - Log line: `event=switch from=<old-email> to=<new-email>
-     identity_written=ok keychain_written=ok`. `[TBD: verify against CAS
-     PR]` for the exact field names — confirm `identity_written` and
-     `keychain_written` (or their equivalents) both read `ok`, not just that
-     a switch line exists at all.
+     identity_written=ok keychain_written=ok` — confirm both
+     `identity_written` and `keychain_written` read `ok`, not just that a
+     switch line exists at all.
 
 ### T5 — Auto-swap
 
@@ -134,7 +127,7 @@ the change.
      by a swap-related log line.
    - **No keychain dialog** appears during the swap.
 
-### T6 — Inactive-account refresh (mirror-back) `[TBD: verify against CAS PR]`
+### T6 — Inactive-account refresh (mirror-back)
 
 1. Pick an account that is currently inactive and near token expiry.
 2. Wait for the next poll cycle (base cadence is 150s; shorter if any
@@ -180,9 +173,9 @@ the change.
 | `menubar poll failed: ...` | The poll cycle itself errored (not a single account's refresh) — check `state.json` isn't corrupt, check disk permissions on `~/.config/usagio`. |
 | `rate limited; backing off to <n>s` | Expected under heavy polling / after a burst of manual `--refresh` calls; exponential backoff, not a bug. Should recover once the vendor's rate limit window passes. |
 | No `cadence:` tightening lines ever appear despite an account visibly approaching the trigger | Adaptive cadence isn't engaging — check `TRIGGER_PCT` / `trigger_pct` in state.json matches what Settings shows, and that `max_session_pct` is actually being computed (a stale usage cache would make usagio think usage is lower than it is). |
-| A keychain "always allow?" / SecurityAgent dialog appears at all | The `security` CLI path isn't being used, or (once CAS lands) `-U` update-in-place is being used instead of delete-then-add — see `docs/architecture-0.5.0.md`'s CAS-mechanics section. `[TBD: verify against CAS PR]`. |
+| A keychain "always allow?" / SecurityAgent dialog appears at all | The `security` CLI path isn't being used, or `-U` update-in-place regressed back in over delete-then-add — see `docs/architecture-0.5.0.md`'s CAS-mechanics section. |
 | `security delete-generic-password` / `add-generic-password` failing repeatedly in the log | Keychain is locked (screen-lock timing?), or a permissions/ACL issue on the `"Claude Code-credentials"` item — check `security find-generic-password -s "Claude Code-credentials"` manually. |
-| `event=active_refresh_skipped_drift` appearing every single cycle for the same account, never resolving to `_won`/`_lost` | CAS is stuck comparing against a stale baseline — likely a bug in the before-read/after-read comparison rather than genuine concurrent drift; file as a bug rather than assuming it's benign. `[TBD: verify against CAS PR]`. |
+| `event=active_refresh_skipped_drift` appearing every single cycle for the same account, never resolving to `_won`/`_lost` | CAS is stuck comparing against a stale baseline — likely a bug in the before-read/after-read comparison rather than genuine concurrent drift; file as a bug rather than assuming it's benign. |
 | `mirror_back=err` (or the field missing entirely) in an `inactive_refresh` line | `mirror_rotated_token` failed or wasn't called for that provider — check the specific provider's override (Claude/Codex) is wired up, and that the target path (keychain / `.credentials.json` / `auth.json`) is writable. |
 
 ---

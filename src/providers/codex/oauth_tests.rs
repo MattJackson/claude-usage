@@ -267,6 +267,10 @@ fn refresh_token_grant_keeps_refresh_token_if_server_omits_it() {
 
 #[test]
 fn codex_active_refresh_cas_won_writes_auth_json_and_state() {
+    // active_refresh_cas reaches logging::log → store::config_dir(), which
+    // panics in tests without a HOME_OVERRIDE. Wrap in ScopedConfigDir so
+    // the tripwire doesn't fire.
+    let _g = crate::store::ScopedConfigDir::new();
     // "state" for Codex today IS auth.json — there is no separate
     // state.json account slot yet (see codex::mod's absorb_credential doc).
     // So "writes ... and state" here means: the CAS write lands, and it's
@@ -304,6 +308,7 @@ fn codex_active_refresh_cas_won_writes_auth_json_and_state() {
 
 #[test]
 fn codex_active_refresh_cas_lost_adopts_cli_rotation() {
+    let _g = crate::store::ScopedConfigDir::new();
     // Simulate a `codex` CLI process rotating auth.json WHILE our refresh
     // POST is in flight: the mock server rewrites the file from its
     // background thread before answering our request. active_refresh_cas
@@ -385,6 +390,7 @@ fn codex_inactive_refresh_atomic_no_toctou() {
 
 #[test]
 fn codex_active_refresh_cas_adopts_when_last_known_blob_already_stale() {
+    let _g = crate::store::ScopedConfigDir::new();
     // If the caller's cached reference doesn't match what's on disk BEFORE
     // we even check whether a refresh is due, someone already rotated the
     // file behind our back — adopt it immediately, no network call at all.
@@ -409,6 +415,7 @@ fn codex_active_refresh_cas_adopts_when_last_known_blob_already_stale() {
 
 #[test]
 fn active_refresh_cas_errors_without_refresh_token() {
+    let _g = crate::store::ScopedConfigDir::new();
     let dir = tempfile::tempdir().unwrap();
     let blob = serde_json::json!({
         "tokens": {

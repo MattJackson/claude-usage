@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-08
+
+Audit-fix + UX round following the v0.5.0 release: a menu-bar readability
+pass and a batch of robustness/concurrency/efficiency fixes from the
+post-release codeaudit.
+
+### Changed
+- **Per-provider menu grouping.** The main menu now groups accounts by
+  provider with an `NSMenuItem.separatorItem` between sections, instead of
+  one flat undifferentiated list.
+- **Version row right-aligned; dropped the `S`/`W` prefix.** The Quit-row
+  version string is right-aligned via a tab-stop paragraph style, and no
+  longer prefixes itself with the redundant `S`/`W` status letters.
+
+### Fixed
+- **`use_default` install-dialog fix.** The install flow's default-app
+  prompt now routes through `lsregister` instead of the path that could
+  leave macOS pointing at a stale/duplicate `usagio.app` registration.
+- **concurrency-01 [lock].** Closed a lock-ordering/hold gap in the state
+  lock usage the audit flagged as a potential deadlock/race window.
+- **robustness-01 [HIGH]: `security(1)` calls could hang forever.**
+  `real_get`/`real_set`/`real_delete` in `src/platform/macos.rs` now wrap
+  every `security` invocation in `timeout(1) 5` — a locked keychain or an
+  unattended SecurityAgent dialog previously hung the poll thread
+  indefinitely; it now surfaces as a `keychain_read_timeout` /
+  `keychain_write_timeout` / `keychain_delete_timeout` log event and a
+  regular (non-fatal) `Err` to the caller. Falls back to an unguarded
+  `security` call, logged once, on a machine with no `timeout` binary on
+  `PATH`.
+- **robustness-02 through robustness-05.** Further hardening fixes from the
+  same audit pass (see individual commits for detail).
+- **efficiency-01.** Closed a wasted-work finding from the audit pass.
+- **concurrency-03 [narrowed].** Tightened the scope of a previously
+  over-broad lock/critical section identified in round 3 of the audit.
+
 ## [0.5.0] - 2026-09-07
 
 Cross-platform release. Linux and Windows get real `Platform` trait
