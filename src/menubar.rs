@@ -3838,9 +3838,14 @@ mod tests {
                 None,
             );
             let r = account_header_row(&sec, &a);
-            assert_eq!(r.plain, "Claude · matt@example.com\t1h 30m");
+            // Session-locked + weekly-healthy nuance (v0.5.2 addendum #7):
+            // trailing = "<countdown> / <weekly%>" so the user can still see
+            // the healthy weekly headroom while the session countdown ticks.
+            assert_eq!(r.plain, "Claude · matt@example.com\t1h 30m / 20%");
             assert!(r.bold, "active locked row is still bold");
             assert!(r.checkmark, "active row gets a leading checkmark");
+            // countdown is red; weekly=20 sits below the severity bands so it
+            // contributes no additional color entry.
             assert_eq!(r.colors.len(), 1);
             let (_, _, sev) = r.colors[0];
             assert_eq!(sev, Severity::Red);
