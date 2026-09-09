@@ -25,6 +25,12 @@ mod platform;
 mod pricing;
 mod providers;
 mod store;
+// Custom tray-anchored popup UI (Phase 1). Whole module compiled only on macOS
+// under the off-by-default `custom-popup` feature; this single gated `mod ui;`
+// is the ONLY target_os cfg it needs (the module body has none), per
+// docs/design/custom-tray-popup.md and the strict_cfg allowlist note.
+#[cfg(all(target_os = "macos", feature = "custom-popup"))]
+mod ui;
 mod usage_log;
 
 use providers::claude::{oauth, usage};
@@ -3259,13 +3265,19 @@ fn cmd_uninstall() -> Result<()> {
     Ok(())
 }
 
-/// Bump the soft `RLIMIT_NOFILE` up to the hard cap (or 4096, whichever is
+/// Bump the soft `RLIMIT_NOFILE` up to the hard cap (or 65536, whichever is
 /// smaller). macOS ships every process with a soft cap of 256 files, which
 /// is fine for a CLI one-shot but crippling for a menubar that keeps
 /// fsnotify watchers open, opens state.json on every poll, does DNS, and
 /// talks to the keychain. libc getrlimit/setrlimit are always available on
 /// Unix; failure is logged and swallowed (we still run, just with the
 /// stock cap).
+///
+/// The ceiling was 4096, but a since-fixed fsnotify fd leak (the `macos_kqueue`
+/// backend — see `credentials.rs`) blew past 4096 and started failing keychain
+/// calls with EMFILE. The real fix removed the leak; this higher ceiling is
+/// defense-in-depth so any future fd growth degrades gracefully rather than
+/// silently breaking account switching.
 #[cfg(unix)]
 fn raise_nofile_limit() {
     // SAFETY: getrlimit/setrlimit take a valid resource id and a writable
@@ -3279,7 +3291,7 @@ fn raise_nofile_limit() {
             crate::logging::log("credentials: getrlimit(NOFILE) failed; leaving stock cap");
             return;
         }
-        let target = rl.rlim_max.min(4096);
+        let target = rl.rlim_max.min(65536);
         if rl.rlim_cur >= target {
             return;
         }

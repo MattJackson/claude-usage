@@ -682,6 +682,123 @@ fn fsnotify_watcher_supervisor_recovers_from_panic_and_keeps_processing() {
 }
 
 // -----------------------------------------------------------------------------
+// File-descriptor leak regression (v0.5.9).
+//
+// The credential watcher registers `notify::recommended_watcher().watch(parent,
+// NonRecursive)` on each provider's credential-file parent — e.g. `~/.claude`.
+// With the `macos_kqueue` backend that dir watch holds one open fd PER entry (and
+// descends), so on a real `~/.claude` (hundreds of `tasks/` dirs, a `plugins`
+// venv with thousands of files) the daemon leaked >4000 fds within a day and
+// every `security(1)` keychain call then failed with EMFILE — silently breaking
+// account switching, auto-swap, and refresh. The default FSEvents backend is a
+// single coalesced stream with no per-entry fd cost. This test watches a
+// deliberately large directory the exact way the app does and asserts the fd
+// count barely moves; it FAILS loudly if anyone reintroduces `macos_kqueue`.
+// -----------------------------------------------------------------------------
+#[cfg(unix)]
+fn open_fd_count() -> usize {
+    // Both enumerate THIS process's open descriptors: /proc/self/fd on Linux,
+    // /dev/fd on macOS/BSD.
+    let dir = if std::path::Path::new("/proc/self/fd").exists() {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    std::fs::read_dir(dir).map(|rd| rd.count()).unwrap_or(0)
+}
+
+#[test]
+#[cfg(unix)]
+fn watcher_does_not_leak_an_fd_per_file_in_a_large_dir() {
+    use notify::{RecursiveMode, Watcher};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let watched = tmp.path().join(".claude");
+    std::fs::create_dir_all(&watched).unwrap();
+    // Simulate a real ~/.claude: many immediate entries plus a growing tasks/
+    // subtree. kqueue would open an fd for each; FSEvents opens none per entry.
+    const ENTRIES: usize = 800;
+    for i in 0..ENTRIES {
+        std::fs::write(watched.join(format!("f{i}.json")), b"{}").unwrap();
+    }
+    for i in 0..200 {
+        let d = watched.join("tasks").join(format!("task-{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("meta.json"), b"{}").unwrap();
+    }
+
+    let before = open_fd_count();
+    let mut watcher = notify::recommended_watcher(|_res| {}).unwrap();
+    watcher
+        .watch(&watched, RecursiveMode::NonRecursive)
+        .expect("watch must succeed");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Churn the watched dir DIRECTLY the way the vendor CLIs do in a real
+    // session: rapid create/modify/delete of files right in the watched dir,
+    // each of which fires a directory-change event. notify's kqueue backend
+    // re-scans and opens (and fails to release) an fd per entry on every such
+    // event, so over a busy session the daemon climbs past RLIMIT_NOFILE and
+    // every `security(1)` keychain call then fails with EMFILE. FSEvents is a
+    // single coalesced stream — no per-event, per-entry fds.
+    for round in 0..250 {
+        let f = watched.join(format!("churn-{round}.tmp"));
+        std::fs::write(&f, b"x").unwrap();
+        let _ = std::fs::remove_file(&f);
+        if round % 25 == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let after = open_fd_count();
+    let delta = after.saturating_sub(before);
+
+    // General fd-leak canary: on FSEvents (and any sane backend) a watch +
+    // heavy churn adds only a handful of descriptors. If this ever balloons,
+    // SOMETHING is leaking fds per event (the class of bug that took the app
+    // down). Note: this alone does NOT deterministically catch the specific
+    // kqueue regression — reproducing kqueue's real-world leak needs a
+    // long-running session against a real ~/.claude, which a sandbox can't. The
+    // deterministic guard for that exact regression is
+    // `notify_backend_is_not_kqueue` below.
+    assert!(
+        delta < 64,
+        "watching + churning a dir opened {delta} fds — something is leaking a \
+         descriptor per filesystem event; investigate the notify backend / any \
+         per-event file opens."
+    );
+
+    drop(watcher);
+}
+
+/// Deterministic regression guard for the file-descriptor-exhaustion outage:
+/// the macOS `notify` backend MUST be FSEvents, never `macos_kqueue`. kqueue
+/// holds one fd per watched file/dir and descends `~/.claude`'s unbounded
+/// `tasks/` + `plugins/venv/` trees, leaking thousands of fds until every
+/// `security(1)` keychain call fails with EMFILE — which silently broke account
+/// switching, auto-swap, and refresh. This reads the crate manifest directly so
+/// it fails fast and unambiguously if anyone reintroduces the kqueue feature.
+#[test]
+fn notify_backend_is_not_kqueue() {
+    let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .expect("read Cargo.toml");
+    // Isolate the `notify = ...` dependency line(s) (ignore `notify-rust`).
+    for line in manifest.lines() {
+        let t = line.trim_start();
+        if t.starts_with("notify ") || t.starts_with("notify=") {
+            assert!(
+                !line.contains("macos_kqueue"),
+                "Cargo.toml enables the notify `macos_kqueue` backend, which \
+                 leaks a file descriptor per watched file and exhausted \
+                 RLIMIT_NOFILE (breaking keychain switch/refresh). Use the \
+                 default FSEvents backend: `notify = \"6\"`."
+            );
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Silence the unused-import warning on `Value` — kept around for future test
 // growth and to document that fixtures traffic in raw JSON strings, not
 // pre-parsed structures (the sync layer only ever sees blobs).

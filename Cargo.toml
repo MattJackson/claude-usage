@@ -39,6 +39,14 @@ default = [
 # default — the ~2MB tiktoken binary cost isn't worth it for a ±20% signal that
 # the fallback (chars/3.6) already provides.
 tiktoken = ["dep:tiktoken-rs"]
+# Phase 1 of the custom tray-anchored popup UI (docs/design/custom-tray-popup.md):
+# a real NSPopover anchored to the NSStatusItem button, drawn with native AppKit
+# views, replacing the native NSMenu's chevron-gap layout. macOS-only (Linux/
+# Windows keep the native menu — a tray-anchored popup is impossible on Linux).
+# OFF by default: the native NSMenu stays the shipping default until parity. The
+# `src/ui` module is compiled only under `cfg(all(target_os = "macos", feature =
+# "custom-popup"))`; on every other build this feature is inert.
+custom-popup = []
 claude = []
 codex = []
 opencode = []
@@ -74,7 +82,17 @@ notify-rust = "4"
 # fsnotify (filesystem change notifications) for the credential-sync layer:
 # watches every provider's credential_paths and drives absorb_all_lagging +
 # refresh_inactive_if_stale in response to vendor-CLI rotations.
-notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
+#
+# Uses the DEFAULT native backends (macOS FSEvents, Linux inotify, Windows
+# ReadDirectoryChangesW). Do NOT switch macOS to `macos_kqueue`: kqueue holds
+# one open file descriptor PER watched file/directory and descends the subtree,
+# so watching `~/.claude` (whose `tasks/` and `plugins/venv/` trees grow without
+# bound) leaked thousands of fds until every `security(1)` keychain call failed
+# with EMFILE ("Too many open files") — which silently broke account switching,
+# auto-swap, and refresh. FSEvents is a single coalesced stream with no per-file
+# fd cost, so a large watched subtree costs ~0 descriptors. See the fd-growth
+# regression test in `credentials.rs`.
+notify = "6"
 
 # Context Ledger deps: home/config discovery, typed errors, TOML config parsing
 # (Codex config.toml), and optional real tokenization behind the `tiktoken`
@@ -131,6 +149,21 @@ objc2-app-kit = { version = "0.3", features = [
                            # fixed magic number (v0.5.1)
     "NSImage",            # 16px provider icons on section header rows
     "objc2-core-foundation", # REQUIRED: CGFloat-typed methods are cfg-gated on it
+    # --- custom-popup (src/ui) NSPopover renderer; inert unless that feature is
+    # on, but enabling the AppKit classes unconditionally here (the dep is
+    # macOS-only already) avoids a cross-target `dep/feature` forward that would
+    # break `--features custom-popup` on Linux/Windows. ---
+    "NSPopover",          # the tray-anchored popover itself
+    "NSViewController",   # popover contentViewController host
+    "NSView",             # flipped container + row views
+    "NSControl",          # NSTextField setAlignment/setFont live here
+    "NSButton",           # NSStatusBarButton superclass
+    "NSTextField",        # row labels (email / trailing % / actions)
+    "NSImageView",        # provider icon on group-header rows
+    "NSBox",              # separator lines between provider groups
+    "NSStatusItem",       # status_item.button() anchor
+    "NSStatusBarButton",  # the concrete anchor view type
+    "NSEvent",            # mouseDown dispatch on row views
 ] }
 block2 = "0.6"
 
