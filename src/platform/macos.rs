@@ -527,6 +527,31 @@ pub(crate) fn launchctl_bootout_argv(uid: u32, label: &str) -> Vec<String> {
     vec!["bootout".to_string(), format!("gui/{uid}/{label}")]
 }
 
+/// Build the argv for `launchctl print gui/<uid>/<label>`, the probe used to
+/// tell whether the agent is currently loaded before we bootout/unload it.
+/// Split out so a hermetic test can pin its exact shape without invoking
+/// `launchctl` for real (v0.5.7: `install`/`uninstall` used to run a
+/// best-effort legacy `unload` unconditionally, which printed a scary
+/// "Unload failed: 5: Input/output error" to stderr whenever nothing was
+/// loaded — we now only unload/bootout when this probe says the agent is up).
+pub(crate) fn launchctl_print_argv(uid: u32, label: &str) -> Vec<String> {
+    vec!["print".to_string(), format!("gui/{uid}/{label}")]
+}
+
+/// Whether the LaunchAgent `label` is currently loaded in the caller's GUI
+/// domain. `launchctl print gui/<uid>/<label>` exits 0 iff the service is
+/// registered, so a successful exit is our "is it loaded?" signal. Any error
+/// (not loaded, launchctl missing) is treated as "not loaded" — the caller
+/// then skips bootout/unload entirely, which is exactly the safe default.
+#[cfg(unix)]
+fn is_agent_loaded(uid: u32, label: &str) -> bool {
+    Command::new("launchctl")
+        .args(launchctl_print_argv(uid, label))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Max attempts and backoff for the v0.5.4 bootstrap retry loop below.
 /// v0.5.3 shipped a single-shot `launchctl bootstrap`; on a fresh
 /// `brew install`, brew's `def post_install` invokes `system bin/"usagio",
@@ -667,22 +692,33 @@ impl Autostart for MacOsAutostart {
 
         // v0.5.3 P0 #2: after brew's `post_install` (or a manual `usagio
         // install`) writes the plist, we MUST also load it — otherwise the
-        // menu bar app doesn't run until the next reboot. Bootout first to
-        // clear any stale entry holding the label, then bootstrap the fresh
-        // plist. `launchctl_bootstrap` falls back to `load -w` if bootstrap
-        // fails (some older macOS point releases still need the legacy form).
+        // menu bar app doesn't run until the next reboot. If a stale entry is
+        // holding the label, bootout first; then bootstrap the fresh plist.
+        // `launchctl_bootstrap` falls back to `load -w` if bootstrap fails
+        // (some older macOS point releases still need the legacy form).
+        //
+        // v0.5.7: probe with `launchctl print` FIRST and only unload/bootout
+        // when the agent is actually loaded. Running a best-effort `unload`
+        // unconditionally printed a scary "Unload failed: 5: Input/output
+        // error\nTry running `launchctl bootout` as root for richer errors."
+        // to stderr on every fresh install (nothing was loaded yet). We
+        // prevent that noise rather than suppress it — if a bootout genuinely
+        // fails while the agent IS loaded, that error is worth surfacing.
         #[cfg(unix)]
         {
             let uid = unsafe { libc::getuid() };
-            let _ = Command::new("launchctl")
-                .args(launchctl_bootout_argv(uid, label))
-                .output();
-            // Also try the legacy `unload` form so a plist previously loaded
-            // via `load -w` is definitely gone before we bootstrap the fresh
-            // one — bootout won't find it if it was registered the old way.
-            let _ = Command::new("launchctl")
-                .args(["unload", &path.to_string_lossy()])
-                .status();
+            if is_agent_loaded(uid, label) {
+                // The agent is up — tear it down before bootstrapping the
+                // fresh plist. bootout is the modern form and should succeed
+                // here; a real failure now is worth seeing (unlike the
+                // spurious "nothing loaded" error we used to emit).
+                let _ = Command::new("launchctl")
+                    .args(launchctl_bootout_argv(uid, label))
+                    .output();
+            }
+            // If NOT loaded we skip both bootout AND the legacy `unload`
+            // entirely: there is nothing to unload, and the legacy `unload`
+            // is exactly what emitted the "Input/output error" noise.
             launchctl_bootstrap(&path)?;
         }
         Ok(())
@@ -693,19 +729,25 @@ impl Autostart for MacOsAutostart {
         #[cfg(unix)]
         {
             let uid = unsafe { libc::getuid() };
-            // Bootout is the modern counterpart to `unload`. Best-effort:
-            // ignore exit status (the label may not be currently bootstrapped
-            // — a fresh install after a failed prior run — which is fine).
-            let _ = Command::new("launchctl")
-                .args(launchctl_bootout_argv(uid, label))
-                .output();
+            // v0.5.7: only tear down when the agent is actually loaded. Probe
+            // with `launchctl print` first so we never run bootout/unload
+            // against a label that isn't bootstrapped — an unconditional
+            // legacy `unload` there prints a spurious "Unload failed: 5:
+            // Input/output error" to stderr (same noise `install` used to
+            // emit). When it IS loaded, a real failure is worth surfacing.
+            if is_agent_loaded(uid, label) {
+                // Bootout is the modern counterpart to `unload`.
+                let _ = Command::new("launchctl")
+                    .args(launchctl_bootout_argv(uid, label))
+                    .output();
+                // Also drop any legacy `load`-registered entry before removing
+                // the file, so a switch from an older usagio that used the
+                // legacy form doesn't leave a stale live job behind.
+                let _ = Command::new("launchctl")
+                    .args(["unload", &path.to_string_lossy()])
+                    .status();
+            }
         }
-        // Also drop any legacy `load`-registered entry before removing the
-        // file, so a switch from an older usagio that used the legacy form
-        // doesn't leave a stale live job behind.
-        let _ = Command::new("launchctl")
-            .args(["unload", &path.to_string_lossy()])
-            .status();
         if path.exists() {
             std::fs::remove_file(&path).context("removing plist")?;
         }
@@ -877,6 +919,23 @@ mod tests {
             argv,
             vec![
                 "bootout".to_string(),
+                "gui/501/com.mattjackson.usagio.menubar".to_string(),
+            ],
+        );
+    }
+
+    /// v0.5.7: `launchctl_print_argv` must be the exact `["print",
+    /// "gui/<uid>/<label>"]` probe `install`/`uninstall` use to decide whether
+    /// to bootout/unload at all — the guard that stops the spurious
+    /// "Unload failed: 5: Input/output error" on a fresh install. Hermetic:
+    /// pins the argv shape without invoking `launchctl` for real.
+    #[test]
+    fn launchctl_print_argv_matches_expected_shape() {
+        let argv = super::launchctl_print_argv(501, "com.mattjackson.usagio.menubar");
+        assert_eq!(
+            argv,
+            vec![
+                "print".to_string(),
                 "gui/501/com.mattjackson.usagio.menubar".to_string(),
             ],
         );
