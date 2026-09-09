@@ -21,6 +21,7 @@
 use super::*;
 use anyhow::{bail, Context, Result};
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -186,17 +187,46 @@ fn run_security(args: &[&str]) -> Result<SecurityRun> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Spawn as its own process-group leader (pgid == child pid) so the
+        // overrun path can SIGKILL the whole group — see `kill_group_and_reap`.
+        .process_group(0)
         .spawn()
         .context("spawning `security`")?;
     run_with_timeout(child, SECURITY_TIMEOUT)
 }
 
+/// SIGKILL the child's entire process group, then reap the direct child.
+///
+/// Precondition: `child` was spawned as its own group leader (`process_group(0)`
+/// in `run_security` and the test spawner), so its process-group id equals its
+/// pid and we can never signal an unrelated group. Killing the whole group —
+/// rather than just the direct child — means any descendant that inherited the
+/// stdout/stderr pipe also dies, so its write end closes and the reader threads'
+/// `read_to_end` can't block forever waiting on a surviving grandchild. `wait`
+/// reaps the direct child; group descendants are reparented to launchd/init.
+fn kill_group_and_reap(child: &mut Child) {
+    // SAFETY: `killpg` with the child's own group id; harmless ESRCH if the
+    // group has already exited. libc is a unix-target dependency.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
 /// Wait for an already-spawned child up to `timeout`, killing it if it
 /// overruns. stdout/stderr are drained on dedicated threads so a child that
-/// fills a pipe buffer can't deadlock against the `try_wait` poll loop (and so
-/// the reader threads unblock as soon as a killed child's pipes close). Split
-/// out from `run_security` so it can be unit-tested with ordinary commands
-/// (`sleep`, `echo`) rather than the real keychain.
+/// fills a pipe buffer can't deadlock against the `try_wait` poll loop. On
+/// overrun (or a `try_wait` error) the child's whole process GROUP is killed,
+/// so a hung child AND any pipe-inheriting descendant die and the reader
+/// threads unblock — the join below then can't hang. (The one residual case
+/// the deadline can't bound is a child that exits cleanly but leaves a
+/// backgrounded descendant holding the pipe open; `security(1)` never does
+/// this — it reaches SecurityAgent over XPC, not via a fork/exec child.)
+///
+/// Split out from `run_security` so it can be unit-tested with ordinary
+/// commands (`sleep`, `echo`) rather than the real keychain; the test spawner
+/// mirrors `run_security`'s `process_group(0)` so the group-kill precondition
+/// holds there too.
 fn run_with_timeout(mut child: Child, timeout: Duration) -> Result<SecurityRun> {
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
@@ -217,18 +247,26 @@ fn run_with_timeout(mut child: Child, timeout: Duration) -> Result<SecurityRun> 
 
     let deadline = Instant::now() + timeout;
     let status = loop {
-        match child.try_wait().context("waiting on `security`")? {
-            Some(s) => break Some(s),
-            None => {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => {
                 if Instant::now() >= deadline {
-                    // Overran: kill and reap. Reaping closes the child's pipe
-                    // write ends, so the reader threads' read_to_end returns
-                    // and the joins below can't hang.
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // Overran: kill the whole group and reap. Closing every
+                    // write end of the pipe lets the reader threads' read_to_end
+                    // return so the joins below can't hang.
+                    kill_group_and_reap(&mut child);
                     break None;
                 }
                 std::thread::sleep(SECURITY_POLL_INTERVAL);
+            }
+            Err(e) => {
+                // Rare (try_wait handles EINTR internally). Don't leak the
+                // child or the reader threads: kill the group so the pipes
+                // close and the joins return, reap, then surface the error.
+                kill_group_and_reap(&mut child);
+                let _ = out_reader.join();
+                let _ = err_reader.join();
+                return Err(e).context("waiting on `security`");
             }
         }
     };
@@ -923,6 +961,10 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Mirror run_security so kill_group_and_reap's group-leader
+            // precondition holds — otherwise killpg could signal the test
+            // runner's own group.
+            .process_group(0)
             .spawn()
             .expect("spawn test child")
     }
@@ -983,6 +1025,27 @@ mod tests {
         assert!(!run.timed_out);
         assert!(run.success());
         assert_eq!(run.stdout.len(), 262144);
+    }
+
+    /// robustness-01 (invariant hardening): an overrunning child that has
+    /// spawned a descendant which INHERITED the stdout pipe must still return
+    /// promptly — the group kill takes out the descendant too, so the reader
+    /// threads' read_to_end unblocks and the join doesn't hang. Without the
+    /// process-group kill, the backgrounded `sleep` would hold the pipe open
+    /// and `run_with_timeout` would block for the full 30s.
+    #[test]
+    fn run_with_timeout_kills_pipe_inheriting_descendants_on_overrun() {
+        let started = Instant::now();
+        // The shell exits after backgrounding `sleep`, but the sleep inherits
+        // the stdout pipe. The parent shell also `sleep`s so try_wait is None
+        // at the deadline and we take the overrun/group-kill path.
+        let child = spawn_for_test("sh", &["-c", "sleep 30 & sleep 30"]);
+        let run = run_with_timeout(child, Duration::from_millis(150)).expect("run");
+        assert!(run.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "group kill must reap the pipe-inheriting descendant, not wait it out"
+        );
     }
 
     /// v0.5.3 P0 #2: `launchctl_bootstrap_argv` MUST produce the exact
@@ -1055,6 +1118,10 @@ mod tests {
     #[test]
     #[ignore = "touches the real login keychain; run with --ignored"]
     fn secret_store_roundtrip() {
+        // real_get/set/delete log through crate::logging, which resolves
+        // store::config_dir(); the test harness forbids that without a
+        // HOME_OVERRIDE, so install a tempdir one for the duration.
+        let _g = crate::store::ScopedConfigDir::new();
         let service = format!("usagio-platform-test-{}", std::process::id());
         let account = "roundtrip";
         let secret = "hunter2";
@@ -1080,6 +1147,7 @@ mod tests {
     #[test]
     #[ignore = "touches the real login keychain; run with --ignored"]
     fn macos_secrets_set_deletes_then_adds() {
+        let _g = crate::store::ScopedConfigDir::new();
         let service = format!("usagio-platform-test-cas-{}", std::process::id());
         let account = "cas-write";
         let ss = MacOsSecrets;
