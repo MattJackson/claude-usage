@@ -67,6 +67,15 @@ $Awsi = "$Work\awscli.msi"
 Invoke-WebRequest -UseBasicParsing $AwsUrl -OutFile $Awsi
 Start-Process -FilePath msiexec -ArgumentList "/i","$Awsi","/qn" -Wait
 
+# Diagnostic checkpoint: prove first-boot provisioning finished and that the
+# AWS CLI can reach S3 from SYSTEM. If nothing else uploads, this marker tells
+# us the capture (post-reboot, interactive session) is where it broke.
+$AwsExe = "C:\Program Files\Amazon\AWSCLIV2\aws.exe"
+if (Test-Path $AwsExe) {
+    $usagioExe = (Get-ChildItem -Recurse -Path "C:\Program Files","C:\Program Files (x86)","$env:LOCALAPPDATA\Programs" -Filter usagio.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+    "firstboot done $(Get-Date -Format o); usagio=$usagioExe; python=$(Get-Command python -ErrorAction SilentlyContinue)" | & $AwsExe s3 cp - "$S3Uri/_firstboot.txt"
+}
+
 # --- 3. Capture script (runs interactively at logon) --------------------
 $CaptureBody = @'
 $ErrorActionPreference = "Continue"
@@ -77,6 +86,9 @@ $S3Uri    = "__S3URI__"
 $Fixtures = "__FIXTURES__".Split(" ")
 $Aws = "C:\Program Files\Amazon\AWSCLIV2\aws.exe"
 if (-not (Test-Path $Aws)) { $Aws = "aws" }
+
+# Checkpoint: the interactive capture session actually started.
+"capture started $(Get-Date -Format o) as $(whoami)" | & $Aws s3 cp - "$S3Uri/_capture-started.txt" 2>$null
 
 # Force all tray icons to always show for THIS user, then restart Explorer
 # so the notification area has no overflow.

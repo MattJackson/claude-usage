@@ -22,11 +22,61 @@ FIXTURES="@@FIXTURES@@"        # space-separated list e.g. "healthy mixed ..."
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y --no-install-recommends \
-  xvfb x11-utils xdotool imagemagick openbox xfce4-panel \
+
+# At first boot, cloud-init's own package step + apt-daily/unattended-upgrades
+# contend for the dpkg/apt lock. A plain `apt-get install` run here races them
+# and fails as a WHOLE transaction (apt is all-or-nothing), silently leaving
+# NONE of our tools installed (xvfb/xdotool/dbus-x11/awscli...). Wait the lock
+# out, then install with retries.
+wait_for_apt() {
+  for _ in $(seq 1 60); do
+    if fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+             /var/lib/apt/lists/lock >/dev/null 2>&1; then
+      log "apt/dpkg lock held; waiting..."; sleep 5
+    else
+      return 0
+    fi
+  done
+}
+apt_install() { # retry a transactional install a few times
+  local tries=0
+  until apt-get install -y --no-install-recommends "$@"; do
+    tries=$((tries+1)); [[ $tries -ge 4 ]] && return 1
+    log "apt install failed (try $tries); waiting + retrying"
+    wait_for_apt; apt-get update -y || true; sleep 8
+  done
+}
+
+wait_for_apt
+apt-get update -y || { wait_for_apt; apt-get update -y; }
+# libxdo3 is an explicit add: the usagio binary dlopens libxdo.so.3 and won't
+# even print --version without it (it ships with xdotool but we pin it too).
+apt_install \
+  xvfb x11-utils xdotool libxdo3 imagemagick openbox xfce4-panel \
   awscli curl ca-certificates python3 dbus-x11 fonts-dejavu-core \
   libayatana-appindicator3-1 libwebkit2gtk-4.1-0 x11-xserver-utils
+
+# Hard-verify the tools the rest of this script depends on actually landed.
+# If not, bail loudly AND ship the log (the EXIT trap below handles upload).
+MISSING=""
+for bin in aws Xvfb xdotool dbus-launch openbox xfce4-panel import python3; do
+  command -v "$bin" >/dev/null 2>&1 || MISSING="$MISSING $bin"
+done
+
+# --- Always ship diagnostics to S3, wherever we exit -----------------
+# (awscli must exist for this; verified just above. If it somehow doesn't,
+# the trap's aws calls no-op and we still have the EC2 console log.)
+ship_logs() {
+  local rc=$?
+  aws s3 cp /var/log/cloud-init-output.log "$S3_URI/_cloud-init.log" 2>/dev/null || true
+  echo "exit_rc=$rc missing=[$MISSING]" | aws s3 cp - "$S3_URI/_status.txt" 2>/dev/null || true
+}
+trap ship_logs EXIT
+
+if [[ -n "$MISSING" ]]; then
+  log "FATAL: required tools missing after apt install:$MISSING"
+  exit 1
+fi
 
 # ImageMagick's default policy disables some coders but PNG is fine; make
 # sure nothing blocks a root-window import.
@@ -36,7 +86,8 @@ sed -i 's/rights="none" pattern="PNG"/rights="read|write" pattern="PNG"/' \
 # Install usagio from the release .deb.
 DEB_URL="https://github.com/MattJackson/usagio/releases/download/${VERSION}/usagio_${VERSION#v}_amd64.deb"
 curl -fsSL -o /tmp/usagio.deb "$DEB_URL"
-apt-get install -y /tmp/usagio.deb || { apt-get -f install -y; dpkg -i /tmp/usagio.deb; }
+wait_for_apt
+apt-get install -y /tmp/usagio.deb || { apt-get -f install -y; dpkg -i /tmp/usagio.deb; apt-get -f install -y; }
 USAGIO_BIN="$(command -v usagio || echo /usr/bin/usagio)"
 log "usagio: $USAGIO_BIN ($($USAGIO_BIN --version 2>&1 | head -1))"
 
@@ -50,7 +101,10 @@ for f in $FIXTURES; do
 done
 
 # --- One shared D-Bus session bus for panel + usagio -----------------
-eval "$(dbus-launch --sh-syntax)"
+# Pre-declare so a dbus-launch failure can't trip `set -u` on the export.
+DBUS_SESSION_BUS_ADDRESS=""
+DBUS_SESSION_BUS_PID=""
+eval "$(dbus-launch --sh-syntax)" || log "WARN: dbus-launch failed"
 export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
 log "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
 

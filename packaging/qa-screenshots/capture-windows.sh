@@ -66,7 +66,7 @@ echo "[windows] instance=$INSTANCE_ID"
 
 # Windows boots + installs runtime (setup.exe, python, AWS CLI) + reboots
 # + autologons + runs capture. In practice 10-18 min. Deadline 25 min.
-DEADLINE=$(( $(date +%s) + 1500 ))
+DEADLINE=$(( $(date +%s) + 2100 ))
 echo "[windows] waiting for s3://$USAGIO_QA_S3_BUCKET/$S3_PREFIX/_done ..."
 while true; do
   if aws --region "$REGION" s3 ls "$S3_URI/_done" >/dev/null 2>&1; then

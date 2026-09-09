@@ -70,7 +70,7 @@ echo "[linux] instance=$INSTANCE_ID"
 # Poll S3 for the _done sentinel the user-data script drops. The 24.04 GUI
 # stack (Xvfb + xfce4-panel + webkit + imagemagick) is a heavy apt install,
 # so allow ~15 min.
-DEADLINE=$(( $(date +%s) + 900 ))
+DEADLINE=$(( $(date +%s) + 1200 ))
 echo "[linux] waiting for s3://$USAGIO_QA_S3_BUCKET/$S3_PREFIX/_done ..."
 while true; do
   if aws --region "$REGION" s3 ls "$S3_URI/_done" >/dev/null 2>&1; then
