@@ -1611,9 +1611,9 @@ fn refresh_provider_active_account_noop_when_provider_does_not_support_active_re
 
 #[test]
 fn refresh_provider_active_account_codex_fresh_token_is_a_noop() {
-    // The stored token is far from expiry and has no `last_refresh` at all,
-    // so `grant_needs_refresh` reports `Fresh` — no network call should even
-    // be attempted, and the account must be byte-for-byte unchanged.
+    // The stored blob still matches the slot on disk (the Codex CLI hasn't
+    // rotated it), so the active-account follower reports `Fresh` — no network
+    // call is made, and the account must be byte-for-byte unchanged.
     let _cfg = crate::store::ScopedConfigDir::new();
     let dir = tempfile::tempdir().unwrap();
     crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
@@ -1633,13 +1633,14 @@ fn refresh_provider_active_account_codex_fresh_token_is_a_noop() {
 }
 
 #[test]
-fn refresh_provider_active_account_codex_refreshes_and_persists_new_grant() {
-    // End-to-end: an expired stored token triggers `codex_active_refresh`,
-    // which drives `providers::codex::oauth::active_refresh_cas` against a
-    // local mock token endpoint, wins the CAS (nothing else touches
-    // auth.json during the test), and the new grant lands back in
-    // `state.providers["codex"]` — this is gap-4 of codex-switch-e2e end to
-    // end, without touching the real network or `~/.codex/auth.json`.
+fn refresh_provider_active_account_codex_adopts_cli_rotation_without_posting() {
+    // End-to-end for the NEVER-POST active-account contract: usagio captured
+    // one blob, then the Codex CLI rotated `auth.json` on its own cadence.
+    // `refresh_provider_active_account` must ADOPT the CLI's new blob into
+    // `state.providers["codex"]` WITHOUT ever POSTing `/token` — a usagio POST
+    // for the active account would consume the single-use refresh token and
+    // force a `codex login`. We prove zero POSTs by pointing the token-URL
+    // override at a mock server and asserting its hit counter stays 0.
     let _cfg = crate::store::ScopedConfigDir::new();
     let dir = tempfile::tempdir().unwrap();
     let codex_home = dir.path().to_str().unwrap().to_string();
@@ -1648,11 +1649,21 @@ fn refresh_provider_active_account_codex_refreshes_and_persists_new_grant() {
     // call (mirrors `providers::codex::oauth_tests::with_codex_env`, which
     // this file's edit scope doesn't extend to import from).
     crate::env_lock::scoped_env_var("CODEX_HOME", Some(&codex_home), || {
-        let expired_blob = codex_auth_json("stale@example.com", 1, "stale-at", "stale-rt");
-        std::fs::write(dir.path().join("auth.json"), &expired_blob).unwrap();
+        // usagio's last-observed blob (captured into state).
+        let captured_blob = codex_auth_json("user@example.com", 1, "old-at", "old-rt");
+        std::fs::write(dir.path().join("auth.json"), &captured_blob).unwrap();
         capture_current_generic("codex").unwrap();
 
-        let (base_url, _hits) = spawn_mock_token_server();
+        // The Codex CLI now rotates auth.json to a fresh grant behind our back.
+        let cli_rotated = codex_auth_json(
+            "user@example.com",
+            4_000_000_000,
+            "cli-rotated-at",
+            "cli-rotated-rt",
+        );
+        std::fs::write(dir.path().join("auth.json"), &cli_rotated).unwrap();
+
+        let (base_url, hits) = spawn_mock_token_server();
         #[allow(clippy::disallowed_methods)]
         let prev_url = std::env::var_os("CODEX_REFRESH_TOKEN_URL_OVERRIDE");
         #[allow(clippy::disallowed_methods)]
@@ -1669,15 +1680,23 @@ fn refresh_provider_active_account_codex_refreshes_and_persists_new_grant() {
             None => std::env::remove_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE"),
         }
 
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "active-account refresh must NEVER POST /token"
+        );
+
+        // State adopted the CLI's rotated grant verbatim.
         let state = State::load().unwrap();
         let acct = state
-            .find_provider_account("codex", "stale@example.com")
-            .expect("account survives the refresh");
-        assert_eq!(acct.access_token, "mock-refreshed-access-token");
-        assert_ne!(acct.secret_blob, expired_blob);
+            .find_provider_account("codex", "user@example.com")
+            .expect("account survives the adopt");
+        assert_eq!(acct.access_token, "cli-rotated-at");
+        assert_eq!(acct.secret_blob, cli_rotated);
 
+        // usagio never wrote auth.json — the CLI's blob stands untouched.
         let on_disk = std::fs::read_to_string(dir.path().join("auth.json")).unwrap();
-        assert!(on_disk.contains("mock-refreshed-access-token"));
+        assert_eq!(on_disk, cli_rotated);
     });
 }
 

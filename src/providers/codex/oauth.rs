@@ -33,8 +33,9 @@
 //!   (a) the access token expires within 5 minutes, OR (b) `last_refresh` is
 //!   more than `TOKEN_REFRESH_INTERVAL = 8` days old — i.e. OpenAI enforces
 //!   roughly an 8-day rotation cadence on the session regardless of how long
-//!   the bearer token itself remains valid. `grant_needs_refresh` below
-//!   mirrors both conditions.
+//!   the bearer token itself remains valid. usagio leaves that cadence to the
+//!   Codex CLI for the active login (see `active_refresh_cas` — usagio never
+//!   POSTs `/token` for the account the CLI owns).
 //! - **Refresh is fully programmatic**: a plain HTTPS POST issued by the CLI
 //!   binary itself (or, per community reports, OpenAI's server-side session
 //!   also expires refresh tokens outright after on the order of ~10-30 days
@@ -46,7 +47,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{auth_json_path, jwt_payload_claims, parse_codex_blob, write_auth_json_atomically};
+use super::{auth_json_path, jwt_payload_claims};
 use crate::providers::trait_def::TokenGrant;
 
 /// Codex's OAuth token endpoint. Override via `CODEX_REFRESH_TOKEN_URL_OVERRIDE`
@@ -60,11 +61,6 @@ pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_URL_OVERRIDE_ENV: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
 #[cfg(test)]
 const CLIENT_ID_OVERRIDE_ENV: &str = "CODEX_APP_SERVER_LOGIN_CLIENT_ID";
-
-/// Vendor's own proactive-refresh cadence: refresh if `last_refresh` in
-/// `auth.json` is older than this many days, even if the access token isn't
-/// close to expiry yet. See the module doc for the source.
-pub const SESSION_STALE_AFTER_DAYS: i64 = 8;
 
 // Prod: always hardcoded HTTPS endpoint + client id. The env-var overrides
 // (used by tests to point at a local mock server) are `#[cfg(test)]`-only —
@@ -140,15 +136,15 @@ impl std::fmt::Display for RefreshError {
 
 impl std::error::Error for RefreshError {}
 
-/// A refreshed Codex grant, still carrying `id_token` (unlike the generic
-/// `TokenGrant`) so the CAS writer below can patch `auth.json`'s `tokens`
-/// object completely — including the identity-bearing `id_token` — not just
-/// the two fields `TokenGrant` knows about.
+/// A refreshed Codex grant produced by the INACTIVE-account refresh path
+/// (`CodexProvider::refresh_token`). The active login is never refreshed by
+/// usagio (see `active_refresh_cas`), so this only ever feeds the generic
+/// `TokenGrant` conversion below — it carries just the fields that conversion
+/// needs.
 #[derive(Debug, Clone)]
 pub struct CodexRefreshGrant {
     pub access_token: String,
     pub refresh_token: String,
-    pub id_token: Option<String>,
     pub expires_in_secs: i64,
 }
 
@@ -220,228 +216,63 @@ pub fn refresh_token_grant(refresh_token: &str) -> Result<CodexRefreshGrant, Ref
     Ok(CodexRefreshGrant {
         access_token,
         refresh_token: refresh_token_out,
-        id_token: parsed.id_token,
         expires_in_secs,
     })
-}
-
-/// Whether `blob` (a full `auth.json` blob) needs a refresh right now: either
-/// its access token expires within `skew_secs`, or its `last_refresh` is
-/// older than `stale_after_secs` (the vendor's own ~8-day session cadence —
-/// see the module doc). A blob with no `last_refresh` at all only triggers
-/// the skew check, matching the vendor CLI's own `should_refresh_proactively`
-/// (which likewise only applies the staleness check when `last_refresh` is
-/// present).
-pub fn grant_needs_refresh(blob: &str, skew_secs: i64, stale_after_secs: i64) -> bool {
-    let Ok(parsed) = parse_codex_blob(blob) else {
-        // Unparseable / no usable access_token: nothing we can refresh our
-        // way out of here, but report "doesn't need refresh" so callers don't
-        // spin retrying a network call against a blob that isn't ours to fix.
-        return false;
-    };
-    let claims = parsed
-        .tokens
-        .id_token
-        .as_deref()
-        .and_then(jwt_payload_claims);
-    if let Some(exp) = claims
-        .as_ref()
-        .and_then(|c| c.get("exp"))
-        .and_then(|x| x.as_i64())
-    {
-        let remaining = exp.saturating_sub(chrono::Utc::now().timestamp());
-        if remaining <= skew_secs {
-            return true;
-        }
-    }
-    if let Some(last_refresh) = parsed.last_refresh.as_deref() {
-        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_refresh) {
-            let age = chrono::Utc::now()
-                .signed_duration_since(ts.with_timezone(&chrono::Utc))
-                .num_seconds();
-            if age >= stale_after_secs {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Outcome of `active_refresh_cas`.
 #[derive(Debug, PartialEq)]
 pub enum CasOutcome {
-    /// The stored access token had plenty of life left; no network call was
-    /// made.
+    /// The on-disk `auth.json` still matches the blob the caller last observed
+    /// (`last_known_blob`): the Codex CLI hasn't rotated it, so there is
+    /// nothing new to adopt and no state update is needed.
     Fresh,
-    /// We refreshed and won the compare-and-swap: `auth.json` now holds our
-    /// new grant.
-    Refreshed,
-    /// Someone else (the `codex` CLI, or another `usagio` process) rotated
-    /// `auth.json` either before we started or while our POST was in
-    /// flight. We discarded our own grant and adopted theirs — the returned
-    /// `String` is the winning blob, exactly as read from disk, so the
-    /// caller can absorb it into whatever cache it keeps.
+    /// The active `auth.json` differs from (or was never compared against) the
+    /// caller's last-known blob — the Codex CLI has rotated it since. usagio
+    /// adopts whatever the CLI now holds; the returned `String` is the winning
+    /// blob, exactly as read from disk, so the caller can absorb it into
+    /// whatever cache it keeps.
     Adopted(String),
 }
 
-/// Refresh the single active Codex login under a compare-and-swap on
-/// `auth.json`'s raw bytes.
+/// Adopt the single active Codex login from the slot the Codex CLI owns
+/// (`~/.codex/auth.json`), **never POSTing `/token` for it**.
 ///
-/// Unlike Claude (keychain blob + `~/.claude.json` identity file + a
-/// state.json copy, three places that can independently drift), Codex has
-/// exactly one source of truth: `auth.json` itself (see the module doc on
-/// `codex::mod` — "the auth.json write *is* the entire switch"). So the CAS
-/// reference point is simply "the last blob we observed", passed in as
-/// `last_known_blob` (typically the blob a caller read a few seconds ago
-/// while deciding whether a refresh was due); there is no separate cached
-/// copy in `state.json` to reconcile against because Codex has no state.json
-/// account slot yet (`absorb_credential`'s doc comment on the same TODO).
+/// ## Why usagio must never refresh the active Codex account
 ///
-/// Sequence:
-/// 1. Read `auth.json`. If `last_known_blob` is `Some` and disagrees with
-///    what's on disk right now, someone already rotated it — adopt it and
-///    return `Adopted` without ever touching the network.
-/// 2. If the (now-confirmed-current) blob doesn't need a refresh yet, return
-///    `Fresh`.
-/// 3. POST the refresh. This is the only network I/O and the only step that
-///    can take arbitrarily long — exactly the window a concurrent `codex`
-///    CLI refresh could land in.
-/// 4. Re-read `auth.json`. If it's unchanged since step 1, we won: patch in
-///    our new tokens and write atomically. If it changed, we lost: discard
-///    our (now-guaranteed-stale, about to be `refresh_token_reused`) grant
-///    and adopt whatever's there instead.
+/// Codex's refresh tokens are single-use / rotated server-side (see the module
+/// doc: reuse comes back `refresh_token_reused`). The Codex CLI reads and
+/// rewrites `auth.json` on its own cadence. If usagio POSTed `/token` for the
+/// active account it would rotate the token family server-side and permanently
+/// invalidate the copy the CLI holds — the CLI's next refresh would then fail
+/// and force an interactive `codex login`. The destructive act is the POST
+/// itself, and it is irreversible by the time we read the slot back, so no
+/// after-the-fact compare-and-swap can prevent it. This is the exact class of
+/// bug fixed for Claude in `main.rs::active_refresh_cas`.
 ///
-/// concurrency-03 (v0.5.1 audit): step 4's "we won" conclusion is NOT a real
-/// atomic compare-and-swap on the filesystem — it's "read, POST, read, then
-/// separately write", and nothing excludes a genuinely concurrent writer
-/// (most importantly the real `codex` CLI, a separate process that has no
-/// knowledge of and cannot participate in any lock usagio takes) from
-/// writing `auth.json` in the gap between the confirming re-read and the
-/// `rename()` inside `write_auth_json_atomically`. There is no portable
-/// "compare bytes and write" filesystem primitive that closes this
-/// completely — doing so for real would require an OS-level lock file the
-/// vendor CLI would ALSO have to honor, which usagio cannot arrange since it
-/// doesn't control that binary. What this function does instead: (a) keep
-/// the re-read-to-write gap as small as physically possible (no I/O, no
-/// network calls, nothing but pure in-memory patching between the
-/// confirming read and the write below), and (b) immediately re-read once
-/// more right after the write completes, so if a third writer's rotation
-/// landed in that residual gap and our write clobbered it, we detect the
-/// mismatch on the very next line and adopt the now-current content instead
-/// of trusting our own write blindly. This narrows the blast radius to "we
-/// might silently clobber a rotation that lands in a multi-microsecond
-/// window" rather than "we might clobber a rotation and never notice."
-pub fn active_refresh_cas(
-    skew_secs: i64,
-    stale_after_secs: i64,
-    last_known_blob: Option<&str>,
-) -> Result<CasOutcome, RefreshError> {
+/// So for the active account usagio is a pure follower: it reads `auth.json`
+/// and adopts whatever the Codex CLI currently holds, keeping usagio's state in
+/// sync without ever minting a token. The CLI refreshes the active login on its
+/// own cadence; usagio only needs the current tokens (from the slot) to query
+/// usage. The INACTIVE-account refresh path (`CodexProvider::refresh_token` →
+/// `refresh_token_grant`) is unaffected — the CLI isn't using those logins, so
+/// refreshing them is safe.
+///
+/// `last_known_blob` is the blob the caller last observed (typically the
+/// account's cached `secret_blob`). If the on-disk blob still equals it, the
+/// CLI hasn't rotated anything and we return `Fresh` (no state update needed);
+/// otherwise we return `Adopted(blob)` with the current on-disk bytes for the
+/// caller to absorb.
+pub fn active_refresh_cas(last_known_blob: Option<&str>) -> Result<CasOutcome, RefreshError> {
     let path = auth_json_path()
         .ok_or_else(|| RefreshError::Transient("could not resolve $CODEX_HOME / $HOME".into()))?;
     let before = std::fs::read_to_string(&path)
         .map_err(|e| RefreshError::Transient(format!("reading auth.json: {e}")))?;
 
-    if let Some(known) = last_known_blob {
-        if known != before {
-            return Ok(CasOutcome::Adopted(before));
-        }
+    match last_known_blob {
+        Some(known) if known == before => Ok(CasOutcome::Fresh),
+        _ => Ok(CasOutcome::Adopted(before)),
     }
-
-    if !grant_needs_refresh(&before, skew_secs, stale_after_secs) {
-        return Ok(CasOutcome::Fresh);
-    }
-
-    let parsed = parse_codex_blob(&before).map_err(|e| RefreshError::Transient(e.to_string()))?;
-    let refresh_token = parsed
-        .tokens
-        .refresh_token
-        .clone()
-        .ok_or(RefreshError::InvalidGrant)?;
-
-    let grant = refresh_token_grant(&refresh_token)?;
-
-    let after = std::fs::read_to_string(&path)
-        .map_err(|e| RefreshError::Transient(format!("reading auth.json: {e}")))?;
-    if after != before {
-        // Lost the race: our grant is now stale (the CLI's own refresh just
-        // consumed the same refresh_token family), so we throw it away
-        // rather than risk a `refresh_token_reused` write that could corrupt
-        // the CLI's freshly-written state.
-        return Ok(CasOutcome::Adopted(after));
-    }
-
-    // Nothing but pure, in-memory patching between the confirming read
-    // above and the write below — see the concurrency-03 doc comment on
-    // this function for why that gap can't be closed to zero.
-    let patched = apply_grant_to_blob(&before, &grant)
-        .map_err(|e| RefreshError::Transient(format!("patching auth.json: {e}")))?;
-    write_auth_json_atomically(&path, &patched)
-        .map_err(|e| RefreshError::Transient(format!("writing auth.json: {e}")))?;
-
-    // Post-write confirmation re-read (concurrency-03): if a concurrent
-    // writer's rotation landed in the residual read-to-write gap and our
-    // `rename()` clobbered it, this catches the mismatch immediately and
-    // adopts what's actually on disk now instead of the caller believing
-    // our (possibly already-stale) write stuck.
-    match std::fs::read_to_string(&path) {
-        Ok(confirm) if confirm == patched => {
-            crate::logging::log("event=codex_cas_write_confirmed");
-        }
-        Ok(confirm) => {
-            crate::logging::log(
-                "event=codex_cas_post_write_race_detected reason=auth_json_changed_after_our_write",
-            );
-            return Ok(CasOutcome::Adopted(confirm));
-        }
-        Err(e) => {
-            // Can't confirm, but the write itself already reported success —
-            // log and proceed rather than fail an otherwise-successful
-            // refresh over a read error on the confirmation step alone.
-            crate::logging::log(&format!(
-                "event=codex_cas_post_write_confirm_read_failed reason={e}"
-            ));
-        }
-    }
-    Ok(CasOutcome::Refreshed)
-}
-
-/// Merge a `CodexRefreshGrant` into a full `auth.json` blob, preserving every
-/// other top-level field (`OPENAI_API_KEY`, etc.) untouched. Unlike
-/// `CodexProvider::patch_stored_blob` (which only knows the generic
-/// `TokenGrant` shape), this also updates `tokens.id_token` — needed so the
-/// next `capture_current_login` / `identify_credential` sees the refreshed
-/// identity claims, not stale ones.
-fn apply_grant_to_blob(blob: &str, grant: &CodexRefreshGrant) -> Result<String, String> {
-    let mut v: serde_json::Value =
-        serde_json::from_str(blob).map_err(|e| format!("auth.json is not valid JSON: {e}"))?;
-    let obj = v
-        .as_object_mut()
-        .ok_or_else(|| "auth.json is not a JSON object".to_string())?;
-    let tokens = obj
-        .entry("tokens".to_string())
-        .or_insert_with(|| serde_json::Value::Object(Default::default()));
-    let tokens_obj = tokens
-        .as_object_mut()
-        .ok_or_else(|| "auth.json `tokens` is not an object".to_string())?;
-    tokens_obj.insert(
-        "access_token".into(),
-        serde_json::Value::String(grant.access_token.clone()),
-    );
-    tokens_obj.insert(
-        "refresh_token".into(),
-        serde_json::Value::String(grant.refresh_token.clone()),
-    );
-    if let Some(id_token) = grant.id_token.as_ref() {
-        tokens_obj.insert(
-            "id_token".into(),
-            serde_json::Value::String(id_token.clone()),
-        );
-    }
-    obj.insert(
-        "last_refresh".into(),
-        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
-    );
-    Ok(v.to_string())
 }
 
 #[cfg(test)]

@@ -143,64 +143,6 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-// --- grant_needs_refresh ----------------------------------------------------
-
-#[test]
-fn grant_needs_refresh_false_for_far_future_exp_and_recent_last_refresh() {
-    let now = chrono::Utc::now();
-    let blob = make_auth_json(
-        "u@e.com",
-        now.timestamp() + 3600,
-        "at",
-        "rt",
-        Some(&now.to_rfc3339()),
-    );
-    assert!(!grant_needs_refresh(&blob, 900, 8 * 86400));
-}
-
-#[test]
-fn grant_needs_refresh_true_when_access_token_near_expiry() {
-    let now = chrono::Utc::now();
-    let blob = make_auth_json(
-        "u@e.com",
-        now.timestamp() + 60,
-        "at",
-        "rt",
-        Some(&now.to_rfc3339()),
-    );
-    assert!(grant_needs_refresh(&blob, 900, 8 * 86400));
-}
-
-#[test]
-fn grant_needs_refresh_true_when_last_refresh_older_than_session_ttl() {
-    // Access token itself still has a year of life, but last_refresh is 9
-    // days old — the vendor's own ~8-day session cadence should fire.
-    let now = chrono::Utc::now();
-    let stale_last_refresh = now - chrono::Duration::days(9);
-    let blob = make_auth_json(
-        "u@e.com",
-        now.timestamp() + 365 * 86400,
-        "at",
-        "rt",
-        Some(&stale_last_refresh.to_rfc3339()),
-    );
-    assert!(grant_needs_refresh(&blob, 900, 8 * 86400));
-}
-
-#[test]
-fn grant_needs_refresh_ignores_missing_last_refresh() {
-    // No last_refresh at all (never refreshed since login) — only the skew
-    // check applies, matching the vendor CLI's own should_refresh_proactively.
-    let now = chrono::Utc::now();
-    let blob = make_auth_json("u@e.com", now.timestamp() + 365 * 86400, "at", "rt", None);
-    assert!(!grant_needs_refresh(&blob, 900, 8 * 86400));
-}
-
-#[test]
-fn grant_needs_refresh_false_for_unparseable_blob() {
-    assert!(!grant_needs_refresh("not json", 900, 8 * 86400));
-}
-
 // --- refresh_token_grant -----------------------------------------------------
 
 #[test]
@@ -264,61 +206,85 @@ fn refresh_token_grant_keeps_refresh_token_if_server_omits_it() {
 }
 
 // --- active_refresh_cas -------------------------------------------------------
+//
+// The active-account contract is now NEVER-POST: usagio is a pure follower of
+// the slot the Codex CLI owns (`auth.json`). Codex's refresh tokens are
+// single-use, so a usagio POST would rotate the family server-side and force a
+// `codex login` (see `active_refresh_cas`'s doc, and the Claude analog). Every
+// test below therefore points `CODEX_REFRESH_TOKEN_URL_OVERRIDE` at a listener
+// that counts connections and asserts ZERO were made — if a regression ever
+// reintroduced a `/token` POST for the active account, the counter would catch
+// it — and asserts the function adopts whatever the slot holds.
+
+/// A TCP listener that counts inbound connections. Used to prove the
+/// active-account refresh path makes NO HTTP call: we point
+/// `CODEX_REFRESH_TOKEN_URL_OVERRIDE` at it and assert the counter stays 0.
+/// The accept loop leaks a thread for the test's lifetime (same pattern as
+/// `spawn_mock_token_server`); the atomic is checked only after the
+/// synchronous `active_refresh_cas` call has already returned, so any POST it
+/// might have made would have completed and been counted by then.
+fn spawn_connection_counter() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind connection counter");
+    let addr = listener.local_addr().expect("local_addr");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_thread = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if stream.is_ok() {
+                hits_thread.fetch_add(1, Ordering::SeqCst);
+            } else {
+                break;
+            }
+        }
+    });
+    (format!("http://{addr}/oauth/token"), hits)
+}
 
 #[test]
-fn codex_active_refresh_cas_won_writes_auth_json_and_state() {
+fn codex_active_refresh_cas_adopts_slot_without_posting() {
     // active_refresh_cas reaches logging::log → store::config_dir(), which
     // panics in tests without a HOME_OVERRIDE. Wrap in ScopedConfigDir so
     // the tripwire doesn't fire.
     let _g = crate::store::ScopedConfigDir::new();
-    // "state" for Codex today IS auth.json — there is no separate
-    // state.json account slot yet (see codex::mod's absorb_credential doc).
-    // So "writes ... and state" here means: the CAS write lands, and it's
-    // the one and only place Codex's active-login truth lives.
+    // Even with an EXPIRED access token and no last-known blob, the active
+    // path must NOT POST /token — it adopts the slot exactly as-is. (Under the
+    // old bug this expired token would have driven a token mint.)
     let dir = tempfile::tempdir().unwrap();
     let expired = chrono::Utc::now().timestamp() - 10;
     let initial = make_auth_json("u@e.com", expired, "old-at", "old-rt", None);
     std::fs::write(dir.path().join("auth.json"), &initial).unwrap();
 
-    let new_id_token = make_id_token("u@e.com", chrono::Utc::now().timestamp() + 3600);
-    let body = serde_json::json!({
-        "access_token": "new-at",
-        "refresh_token": "new-rt",
-        "id_token": new_id_token,
-    })
-    .to_string();
-    let (url, handle) = spawn_mock_token_server(200, body, || {});
-
-    with_codex_env(dir.path().to_str().unwrap(), &url, || {
-        let outcome = active_refresh_cas(900, 8 * 86400, None).unwrap();
-        assert_eq!(outcome, CasOutcome::Refreshed);
+    let (url, hits) = spawn_connection_counter();
+    let outcome = with_codex_env(dir.path().to_str().unwrap(), &url, || {
+        active_refresh_cas(None).unwrap()
     });
-    let _ = handle.join();
 
-    let on_disk = std::fs::read_to_string(dir.path().join("auth.json")).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+    match outcome {
+        CasOutcome::Adopted(blob) => assert_eq!(blob, initial, "must adopt the slot verbatim"),
+        other => panic!("expected Adopted(slot), got {other:?}"),
+    }
     assert_eq!(
-        v["tokens"]["access_token"].as_str(),
-        Some("new-at"),
-        "CAS win must persist the refreshed access_token"
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "active-account refresh must make ZERO HTTP calls"
     );
-    assert_eq!(v["tokens"]["refresh_token"].as_str(), Some("new-rt"));
-    assert!(v["last_refresh"].as_str().is_some());
+    // The slot is left byte-for-byte untouched — no write, no rotation.
+    let on_disk = std::fs::read_to_string(dir.path().join("auth.json")).unwrap();
+    assert_eq!(on_disk, initial, "adopt must never rewrite auth.json");
 }
 
 #[test]
 fn codex_active_refresh_cas_lost_adopts_cli_rotation() {
     let _g = crate::store::ScopedConfigDir::new();
-    // Simulate a `codex` CLI process rotating auth.json WHILE our refresh
-    // POST is in flight: the mock server rewrites the file from its
-    // background thread before answering our request. active_refresh_cas
-    // must detect the mismatch on its post-refresh re-read, discard its own
-    // (now úseless) grant, and report the CLI's blob instead of clobbering it.
+    // The Codex CLI rotated auth.json since usagio last observed it
+    // (`last_known` = the old blob). usagio must adopt the CLI's current blob
+    // and never POST — the CLI already holds a valid, freshly-minted grant.
     let dir = tempfile::tempdir().unwrap();
     let auth_path = dir.path().join("auth.json");
     let expired = chrono::Utc::now().timestamp() - 10;
-    let initial = make_auth_json("u@e.com", expired, "old-at", "old-rt", None);
-    std::fs::write(&auth_path, &initial).unwrap();
+    let last_known = make_auth_json("u@e.com", expired, "old-at", "old-rt", None);
 
     let cli_rotated = make_auth_json(
         "u@e.com",
@@ -327,61 +293,61 @@ fn codex_active_refresh_cas_lost_adopts_cli_rotation() {
         "cli-rotated-rt",
         None,
     );
-    let auth_path_for_server = auth_path.clone();
-    let cli_rotated_for_server = cli_rotated.clone();
-    let body =
-        serde_json::json!({ "access_token": "our-at", "refresh_token": "our-rt" }).to_string();
-    let (url, handle) = spawn_mock_token_server(200, body, move || {
-        std::fs::write(&auth_path_for_server, &cli_rotated_for_server).unwrap();
-    });
+    // Disk already holds what the CLI rotated to.
+    std::fs::write(&auth_path, &cli_rotated).unwrap();
 
+    let (url, hits) = spawn_connection_counter();
     let outcome = with_codex_env(dir.path().to_str().unwrap(), &url, || {
-        active_refresh_cas(900, 8 * 86400, None).unwrap()
+        active_refresh_cas(Some(&last_known)).unwrap()
     });
-    let _ = handle.join();
 
     match outcome {
         CasOutcome::Adopted(blob) => assert_eq!(blob, cli_rotated),
         other => panic!("expected Adopted(cli_rotated), got {other:?}"),
     }
-    // The file on disk must still be exactly what the "CLI" wrote — our
-    // stale grant must never have been written over it.
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "adopting a CLI rotation must make ZERO HTTP calls"
+    );
+    // The file on disk must still be exactly what the CLI wrote — usagio must
+    // never write over it.
     let on_disk = std::fs::read_to_string(&auth_path).unwrap();
     assert_eq!(on_disk, cli_rotated);
 }
 
 #[test]
-fn codex_inactive_refresh_atomic_no_toctou() {
-    // Named for parity with the Claude-side inactive-refresh atomicity test;
-    // Codex has no separate inactive-account store yet (single auth.json is
-    // the only tracked login), so the atomicity property under test here is:
-    // when the token is already fresh, active_refresh_cas performs NO
-    // filesystem write at all (not even a no-op rewrite) — there is no
-    // window in which a concurrent reader could observe a torn or
-    // needlessly-rewritten file for an account that didn't need refreshing.
+fn codex_active_refresh_cas_fresh_when_slot_matches_last_known() {
+    // When the slot on disk still equals the caller's last-known blob, the CLI
+    // hasn't rotated anything: return Fresh, make no HTTP call, and never
+    // rewrite the file.
+    let _g = crate::store::ScopedConfigDir::new();
     let dir = tempfile::tempdir().unwrap();
     let auth_path = dir.path().join("auth.json");
-    let fresh = make_auth_json(
+    let blob = make_auth_json(
         "u@e.com",
         chrono::Utc::now().timestamp() + 3600,
         "at",
         "rt",
         Some(&chrono::Utc::now().to_rfc3339()),
     );
-    std::fs::write(&auth_path, &fresh).unwrap();
+    std::fs::write(&auth_path, &blob).unwrap();
     let mtime_before = std::fs::metadata(&auth_path).unwrap().modified().unwrap();
 
-    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
-        // No mock server registered at all — a network call here would fail
-        // fast with a connection error, proving grant_needs_refresh's
-        // short-circuit ran before any I/O beyond the initial read.
-        let outcome = active_refresh_cas(900, 8 * 86400, None).unwrap();
-        assert_eq!(outcome, CasOutcome::Fresh);
+    let (url, hits) = spawn_connection_counter();
+    let outcome = with_codex_env(dir.path().to_str().unwrap(), &url, || {
+        active_refresh_cas(Some(&blob)).unwrap()
     });
+    assert_eq!(outcome, CasOutcome::Fresh);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a Fresh outcome must make ZERO HTTP calls"
+    );
 
     let on_disk = std::fs::read_to_string(&auth_path).unwrap();
     assert_eq!(
-        on_disk, fresh,
+        on_disk, blob,
         "a Fresh outcome must never rewrite auth.json"
     );
     let mtime_after = std::fs::metadata(&auth_path).unwrap().modified().unwrap();
@@ -391,9 +357,8 @@ fn codex_inactive_refresh_atomic_no_toctou() {
 #[test]
 fn codex_active_refresh_cas_adopts_when_last_known_blob_already_stale() {
     let _g = crate::store::ScopedConfigDir::new();
-    // If the caller's cached reference doesn't match what's on disk BEFORE
-    // we even check whether a refresh is due, someone already rotated the
-    // file behind our back — adopt it immediately, no network call at all.
+    // The caller's cached reference doesn't match what's on disk — the CLI
+    // rotated the file behind our back. Adopt it immediately, no network call.
     let dir = tempfile::tempdir().unwrap();
     let current = make_auth_json(
         "u@e.com",
@@ -404,17 +369,26 @@ fn codex_active_refresh_cas_adopts_when_last_known_blob_already_stale() {
     );
     std::fs::write(dir.path().join("auth.json"), &current).unwrap();
 
-    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
-        let outcome = active_refresh_cas(900, 8 * 86400, Some("stale-cached-blob")).unwrap();
-        match outcome {
-            CasOutcome::Adopted(blob) => assert_eq!(blob, current),
-            other => panic!("expected Adopted, got {other:?}"),
-        }
+    let (url, hits) = spawn_connection_counter();
+    let outcome = with_codex_env(dir.path().to_str().unwrap(), &url, || {
+        active_refresh_cas(Some("stale-cached-blob")).unwrap()
     });
+    match outcome {
+        CasOutcome::Adopted(blob) => assert_eq!(blob, current),
+        other => panic!("expected Adopted, got {other:?}"),
+    }
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "stale-cache adopt must make ZERO HTTP calls"
+    );
 }
 
 #[test]
-fn active_refresh_cas_errors_without_refresh_token() {
+fn codex_active_refresh_cas_adopts_slot_even_without_refresh_token() {
+    // A follower never needs a refresh token: even a slot with no
+    // `refresh_token` at all is adopted verbatim (no error, no POST) — the
+    // active blob is by definition whatever the CLI is using.
     let _g = crate::store::ScopedConfigDir::new();
     let dir = tempfile::tempdir().unwrap();
     let blob = serde_json::json!({
@@ -426,40 +400,19 @@ fn active_refresh_cas_errors_without_refresh_token() {
     .to_string();
     std::fs::write(dir.path().join("auth.json"), &blob).unwrap();
 
-    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
-        let err = active_refresh_cas(900, 8 * 86400, None).unwrap_err();
-        assert!(matches!(err, RefreshError::InvalidGrant));
+    let (url, hits) = spawn_connection_counter();
+    let outcome = with_codex_env(dir.path().to_str().unwrap(), &url, || {
+        active_refresh_cas(None).unwrap()
     });
-}
-
-// --- apply_grant_to_blob -----------------------------------------------------
-
-#[test]
-fn apply_grant_to_blob_preserves_unrelated_fields_and_updates_id_token() {
-    let blob = serde_json::json!({
-        "OPENAI_API_KEY": serde_json::Value::Null,
-        "tokens": {
-            "access_token": "old-at",
-            "refresh_token": "old-rt",
-            "id_token": "old-id",
-            "account_id": "acc-1",
-        }
-    })
-    .to_string();
-    let grant = CodexRefreshGrant {
-        access_token: "new-at".into(),
-        refresh_token: "new-rt".into(),
-        id_token: Some("new-id".into()),
-        expires_in_secs: 3600,
-    };
-    let out = apply_grant_to_blob(&blob, &grant).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["tokens"]["access_token"], "new-at");
-    assert_eq!(v["tokens"]["refresh_token"], "new-rt");
-    assert_eq!(v["tokens"]["id_token"], "new-id");
-    // account_id (untouched field) survives.
-    assert_eq!(v["tokens"]["account_id"], "acc-1");
-    assert!(v["last_refresh"].as_str().is_some());
+    match outcome {
+        CasOutcome::Adopted(adopted) => assert_eq!(adopted, blob),
+        other => panic!("expected Adopted even without a refresh_token, got {other:?}"),
+    }
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "adopt of a refresh-token-less slot must make ZERO HTTP calls"
+    );
 }
 
 /// robustness-01: a server that accepts the TCP connection but never writes a

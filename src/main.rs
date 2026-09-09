@@ -1882,26 +1882,24 @@ fn provider_active_refresh(slug: &str, acct: &ProviderAccount) -> ProviderRefres
     }
 }
 
-/// Codex's CAS half: run `codex::oauth::active_refresh_cas` (skew + the
-/// vendor's own ~8-day session-staleness cadence, see that function's doc)
-/// against `acct.secret_blob` as the last-known-good comparison point. On
-/// `Refreshed`/`Adopted`, re-read the live `auth.json` via
-/// `capture_current_login` — reusing the provider's own parsing instead of
-/// hand-rolling a second blob->TokenGrant conversion here — so the result is
-/// guaranteed consistent with what a fresh capture would see.
+/// Codex's active-account half: usagio is a pure FOLLOWER of the slot the
+/// Codex CLI owns (`~/.codex/auth.json`). It NEVER POSTs `/token` for the
+/// active account — Codex's refresh tokens are single-use, so minting one would
+/// rotate the token family server-side and invalidate the copy the CLI holds,
+/// forcing an interactive `codex login` (see `codex::oauth::active_refresh_cas`,
+/// and the Claude analog `main.rs::active_refresh_cas`). It reads the slot and,
+/// if the CLI has rotated it since we last saw it, adopts whatever the CLI now
+/// holds via `capture_current_login` — reusing the provider's own parsing
+/// instead of hand-rolling a blob->TokenGrant conversion — so the result is
+/// consistent with a fresh capture. The inactive-account path
+/// (`CodexProvider::refresh_token`) still refreshes normally; the CLI isn't
+/// using those logins.
 #[cfg(feature = "codex")]
 fn codex_active_refresh(acct: &ProviderAccount) -> ProviderRefreshOutcome {
-    use providers::codex::oauth::{
-        active_refresh_cas, CasOutcome, RefreshError, SESSION_STALE_AFTER_DAYS,
-    };
-    let stale_after_secs = SESSION_STALE_AFTER_DAYS * 24 * 60 * 60;
-    match active_refresh_cas(
-        credentials::REFRESH_SKEW_SECS,
-        stale_after_secs,
-        Some(&acct.secret_blob),
-    ) {
+    use providers::codex::oauth::{active_refresh_cas, CasOutcome, RefreshError};
+    match active_refresh_cas(Some(&acct.secret_blob)) {
         Ok(CasOutcome::Fresh) => ProviderRefreshOutcome::Nothing,
-        Ok(CasOutcome::Refreshed) | Ok(CasOutcome::Adopted(_)) => {
+        Ok(CasOutcome::Adopted(_)) => {
             let Some(provider) = providers::get("codex") else {
                 return ProviderRefreshOutcome::Nothing;
             };
@@ -1913,12 +1911,16 @@ fn codex_active_refresh(acct: &ProviderAccount) -> ProviderRefreshOutcome {
                 Err(e) => {
                     logging::log(&format!(
                         "event=active_refresh_cas_failed provider=codex \
-                         reason=post_cas_reread:{e}"
+                         reason=adopt_reread:{e}"
                     ));
                     ProviderRefreshOutcome::Failed
                 }
             }
         }
+        // `active_refresh_cas` never mints a token for the active account, so it
+        // can no longer return `InvalidGrant`; keep the arm so the generic
+        // `needs_relogin` machinery stays wired for any future provider whose
+        // active-refresh primitive can still reject a grant.
         Err(RefreshError::InvalidGrant) => {
             logging::log("event=active_refresh_cas_failed provider=codex reason=invalid_grant");
             ProviderRefreshOutcome::InvalidGrant
