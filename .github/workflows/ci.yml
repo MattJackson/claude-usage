@@ -79,10 +79,34 @@ jobs:
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             Write-Host ("exit={0} (0x{1:X8})" -f $code, ($code -band 0xFFFFFFFF))
-            Write-Host "== recent Application-error events (faulting module / entry point) =="
-            Get-WinEvent -FilterHashtable @{LogName='Application'} -MaxEvents 15 -ErrorAction SilentlyContinue |
-              Where-Object { $_.Message -match 'usagio|entry point|0xc0000139|c0000139|faulting' } |
-              ForEach-Object { Write-Host "----"; Write-Host $_.Message }
+
+            # Gold-standard: run under cdb with loader snaps on. The loader
+            # prints the EXACT "entry point <symbol> could not be located in
+            # <dll>" as it fails to bind, which dumpbin can't tell us (it lists
+            # what's imported, not what's unresolvable on THIS box).
+            $cdb = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find '**\cdb.exe' 2>$null | Select-Object -First 1
+            if (-not $cdb) {
+              $cdb = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe","C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.FullName }
+            }
+            if ($cdb) {
+              Write-Host "== cdb loader trace (names the missing entry point) =="
+              & $cdb -g -G -c "q" $exe --version 2>&1 | Select-String -Pattern "entry point|could not be located|Ldrp|0xc0000139|ProcessPrng|Snap|Unable to load" | ForEach-Object { Write-Host $_ }
+            } else {
+              Write-Host "(cdb.exe not found on runner — skipping loader trace)"
+            }
+
+            # Probe the two non-standard imports directly: does the on-box DLL
+            # actually export the symbol we import?
+            if ($dumpbin) {
+              Write-Host "== bcryptprimitives.dll exports ProcessPrng? =="
+              & $dumpbin /exports C:\Windows\System32\bcryptprimitives.dll 2>$null | Select-String "ProcessPrng"
+            }
+
+            Write-Host "== recent Application + System events (unfiltered tail) =="
+            Get-WinEvent -FilterHashtable @{LogName='Application'} -MaxEvents 8 -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "----[App] $($_.TimeCreated) $($_.ProviderName)"; Write-Host $_.Message }
+            Get-WinEvent -FilterHashtable @{LogName='System'} -MaxEvents 8 -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "----[Sys] $($_.TimeCreated) $($_.ProviderName)"; Write-Host $_.Message }
             throw "usagio.exe --version exited $code — the binary does not load on this runner"
           }
 
