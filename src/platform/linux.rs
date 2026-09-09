@@ -77,6 +77,14 @@ impl Platform for LinuxPlatform {
     fn secure_permissions(&self, path: &Path) -> Result<()> {
         super::secure_permissions_unix(path)
     }
+    fn notify(&self, summary: &str, body: &str) -> Result<()> {
+        notify_rust::Notification::new()
+            .summary(summary)
+            .body(body)
+            .show()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("notify-rust show failed: {e}"))
+    }
 }
 
 // ---------------------------------------------------------------------------

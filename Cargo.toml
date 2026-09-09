@@ -76,9 +76,6 @@ base64 = "0.22"
 rand = "0.8"
 fs2 = "0.4"
 tray-icon = "0.24.2"
-# Desktop notifications for the notifications module. Best-effort — a broken
-# dbus / user-notification connection never fails a watch cycle.
-notify-rust = "4"
 # fsnotify (filesystem change notifications) for the credential-sync layer:
 # watches every provider's credential_paths and drives absorb_all_lagging +
 # refresh_inactive_if_stale in response to vendor-CLI rotations.
@@ -117,6 +114,20 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "c
 # Unix-common bits (macOS + Linux). libc for getrlimit/setrlimit
 # (raise_nofile_limit in main.rs, #[cfg(unix)]-guarded) and getuid where
 # needed. Windows has neither.
+# Desktop notifications (notifications module). Best-effort — a broken
+# dbus / user-notification connection never fails a watch cycle.
+#
+# Non-Windows ONLY. On Windows, notify-rust pulls in tauri-winrt-notification,
+# which hard-links the WinRT toast backend (RoGetActivationFactory from
+# api-ms-win-core-winrt-l1-1-0.dll). That WinRT activation entry point is not
+# resolvable at process load on clean/Server Windows SKUs, so the exe dies with
+# STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) before `main` ever runs — caught by
+# the Windows load-time smoke test in CI. Windows notifications are a no-op
+# (see src/notifications.rs); they're best-effort, so dropping them there costs
+# nothing and keeps the binary launchable on every Windows box.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+notify-rust = "4"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

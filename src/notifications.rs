@@ -296,14 +296,14 @@ pub fn fire(trigger: &Trigger, account: &AccountKey) -> Result<()> {
     null_notifier_or_real(&summary, &body)
 }
 
+// The real notifier routes through the `Platform` trait's `notify`, which fires
+// via notify-rust on macOS/Linux and is a no-op on Windows (where notify-rust's
+// WinRT toast backend can't be linked — see `Platform::notify` and Cargo.toml).
+// Keeping OS-specificity in `src/platform/*` means this module carries no
+// `#[cfg(target_os)]` of its own.
 #[cfg(not(test))]
 fn null_notifier_or_real(summary: &str, body: &str) -> Result<()> {
-    notify_rust::Notification::new()
-        .summary(summary)
-        .body(body)
-        .show()
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("notify-rust show failed: {e}"))
+    crate::platform::current().notify(summary, body)
 }
 
 /// `NullNotifier`: the `cfg(test)` stand-in for the real notify-rust call.
