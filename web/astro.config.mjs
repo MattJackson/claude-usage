@@ -6,7 +6,7 @@ import sitemap from '@astrojs/sitemap';
 // docs site. Deployed to GitHub Pages from web/dist by
 // .github/workflows/pages.yml.
 export default defineConfig({
-  site: 'https://usagio.app',
+  site: 'https://usagio.dev',
   trailingSlash: 'ignore',
   integrations: [sitemap()],
 });

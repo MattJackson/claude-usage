@@ -9,8 +9,43 @@ const description =
   'Short answers to common usagio questions: install caveats, autostart, and where to look for more.';
 
 const github = 'https://github.com/MattJackson/usagio';
+
+// FAQPage structured data. IMPORTANT: these entries mirror the visible Q&A
+// markup below — keep them in sync whenever a question or answer changes.
+// Answers are plain-text equivalents of the rendered HTML.
+const faqEntries = [
+  {
+    q: 'Windows SmartScreen warned me — is that expected?',
+    a: 'Yes. The .exe is unsigned, so Defender flags it the first run. Choose More info → Run anyway.',
+  },
+  {
+    q: 'Where does autostart get registered?',
+    a: 'Windows: per-user Run key at HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run. Linux: ~/.config/autostart/usagio.desktop. Both are removed by usagio uninstall.',
+  },
+  {
+    q: 'What Linux packages do I need?',
+    a: 'GTK 3, libayatana-appindicator3, libsecret, and an xdg-desktop-portal backend — see packaging/linux/DEPENDENCIES.md if something is missing.',
+  },
+  {
+    q: 'Where are the release notes?',
+    a: "On-site at What's New (/whats-new/), grouped by Added / Changed / Fixed / Removed.",
+  },
+  {
+    q: "The binary isn't on my PATH.",
+    a: 'Run usagio --version to confirm the install landed. If not, open an issue on GitHub with your OS and install method.',
+  },
+];
+const faqPage = {
+  '@type': 'FAQPage',
+  '@id': 'https://usagio.dev/faq/#faqpage',
+  mainEntity: faqEntries.map((e) => ({
+    '@type': 'Question',
+    name: e.q,
+    acceptedAnswer: { '@type': 'Answer', text: e.a },
+  })),
+};
 ---
-<Base title={title} description={description} path="/faq/" current="faq">
+<Base title={title} description={description} path="/faq/" current="faq" jsonLd={faqPage}>
   <section class="faq-section">
     <div class="container container-narrow">
       <h1 class="faq-title fade-up">FAQ</h1>

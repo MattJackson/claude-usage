@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://usagio.dev/sitemap-index.xml

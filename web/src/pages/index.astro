@@ -8,8 +8,29 @@ import InstallSnippet from '../components/InstallSnippet.astro';
 const title = 'usagio — see and swap your AI coding CLI quotas from the menu bar';
 const description =
   'usagio is a native menu-bar app and CLI for macOS, Linux, and Windows that tracks usage and quotas across Claude Code, OpenAI Codex, and other AI coding CLIs. Multi-account per provider, no /login dance, auto-swap when a weekly limit hits. Free, MIT-licensed, single Rust binary.';
+
+// SoftwareApplication node for the home page; merged into the site-wide
+// @graph by Base.astro. Keep softwareVersion in sync with Cargo.toml.
+const softwareApp = {
+  '@type': 'SoftwareApplication',
+  '@id': 'https://usagio.dev/#app',
+  name: 'usagio',
+  applicationCategory: 'DeveloperApplication',
+  operatingSystem: 'macOS, Linux, Windows',
+  description,
+  url: 'https://usagio.dev/',
+  downloadUrl: 'https://usagio.dev/download/',
+  softwareVersion: '0.5.7',
+  license: 'https://opensource.org/licenses/MIT',
+  isAccessibleForFree: true,
+  offers: {
+    '@type': 'Offer',
+    price: '0',
+    priceCurrency: 'USD',
+  },
+};
 ---
-<Base title={title} description={description} path="/" current="home">
+<Base title={title} description={description} path="/" current="home" jsonLd={softwareApp}>
 
   <!-- ============ HERO ============ -->
   <section class="hero">

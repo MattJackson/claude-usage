@@ -12,17 +12,48 @@ export interface Props {
   description: string;
   path?: string;                       // e.g. "/download/"
   current?: 'home' | 'download' | 'whats-new' | 'faq';
+  // Page-specific schema.org node(s) merged into the site-wide @graph below.
+  // Pass a single object or an array of objects (e.g. SoftwareApplication,
+  // FAQPage). Organization + WebSite are always emitted; pages only add extras.
+  jsonLd?: Record<string, unknown> | Record<string, unknown>[];
 }
 const {
   title,
   description,
   path = '/',
   current = 'home',
+  jsonLd,
 } = Astro.props;
 
 const site = Astro.site?.toString().replace(/\/$/, '') ?? 'https://usagio.dev';
 const canonical = `${site}${path}`;
 const ogImage = `${site}/favicon.svg`;
+
+// Site-wide structured data, emitted on every page as one @graph. Pages add
+// their own node(s) via the `jsonLd` prop (normalised to an array below).
+const pageNodes = jsonLd ? (Array.isArray(jsonLd) ? jsonLd : [jsonLd]) : [];
+const jsonLdGraph = {
+  '@context': 'https://schema.org',
+  '@graph': [
+    {
+      '@type': 'Organization',
+      '@id': `${site}/#org`,
+      name: 'usagio',
+      url: `${site}/`,
+      logo: `${site}/logo.svg`,
+      sameAs: ['https://github.com/MattJackson/usagio'],
+    },
+    {
+      '@type': 'WebSite',
+      '@id': `${site}/#website`,
+      url: `${site}/`,
+      name: 'usagio',
+      description,
+      publisher: { '@id': `${site}/#org` },
+    },
+    ...pageNodes,
+  ],
+};
 ---
 <!doctype html>
 <html lang="en">
@@ -58,33 +89,7 @@ const ogImage = `${site}/favicon.svg`;
       })();
     </script>
 
-    <script
-      type="application/ld+json"
-      set:html={JSON.stringify({
-        '@context': 'https://schema.org',
-        '@graph': [
-          {
-            '@type': 'WebSite',
-            '@id': `${site}/#website`,
-            url: `${site}/`,
-            name: 'usagio',
-            description,
-          },
-          {
-            '@type': 'SoftwareApplication',
-            '@id': `${site}/#app`,
-            name: 'usagio',
-            applicationCategory: 'DeveloperApplication',
-            operatingSystem: 'macOS, Linux, Windows',
-            url: `${site}/`,
-            downloadUrl: `${site}/download/`,
-            license: 'https://opensource.org/licenses/MIT',
-            isAccessibleForFree: true,
-            offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
-          },
-        ],
-      })}
-    />
+    <script type="application/ld+json" set:html={JSON.stringify(jsonLdGraph)} />
   </head>
   <body>
     <Header current={current} />

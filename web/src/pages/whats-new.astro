@@ -47,8 +47,18 @@ const entries = await Promise.all(
     return { ...e, html };
   })
 );
+
+// TechArticle node for the changelog page, merged into the site-wide @graph.
+const changelogArticle = {
+  '@type': 'TechArticle',
+  '@id': 'https://usagio.dev/whats-new/#article',
+  headline: "What's new in usagio",
+  description,
+  url: 'https://usagio.dev/whats-new/',
+  ...(entries[0]?.date ? { dateModified: entries[0].date } : {}),
+};
 ---
-<Base title={title} description={description} path="/whats-new/" current="whats-new">
+<Base title={title} description={description} path="/whats-new/" current="whats-new" jsonLd={changelogArticle}>
 
   <!-- ============ ENTRIES ============ -->
   <section class="cl-section">
