@@ -45,18 +45,16 @@ const description =
     </div>
   </section>
 
-  <!-- ============ WHAT'S NEW IN 0.5.0 ============ -->
+  <!-- ============ WHY USAGIO ============ -->
   <section class="whats-new">
     <div class="container">
       <div class="whats-new-head fade-up">
-        <span class="eyebrow">What's new in 0.5.0</span>
+        <span class="eyebrow">Built to stay out of your way</span>
         <h2 class="h-section whats-new-title">Never re-login. Actually.</h2>
         <p class="lede whats-new-lede">
-          v0.4.x had a bug: usagio handed your active account's refresh token
-          back to Anthropic on every poll, which quietly burned Claude Code's
-          own copy and forced a <code>/login</code>. 0.5.0 fixes it at the
-          root. Nothing to change on your end — <code>brew upgrade</code> and
-          you're done.
+          Capture each account's login once. usagio never touches your active
+          account's token — the vendor CLI owns it — so there's no recurring
+          <code>/login</code> dance, on any provider.
         </p>
       </div>
       <div class="whats-new-grid">
@@ -68,7 +66,7 @@ const description =
             </svg>
           </span>
           <h3>usagio on macOS, Linux, and Windows</h3>
-          <p>First release with real Linux and Windows support — same menu, same auto-swap, same never-re-login guarantee, for both Claude Code and Codex.</p>
+          <p>A native menu bar on all three — same menu, same auto-swap, same never-re-login guarantee, for both Claude Code and Codex.</p>
         </article>
         <article class="whats-new-card fade-up">
           <span class="whats-new-icon" aria-hidden="true">
@@ -87,8 +85,8 @@ const description =
               <path d="M5 7V5a3 3 0 0 1 6 0v2"/>
             </svg>
           </span>
-          <h3>Fixed for good: the /login loop</h3>
-          <p>usagio used to hand your active account's refresh token back to Anthropic every few minutes, burning Claude Code's local copy and forcing a re-login. Rearchitected so usagio never touches the active account's token — Claude Code owns it. No more prompts.</p>
+          <h3>No re-login loop</h3>
+          <p>usagio never touches your active account's token — the vendor CLI owns it. Capture a login once and it stays valid; switching between accounts never triggers a fresh <code>/login</code>.</p>
         </article>
       </div>
       <p class="whats-new-foot fade-up"><a href="/whats-new/">See what changed →</a></p>
@@ -170,7 +168,7 @@ const description =
         </article>
         <article class="feature fade-up">
           <h3>OS-native secret storage, no webview</h3>
-          <p>Tokens live in the OS-native secret store (macOS Keychain, Windows Credential Manager, Linux Secret Service). State lives in <code>~/.config/usagio</code> (Unix) or <code>%APPDATA%\usagio\</code> (Windows). No Electron, no bundled Chromium — one binary per OS, launched by <code>launchd</code> (macOS), Windows Autostart Registry, or an XDG autostart <code>.desktop</code> file (Linux).</p>
+          <p>Tokens live in your OS keychain, not a file. One small binary per OS — no Electron, no bundled Chromium.</p>
         </article>
         <article class="feature feature-oss fade-up">
           <h3>Open source, single binary</h3>
