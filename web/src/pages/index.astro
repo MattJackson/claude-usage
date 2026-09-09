@@ -33,22 +33,14 @@ const description =
         <p class="hero-foot">Free &amp; open source · macOS · Linux · Windows</p>
       </div>
 
-      <!-- Product shot: rotating carousel of real menu-bar screenshots, one per OS -->
-      <div class="hero-shot fade-up" aria-hidden="true">
-        <pre class="hero-mock" role="img" aria-label="usagio menu preview">
-<span class="hm-provider">Claude</span>
-<span class="hm-active">  ✓ matt@work.com          <span class="hm-pct">47% / 89%</span></span>
-<span class="hm-row">    matt@personal.com      <span class="hm-pct">12% / 30%</span></span>
-
-<span class="hm-provider">Codex</span>
-<span class="hm-row">    matt@team.com           <span class="hm-pct">5% / 42%</span></span>
-<span class="hm-row">    matt@side.com         <span class="hm-locked">100% / 3h 12m</span></span>
-<span class="hm-sep">─────────────────────────────</span>
-<span class="hm-row">  Capture current login    ▸</span>
-<span class="hm-row">  Settings                 ▸</span>
-<span class="hm-row">  Refresh usage now</span>
-<span class="hm-row">  Quit</span>
-        </pre>
+      <!-- Product shot: a real screenshot of usagio's menu-bar dropdown, captured on macOS. -->
+      <div class="hero-shot fade-up">
+        <img
+          class="hero-img"
+          src="/hero-macos.png"
+          width="1600" height="900"
+          alt="usagio's menu-bar dropdown open on macOS, showing session and weekly quota for several Claude and Codex accounts"
+        />
       </div>
     </div>
   </section>
@@ -216,8 +208,8 @@ const description =
       </div>
       <div class="states-rows">
         <div class="states-row fade-up">
-          <a class="states-shot" href="/screenshots/menu-healthy.svg" target="_blank" rel="noopener" aria-label="Open healthy-state screenshot in a new tab">
-            <img src="/screenshots/menu-healthy.svg" alt="Healthy state — all accounts below 60% weekly usage" width="640" height="360" loading="lazy" />
+          <a class="states-shot" href="/screenshots/macos-menu-healthy.png" target="_blank" rel="noopener" aria-label="Open healthy-state screenshot in a new tab">
+            <img src="/screenshots/macos-menu-healthy.png" alt="Healthy state — every account showing session and weekly percentages" width="640" height="360" loading="lazy" />
           </a>
           <div class="states-copy">
             <h3>Everything's under budget</h3>
@@ -225,8 +217,8 @@ const description =
           </div>
         </div>
         <div class="states-row states-row-flip fade-up">
-          <a class="states-shot" href="/screenshots/menu-mixed.svg" target="_blank" rel="noopener" aria-label="Open mixed-state screenshot in a new tab">
-            <img src="/screenshots/menu-mixed.svg" alt="Mixed state — one account at 82% (warning), one at 94% (critical)" width="640" height="360" loading="lazy" />
+          <a class="states-shot" href="/screenshots/macos-menu-mixed.png" target="_blank" rel="noopener" aria-label="Open mixed-state screenshot in a new tab">
+            <img src="/screenshots/macos-menu-mixed.png" alt="Mixed state — some accounts show percentages, others a reset countdown" width="640" height="360" loading="lazy" />
           </a>
           <div class="states-copy">
             <h3>Two accounts, two colors</h3>
@@ -234,8 +226,8 @@ const description =
           </div>
         </div>
         <div class="states-row fade-up">
-          <a class="states-shot" href="/screenshots/menu-locked.svg" target="_blank" rel="noopener" aria-label="Open locked-state screenshot in a new tab">
-            <img src="/screenshots/menu-locked.svg" alt="Locked state — top account weekly-locked, next account auto-swapped in" width="640" height="360" loading="lazy" />
+          <a class="states-shot" href="/screenshots/macos-menu-locked.png" target="_blank" rel="noopener" aria-label="Open locked-state screenshot in a new tab">
+            <img src="/screenshots/macos-menu-locked.png" alt="Locked state — a weekly-locked account's row swaps its percentage for a reset countdown" width="640" height="360" loading="lazy" />
           </a>
           <div class="states-copy">
             <h3>The lockout turns into a countdown</h3>
@@ -315,15 +307,20 @@ const description =
   .hero-cta { margin-bottom: 1rem; }
   .hero-foot { color: var(--muted); font-size: var(--fs-sm); letter-spacing: 0.005em; }
 
-  /* Product shot: off-center menu over a soft blurred wallpaper card. */
+  /* Product shot: a real macOS menu-bar capture in a lifted card. */
   .hero-shot {
     position: relative;
-    aspect-ratio: 16 / 11;
+    aspect-ratio: 16 / 9;
     border-radius: var(--r-xl);
     overflow: hidden;
-    background: linear-gradient(135deg, #ece7f8 0%, #e2ecff 55%, #f3ecfb 100%);
     box-shadow: var(--shadow-lift);
     border: 1px solid var(--line);
+  }
+  .hero-img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
   }
   .hero-mock {
     margin: 0;
