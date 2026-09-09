@@ -70,10 +70,21 @@ jobs:
         run: |
           $exe = "target/release/usagio.exe"
           $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find '**\dumpbin.exe' 2>$null | Select-Object -First 1
-          if ($dumpbin) { Write-Host "== dependents =="; & $dumpbin /dependents $exe }
+          if ($dumpbin) {
+            Write-Host "== dependents =="; & $dumpbin /dependents $exe
+            Write-Host "== imports (full — look for winrt/combase/ole) =="; & $dumpbin /imports $exe
+          }
           Write-Host "== run --version =="
           & $exe --version
-          if ($LASTEXITCODE -ne 0) { throw "usagio.exe --version exited $LASTEXITCODE — the binary does not load on this runner" }
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Write-Host ("exit={0} (0x{1:X8})" -f $code, ($code -band 0xFFFFFFFF))
+            Write-Host "== recent Application-error events (faulting module / entry point) =="
+            Get-WinEvent -FilterHashtable @{LogName='Application'} -MaxEvents 15 -ErrorAction SilentlyContinue |
+              Where-Object { $_.Message -match 'usagio|entry point|0xc0000139|c0000139|faulting' } |
+              ForEach-Object { Write-Host "----"; Write-Host $_.Message }
+            throw "usagio.exe --version exited $code — the binary does not load on this runner"
+          }
 
       - name: cargo test
         # --test-threads=1 required: several tests mutate process-global $HOME
