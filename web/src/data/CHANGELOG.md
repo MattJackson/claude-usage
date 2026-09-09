@@ -10,15 +10,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.5.18] - 2026-09-09
 
 ### Fixed
-- **Windows: `usagio.exe` now launches on a clean/Server Windows box.** The
-  binary was dying at process load with `STATUS_ENTRYPOINT_NOT_FOUND`
-  (0xC0000139) before `main` ever ran — it hard-linked the WinRT toast backend
-  (`RoGetActivationFactory`) pulled in by the notifications crate, and that
-  activation entry point isn't resolvable at load on clean Windows SKUs. The
-  notifications dependency is now excluded from the Windows build and desktop
-  notifications route through a per-OS trait (native on macOS/Linux, no-op on
-  Windows), so the Windows binary loads everywhere. macOS and Linux are
-  unaffected. A CI load-time smoke test (`usagio.exe --version`) now guards this.
+- **One account order everywhere.** The menu now uses a single, canonical
+  account order on every surface and code path: providers alphabetical, then
+  within a provider by soonest **weekly** reset first (so credits are used
+  top-down and no weekly quota is left behind), with maxed-and-inactive
+  accounts sunk to the bottom and headroom/email breaking ties. Previously the
+  section list and the rendered order used two different sorts (one of them
+  active-first), so the order could look inconsistent. The active account is no
+  longer pinned to the top — it ranks on its own priority like every other
+  account. (Session/5h reset is no longer part of the sort, so the list no
+  longer reshuffles every few hours.)
+
+### Changed (internal)
+- Desktop notifications now route through a per-OS `Platform::notify` trait
+  (native `notify-rust` on macOS/Linux, no-op on Windows) and `notify-rust` is
+  excluded from the Windows build — it hard-linked a WinRT toast backend
+  (`RoGetActivationFactory`) that isn't resolvable at load on clean Windows.
+  macOS/Linux notifications are unchanged.
+
+### Known issues
+- **Windows: the binary still fails to launch** on Windows
+  (`STATUS_ENTRYPOINT_NOT_FOUND` at process load). The WinRT toast link above is
+  ruled out, as are `+crt-static` and `ProcessPrng`; root cause is still under
+  investigation. macOS and Linux are unaffected and verified.
 
 ## [0.5.17] - 2026-09-09
 

@@ -12,12 +12,5 @@
 #
 # Scope: this key applies ONLY to the Windows MSVC target — macOS and Linux
 # builds are completely unaffected.
-# DIAGNOSTIC (fix/windows-launch): crt-static temporarily disabled to isolate
-# whether the static CRT — not a WinRT/RNG import — is what makes usagio.exe
-# fail to load with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) on the CI runner.
-# The runner has the VC++ redist, so a dynamic build should load there; if it
-# does, crt-static is the regression and the clean-VM CRT is solved via the
-# installer instead. Restore (or replace with installer-bundled redist) once
-# the CI Windows load-time smoke test is green.
-# [target.x86_64-pc-windows-msvc]
-# rustflags = ["-C", "target-feature=+crt-static"]
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
