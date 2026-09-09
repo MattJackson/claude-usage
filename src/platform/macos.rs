@@ -65,6 +65,27 @@ impl Platform for MacOsPlatform {
     fn secure_permissions(&self, path: &Path) -> Result<()> {
         super::secure_permissions_unix(path)
     }
+    fn register_notification_app(&self) {
+        // Tell mac-notification-sys our real bundle id so it doesn't fall back
+        // to the "use_default" literal that triggers the "Where is use_default?"
+        // Choose-Application dialog. `set_application` is a one-shot global; a
+        // second call (or an unregistered id) returns Err, which we log and
+        // ignore — the worst case is the pre-existing behavior, never a crash.
+        const BUNDLE_ID: &str = "com.mattjackson.usagio";
+        match notify_rust::set_application(BUNDLE_ID) {
+            Ok(()) => {
+                crate::logging::log(&format!(
+                    "notifications: registered bundle id {BUNDLE_ID}"
+                ));
+            }
+            Err(e) => {
+                crate::logging::log(&format!(
+                    "notifications: set_application({BUNDLE_ID}) failed: {e:?} \
+                     (notifications still fire; the use_default dialog may appear)"
+                ));
+            }
+        }
+    }
 }
 
 // ---- MenuBackend ---------------------------------------------------------

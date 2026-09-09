@@ -235,6 +235,12 @@ fn run() -> Result<()> {
         providers::all().iter().map(|b| &**b).collect();
     credentials::install_watchers(providers_static);
 
+    // Register our bundle id with the OS notification system before any
+    // notification can fire, so macOS doesn't pop the "Where is use_default?"
+    // dialog on the first notify (mac-notification-sys otherwise falls back to
+    // the "use_default" literal). One-shot, best-effort; no-op off macOS.
+    platform::current().register_notification_app();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let exe = std::env::current_exe().unwrap_or_default();
     match effective_first_arg(&args, &exe) {

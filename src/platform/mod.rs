@@ -51,6 +51,14 @@ pub trait Platform: Send + Sync + 'static {
     fn file_dialog(&self) -> &dyn FileDialog {
         &RfdFileDialog
     }
+    /// Register this app's bundle identity with the OS notification system at
+    /// daemon startup so notifications attribute correctly. On macOS this calls
+    /// `notify_rust::set_application(<bundle id>)`; without it `mac-notification-
+    /// sys` falls back to the literal `"use_default"`, and macOS then pops a
+    /// "Where is use_default?" Choose-Application dialog on the first
+    /// notification (the recurring install-time dialog users hit). No-op on
+    /// Linux/Windows. Best-effort — logged, never fatal. Call once per process.
+    fn register_notification_app(&self) {}
 }
 
 // ---------- MenuBackend ---------------------------------------------------
