@@ -63,12 +63,19 @@ echo "[windows] AMI=$AMI"
 
 UD_TEMPLATE="$SCRIPT_DIR/provision/windows-userdata.ps1"
 UD_RENDERED=$(mktemp)
+# Substitute the @@TOKENS@@, then strip full-line comments and blank lines: EC2
+# caps user-data at 16 KiB and the documented source is just over it. Only lines
+# that are ENTIRELY a `#` comment (or blank) are removed — PowerShell ignores
+# blank lines, and no data line in the template begins with `#`. Keeps the
+# committed source fully commented while the deployed blob stays under the cap.
 sed \
   -e "s|@@VERSION@@|$USAGIO_QA_VERSION|g" \
   -e "s|@@S3_URI@@|$S3_URI|g" \
   -e "s|@@FIXTURES@@|$FIXTURES|g" \
   -e "s|@@ADMIN_PASSWORD@@|$ADMIN_PW|g" \
-  "$UD_TEMPLATE" > "$UD_RENDERED"
+  "$UD_TEMPLATE" \
+  | sed -E '/^[[:space:]]*#/d; /^[[:space:]]*$/d' > "$UD_RENDERED"
+echo "[windows] user-data size: $(wc -c < "$UD_RENDERED") bytes (limit 16384)"
 
 echo "[windows] launching t3.medium in $REGION"
 INSTANCE_ID=$(aws --region "$REGION" ec2 run-instances \

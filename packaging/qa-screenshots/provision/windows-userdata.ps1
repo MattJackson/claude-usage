@@ -108,6 +108,9 @@ using System.Runtime.InteropServices;
 public class Win32 {
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, IntPtr e);
+  [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)] public static extern IntPtr FindWindow(string cls, string win);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  public struct RECT { public int Left, Top, Right, Bottom; }
   public const uint LEFTDOWN = 0x0002, LEFTUP = 0x0004, RIGHTDOWN = 0x0008, RIGHTUP = 0x0010;
   public static void LeftClick(int x, int y){ SetCursorPos(x,y); System.Threading.Thread.Sleep(120);
     mouse_event(LEFTDOWN,0,0,0,IntPtr.Zero); System.Threading.Thread.Sleep(40); mouse_event(LEFTUP,0,0,0,IntPtr.Zero); }
@@ -115,6 +118,22 @@ public class Win32 {
     mouse_event(RIGHTDOWN,0,0,0,IntPtr.Zero); System.Threading.Thread.Sleep(40); mouse_event(RIGHTUP,0,0,0,IntPtr.Zero); }
 }
 "@
+
+# The open tray context menu is a top-level window of class "#32768". Find it and
+# read its exact on-screen rect — the reliable way to crop tightly to the menu
+# (UIAutomation doesn't expose these popups here, and the heuristic box clipped
+# the right-hand percentages).
+function Get-PopupMenuRect {
+  $h = [Win32]::FindWindow("#32768", $null)
+  if ($h -ne [IntPtr]::Zero) {
+    $r = New-Object Win32+RECT
+    if ([Win32]::GetWindowRect($h, [ref]$r)) {
+      $w = $r.Right - $r.Left; $ht = $r.Bottom - $r.Top
+      if ($w -ge 40 -and $ht -ge 30) { return @{ x = $r.Left; y = $r.Top; w = $w; h = $ht } }
+    }
+  }
+  return $null
+}
 
 $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
 function Capture-FullScreen([string]$path) {
@@ -162,23 +181,70 @@ function Get-MenuBounds {
   return $null
 }
 
-# Walk the UIAutomation tree for a tray button whose Name mentions usagio.
+$AUTO = [System.Windows.Automation.AutomationElement]
+$SCOPE = [System.Windows.Automation.TreeScope]
+$CTP = [System.Windows.Automation.AutomationElement]::ControlTypeProperty
+$CT = [System.Windows.Automation.ControlType]
+
+function New-Cond([object]$controlType) {
+  New-Object System.Windows.Automation.PropertyCondition($CTP, $controlType)
+}
+
+# Screen-center of an element (fallback when GetClickablePoint throws — dead or
+# off-screen tray icons don't have a clickable point).
+function Center-Of($el) {
+  try {
+    $r = $el.Current.BoundingRectangle
+    if ($r.Width -ge 4 -and $r.Height -ge 4 -and -not [double]::IsInfinity($r.X)) {
+      return @{ x = [int]($r.X + $r.Width/2); y = [int]($r.Y + $r.Height/2) }
+    }
+  } catch { }
+  return $null
+}
+
+# Find usagio's tray icon. Notification-area icons live as Button children of the
+# taskbar's notification ToolBars ("User/System Promoted Notification Area"),
+# which a flat RootElement Button-descendant search misses — so walk ToolBars and
+# also the raw Button descendants, matching the icon by its "usagio" tooltip
+# (Name). Among matches prefer the one with the RIGHTMOST on-screen rect (the
+# live icon sits in the notification area; stale/dead duplicates, if any, sort
+# out by taking the last). Returns {x,y,name} of a real on-screen point.
 function Find-TrayIcon {
-  $root = [System.Windows.Automation.AutomationElement]::RootElement
-  $cond = New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-    [System.Windows.Automation.ControlType]::Button)
-  $btns = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
-  foreach ($b in $btns) {
-    $n = $b.Current.Name
+  $root = $AUTO::RootElement
+  $cands = @()
+  # 1) Buttons under every ToolBar (the notification area is a ToolBar).
+  foreach ($tb in $root.FindAll($SCOPE::Descendants, (New-Cond $CT::ToolBar))) {
+    foreach ($b in $tb.FindAll($SCOPE::Children, (New-Cond $CT::Button))) { $cands += $b }
+  }
+  # 2) All Button descendants (covers shells that expose icons directly).
+  foreach ($b in $root.FindAll($SCOPE::Descendants, (New-Cond $CT::Button))) { $cands += $b }
+  $best = $null; $bestX = -1
+  foreach ($b in $cands) {
+    $n = $null; try { $n = $b.Current.Name } catch { }
     if ($n -and $n.ToLower().Contains("usagio")) {
-      try {
-        $p = $b.GetClickablePoint()
-        return @{ x = [int]$p.X; y = [int]$p.Y; name = $n }
-      } catch { }
+      $pt = $null
+      try { $p = $b.GetClickablePoint(); $pt = @{ x = [int]$p.X; y = [int]$p.Y } } catch { $pt = Center-Of $b }
+      if ($pt -and $pt.x -gt $bestX) { $best = @{ x = $pt.x; y = $pt.y; name = $n }; $bestX = $pt.x }
     }
   }
-  return $null
+  return $best
+}
+
+# Dump the notification-area structure (toolbars + their button names/rects) for
+# diagnosis — this is what actually contains the tray icons.
+function Dump-TrayStructure([string]$path) {
+  $root = $AUTO::RootElement
+  $lines = @()
+  foreach ($tb in $root.FindAll($SCOPE::Descendants, (New-Cond $CT::ToolBar))) {
+    $tn = $null; try { $tn = $tb.Current.Name } catch { }
+    $lines += "TOOLBAR: $tn"
+    foreach ($b in $tb.FindAll($SCOPE::Children, (New-Cond $CT::Button))) {
+      $bn = $null; $r = $null
+      try { $bn = $b.Current.Name; $r = $b.Current.BoundingRectangle } catch { }
+      $lines += ("  BTN: {0} @ {1},{2}" -f $bn, [int]$r.X, [int]$r.Y)
+    }
+  }
+  Set-Content $path ($lines -join "`n")
 }
 
 $UsagioBin = @(
@@ -195,68 +261,57 @@ $StateDir = Join-Path $env:APPDATA "usagio"
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 $StateFile = Join-Path $StateDir "state.json"
 
+# Launch usagio ONCE. Instead of kill+relaunch per fixture (which orphaned tray
+# icons) or restarting Explorer (which tore down the UIAutomation tree and left
+# it enumerating zero buttons), we start usagio a single time and change the
+# fixture by rewriting state.json — usagio's poll/redraw loop re-reads it and
+# updates the menu live. One stable tray icon, no orphans, intact UIA tree.
+Get-Process usagio -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Seconds 2
+Start-Process -FilePath $UsagioBin -ArgumentList "menubar"
+Start-Sleep -Seconds 8
+
 $first = $true
 foreach ($name in $Fixtures) {
   Write-Host "=== fixture: $name ==="
-  # `-I` (isolated): ignore any inherited PYTHONHOME/PYTHONPATH. Without it the
-  # scheduled-task environment resolved sys.prefix to C:\Windows\system32 and
-  # python died with "No module named 'encodings'", so the fixture never
-  # applied and every screenshot showed the same empty state.
-  # Download the fixture's pre-rendered state.json (rendered on the maintainer's
-  # Mac and uploaded before boot — the VM's Python was unreliable). No Python on
-  # the VM anymore.
+  # Pre-rendered on the maintainer's Mac and uploaded before boot (the VM's
+  # Python was unreliable). Rewrite state.json; usagio picks up the change.
   & $Aws s3 cp "$S3Uri/state-$name.json" $StateFile
   if ($LASTEXITCODE -ne 0) { Write-Warning "could not fetch state-$name.json (exit $LASTEXITCODE)" }
+  # Give usagio a couple of redraw ticks to re-read state.json and rebuild the
+  # tray menu before we open it.
+  Start-Sleep -Seconds 5
 
-  # Kill usagio, then restart Explorer so orphaned tray icons from the previous
-  # fixture (a force-killed process can't remove its own notification-area icon,
-  # so dead "usagio" icons pile up and confuse UIAutomation targeting) are
-  # cleared. After the restart only the freshly-launched usagio owns an icon.
-  Get-Process usagio -ErrorAction SilentlyContinue | Stop-Process -Force
-  Start-Sleep -Seconds 1
-  Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-  Start-Sleep -Seconds 6
-  Start-Process -FilePath $UsagioBin -ArgumentList "menubar"
-  Start-Sleep -Seconds 7
-
-  # Always grab a FULL-DESKTOP shot first (before opening the menu) — it's the
-  # ground truth for debugging what the VM actually shows, and we derive the
-  # auto-crop from it. Uploaded as windows-<name>-full.png for every fixture.
   $full = "C:\usagio-qa\windows-$name-full.png"
 
-  # ALWAYS dump every UIAutomation Button name (with a bounding-rect tag) so we
-  # can see exactly what's enumerable — including the notification-area tray
-  # icons — whether or not targeting succeeds. Written per fixture.
-  $allBtns = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
-    [System.Windows.Automation.TreeScope]::Descendants,
-    (New-Object System.Windows.Automation.PropertyCondition(
-      [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-      [System.Windows.Automation.ControlType]::Button)))
-  $dump = @()
-  foreach ($b in $allBtns) {
-    try { $r = $b.Current.BoundingRectangle; $dump += ("{0} @ {1},{2} {3}x{4}" -f $b.Current.Name, [int]$r.X, [int]$r.Y, [int]$r.Width, [int]$r.Height) } catch { $dump += $b.Current.Name }
-  }
-  Set-Content "C:\usagio-qa\uia-buttons-$name.txt" ($dump -join "`n")
-  & $Aws s3 cp "C:\usagio-qa\uia-buttons-$name.txt" "$S3Uri/_uia-buttons-$name.txt"
+  # Dump the notification-area toolbar structure (what actually holds tray icons)
+  # every fixture, for diagnosis.
+  Dump-TrayStructure "C:\usagio-qa\uia-tray-$name.txt"
+  & $Aws s3 cp "C:\usagio-qa\uia-tray-$name.txt" "$S3Uri/_uia-tray-$name.txt"
 
+  # Locate usagio's tray icon. UIAutomation does NOT expose notification-area
+  # tray icons on this Windows Server (they live in explorer's ToolbarWindow32,
+  # which UIA descendant search doesn't surface — only taskbar buttons show up),
+  # so Find-TrayIcon is best-effort. The reliable path is a POSITION click: with
+  # EnableAutoTray=0 every tray icon is visible and usagio's is the left-most
+  # custom icon in the notification area, a fixed offset from the bottom-right on
+  # this fixed AMI/resolution. Measured at ~ (screenW-209, screenH-20).
   $icon = Find-TrayIcon
   if ($icon) {
-    Write-Host "tray icon '$($icon.name)' at $($icon.x),$($icon.y)"
-    # tray-icon shows the menu on left-click by default on Windows.
-    [Win32]::LeftClick($icon.x, $icon.y)
-    Start-Sleep -Milliseconds 900
-    # Some builds map the menu to right-click; if the left click only
-    # activated, a right-click brings up the context menu without harm.
-    [Win32]::RightClick($icon.x, $icon.y)
-    Start-Sleep -Seconds 1
+    Write-Host "tray icon '$($icon.name)' at $($icon.x),$($icon.y) (UIA)"
+    $ix = $icon.x; $iy = $icon.y
   } else {
-    Write-Warning "usagio tray icon not found via UIAutomation; falling back to Win+B"
-    $ws = New-Object -ComObject WScript.Shell
-    $ws.SendKeys("{ESC}")
-    # Win+B then Enter (best-effort).
-    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-    Start-Sleep -Seconds 1
+    $ix = $vs.Right - 209; $iy = $vs.Bottom - 20
+    Write-Host "tray icon via fixed position $ix,$iy (UIA did not expose it)"
   }
+  # tray-icon shows the menu on left-click on Windows. Move first (some shells
+  # need a hover to register the icon), then click.
+  [Win32]::LeftClick($ix, $iy)
+  Start-Sleep -Milliseconds 1200
+  # If the left click only activated/toggled, a right-click still brings up the
+  # context menu. Harmless if the menu is already open (it just reopens).
+  [Win32]::RightClick($ix, $iy)
+  Start-Sleep -Seconds 1
 
   # Full desktop (menu open) — for debugging + crop derivation.
   Capture-FullScreen $full
@@ -267,17 +322,20 @@ foreach ($name in $Fixtures) {
   # of a bottom-right tray icon). Uploaded as windows-<name>.png — the shot the
   # website uses.
   $raw = "C:\usagio-qa\windows-$name.png"
-  $pad = 12
-  $mb = Get-MenuBounds
+  $pad = 10
+  # Prefer the real #32768 popup-menu window rect; fall back to UIA menu bounds.
+  $mb = Get-PopupMenuRect
+  if (-not $mb) { $mb = Get-MenuBounds }
   $cropped = $false
   if ($mb) {
-    Write-Host "menu bounds: $($mb.x),$($mb.y) $($mb.w)x$($mb.h)"
+    Write-Host "menu rect: $($mb.x),$($mb.y) $($mb.w)x$($mb.h)"
     $cropped = Capture-Region $raw ($mb.x - $pad) ($mb.y - $pad) ($mb.w + 2*$pad) ($mb.h + 2*$pad)
   }
-  if (-not $cropped -and $icon) {
-    # Heuristic: menu rises above-left of the icon. Grab a generous box.
+  if (-not $cropped) {
+    # Heuristic: the menu rises above-left of the icon at ($ix,$iy). Grab a
+    # generous box anchored there.
     $cw = 460; $ch = 520
-    $cropped = Capture-Region $raw ($icon.x - $cw + 40) ($icon.y - $ch) $cw $ch
+    $cropped = Capture-Region $raw ($ix - $cw + 40) ($iy - $ch) $cw $ch
   }
   if (-not $cropped) { Capture-FullScreen $raw }  # last resort: full frame
   & $Aws s3 cp $raw "$S3Uri/windows-$name.png"

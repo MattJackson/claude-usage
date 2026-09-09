@@ -20,10 +20,14 @@ interrupts your work.
 
 > **Unofficial.** Not affiliated with, endorsed by, or supported by Anthropic. It
 > talks only to the same first-party endpoints the official Claude Code CLI uses,
-> with the same public OAuth client id. Use at your own risk. **macOS only** (it
-> relies on the macOS Keychain and `launchd`).
+> with the same public OAuth client id. Use at your own risk. Runs on **macOS,
+> Linux, and Windows** — a native menu-bar/tray app on each, using the OS
+> credential store (macOS Keychain, Linux Secret Service, Windows Credential
+> Manager) and the OS autostart mechanism (launchd, XDG autostart, HKCU Run).
 
 ## Install
+
+**macOS** — Homebrew:
 
 ```sh
 brew tap mattjackson/tap
@@ -34,17 +38,27 @@ usagio install                          # menu-bar app + auto-swap, now and at e
 
 Upgrades come through Homebrew: `brew upgrade usagio` — a running menu-bar app
 notices the new binary and relaunches itself into it, so you don't have to restart
-anything. Building from source is covered [below](#from-source).
+anything.
+
+**Linux** — download `usagio_*_amd64.deb` (or the `x86_64-unknown-linux-gnu`
+tarball) from the [latest release](https://github.com/MattJackson/usagio/releases/latest),
+install it, then run `usagio install` to register the tray app + auto-swap.
+
+**Windows** — download and run `usagio-*-x86_64-pc-windows-msvc-setup.exe` from
+the [latest release](https://github.com/MattJackson/usagio/releases/latest); it
+installs the tray app and starts it at login.
+
+Building from source is covered [below](#from-source).
 
 **At a glance**
 
 | | |
 |---|---|
-| **Platform** | macOS |
+| **Platform** | macOS · Linux · Windows |
 | **Interface** | Menu-bar app (primary) + CLI |
 | **Language** | Rust (single binary, no webview) |
 | **Talks to** | `api.anthropic.com` / `platform.claude.com` only |
-| **Token storage** | `~/.config/usagio/state.json` (chmod 600) + macOS Keychain |
+| **Token storage** | `~/.config/usagio/state.json` (chmod 600) + OS keystore (macOS Keychain / Linux Secret Service / Windows Credential Manager) |
 
 ## Table of contents
 
