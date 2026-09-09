@@ -50,6 +50,17 @@ const NEEDLES: &[&str] = &[
 /// `mod`/fn per macOS-only or non-macOS-only cluster) to keep this list as
 /// short as the dependency-gating requirement allows.
 const ALLOWLIST: &[(&str, u32)] = &[
+    // src/main.rs — the single gated `mod ui;` for the custom-popup NSPopover
+    // renderer (docs/design/custom-tray-popup.md, Phase 1). The `src/ui/`
+    // module is macOS-only AND behind the off-by-default `custom-popup`
+    // feature; gating the whole module at this one `mod` line (rather than
+    // scattering `cfg`s through `src/ui/*`) is the structure the design
+    // mandates. It isn't routable through the `Platform` trait: the module
+    // links `objc2-app-kit`'s NSPopover/NSView classes, real
+    // `[target.'cfg(target_os = "macos")'.dependencies]` absent from the
+    // Linux/Windows dependency graph. Goes away when the popover becomes the
+    // macOS default and the feature gate is dropped (Phase 2/3).
+    ("src/main.rs", 32),
     // src/menubar.rs — `use std::cell::RefCell` (macOS thread-local NSMenu
     // context storage; only reachable via mac_style).
     ("src/menubar.rs", 15),
@@ -62,32 +73,42 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // src/menubar.rs — `pub fn run()`, macOS branch: the native
     // `NSApplication` run loop.
     ("src/menubar.rs", 615),
+    // src/menubar.rs — `build_popover_host`: macOS + `custom-popup`-only.
+    // Builds the `ui::popover::PopoverHost` anchored to the NSStatusItem
+    // button (links `objc2-app-kit`'s NSPopover/NSStatusItem, macOS-only
+    // deps). Gated on the `custom-popup` feature too, so it's inert in the
+    // shipping default build. Goes away when the popover is the macOS default.
+    ("src/menubar.rs", 741),
+    // src/menubar.rs — `popover_model`: macOS + `custom-popup`-only. Folds a
+    // `Snapshot` into the toolkit-neutral `ui::PopoverModel` (references
+    // `crate::ui`, compiled only on macOS under `custom-popup`).
+    ("src/menubar.rs", 775),
     // src/menubar.rs — `build_menu`: builds a native `tray_icon::menu::Menu`
     // for the macOS `apply_menu_styles` NSMenu walk to mutate in place.
     // Linux/Windows build the equivalent `platform::MenuTree` via
     // `cross_platform::menu_tree_from_snapshot`.
-    ("src/menubar.rs", 1367),
+    ("src/menubar.rs", 1537),
     // src/menubar.rs — `build_provider_group`: macOS-only counterpart to
     // `cross_platform::build_provider_group_item` (v0.5.3 menu redesign).
-    ("src/menubar.rs", 1678),
+    ("src/menubar.rs", 1848),
     // src/menubar.rs — `build_account_submenu`: macOS-only counterpart to
     // `cross_platform::build_account_submenu_item` (v0.5.3 menu redesign).
-    ("src/menubar.rs", 1706),
+    ("src/menubar.rs", 1876),
     // src/menubar.rs — `mod mac_style`: the NSMenu attributedTitle styling
     // walk (`install_menu`/`color_for`/`attributed`/`apply_menu_styles`) plus
     // the `objc2*` imports it needs. Grouped into one module so this whole
     // cluster needs exactly one cfg site instead of one per function.
-    ("src/menubar.rs", 1776),
+    ("src/menubar.rs", 1946),
     // src/menubar.rs — `add`: `build_menu`/`build_provider_group`/
     // `build_account_submenu` helper (native `tray_icon::menu::Menu::append`).
-    ("src/menubar.rs", 2285),
+    ("src/menubar.rs", 2455),
     // src/menubar.rs — `mod cross_platform`: the Linux/Windows renderer
     // (`platform::MenuBackend`-based). Never compiled alongside `mac_style`.
-    ("src/menubar.rs", 2848),
+    ("src/menubar.rs", 3018),
     // src/menubar.rs — `tests::mac_style_tests`: exercises
     // `mac_style::attributed` (NSAttributedString attribute inspection)
     // directly; needs the same `objc2*` crates as `mac_style` itself.
-    ("src/menubar.rs", 4792),
+    ("src/menubar.rs", 4962),
 ];
 
 fn src_root() -> PathBuf {
