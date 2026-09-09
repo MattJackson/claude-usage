@@ -13,10 +13,10 @@
       },
       "user_id": "demo-user-id-1",
       "cached_usage": {
-        "session_pct": 30.0,
+        "session_pct": 10.0,
         "weekly_pct": 100.0,
         "session_reset": "2026-12-31T18:00:00Z",
-        "weekly_reset": "NOW+2d14h",
+        "weekly_reset": "NOW+2d13h",
         "opus_pct": 12.0,
         "opus_reset": "2027-01-04T00:00:00Z",
         "fetched_at": 4102358400
@@ -36,8 +36,8 @@
       },
       "user_id": "demo-user-id-2",
       "cached_usage": {
-        "session_pct": 2.0,
-        "weekly_pct": 55.0,
+        "session_pct": 25.0,
+        "weekly_pct": 30.0,
         "session_reset": "2026-12-31T20:00:00Z",
         "weekly_reset": "2027-01-04T00:00:00Z",
         "opus_pct": 0.0,
@@ -64,7 +64,7 @@
           "identity_native_blob": {},
           "cached_usage": {
             "session_pct": 33.0,
-            "weekly_pct": 61.0,
+            "weekly_pct": 40.0,
             "session_reset": "2026-12-31T19:00:00Z",
             "weekly_reset": "2027-01-04T00:00:00Z",
             "opus_pct": null,

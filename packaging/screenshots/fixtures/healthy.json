@@ -14,7 +14,7 @@
       "user_id": "demo-user-id-1",
       "cached_usage": {
         "session_pct": 47.0,
-        "weekly_pct": 89.0,
+        "weekly_pct": 52.0,
         "session_reset": "2026-12-31T18:00:00Z",
         "weekly_reset": "2027-01-04T00:00:00Z",
         "opus_pct": 12.0,
@@ -36,8 +36,8 @@
       },
       "user_id": "demo-user-id-2",
       "cached_usage": {
-        "session_pct": 2.0,
-        "weekly_pct": 98.0,
+        "session_pct": 20.0,
+        "weekly_pct": 38.0,
         "session_reset": "2026-12-31T20:00:00Z",
         "weekly_reset": "2027-01-04T00:00:00Z",
         "opus_pct": 0.0,
@@ -64,7 +64,7 @@
           "identity_native_blob": {},
           "cached_usage": {
             "session_pct": 33.0,
-            "weekly_pct": 61.0,
+            "weekly_pct": 55.0,
             "session_reset": "2026-12-31T19:00:00Z",
             "weekly_reset": "2027-01-04T00:00:00Z",
             "opus_pct": null,
@@ -107,8 +107,8 @@
           "identity_display_name": "Carol (Demo)",
           "identity_native_blob": {},
           "cached_usage": {
-            "session_pct": 55.0,
-            "weekly_pct": 78.0,
+            "session_pct": 30.0,
+            "weekly_pct": 44.0,
             "session_reset": "2026-12-31T23:00:00Z",
             "weekly_reset": "2027-01-04T00:00:00Z",
             "opus_pct": null,
