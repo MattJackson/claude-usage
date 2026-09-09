@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.20] - 2026-09-09
+
+### Fixed
+- **Windows: no more console window / taskbar button.** usagio is a
+  console-subsystem binary so its CLI subcommands can print to a terminal, but
+  the `menubar` daemon was also handed a console window that surfaced as a
+  taskbar button ("usagio - 1 running window") and a blank window. The menubar
+  now hides its console at startup (`ShowWindow(GetConsoleWindow(), SW_HIDE)`),
+  so on Windows usagio is a tray-only app — matching the macOS menu-bar and
+  Linux tray experience. macOS/Linux unaffected.
+
 ## [0.5.19] - 2026-09-09
 
 ### Fixed

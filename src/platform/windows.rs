@@ -260,6 +260,24 @@ fn build_native_menu(tree: &MenuTree) -> Result<Menu> {
 /// `tray-icon`'s hidden window needs its messages dispatched for mouse
 /// clicks / menu commands on the notification icon to turn into
 /// `TrayIconEvent`/`MenuEvent` channel entries at all.
+/// Hide this process's console window, if it has one. A console-subsystem exe
+/// launched to run the tray daemon is handed a console that Windows surfaces as
+/// a taskbar button and a blank window; `SW_HIDE` removes both. No-op when there
+/// is no console (null HWND) — e.g. if usagio is ever relaunched detached.
+fn hide_console_window() {
+    use ::windows::Win32::System::Console::GetConsoleWindow;
+    use ::windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    // SAFETY: `GetConsoleWindow` returns this process's console HWND (or a null
+    // handle if none is attached, in which case `ShowWindow` is a harmless
+    // no-op). Both are plain FFI calls with no shared-state requirements.
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        if !hwnd.0.is_null() {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
 fn pump_windows_messages() {
     use ::windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
@@ -328,6 +346,15 @@ impl MenuBackend for WindowsMenu {
     }
 
     fn run_event_loop(&self) -> Result<()> {
+        // Hide the console window. usagio is a console-subsystem binary (so
+        // `usagio --version` and the other CLI subcommands print to a terminal),
+        // but the `menubar` daemon is a tray app: the console window it's handed
+        // at launch otherwise shows up as a taskbar button ("usagio - 1 running
+        // window") plus a blank window. Hiding it makes usagio present as a
+        // tray-only app on Windows — matching the macOS menu-bar / Linux tray
+        // experience — and leaves the tray icon as the only usagio UI element.
+        hide_console_window();
+
         // If `request_quit()` was called before this call started (e.g. the
         // caller tore down and quit during startup, possibly even before
         // `create_status_item`), `quit` is already `true` here. Honor it

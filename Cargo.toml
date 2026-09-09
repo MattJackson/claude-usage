@@ -1,6 +1,6 @@
 [package]
 name = "usagio"
-version = "0.5.19"
+version = "0.5.20"
 edition = "2021"
 rust-version = "1.88"
 description = "Track usage / limits across every AI coding CLI you use, and switch between accounts."
@@ -234,6 +234,7 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 windows = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Console", # GetConsoleWindow — hide the menubar daemon's console
 ] }
 # Credential Manager-backed secret storage (Platform::secrets()). `v1` gives
 # the simple Entry::new/get_password/set_password/delete_credential surface;

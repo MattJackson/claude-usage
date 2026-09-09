@@ -125,6 +125,43 @@ function Capture-FullScreen([string]$path) {
   $g.Dispose(); $bmp.Dispose()
 }
 
+# Crop a rectangle (screen coords) out of a full-screen grab and save it. Clamps
+# to the virtual screen so an off-screen menu bound can't throw.
+function Capture-Region([string]$path, [int]$x, [int]$y, [int]$w, [int]$h) {
+  $x = [Math]::Max($vs.Left, $x); $y = [Math]::Max($vs.Top, $y)
+  if ($x + $w -gt $vs.Right)  { $w = $vs.Right  - $x }
+  if ($y + $h -gt $vs.Bottom) { $h = $vs.Bottom - $y }
+  if ($w -lt 8 -or $h -lt 8) { return $false }
+  $bmp = New-Object System.Drawing.Bitmap $w, $h
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.CopyFromScreen($x, $y, 0, 0, (New-Object System.Drawing.Size($w, $h)))
+  $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+  $g.Dispose(); $bmp.Dispose()
+  return $true
+}
+
+# Find the bounds of the open context menu (the tray icon's popup). tray-icon's
+# menu surfaces as a top-level ControlType.Menu (Win32 #32768) popup; grab the
+# first visible one with a real on-screen rectangle. Returns a hashtable of
+# {x,y,w,h} in screen coords, or $null if no menu is open — which lets the
+# caller fall back to a heuristic crop derived from the tray-icon location.
+function Get-MenuBounds {
+  $root = [System.Windows.Automation.AutomationElement]::RootElement
+  $cond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Menu)
+  $menus = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+  foreach ($m in $menus) {
+    try {
+      $r = $m.Current.BoundingRectangle
+      if ($r.Width -ge 40 -and $r.Height -ge 30 -and -not [double]::IsInfinity($r.X)) {
+        return @{ x = [int]$r.X; y = [int]$r.Y; w = [int]$r.Width; h = [int]$r.Height }
+      }
+    } catch { }
+  }
+  return $null
+}
+
 # Walk the UIAutomation tree for a tray button whose Name mentions usagio.
 function Find-TrayIcon {
   $root = [System.Windows.Automation.AutomationElement]::RootElement
@@ -161,12 +198,22 @@ $StateFile = Join-Path $StateDir "state.json"
 $first = $true
 foreach ($name in $Fixtures) {
   Write-Host "=== fixture: $name ==="
-  & python "C:\usagio-qa\render_fixture.py" "C:\usagio-qa\fixtures\$name.json" $StateFile
+  # `-I` (isolated): ignore any inherited PYTHONHOME/PYTHONPATH. Without it the
+  # scheduled-task environment resolved sys.prefix to C:\Windows\system32 and
+  # python died with "No module named 'encodings'", so the fixture never
+  # applied and every screenshot showed the same empty state.
+  & python -I "C:\usagio-qa\render_fixture.py" "C:\usagio-qa\fixtures\$name.json" $StateFile
+  if ($LASTEXITCODE -ne 0) { Write-Warning "render_fixture.py failed for $name (exit $LASTEXITCODE)" }
 
   Get-Process usagio -ErrorAction SilentlyContinue | Stop-Process -Force
   Start-Sleep -Seconds 2
   Start-Process -FilePath $UsagioBin -ArgumentList "menubar"
   Start-Sleep -Seconds 7
+
+  # Always grab a FULL-DESKTOP shot first (before opening the menu) — it's the
+  # ground truth for debugging what the VM actually shows, and we derive the
+  # auto-crop from it. Uploaded as windows-<name>-full.png for every fixture.
+  $full = "C:\usagio-qa\windows-$name-full.png"
 
   $icon = Find-TrayIcon
   if ($icon) {
@@ -197,14 +244,28 @@ foreach ($name in $Fixtures) {
     Start-Sleep -Seconds 1
   }
 
-  if ($first) {
-    $dbg = "C:\usagio-qa\windows-_debug-$name.png"
-    Capture-FullScreen $dbg
-    & $Aws s3 cp $dbg "$S3Uri/windows-_debug-$name.png"
-  }
+  # Full desktop (menu open) — for debugging + crop derivation.
+  Capture-FullScreen $full
+  & $Aws s3 cp $full "$S3Uri/windows-$name-full.png"
 
+  # Auto-crop to the open menu. Prefer the menu's real UIAutomation bounds;
+  # fall back to a heuristic box anchored on the tray icon (menu opens up-left
+  # of a bottom-right tray icon). Uploaded as windows-<name>.png — the shot the
+  # website uses.
   $raw = "C:\usagio-qa\windows-$name.png"
-  Capture-FullScreen $raw
+  $pad = 12
+  $mb = Get-MenuBounds
+  $cropped = $false
+  if ($mb) {
+    Write-Host "menu bounds: $($mb.x),$($mb.y) $($mb.w)x$($mb.h)"
+    $cropped = Capture-Region $raw ($mb.x - $pad) ($mb.y - $pad) ($mb.w + 2*$pad) ($mb.h + 2*$pad)
+  }
+  if (-not $cropped -and $icon) {
+    # Heuristic: menu rises above-left of the icon. Grab a generous box.
+    $cw = 460; $ch = 520
+    $cropped = Capture-Region $raw ($icon.x - $cw + 40) ($icon.y - $ch) $cw $ch
+  }
+  if (-not $cropped) { Capture-FullScreen $raw }  # last resort: full frame
   & $Aws s3 cp $raw "$S3Uri/windows-$name.png"
 
   # Dismiss the menu.
