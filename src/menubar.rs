@@ -1560,27 +1560,16 @@ fn build_menu(snap: &Snapshot) -> Menu {
     menu
 }
 
-/// Leading glyphs that tag each kind of informational submenu row so the
-/// details panel reads as a designed block (one glyph per fact type) rather
-/// than a stack of look-alike plain sentences. The two spaces after the glyph
-/// give a consistent gutter between the icon and the text. Shared by every
-/// renderer so the macOS attributed-title walk (which matches these rows by
-/// their exact plain string) never drifts from what `build_menu` emitted.
-const RESET_GLYPH: &str = "⏱";
-const BURN_GLYPH: &str = "🔥";
-const COST_GLYPH: &str = "💰";
-
 /// Human-facing "{Label} resets in X" copy for a window row inside an account
 /// submenu. Percentages are deliberately NOT shown here (item 3 of the
 /// redesign moved them to the main-list row via `main_row`) — this row is
-/// purely about *when* the window refreshes. Prefixed with `RESET_GLYPH` so the
-/// reset rows read as a tagged group in the details panel.
+/// purely about *when* the window refreshes.
 fn window_reset_row(w: &WindowView) -> String {
     let label = stat_display_label(w);
     if w.reset.is_empty() {
-        format!("{RESET_GLYPH}  {label}: no reset info yet")
+        format!("{label}: no reset info yet")
     } else {
-        format!("{RESET_GLYPH}  {label} resets in {}", w.reset)
+        format!("{label} resets in {}", w.reset)
     }
 }
 
@@ -1638,20 +1627,14 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
             Utc::now(),
         ) {
             if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
-                rows.push(format!(
-                    "{BURN_GLYPH}  {}",
-                    crate::burn_rate::format_menu_row(&est)
-                ));
+                rows.push(crate::burn_rate::format_menu_row(&est));
             }
         }
         if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
             &account_key,
             crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
         ) {
-            rows.push(format!(
-                "{COST_GLYPH}  ~${:.2} this cycle (est)",
-                cost.estimated_usd
-            ));
+            rows.push(format!("~${:.2} this cycle (est)", cost.estimated_usd));
         }
         rows.push(format!("updated {}", a.updated));
     }
@@ -1729,18 +1712,20 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
     let sub = Submenu::with_id("noop", head, true);
 
     // Informational rows (reset windows, then burn-rate / cost / "updated"):
-    // rendered as DISABLED (`enabled: false`) items so AppKit gives them no
-    // hover highlight — they aren't actionable, and a highlight on a row that
-    // does nothing when clicked reads as broken. They stay legible (not the
-    // greyed disabled look) because the native attributed-title walk paints
-    // them in `NSColor::labelColor()` via the `disabled_but_white` styles from
-    // `menu_styles` (reset rows) and `mac_style::install_menu`'s augmentation
-    // (the disk-derived burn/cost/updated rows). See `account_extra_info_rows`.
+    // rendered ENABLED (`enabled: true`) with a no-op click id. macOS draws a
+    // DISABLED menu item's title dimmed to grey *regardless* of any
+    // attributed foreground color — the disabled appearance overrides
+    // `NSColor::labelColor()` — so a disabled row here is unreadable, not
+    // merely un-hoverable. Readability wins: these render at full contrast; the
+    // cost is a hover highlight on a row that does nothing (clicks route to the
+    // `("noop", …)` arm in `handle_click`). Eliminating the hover *and* keeping
+    // full contrast isn't possible with a native NSMenu — that's a goal for the
+    // custom-popup UI (see docs/design/custom-tray-popup.md).
     for row in submenu_info_rows(sec, a) {
-        let _ = sub.append(&MenuItem::with_id("noop", row, false, None));
+        let _ = sub.append(&MenuItem::with_id("noop", row, true, None));
     }
     for row in account_extra_info_rows(sec, a) {
-        let _ = sub.append(&MenuItem::with_id("noop", row, false, None));
+        let _ = sub.append(&MenuItem::with_id("noop", row, true, None));
     }
 
     // Action rows: Switch/Active, Launch, Remove. Gated per H3 (v0.5.0
@@ -2887,11 +2872,14 @@ mod cross_platform {
     /// can't be re-tinted to stay full-contrast; a disabled row's native grey
     /// is the closest structural match to "info, not an action".
     fn noop_info(label: impl Into<String>) -> PMenuItem {
+        // Enabled (not disabled): a disabled item renders greyed/dimmed on GTK
+        // and Windows just as on macOS, which the maintainer flagged as
+        // unreadable. Full-contrast wins; the click is a harmless no-op.
         PMenuItem::Action {
             id: "noop".to_string(),
             label: label.into(),
             icon_png: None,
-            enabled: false,
+            enabled: true,
             checked: false,
             checkable: false,
         }
@@ -3553,11 +3541,11 @@ mod tests {
     }
 
     #[test]
-    fn submenu_reset_rows_carry_the_clock_glyph() {
-        // The details-panel redesign tags each reset-window row with a leading
-        // clock glyph so the info block reads as a designed group rather than a
-        // stack of look-alike menu rows. Every row `submenu_info_rows` emits
-        // for an account WITH data is a reset-window row, so all must carry it.
+    fn submenu_reset_rows_are_plain_text_no_emoji() {
+        // The details panel deliberately carries NO leading emoji glyphs (the
+        // maintainer found them out of place). Reset rows are plain "<Label>
+        // resets in X" text — assert they read that way and never lead with a
+        // non-ASCII decoration.
         let a = acct("a@x.com", Some(20.0), Some(30.0), false);
         let sec = ProviderSection {
             provider_id: CLAUDE_SLUG,
@@ -3574,8 +3562,12 @@ mod tests {
         assert!(!rows.is_empty());
         for row in &rows {
             assert!(
-                row.starts_with(RESET_GLYPH),
-                "reset row missing clock glyph: {row}",
+                row.is_ascii(),
+                "reset row should be plain ASCII text, no emoji: {row}"
+            );
+            assert!(
+                row.contains("resets in") || row.contains("no reset info"),
+                "unexpected reset row text: {row}"
             );
         }
     }
