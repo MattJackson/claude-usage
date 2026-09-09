@@ -105,9 +105,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Locate the usagio binary.
+# Locate the usagio binary. `USAGIO_BIN_OVERRIDE` wins if set (used to test a
+# dev build against the release install).
 USAGIO_BIN=""
 for cand in \
+  "${USAGIO_BIN_OVERRIDE:-}" \
   "/opt/homebrew/opt/usagio/usagio.app/Contents/MacOS/usagio" \
   "/Applications/usagio.app/Contents/MacOS/usagio" \
   "$HOME/Applications/usagio.app/Contents/MacOS/usagio" \
