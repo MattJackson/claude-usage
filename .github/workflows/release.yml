@@ -283,7 +283,16 @@ jobs:
 
   build-linux:
     name: Build Linux binary and publish release asset
-    runs-on: ubuntu-latest
+    # Pinned to 22.04 (glibc 2.35), NOT ubuntu-latest (24.04 = glibc 2.39):
+    # the release binary dynamically links glibc, so building on the newest
+    # runner raises the required GLIBC version and the binary then refuses to
+    # start on Ubuntu 22.04 LTS / Debian 12 ("GLIBC_2.39 not found"). Building
+    # on the oldest supported runner sets the lowest practical glibc floor
+    # (2.35) so usagio runs on 22.04+ and every newer distro. (musl-static
+    # would drop the glibc dep entirely but breaks the libsecret/D-Bus
+    # secret-service backend usagio needs on Linux, so glibc-on-old-runner is
+    # the correct trade here.)
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
