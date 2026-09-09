@@ -502,7 +502,13 @@ fn cmd_list(args: &[String]) -> Result<()> {
         println!("No accounts yet. Log into one with `claude`, then: usagio capture");
         return Ok(());
     }
-    let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
+    let mut rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
+    // Order by the same auto-pick priority the menu uses (best switch target
+    // first, maxed/no-data accounts sinking) instead of raw insertion order,
+    // so `usagio list` and the menu bar agree on account order (user report:
+    // "account ordering seems off" — the CLI was the only surface still in
+    // insertion order).
+    rows.sort_by(menu_order);
     render_table(&rows, state.active.as_deref());
     Ok(())
 }
@@ -1363,8 +1369,9 @@ fn candidate_order(a: &Row, b: &Row) -> std::cmp::Ordering {
 
 /// Order accounts for the menu the way auto-pick prioritizes them: the account
 /// you'd switch to first on top, then the rest by the same rule, with unusable
-/// ones (maxed out, or no data yet) sinking to the bottom. Display-only — the
-/// CLI keeps insertion order.
+/// ones (maxed out, or no data yet) sinking to the bottom. Used by BOTH the
+/// menu bar and `usagio list` so the two surfaces present accounts in the same
+/// order.
 pub(crate) fn menu_order(a: &Row, b: &Row) -> std::cmp::Ordering {
     // Usable (has data + room) before unusable; then accounts with data before
     // those without; then the normal auto-pick priority within each group.
