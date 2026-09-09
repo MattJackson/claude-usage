@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.18] - 2026-09-09
+
+### Fixed
+- **Windows: `usagio.exe` now launches on a clean/Server Windows box.** The
+  binary was dying at process load with `STATUS_ENTRYPOINT_NOT_FOUND`
+  (0xC0000139) before `main` ever ran — it hard-linked the WinRT toast backend
+  (`RoGetActivationFactory`) pulled in by the notifications crate, and that
+  activation entry point isn't resolvable at load on clean Windows SKUs. The
+  notifications dependency is now excluded from the Windows build and desktop
+  notifications route through a per-OS trait (native on macOS/Linux, no-op on
+  Windows), so the Windows binary loads everywhere. macOS and Linux are
+  unaffected. A CI load-time smoke test (`usagio.exe --version`) now guards this.
+
 ## [0.5.17] - 2026-09-09
 
 Correctness + robustness round from a full-codebase audit (all findings
