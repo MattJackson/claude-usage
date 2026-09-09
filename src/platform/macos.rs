@@ -87,6 +87,14 @@ impl Platform for MacOsPlatform {
             }
         }
     }
+    fn notify(&self, summary: &str, body: &str) -> Result<()> {
+        notify_rust::Notification::new()
+            .summary(summary)
+            .body(body)
+            .show()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("notify-rust show failed: {e}"))
+    }
 }
 
 // ---- MenuBackend ---------------------------------------------------------

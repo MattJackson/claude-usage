@@ -59,6 +59,21 @@ pub trait Platform: Send + Sync + 'static {
     /// notification (the recurring install-time dialog users hit). No-op on
     /// Linux/Windows. Best-effort — logged, never fatal. Call once per process.
     fn register_notification_app(&self) {}
+
+    /// Fire a best-effort desktop notification. Overridden on macOS and Linux
+    /// to fire through `notify-rust` (macOS User Notifications, Linux dbus).
+    ///
+    /// The default here is a no-op, which is what Windows uses: `notify-rust`
+    /// is a non-Windows-only dependency because it links a WinRT toast backend
+    /// (`RoGetActivationFactory` from `api-ms-win-core-winrt-l1-1-0.dll`) whose
+    /// activation entry point isn't resolvable at process load on clean/Server
+    /// Windows SKUs — the exe would die with STATUS_ENTRYPOINT_NOT_FOUND
+    /// (0xC0000139) before `main` (caught by the CI Windows load-time smoke
+    /// test). Notifications are best-effort, so a Windows no-op costs nothing.
+    /// See the `notify-rust` note in Cargo.toml.
+    fn notify(&self, _summary: &str, _body: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ---------- MenuBackend ---------------------------------------------------

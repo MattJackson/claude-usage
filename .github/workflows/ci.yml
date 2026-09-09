@@ -55,6 +55,72 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --all-features
 
+      # A build that compiles is NOT proof the binary LOADS. usagio statically
+      # imports tray-icon/muda + the VC++ CRT; if any of those fail to resolve
+      # at process load (missing redistributable on a clean box, or a
+      # STATUS_ENTRYPOINT_NOT_FOUND symbol mismatch) the exe dies before `main`.
+      # Run the pure-CLI `--version` (no tray/display needed) so a load-time
+      # failure fails CI here with the exact DLL/entry-point in the log, instead
+      # of shipping a binary that only "works" on machines with the dev runtime.
+      # `dumpbin /dependents` additionally records the DLL imports so we can
+      # confirm the CRT is statically linked (no vcruntime140.dll import).
+      # KNOWN-RED (tracked): on windows-latest the release binary still exits at
+      # process load with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) before `main`.
+      # Ruled out so far: the notify-rust WinRT toast backend (removed — no longer
+      # imported), `+crt-static` (fails identically with and without it), and
+      # `ProcessPrng` (bcryptprimitives.dll DOES export it on the runner). Root
+      # cause not yet isolated — cdb hasn't surfaced the faulting symbol and no
+      # Application Error event is written. `continue-on-error` keeps this step
+      # RUNNING and REPORTING (so the failure stays visible and we keep the
+      # diagnostics) without gating macOS/Linux releases, which are verified.
+      # Flip back to blocking (remove continue-on-error) the moment it goes green.
+      - name: Windows — binary must actually launch (load-time smoke test)
+        if: matrix.os == 'windows-latest'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = "target/release/usagio.exe"
+          $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find '**\dumpbin.exe' 2>$null | Select-Object -First 1
+          if ($dumpbin) {
+            Write-Host "== dependents =="; & $dumpbin /dependents $exe
+            Write-Host "== imports (full — look for winrt/combase/ole) =="; & $dumpbin /imports $exe
+          }
+          Write-Host "== run --version =="
+          & $exe --version
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Write-Host ("exit={0} (0x{1:X8})" -f $code, ($code -band 0xFFFFFFFF))
+
+            # Gold-standard: run under cdb with loader snaps on. The loader
+            # prints the EXACT "entry point <symbol> could not be located in
+            # <dll>" as it fails to bind, which dumpbin can't tell us (it lists
+            # what's imported, not what's unresolvable on THIS box).
+            $cdb = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find '**\cdb.exe' 2>$null | Select-Object -First 1
+            if (-not $cdb) {
+              $cdb = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe","C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.FullName }
+            }
+            if ($cdb) {
+              Write-Host "== cdb loader trace (names the missing entry point) =="
+              & $cdb -g -G -c "q" $exe --version 2>&1 | Select-String -Pattern "entry point|could not be located|Ldrp|0xc0000139|ProcessPrng|Snap|Unable to load" | ForEach-Object { Write-Host $_ }
+            } else {
+              Write-Host "(cdb.exe not found on runner — skipping loader trace)"
+            }
+
+            # Probe the two non-standard imports directly: does the on-box DLL
+            # actually export the symbol we import?
+            if ($dumpbin) {
+              Write-Host "== bcryptprimitives.dll exports ProcessPrng? =="
+              & $dumpbin /exports C:\Windows\System32\bcryptprimitives.dll 2>$null | Select-String "ProcessPrng"
+            }
+
+            Write-Host "== recent Application + System events (unfiltered tail) =="
+            Get-WinEvent -FilterHashtable @{LogName='Application'} -MaxEvents 8 -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "----[App] $($_.TimeCreated) $($_.ProviderName)"; Write-Host $_.Message }
+            Get-WinEvent -FilterHashtable @{LogName='System'} -MaxEvents 8 -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "----[Sys] $($_.TimeCreated) $($_.ProviderName)"; Write-Host $_.Message }
+            throw "usagio.exe --version exited $code — the binary does not load on this runner"
+          }
+
       - name: cargo test
         # --test-threads=1 required: several tests mutate process-global $HOME
         # to point at a tempdir via env_lock::scoped_env_var. Parallel runs

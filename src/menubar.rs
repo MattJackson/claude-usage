@@ -1184,76 +1184,72 @@ fn env_override_for(provider_id: &str) -> bool {
     env_override_active(provider_id)
 }
 
-/// Compare two `AcctView` values by their weekly-reset instant, treating a
-/// `None` reset as "furthest in the future" so accounts without data yet sort
-/// last. Used inside `build_snapshot` and asserted directly in the
-/// `sort_by_expiration_orders_accounts_soonest_first` test.
-fn sort_by_expiration(a: &AcctView, b: &AcctView) -> std::cmp::Ordering {
-    let ka = a.weekly_reset_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
-    let kb = b.weekly_reset_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
-    ka.cmp(&kb)
+/// The ONE canonical account-ordering comparator — used everywhere an account
+/// list is built (`build_snapshot`'s per-section `accounts` vec AND
+/// `flat_account_order`), so the menu has exactly one order on every surface
+/// and code path (v0.5.18 "1 order only" fix). Before this, a section's
+/// `accounts` vec was sorted active-first + weekly-expiration while the rendered
+/// list used the flat comparator, so the two could disagree — the "order looks
+/// wrong / there's more than one order" report.
+///
+/// Priority, in order (lower = higher in the list):
+///   1. Locked-and-not-active sinks to the bottom — it isn't a usable swap
+///      target regardless of how soon its reset is. An account that's BOTH
+///      locked and currently active stays in normal rotation so its countdown
+///      is still visible up top.
+///   2. Soonest WEEKLY reset ascending — the account whose 7-day window resets
+///      first sits on top, so it gets used first and no weekly quota is left
+///      behind before it resets (the "use credits top-down" rule). A `None`
+///      weekly reset (no data yet) sorts last within its rank. NOTE: session
+///      (5h) reset is deliberately NOT used here — it ticks every few hours and
+///      would reshuffle the list constantly; the weekly window is the stable
+///      signal we want to burn down.
+///   3. More headroom (`100 - max(session%, weekly%)`) first — the better
+///      auto-swap candidate wins a tie on weekly-reset time.
+///   4. Key (email) ascending — deterministic final tiebreak so accounts
+///      identical on 1–3 always render in the same order.
+///
+/// NOT active-first: the active account ranks on its own priority, one stable
+/// rule for everyone (user decision — matches the auto-swap target priority).
+fn account_priority_cmp(a: &AcctView, b: &AcctView, now: DateTime<Utc>) -> std::cmp::Ordering {
+    let sink = |x: &AcctView| locked_countdown_for(x, now).is_some() && !x.active;
+    let weekly_reset = |x: &AcctView| x.weekly_reset_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let headroom = |x: &AcctView| {
+        let (sp, wp) = summary_pcts(x);
+        100.0 - sp.unwrap_or(0.0).max(wp.unwrap_or(0.0))
+    };
+    sink(a)
+        .cmp(&sink(b))
+        .then(weekly_reset(a).cmp(&weekly_reset(b)))
+        .then(
+            headroom(b)
+                .partial_cmp(&headroom(a))
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+        .then(a.key.cmp(&b.key))
 }
 
-/// Global soonest-expiring / priority order for the flat main-list block
-/// sequence, spanning ALL providers — not grouped by provider (v0.5.2 fix for
-/// the "account order keeps changing" report: `sections` were previously
-/// rendered in fixed `providers::all()` order with only a per-section
-/// re-sort, so an account's position could jump around relative to another
-/// provider's account for no reason a user could predict). Four-level
-/// comparator, in priority order:
-///   1. Locked-and-not-active sinks to the very bottom — it isn't a usable
-///      swap target regardless of how soon its reset is. An account that's
-///      BOTH locked and currently active stays in normal rotation (rank 0)
-///      so the user can still see it and its countdown up top.
-///   2. Soonest of `{session_reset, weekly_reset}` ascending — the account
-///      about to reset (and therefore about to free up quota) surfaces
-///      first; no known reset sorts last within its rank.
-///   3. More headroom (`100 - max(session%, weekly%)`) first — the better
-///      auto-swap candidate wins a tie on reset time.
-///   4. Email, ascending — final deterministic tie-break so two accounts
-///      that are identical on 1–3 always render in the same order.
+/// Global priority order for the flat main-list block sequence, spanning ALL
+/// providers — not grouped by provider (v0.5.2 fix for the "account order keeps
+/// changing" report: `sections` were previously rendered in fixed
+/// `providers::all()` order with only a per-section re-sort, so an account's
+/// position could jump around relative to another provider's account for no
+/// reason a user could predict). Delegates to [`account_priority_cmp`] — the
+/// SAME comparator `build_snapshot` sorts each section's `accounts` vec with —
+/// so `account_order` and the section vecs can never disagree (v0.5.18
+/// "1 order only"). `provider_grouped_order` later brackets this flat order by
+/// provider (alphabetically) for rendering.
 fn flat_account_order(sections: &[ProviderSection], now: DateTime<Utc>) -> Vec<(usize, usize)> {
-    struct Key {
-        sink: bool,
-        soonest: DateTime<Utc>,
-        headroom: f64,
-        email: String,
-    }
     let mut idx: Vec<(usize, usize)> = Vec::new();
-    let mut keys: Vec<Key> = Vec::new();
     for (si, sec) in sections.iter().enumerate() {
-        for (ai, a) in sec.accounts.iter().enumerate() {
-            let locked = locked_countdown_for(a, now).is_some();
-            let soonest = [a.session_reset_at, a.weekly_reset_at]
-                .into_iter()
-                .flatten()
-                .min()
-                .unwrap_or(DateTime::<Utc>::MAX_UTC);
-            let (sp, wp) = summary_pcts(a);
-            let headroom = 100.0 - sp.unwrap_or(0.0).max(wp.unwrap_or(0.0));
+        for ai in 0..sec.accounts.len() {
             idx.push((si, ai));
-            keys.push(Key {
-                sink: locked && !a.active,
-                soonest,
-                headroom,
-                email: a.key.clone(),
-            });
         }
     }
-    let mut order: Vec<usize> = (0..idx.len()).collect();
-    order.sort_by(|&x, &y| {
-        let (kx, ky) = (&keys[x], &keys[y]);
-        kx.sink
-            .cmp(&ky.sink)
-            .then(kx.soonest.cmp(&ky.soonest))
-            .then(
-                ky.headroom
-                    .partial_cmp(&kx.headroom)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-            .then(kx.email.cmp(&ky.email))
+    idx.sort_by(|&(sx, ax), &(sy, ay)| {
+        account_priority_cmp(&sections[sx].accounts[ax], &sections[sy].accounts[ay], now)
     });
-    order.into_iter().map(|i| idx[i]).collect()
+    idx
 }
 
 /// v0.5.3 menu redesign: partition `snap.account_order` by provider,
@@ -1349,6 +1345,9 @@ fn build_snapshot() -> Snapshot {
     let autoswap = !st.autoswap_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     let active = st.active.clone();
+    // One `now` for every ordering decision this snapshot makes, so the
+    // per-section sort and the flat `account_order` agree to the instant.
+    let now = now_utc();
 
     // Claude's accounts live in `st.accounts` (its own dedicated slot); every
     // other provider's captured accounts live in `st.providers[slug]` (state
@@ -1385,16 +1384,13 @@ fn build_snapshot() -> Snapshot {
             .into_iter()
             .map(|r| acctview_from_row(r, &active_for_slug, slug, provider.window_order()))
             .collect();
-        // Primary sort: soonest-to-expire first, using the weekly-reset instant
-        // as the "expiration" signal (accounts with no data yet sort last).
-        // Without this, a newly-captured account lands at the tail of the vec
-        // (State::upsert appends) and stays there in the menu — the "sort-by-
-        // expiration on add" bug the user reported.
-        accounts.sort_by(sort_by_expiration);
-        // Flat-list rule: within a provider section the active account renders
-        // first, then everyone else in the order picked above. Stable sort so
-        // the expiration ordering is preserved among the inactives.
-        accounts.sort_by_key(|a| std::cmp::Reverse(a.active));
+        // The ONE canonical order (v0.5.18 "1 order only"): soonest WEEKLY
+        // reset first (use credits top-down so no weekly is left behind),
+        // maxed-and-inactive sinks last, headroom then email break ties. NOT
+        // active-first — the active account ranks on its own priority. This is
+        // the exact comparator `flat_account_order` uses, so this section vec
+        // and the rendered `account_order` are always identical.
+        accounts.sort_by(|a, b| account_priority_cmp(a, b, now));
         let caps = provider.capabilities();
         sections.push(ProviderSection {
             provider_id: slug,
@@ -1429,7 +1425,7 @@ fn build_snapshot() -> Snapshot {
         .map(register_provider)
         .collect();
 
-    let account_order = flat_account_order(&sections, now_utc());
+    let account_order = flat_account_order(&sections, now);
 
     Snapshot {
         sections,
@@ -4266,12 +4262,13 @@ mod tests {
     }
 
     #[test]
-    fn sort_by_expiration_orders_accounts_soonest_first() {
-        // Regression test for the user-reported bug: newly-added accounts land
-        // at the tail of `state.accounts` (upsert appends) and stayed at the
-        // bottom of the menu even when their weekly window resets sooner.
-        // `sort_by_expiration` fixes that — accounts sort by weekly_reset_at
-        // ASC, so the "closest to expiration" is on top.
+    fn account_priority_orders_by_soonest_weekly_reset() {
+        // The canonical comparator ranks by soonest WEEKLY reset first (use
+        // credits top-down so no weekly is left behind). Session reset is
+        // deliberately ignored. Accounts here tie on sink/headroom, so weekly
+        // reset alone decides. Regression for the user-reported bug: a
+        // newly-added account (upsert appends to the tail) must still float to
+        // the top when its weekly window resets sooner.
         let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         let mut soonest = acct("soon@x.com", Some(50.0), Some(60.0), false);
         soonest.weekly_reset_at = Some(now + chrono::Duration::hours(6));
@@ -4283,18 +4280,18 @@ mod tests {
         // Insert in REVERSE-expiration order (mirrors what upsert would
         // produce if the user added them latest-first).
         let mut accounts = [latest, middle, soonest];
-        accounts.sort_by(sort_by_expiration);
+        accounts.sort_by(|a, b| account_priority_cmp(a, b, now));
 
         let keys: Vec<&str> = accounts.iter().map(|a| a.key.as_str()).collect();
         assert_eq!(keys, vec!["soon@x.com", "mid@x.com", "late@x.com"]);
     }
 
     #[test]
-    fn sort_by_expiration_places_no_data_accounts_last() {
+    fn account_priority_places_no_data_accounts_last() {
         // An account without cached usage yet has `weekly_reset_at == None`.
-        // The sort treats None as "furthest in the future" so a freshly-
-        // captured account (no data) sinks to the bottom rather than
-        // displacing an account with a real, soon reset.
+        // The comparator treats None as "furthest in the future" so a freshly-
+        // captured account (no data) sinks below one with a real, soon reset —
+        // even though the no-data account has more nominal headroom.
         let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         let mut with_data = acct("data@x.com", Some(10.0), Some(20.0), false);
         with_data.weekly_reset_at = Some(now + chrono::Duration::hours(6));
@@ -4302,9 +4299,28 @@ mod tests {
         assert!(no_data.weekly_reset_at.is_none(), "precondition");
 
         let mut accounts = [no_data, with_data];
-        accounts.sort_by(sort_by_expiration);
+        accounts.sort_by(|a, b| account_priority_cmp(a, b, now));
         let keys: Vec<&str> = accounts.iter().map(|a| a.key.as_str()).collect();
         assert_eq!(keys, vec!["data@x.com", "nodata@x.com"]);
+    }
+
+    #[test]
+    fn account_priority_does_not_pin_active_account() {
+        // "1 order only" (v0.5.18): the active account is NOT floated to the
+        // top — it ranks on its own priority like everyone else. Here the
+        // active account resets LATEST, so it must sort LAST despite being
+        // active.
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let mut early = acct("early@x.com", Some(10.0), Some(20.0), false);
+        early.weekly_reset_at = Some(now + chrono::Duration::hours(6));
+        let mut active_late = acct("active@x.com", Some(10.0), Some(20.0), true);
+        active_late.weekly_reset_at = Some(now + chrono::Duration::hours(200));
+        assert!(active_late.active, "precondition: active");
+
+        let mut accounts = [active_late, early];
+        accounts.sort_by(|a, b| account_priority_cmp(a, b, now));
+        let keys: Vec<&str> = accounts.iter().map(|a| a.key.as_str()).collect();
+        assert_eq!(keys, vec!["early@x.com", "active@x.com"]);
     }
 
     // -----------------------------------------------------------------------
@@ -4408,15 +4424,18 @@ mod tests {
     #[test]
     fn flat_account_order_keeps_active_locked_account_in_normal_rotation() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        // Locked AND active — must NOT sink; it still sorts by its own reset
-        // like anyone else, so the user can see its countdown up top.
+        // Locked (weekly maxed, future weekly reset) AND active — must NOT
+        // sink; it still sorts by its own weekly reset like anyone else, so the
+        // user can see its countdown up top. Its weekly reset (+30m) is sooner
+        // than healthy's (+5d), so if it weren't sunk it sorts FIRST — which is
+        // exactly what proves it stayed in normal rotation.
         let locked_active = acct_with_resets(
             "locked-active@x.com",
-            Some(100.0),
             Some(10.0),
+            Some(100.0),
             true,
-            Some(now + chrono::Duration::minutes(30)),
             None,
+            Some(now + chrono::Duration::minutes(30)),
         );
         let healthy = acct_with_resets(
             "healthy@x.com",
@@ -4436,7 +4455,6 @@ mod tests {
             .iter()
             .map(|&(si, ai)| sections[si].accounts[ai].key.as_str())
             .collect();
-        // locked_active's soonest reset (+30m) is sooner than healthy's (+5d).
         assert_eq!(keys, vec!["locked-active@x.com", "healthy@x.com"]);
     }
 
