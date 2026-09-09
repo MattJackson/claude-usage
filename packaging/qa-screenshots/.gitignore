@@ -1,0 +1,4 @@
+# Captured PNGs land here per version — never commit.
+output/
+# Local state files the orchestrator drops between run/teardown.
+.state-*

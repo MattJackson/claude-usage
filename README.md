@@ -226,6 +226,10 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the workfl
 for community expectations. CI runs `cargo fmt --check`, `cargo clippy`, and
 `cargo test` on macOS on every push and pull request.
 
+Before / after each release the maintainer runs the on-demand QA screenshot
+pipeline (real EC2 VMs, one per OS) — see
+[packaging/qa-screenshots/README.md](packaging/qa-screenshots/README.md).
+
 ## Security
 
 - To report a vulnerability privately, see [SECURITY.md](SECURITY.md).
