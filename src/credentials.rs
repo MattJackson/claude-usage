@@ -496,6 +496,62 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
     })
 }
 
+/// Process-global registry of the live fsnotify watcher plus the provider
+/// list it was built from, so the fd-watchdog (see `crate::watchdog`) can drop
+/// and rebuild the watcher at runtime to release leaked descriptors.
+///
+/// Historically the watcher was built once in `main` and `Box::leak`'d, which
+/// made it impossible to release its descriptors without exiting the process —
+/// exactly the dead end the fd-leak outage hit (the since-fixed kqueue backend
+/// held thousands of fds with no way to reclaim them short of a restart). The
+/// FSEvents backend fixed the leak's root cause; storing the handle here adds a
+/// runtime safety net so any FUTURE descriptor leak in the watcher can be
+/// remediated by `respawn_watchers()` without a full process restart.
+struct WatcherRegistry {
+    handle: Option<WatcherHandle>,
+    providers: Vec<&'static dyn Provider>,
+}
+
+static WATCHER_REGISTRY: std::sync::Mutex<WatcherRegistry> =
+    std::sync::Mutex::new(WatcherRegistry {
+        handle: None,
+        providers: Vec::new(),
+    });
+
+/// Build the fsnotify watcher for `providers` and store it in the process-global
+/// registry (replacing the `Box::leak` the daemon used to do). Keeps the
+/// provider list around so the watchdog can rebuild the watcher later without
+/// re-threading it through from `main`.
+pub fn install_watchers(providers: Vec<&'static dyn Provider>) {
+    let handle = spawn_watchers(providers.clone());
+    let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    reg.providers = providers;
+    reg.handle = handle;
+}
+
+/// Drop the live fsnotify watcher (releasing every descriptor it holds — the
+/// historical fd sink) and build a fresh one from the stored provider list.
+/// Called by the fd-watchdog as its first remediation step when the process's
+/// open-descriptor count goes critical. Best-effort: if the rebuild fails the
+/// registry is simply left without a watcher (logged by `spawn_watchers`), and
+/// the periodic `absorb_all_lagging` poll still keeps credentials in sync.
+///
+/// No-op (returns `false`) if no providers were ever installed (e.g. a one-shot
+/// CLI command that never called `install_watchers`).
+pub fn respawn_watchers() -> bool {
+    let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    if reg.providers.is_empty() {
+        return false;
+    }
+    // Drop the old handle FIRST so its descriptors are released before we open
+    // the new watcher — otherwise we'd transiently double the watcher's fd
+    // footprint at the exact moment we're trying to shed descriptors.
+    reg.handle = None;
+    let providers = reg.providers.clone();
+    reg.handle = spawn_watchers(providers);
+    true
+}
+
 /// Backoff after a caught panic in the fsnotify watcher's processing loop,
 /// before we resume listening on `rx`. Mirrors the poll loop's supervisor
 /// backoff (errors-03, v0.5.2 audit): short enough that real-time credential

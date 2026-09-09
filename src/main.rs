@@ -32,6 +32,7 @@ mod store;
 #[cfg(all(target_os = "macos", feature = "custom-popup"))]
 mod ui;
 mod usage_log;
+mod watchdog;
 
 use providers::claude::{oauth, usage};
 
@@ -225,11 +226,14 @@ fn run() -> Result<()> {
     // Leaked deliberately: the watcher owns a thread and must outlive the
     // process. `Box::leak` on a heap allocation is the standard trick for
     // "live for program lifetime" without introducing a global mutex.
+    // Stored in a process-global registry (not `Box::leak`'d) so the fd-watchdog
+    // can drop + rebuild the watcher at runtime to release leaked descriptors —
+    // the runtime safety net for the fd-leak class of outage (see
+    // `src/watchdog.rs`). The watcher still lives for the process lifetime; the
+    // registry just gives the watchdog a handle on it.
     let providers_static: Vec<&'static dyn Provider> =
         providers::all().iter().map(|b| &**b).collect();
-    if let Some(handle) = credentials::spawn_watchers(providers_static) {
-        Box::leak(Box::new(handle));
-    }
+    credentials::install_watchers(providers_static);
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let exe = std::env::current_exe().unwrap_or_default();
@@ -1513,9 +1517,15 @@ fn keychain_read() -> Option<String> {
 }
 
 fn keychain_write(blob: &str) -> Result<()> {
-    platform()
+    let result = platform()
         .secrets()
-        .set(KEYCHAIN_SERVICE, &keychain_account(), blob)
+        .set(KEYCHAIN_SERVICE, &keychain_account(), blob);
+    // Feed the keychain-write health signal the watchdog watches: a run of
+    // consecutive failures is the fingerprint of the fd-exhaustion EMFILE that
+    // silently broke account switching (see `src/watchdog.rs`). A success
+    // resets the counter.
+    watchdog::record_keychain_result(result.is_ok());
+    result
 }
 
 /// Internal, undocumented CLI hook used ONLY by
@@ -2281,7 +2291,14 @@ fn cmd_watch(args: &[String]) -> Result<()> {
     let base = interval;
     let mut current = base;
     let mut guard = SwapGuard::default();
+    let mut wd = watchdog::Watchdog::default();
+    let mut wd_effects = watchdog::RealEffects;
     loop {
+        // Self-healing health check (fd-count + keychain-write). Throttled to
+        // ~once a minute internally; a cheap directory read otherwise. Keeps
+        // account switching from silently breaking if fds ever leak or the
+        // keychain starts failing again (see `src/watchdog.rs`).
+        wd.maybe_run(&mut wd_effects);
         match watch_cycle(trigger, ceiling, &mut guard) {
             Ok(outcome) => {
                 if let Some((from, to)) = outcome.swapped {

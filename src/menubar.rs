@@ -883,7 +883,14 @@ fn poll_loop() {
     let guard = shared_swap_guard();
     let base = WATCH_INTERVAL_SECS;
     let mut current = base;
+    let mut wd = crate::watchdog::Watchdog::default();
+    let mut wd_effects = crate::watchdog::RealEffects;
     loop {
+        // Self-healing health check (fd-count + keychain-write), throttled to
+        // ~once a minute. The menubar poller runs under launchd, so a critical
+        // fd leak that a watcher respawn can't clear escalates to a launchd
+        // kickstart into a clean process (see `crate::watchdog`).
+        wd.maybe_run(&mut wd_effects);
         // Fetch usage + auto-swap; this writes cached usage to state.json, which
         // the main-thread timer reads back to render. This is the ONLY thing that
         // hits the network, so ordinary use can never rate-limit.
@@ -1055,6 +1062,44 @@ fn relaunch_via_launchd() -> LaunchdRestart {
         return LaunchdRestart::NotManaged;
     }
     relaunch_via_launchd_kickstart()
+}
+
+/// Watchdog self-restart: when the fd/keychain watchdog's remediation ladder
+/// reaches `SelfRestart`, bring the daemon back in a clean process via a
+/// launchd kickstart. We reuse `relaunch_via_launchd` (the same path the
+/// brew-upgrade hot-swap uses), which is battle-tested and only acts when we're
+/// actually launchd-managed.
+///
+/// Deliberately restart-loop-safe: a kickstart replaces the process with a
+/// fresh fd table, so we `sleep` briefly then `exit(0)` and wait to be
+/// replaced. If we are NOT launchd-managed (a bare foreground `usagio watch`)
+/// or the kickstart fails, we DO NOT exit — the plist ships `KeepAlive=false`,
+/// so a bare `exit()` would leave nothing to revive us. Returning `false` there
+/// is correct: the watcher respawn + the watchdog's surfaced log lines are the
+/// safety net for that case, with zero restart-loop risk. Returns `true` only
+/// when a restart was issued (in which case this does not return).
+pub(crate) fn watchdog_self_restart() -> bool {
+    match relaunch_via_launchd() {
+        LaunchdRestart::Issued => {
+            crate::logging::log("event=fd_watchdog self_restart=issued via launchctl kickstart");
+            std::thread::sleep(Duration::from_secs(3));
+            std::process::exit(0);
+        }
+        LaunchdRestart::Failed => {
+            crate::logging::log(
+                "event=fd_watchdog self_restart=failed (launchctl kickstart did not take); \
+                 staying alive",
+            );
+            false
+        }
+        LaunchdRestart::NotManaged => {
+            crate::logging::log(
+                "event=fd_watchdog self_restart=skipped (not launchd-managed); \
+                 relying on watcher respawn",
+            );
+            false
+        }
+    }
 }
 
 // Split out from `relaunch_via_launchd` so the `libc::getuid()` call (`libc`
