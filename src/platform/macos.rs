@@ -74,9 +74,7 @@ impl Platform for MacOsPlatform {
         const BUNDLE_ID: &str = "com.mattjackson.usagio";
         match notify_rust::set_application(BUNDLE_ID) {
             Ok(()) => {
-                crate::logging::log(&format!(
-                    "notifications: registered bundle id {BUNDLE_ID}"
-                ));
+                crate::logging::log(&format!("notifications: registered bundle id {BUNDLE_ID}"));
             }
             Err(e) => {
                 crate::logging::log(&format!(
