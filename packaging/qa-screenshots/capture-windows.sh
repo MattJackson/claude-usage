@@ -20,9 +20,10 @@ FIXTURES="healthy session-locked weekly-locked mixed"
 S3_PREFIX="qa-runs/$RUN_ID/windows"
 S3_URI="s3://$USAGIO_QA_S3_BUCKET/$S3_PREFIX"
 
-# Random 20-char admin password (used only for autologon on this
-# throwaway VM; never leaves the user-data blob).
-ADMIN_PW="Qa!$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)9"
+# Random admin password (used only for autologon on this throwaway VM;
+# never leaves the user-data blob). Built with openssl to avoid the
+# `tr </dev/urandom | head` SIGPIPE that trips `set -o pipefail`.
+ADMIN_PW="Qa$(openssl rand -hex 9)9!"
 
 INSTANCE_ID=""
 UD_RENDERED=""
@@ -59,13 +60,13 @@ INSTANCE_ID=$(aws --region "$REGION" ec2 run-instances \
   --iam-instance-profile "Name=$USAGIO_QA_INSTANCE_PROFILE" \
   --user-data "file://$UD_RENDERED" \
   --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=50,VolumeType=gp3}' \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=usagio-qa-windows-$RUN_ID},{Key=usagio-qa,Value=$RUN_ID}]" \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=usagio-qa-windows-$RUN_ID},{Key=Project,Value=usagio-qa},{Key=usagio-qa,Value=$RUN_ID}]" \
   --query 'Instances[0].InstanceId' --output text)
 echo "[windows] instance=$INSTANCE_ID"
 
-# Windows boots + installs runtime + reboots + autologons + runs capture.
-# In practice this is 6-9 min. Deadline 15 min.
-DEADLINE=$(( $(date +%s) + 900 ))
+# Windows boots + installs runtime (setup.exe, python, AWS CLI) + reboots
+# + autologons + runs capture. In practice 10-18 min. Deadline 25 min.
+DEADLINE=$(( $(date +%s) + 1500 ))
 echo "[windows] waiting for s3://$USAGIO_QA_S3_BUCKET/$S3_PREFIX/_done ..."
 while true; do
   if aws --region "$REGION" s3 ls "$S3_URI/_done" >/dev/null 2>&1; then

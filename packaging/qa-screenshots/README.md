@@ -13,7 +13,32 @@ see "macOS: no cheap cloud option" below.
 (hosted runners have no real desktop). This is a manual maintainer tool
 run before / after each release.
 
-## One-time setup
+## Configured prerequisites (already created in account 457667483187)
+
+These were provisioned once (region `us-east-1`) and are tagged
+`Project=usagio-qa` for auditing/cleanup. Reuse them for every run:
+
+| resource | value |
+|----------|-------|
+| S3 bucket | `usagio-qa-screenshots-457667483187` (private, `qa-runs/` expires after 7 days) |
+| IAM instance profile / role | `usagio-qa-capture` (inline policy `usagio-qa-s3`: Get/Put/List on that bucket only) |
+| EC2 key pair | `usagio-qa` (private key is NOT committed; regenerate with `aws ec2 create-key-pair` if lost) |
+| Security group | `usagio-qa-sg` (`sg-09a2032c2505aa4f2`, default VPC) — inbound 22/3389/5985 from the maintainer IP only, outbound all |
+
+Env vars to run:
+```sh
+export USAGIO_QA_S3_BUCKET=usagio-qa-screenshots-457667483187
+export USAGIO_QA_INSTANCE_PROFILE=usagio-qa-capture
+export USAGIO_QA_KEYPAIR=usagio-qa
+export USAGIO_QA_SSH_KEY=/path/to/usagio-qa.pem
+export USAGIO_QA_SECURITY_GROUP=sg-09a2032c2505aa4f2
+```
+
+Linux runs on **Ubuntu 24.04** (glibc 2.39 — the released usagio binary
+requires `GLIBC_2.39`, so 22.04 cannot run it). Windows runs on Windows
+Server 2022.
+
+## One-time setup (from scratch, if recreating)
 
 The orchestrator uses S3 as the transport for PNGs coming off the VMs
 (so it doesn't have to open SSH-in on Windows or wire up WinRM). You

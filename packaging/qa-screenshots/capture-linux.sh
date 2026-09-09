@@ -37,9 +37,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Resolve the latest Ubuntu 22.04 LTS amd64 AMI in this region via SSM.
+# Resolve the latest Ubuntu 24.04 LTS amd64 AMI in this region via SSM.
+# 24.04 ships glibc 2.39 — the released usagio binary requires GLIBC_2.39,
+# so 22.04 (glibc 2.35) can't run it.
 AMI=$(aws --region "$REGION" ssm get-parameter \
-  --name /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id \
+  --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
   --query 'Parameter.Value' --output text)
 echo "[linux] AMI=$AMI"
 
@@ -61,13 +63,14 @@ INSTANCE_ID=$(aws --region "$REGION" ec2 run-instances \
   --iam-instance-profile "Name=$USAGIO_QA_INSTANCE_PROFILE" \
   --user-data "file://$UD_RENDERED" \
   --instance-initiated-shutdown-behavior terminate \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=usagio-qa-linux-$RUN_ID},{Key=usagio-qa,Value=$RUN_ID}]" \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=usagio-qa-linux-$RUN_ID},{Key=Project,Value=usagio-qa},{Key=usagio-qa,Value=$RUN_ID}]" \
   --query 'Instances[0].InstanceId' --output text)
 echo "[linux] instance=$INSTANCE_ID"
 
-# Poll S3 for the _done sentinel the user-data script drops. Bail after
-# ~8 min; on a warm apt cache and cached AMI, done is typically < 4 min.
-DEADLINE=$(( $(date +%s) + 480 ))
+# Poll S3 for the _done sentinel the user-data script drops. The 24.04 GUI
+# stack (Xvfb + xfce4-panel + webkit + imagemagick) is a heavy apt install,
+# so allow ~15 min.
+DEADLINE=$(( $(date +%s) + 900 ))
 echo "[linux] waiting for s3://$USAGIO_QA_S3_BUCKET/$S3_PREFIX/_done ..."
 while true; do
   if aws --region "$REGION" s3 ls "$S3_URI/_done" >/dev/null 2>&1; then
