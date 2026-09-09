@@ -38,6 +38,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Pre-render each fixture to a concrete state.json HERE (this Mac has a working
+# Python) and upload to S3, instead of running render_fixture.py on the VM — the
+# VM's Python env was unreliable (sys.prefix resolved to system32, "No module
+# named 'encodings'"), so fixtures silently didn't apply. The VM just downloads
+# the ready state.json per fixture. Relative "NOW+" tokens resolve to ~now here,
+# a few minutes before the VM reads them; negligible for day/hour countdowns.
+RENDER_PY="$SCRIPT_DIR/../screenshots/render_fixture.py"
+FIX_DIR="$SCRIPT_DIR/../screenshots/fixtures"
+PY=$(command -v python3 || command -v python)
+echo "[windows] pre-rendering fixtures locally with $PY"
+for f in $FIXTURES; do
+  tmp_state=$(mktemp)
+  "$PY" "$RENDER_PY" "$FIX_DIR/$f.json" "$tmp_state"
+  aws --region "$REGION" s3 cp "$tmp_state" "$S3_URI/state-$f.json" >/dev/null
+  rm -f "$tmp_state"
+  echo "[windows]   uploaded state-$f.json"
+done
+
 AMI=$(aws --region "$REGION" ssm get-parameter \
   --name /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base \
   --query 'Parameter.Value' --output text)

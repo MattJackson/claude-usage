@@ -295,6 +295,20 @@ fn pump_windows_messages() {
     }
 }
 
+/// Format the tray-icon tooltip so it always identifies usagio. The shared
+/// `title_for` summary (e.g. "56% / 64%") works as the macOS menu-bar text, but
+/// a Windows tray tooltip reading only "56%" doesn't tell the user which app the
+/// icon belongs to — and neither a person nor UI automation can locate the icon
+/// by name. Prefix with "usagio" (dropping the summary when it's empty).
+fn windows_tooltip(title: &str) -> String {
+    let t = title.trim();
+    if t.is_empty() {
+        "usagio".to_string()
+    } else {
+        format!("usagio — {t}")
+    }
+}
+
 fn apply_ui_cmd(tray: &TrayIcon, cmd: UiCmd) -> Result<()> {
     match cmd {
         UiCmd::SetIcon(bytes) => {
@@ -303,7 +317,7 @@ fn apply_ui_cmd(tray: &TrayIcon, cmd: UiCmd) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("set_icon: {e}"))?;
         }
         UiCmd::SetTitle(title) => {
-            tray.set_tooltip(Some(title))
+            tray.set_tooltip(Some(windows_tooltip(&title)))
                 .map_err(|e| anyhow::anyhow!("set_tooltip: {e}"))?;
         }
         UiCmd::SetMenu(tree) => {
@@ -324,7 +338,7 @@ impl MenuBackend for WindowsMenu {
         let menu = Menu::new();
         let tray = TrayIconBuilder::new()
             .with_icon(icon)
-            .with_tooltip(initial_title)
+            .with_tooltip(windows_tooltip(initial_title))
             .with_menu(Box::new(menu))
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;

@@ -202,11 +202,20 @@ foreach ($name in $Fixtures) {
   # scheduled-task environment resolved sys.prefix to C:\Windows\system32 and
   # python died with "No module named 'encodings'", so the fixture never
   # applied and every screenshot showed the same empty state.
-  & python -I "C:\usagio-qa\render_fixture.py" "C:\usagio-qa\fixtures\$name.json" $StateFile
-  if ($LASTEXITCODE -ne 0) { Write-Warning "render_fixture.py failed for $name (exit $LASTEXITCODE)" }
+  # Download the fixture's pre-rendered state.json (rendered on the maintainer's
+  # Mac and uploaded before boot — the VM's Python was unreliable). No Python on
+  # the VM anymore.
+  & $Aws s3 cp "$S3Uri/state-$name.json" $StateFile
+  if ($LASTEXITCODE -ne 0) { Write-Warning "could not fetch state-$name.json (exit $LASTEXITCODE)" }
 
+  # Kill usagio, then restart Explorer so orphaned tray icons from the previous
+  # fixture (a force-killed process can't remove its own notification-area icon,
+  # so dead "usagio" icons pile up and confuse UIAutomation targeting) are
+  # cleared. After the restart only the freshly-launched usagio owns an icon.
   Get-Process usagio -ErrorAction SilentlyContinue | Stop-Process -Force
-  Start-Sleep -Seconds 2
+  Start-Sleep -Seconds 1
+  Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 6
   Start-Process -FilePath $UsagioBin -ArgumentList "menubar"
   Start-Sleep -Seconds 7
 
@@ -215,19 +224,24 @@ foreach ($name in $Fixtures) {
   # auto-crop from it. Uploaded as windows-<name>-full.png for every fixture.
   $full = "C:\usagio-qa\windows-$name-full.png"
 
+  # ALWAYS dump every UIAutomation Button name (with a bounding-rect tag) so we
+  # can see exactly what's enumerable — including the notification-area tray
+  # icons — whether or not targeting succeeds. Written per fixture.
+  $allBtns = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    (New-Object System.Windows.Automation.PropertyCondition(
+      [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+      [System.Windows.Automation.ControlType]::Button)))
+  $dump = @()
+  foreach ($b in $allBtns) {
+    try { $r = $b.Current.BoundingRectangle; $dump += ("{0} @ {1},{2} {3}x{4}" -f $b.Current.Name, [int]$r.X, [int]$r.Y, [int]$r.Width, [int]$r.Height) } catch { $dump += $b.Current.Name }
+  }
+  Set-Content "C:\usagio-qa\uia-buttons-$name.txt" ($dump -join "`n")
+  & $Aws s3 cp "C:\usagio-qa\uia-buttons-$name.txt" "$S3Uri/_uia-buttons-$name.txt"
+
   $icon = Find-TrayIcon
   if ($icon) {
     Write-Host "tray icon '$($icon.name)' at $($icon.x),$($icon.y)"
-    if ($first) {
-      $names = ([System.Windows.Automation.AutomationElement]::RootElement.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        (New-Object System.Windows.Automation.PropertyCondition(
-          [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-          [System.Windows.Automation.ControlType]::Button))) |
-        ForEach-Object { $_.Current.Name }) -join " | "
-      Set-Content "C:\usagio-qa\uia-buttons.txt" $names
-      & $Aws s3 cp "C:\usagio-qa\uia-buttons.txt" "$S3Uri/_uia-buttons.txt"
-    }
     # tray-icon shows the menu on left-click by default on Windows.
     [Win32]::LeftClick($icon.x, $icon.y)
     Start-Sleep -Milliseconds 900

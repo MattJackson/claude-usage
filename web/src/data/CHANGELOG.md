@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.21] - 2026-09-09
+
+### Fixed
+- **Windows tray tooltip now identifies usagio.** The tray icon's tooltip was
+  the bare usage summary (e.g. "56% / 64%"), which doesn't tell you which app
+  the icon belongs to. It now reads "usagio — 56% / 64%" (just "usagio" when
+  there's no summary yet). macOS/Linux unaffected.
+
 ## [0.5.20] - 2026-09-09
 
 ### Fixed
