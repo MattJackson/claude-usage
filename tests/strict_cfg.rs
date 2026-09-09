@@ -69,25 +69,25 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("src/menubar.rs", 1367),
     // src/menubar.rs — `build_provider_group`: macOS-only counterpart to
     // `cross_platform::build_provider_group_item` (v0.5.3 menu redesign).
-    ("src/menubar.rs", 1641),
+    ("src/menubar.rs", 1695),
     // src/menubar.rs — `build_account_submenu`: macOS-only counterpart to
     // `cross_platform::build_account_submenu_item` (v0.5.3 menu redesign).
-    ("src/menubar.rs", 1669),
+    ("src/menubar.rs", 1723),
     // src/menubar.rs — `mod mac_style`: the NSMenu attributedTitle styling
     // walk (`install_menu`/`color_for`/`attributed`/`apply_menu_styles`) plus
     // the `objc2*` imports it needs. Grouped into one module so this whole
     // cluster needs exactly one cfg site instead of one per function.
-    ("src/menubar.rs", 1766),
+    ("src/menubar.rs", 1791),
     // src/menubar.rs — `add`: `build_menu`/`build_provider_group`/
     // `build_account_submenu` helper (native `tray_icon::menu::Menu::append`).
-    ("src/menubar.rs", 2259),
+    ("src/menubar.rs", 2300),
     // src/menubar.rs — `mod cross_platform`: the Linux/Windows renderer
     // (`platform::MenuBackend`-based). Never compiled alongside `mac_style`.
-    ("src/menubar.rs", 2822),
+    ("src/menubar.rs", 2863),
     // src/menubar.rs — `tests::mac_style_tests`: exercises
     // `mac_style::attributed` (NSAttributedString attribute inspection)
     // directly; needs the same `objc2*` crates as `mac_style` itself.
-    ("src/menubar.rs", 4725),
+    ("src/menubar.rs", 4800),
 ];
 
 fn src_root() -> PathBuf {

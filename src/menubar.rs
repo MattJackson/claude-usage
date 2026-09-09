@@ -1560,16 +1560,27 @@ fn build_menu(snap: &Snapshot) -> Menu {
     menu
 }
 
+/// Leading glyphs that tag each kind of informational submenu row so the
+/// details panel reads as a designed block (one glyph per fact type) rather
+/// than a stack of look-alike plain sentences. The two spaces after the glyph
+/// give a consistent gutter between the icon and the text. Shared by every
+/// renderer so the macOS attributed-title walk (which matches these rows by
+/// their exact plain string) never drifts from what `build_menu` emitted.
+const RESET_GLYPH: &str = "⏱";
+const BURN_GLYPH: &str = "🔥";
+const COST_GLYPH: &str = "💰";
+
 /// Human-facing "{Label} resets in X" copy for a window row inside an account
 /// submenu. Percentages are deliberately NOT shown here (item 3 of the
 /// redesign moved them to the main-list row via `main_row`) — this row is
-/// purely about *when* the window refreshes.
+/// purely about *when* the window refreshes. Prefixed with `RESET_GLYPH` so the
+/// reset rows read as a tagged group in the details panel.
 fn window_reset_row(w: &WindowView) -> String {
     let label = stat_display_label(w);
     if w.reset.is_empty() {
-        format!("{label}: no reset info yet")
+        format!("{RESET_GLYPH}  {label}: no reset info yet")
     } else {
-        format!("{label} resets in {}", w.reset)
+        format!("{RESET_GLYPH}  {label} resets in {}", w.reset)
     }
 }
 
@@ -1600,6 +1611,49 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
         }
     } else {
         rows.push("(no usage endpoint — headers only)".to_string());
+    }
+    rows
+}
+
+/// The disk-derived informational rows for an account's submenu, in render
+/// order: burn-rate estimate (`🔥`), cost estimate (`💰`), and the "updated Xm
+/// ago" footer. Split out from `submenu_info_rows` — which must stay
+/// disk-I/O-free so the pure `menu_styles` can call it from a unit test —
+/// because these read the on-disk usage log via `crate::burn_rate` /
+/// `crate::cost_tracking`. Shared by every renderer that lays out the submenu
+/// (the macOS `build_account_submenu` and its `mac_style::install_menu`
+/// style-augmentation, plus the cross-platform `build_account_submenu_item`)
+/// so the row TEXT stays byte-for-byte identical across them: the macOS
+/// attributed-title walk matches these rows by their exact plain string, and a
+/// glyph added on one path but not the other would leave the row unstyled
+/// (greyed) on macOS.
+fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
+    let mut rows = Vec::new();
+    if sec.supports_usage && a.has_data && !a.windows.is_empty() {
+        let account_key =
+            crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
+        if let Some(est) = crate::burn_rate::estimate(
+            &account_key,
+            crate::providers::trait_def::Window::Weekly,
+            Utc::now(),
+        ) {
+            if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
+                rows.push(format!(
+                    "{BURN_GLYPH}  {}",
+                    crate::burn_rate::format_menu_row(&est)
+                ));
+            }
+        }
+        if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
+            &account_key,
+            crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
+        ) {
+            rows.push(format!(
+                "{COST_GLYPH}  ~${:.2} this cycle (est)",
+                cost.estimated_usd
+            ));
+        }
+        rows.push(format!("updated {}", a.updated));
     }
     rows
 }
@@ -1674,48 +1728,19 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
     // live on the children below.
     let sub = Submenu::with_id("noop", head, true);
 
+    // Informational rows (reset windows, then burn-rate / cost / "updated"):
+    // rendered as DISABLED (`enabled: false`) items so AppKit gives them no
+    // hover highlight — they aren't actionable, and a highlight on a row that
+    // does nothing when clicked reads as broken. They stay legible (not the
+    // greyed disabled look) because the native attributed-title walk paints
+    // them in `NSColor::labelColor()` via the `disabled_but_white` styles from
+    // `menu_styles` (reset rows) and `mac_style::install_menu`'s augmentation
+    // (the disk-derived burn/cost/updated rows). See `account_extra_info_rows`.
     for row in submenu_info_rows(sec, a) {
-        let _ = sub.append(&MenuItem::with_id("noop", row, true, None));
+        let _ = sub.append(&MenuItem::with_id("noop", row, false, None));
     }
-    // Burn-rate + cost estimator rows: cheap best-effort reads against the
-    // usage log; if we don't have enough samples yet the rows are simply
-    // skipped. Not part of `submenu_info_rows` (which `menu_styles` also
-    // calls, and must stay disk-I/O-free) since these touch
-    // `crate::usage_log` on disk.
-    if sec.supports_usage && a.has_data && !a.windows.is_empty() {
-        let account_key =
-            crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
-        if let Some(est) = crate::burn_rate::estimate(
-            &account_key,
-            crate::providers::trait_def::Window::Weekly,
-            Utc::now(),
-        ) {
-            if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
-                let _ = sub.append(&MenuItem::with_id(
-                    "noop",
-                    crate::burn_rate::format_menu_row(&est),
-                    true,
-                    None,
-                ));
-            }
-        }
-        if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
-            &account_key,
-            crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
-        ) {
-            let _ = sub.append(&MenuItem::with_id(
-                "noop",
-                format!("~${:.2} this cycle (est)", cost.estimated_usd),
-                true,
-                None,
-            ));
-        }
-        let _ = sub.append(&MenuItem::with_id(
-            "noop",
-            format!("updated {}", a.updated),
-            true,
-            None,
-        ));
+    for row in account_extra_info_rows(sec, a) {
+        let _ = sub.append(&MenuItem::with_id("noop", row, false, None));
     }
 
     // Action rows: Switch/Active, Launch, Remove. Gated per H3 (v0.5.0
@@ -1781,7 +1806,23 @@ mod mac_style {
             menu.ns_menu()
         };
         tray.set_menu(Some(Box::new(menu)));
-        let styles = menu_styles(snap);
+        let mut styles = menu_styles(snap);
+        // The burn-rate / cost / "updated" submenu rows are derived with disk
+        // I/O and so live outside the pure `menu_styles`. Now that they render
+        // as DISABLED items (no hover), they need the same `disabled_but_white`
+        // treatment as the reset rows or AppKit would grey them out — add those
+        // styles here (macOS install path only, where disk reads are fine).
+        for (si, _) in provider_grouped_order(snap) {
+            let sec = &snap.sections[si];
+            for a in &sec.accounts {
+                for row in account_extra_info_rows(sec, a) {
+                    styles.push(RowStyle {
+                        disabled_but_white: true,
+                        ..RowStyle::plain_row(row)
+                    });
+                }
+            }
+        }
         let menu_right_x = compute_menu_right_x(ns_menu, &styles);
         apply_menu_styles(ns_menu, &styles, menu_right_x);
     }
@@ -2839,12 +2880,18 @@ mod cross_platform {
         style.plain.replace('\t', SEP)
     }
 
-    fn noop_action(label: impl Into<String>) -> PMenuItem {
+    /// A non-clickable informational submenu row. `enabled: false` so the
+    /// muda/GTK/Win32 renderer draws it as static text with no hover highlight
+    /// — it mirrors the macOS treatment where the same rows are DISABLED (see
+    /// `build_account_submenu`). muda has no rich-text, so unlike macOS these
+    /// can't be re-tinted to stay full-contrast; a disabled row's native grey
+    /// is the closest structural match to "info, not an action".
+    fn noop_info(label: impl Into<String>) -> PMenuItem {
         PMenuItem::Action {
             id: "noop".to_string(),
             label: label.into(),
             icon_png: None,
-            enabled: true,
+            enabled: false,
             checked: false,
             checkable: false,
         }
@@ -2885,30 +2932,10 @@ mod cross_platform {
     fn build_account_submenu_item(sec: &ProviderSection, a: &AcctView) -> PMenuItem {
         let mut items = Vec::new();
         for row in submenu_info_rows(sec, a) {
-            items.push(noop_action(row));
+            items.push(noop_info(row));
         }
-        if sec.supports_usage && a.has_data && !a.windows.is_empty() {
-            let account_key =
-                crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
-            if let Some(est) = crate::burn_rate::estimate(
-                &account_key,
-                crate::providers::trait_def::Window::Weekly,
-                Utc::now(),
-            ) {
-                if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
-                    items.push(noop_action(crate::burn_rate::format_menu_row(&est)));
-                }
-            }
-            if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
-                &account_key,
-                crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
-            ) {
-                items.push(noop_action(format!(
-                    "~${:.2} this cycle (est)",
-                    cost.estimated_usd
-                )));
-            }
-            items.push(noop_action(format!("updated {}", a.updated)));
+        for row in account_extra_info_rows(sec, a) {
+            items.push(noop_info(row));
         }
         // Action rows: Switch/Active, Launch, Remove.
         let rows = account_submenu_rows(sec, a);
@@ -3523,6 +3550,54 @@ mod tests {
         for row in submenu_info_rows(&sec, &a) {
             assert!(!row.contains('%'), "submenu row leaked a percentage: {row}");
         }
+    }
+
+    #[test]
+    fn submenu_reset_rows_carry_the_clock_glyph() {
+        // The details-panel redesign tags each reset-window row with a leading
+        // clock glyph so the info block reads as a designed group rather than a
+        // stack of look-alike menu rows. Every row `submenu_info_rows` emits
+        // for an account WITH data is a reset-window row, so all must carry it.
+        let a = acct("a@x.com", Some(20.0), Some(30.0), false);
+        let sec = ProviderSection {
+            provider_id: CLAUDE_SLUG,
+            display_name: "Claude",
+            supports_switching: true,
+            supports_usage: true,
+            supports_launch: true,
+            supports_remove: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![],
+        };
+        let rows = submenu_info_rows(&sec, &a);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert!(
+                row.starts_with(RESET_GLYPH),
+                "reset row missing clock glyph: {row}",
+            );
+        }
+    }
+
+    #[test]
+    fn account_extra_info_rows_empty_without_usage_support() {
+        // A provider with no usage endpoint has no burn-rate / cost / "updated"
+        // rows — and crucially the extractor must take the no-disk path so it
+        // stays callable off the main thread without a ScopedConfigDir.
+        let a = acct("a@x.com", Some(20.0), Some(30.0), false);
+        let sec = ProviderSection {
+            provider_id: CLAUDE_SLUG,
+            display_name: "Claude",
+            supports_switching: true,
+            supports_usage: false,
+            supports_launch: true,
+            supports_remove: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![],
+        };
+        assert!(account_extra_info_rows(&sec, &a).is_empty());
     }
 
     #[test]
