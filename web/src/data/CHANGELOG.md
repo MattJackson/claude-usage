@@ -7,6 +7,166 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.15] - 2026-09-09
+
+### Fixed
+- **Keychain calls can no longer hang the app.** The `security(1)` hang guard
+  wrapped every keychain call in `timeout(1)` — but macOS doesn't ship
+  `timeout(1)` (it's GNU coreutils), so on a stock Mac the guard silently
+  fell back to an *unguarded* call. Replaced with a native, dependency-free
+  deadline (spawn + poll + kill) that behaves identically on every Mac, so a
+  locked keychain after sleep can't stall account switching or auto-swap.
+
+## [0.5.14] - 2026-09-09
+
+### Fixed
+- **Adaptive poll cadence is scoped to the active account.** An idle account
+  already pinned at 100% used to hold the poll loop at its 10-second backstop
+  indefinitely, hammering the usage endpoint into rate-limiting (HTTP 429) for
+  no benefit — you never swap toward an account that's out of room. Cadence
+  now tightens only as the account you're *actually using* approaches its
+  limit. (Rolls up the 0.5.13 cadence change plus a formatting fix that had
+  left CI red.)
+
+## [0.5.12] - 2026-09-08
+
+### Fixed
+- **No more "Where is use_default?" dialog.** usagio registers its bundle id
+  with the notification system, so the OS no longer tries to open a
+  nonexistent app named "use_default" when a notification fires.
+
+## [0.5.11] - 2026-09-08
+
+### Changed
+- **`usagio list` matches the menu order.** The CLI now sorts accounts by the
+  same priority the menu bar uses (soonest weekly reset / most headroom first)
+  instead of insertion order.
+
+## [0.5.10] - 2026-09-08
+
+### Added
+- **Self-healing watchdog.** The poll loop watches its own file-descriptor use
+  and keychain health, respawning the credential watcher (or restarting the
+  app) before a resource leak or a wedged keychain can break switching.
+
+## [0.5.9] - 2026-09-08
+
+### Fixed
+- **Fixed the file-descriptor leak that broke switching.** The credential
+  watcher used a kqueue backend that held one open descriptor *per watched
+  file* and descended `~/.claude` (whose `tasks/` and `plugins/` trees grow
+  without bound), eventually exhausting the process's descriptors until every
+  `security(1)` keychain call failed with EMFILE — silently breaking account
+  switching, auto-swap, and refresh. Switched to the coalesced FSEvents
+  backend (no per-file descriptor cost) and raised the descriptor ceiling.
+
+## [0.5.8] - 2026-09-08
+
+### Fixed
+- **Codex `/login` is one-time again.** usagio no longer mints a token for the
+  active Codex account — doing so rotated (and invalidated) Codex's single-use
+  refresh token and forced a re-login. (Companion to the 0.5.5 Claude fix.)
+- Stop printing `Unload failed: 5: Input/output error` during `usagio install`.
+
+## [0.5.7] - 2026-09-08
+
+### Changed
+- **Account detail submenu redesigned for readability.** Dropped the emoji
+  glyphs and the hard-to-read grey text in the per-account detail rows.
+
+## [0.5.6] - 2026-09-08
+
+### Fixed
+- **Linux build runs on Ubuntu 22.04 LTS.** The release binary is now built on
+  ubuntu-22.04 (glibc 2.35) rather than a newer image, so it runs on 22.04
+  without a glibc-version error.
+
+## [0.5.5] - 2026-09-08
+
+### Fixed
+- **Claude `/login` is one-time again.** usagio no longer mints a token for the
+  active Claude account — doing so rotated (and invalidated) Claude Code's
+  single-use refresh token, forcing recurring re-logins. Capturing an account
+  once now keeps its login valid.
+
+## [0.5.4] - 2026-09-08
+
+### Fixed
+- Defect batch across the menu bar, autostart, and release packaging.
+
+## [0.5.3] - 2026-09-08
+
+### Added
+- **Compact menu rows.** Accounts render as compact rows grouped by provider,
+  each with a per-account detail submenu.
+
+### Fixed
+- **macOS autostart actually starts.** The LaunchAgent is bootstrapped
+  immediately after its plist is written, so the menu-bar app comes up on
+  install instead of waiting for the next reboot.
+
+## [0.5.2] - 2026-09-08
+
+Robustness + hardening round: background-thread panic supervision, HTTP
+timeouts on every provider call, several concurrency/state-merge fixes, and
+a menu-UX pass grouping accounts into HR-separated blocks.
+
+### Added
+- **`poll_loop` panic supervisor.** The menu-bar background polling thread
+  is now respawned automatically if it panics, instead of silently dying
+  and leaving the app un-updating for the rest of the session.
+- **fsnotify credential-watcher panic supervisor.** The credential-file
+  watcher thread gets the same panic-catch-and-respawn treatment.
+
+### Changed
+- **HTTP read+write timeouts on all provider calls.** `ureq` requests for
+  Claude usage, Claude OAuth, and Codex OAuth now carry explicit
+  read/write timeouts, so a stalled proxy or unresponsive endpoint can no
+  longer hang the poll thread indefinitely.
+- **Shared `SwapGuard` for manual refresh.** `poll_loop` and
+  `handle_refresh_now` now share the same `SwapGuard`, so a manual
+  "Refresh usage now" click honors the same anti-thrash cooldown/no-return
+  windows as the background poller.
+- **Menu UX: account blocks separated by HR.** Accounts now render as
+  visually distinct blocks separated by a horizontal rule, replacing the
+  previous per-account single-line rows grouped by provider.
+- **`usagio install` purges legacy System Events login items.** Previously
+  only `uninstall` did this; brew-upgrade users could end up with a
+  duplicate stale autostart entry.
+- **`LinuxAutostart::restart()` quote-aware path splitting.** Paths
+  containing spaces (e.g. `~/My Apps/usagio`) are now handled correctly.
+- **`~/.config/usagio/` hardened to 0700.** Previously created at the
+  process's default umask.
+- **`usagio.log` opened at mode 0600.** Previously created at 0644 under
+  default umask.
+
+### Fixed
+- **`refresh_usage_cache` merge no longer clobbers `needs_relogin`.** A
+  concurrently-set `needs_relogin=true` flag could be overwritten back to
+  `false` by an in-flight merge; the merge now preserves it.
+- **`context_ledger::mcp::read_line_with_timeout` enforces a real
+  wall-clock timeout**, regardless of whether the child process ever
+  writes anything.
+
+### Removed
+- Dead `Provider::list_accounts` default implementation deleted.
+- `main.rs::capture_current` deleted — Claude now shares
+  `capture_current_generic` with every other provider. Stale doc-comment
+  references to the removed path were cleaned up alongside it.
+
+### Performance
+- Four hot-path efficiency fixes from the post-0.5.1 audit: dropped a
+  redundant `state.json` read+parse on every poll cycle and every
+  credential fsnotify event (the computed `active_email_hint` was unused
+  by the callee); skipped the `refresh_usage_cache` merge+save entirely
+  when no account actually changed that cycle, avoiding a needless
+  read-diff-backup-rotate-write; de-duplicated the per-account history-
+  window filtering shared by `burn_rate` and `cost_tracking` in the menu
+  rebuild; and throttled `cached_state()`'s `metadata()` stat call on the
+  macOS main-thread 0.75s timer tick, matching the existing throttle
+  already applied to `maybe_relaunch_after_upgrade`'s `canonicalize()`
+  call.
+
 ## [0.5.1] - 2026-09-08
 
 Audit-fix + UX round following the v0.5.0 release: a menu-bar readability

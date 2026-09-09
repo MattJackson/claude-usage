@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.15] - 2026-09-09
+
+### Fixed
+- **Keychain calls can no longer hang the app.** The `security(1)` hang guard
+  wrapped every keychain call in `timeout(1)` — but macOS doesn't ship
+  `timeout(1)` (it's GNU coreutils), so on a stock Mac the guard silently
+  fell back to an *unguarded* call. Replaced with a native, dependency-free
+  deadline (spawn + poll + kill) that behaves identically on every Mac, so a
+  locked keychain after sleep can't stall account switching or auto-swap.
+
+## [0.5.14] - 2026-09-09
+
+### Fixed
+- **Adaptive poll cadence is scoped to the active account.** An idle account
+  already pinned at 100% used to hold the poll loop at its 10-second backstop
+  indefinitely, hammering the usage endpoint into rate-limiting (HTTP 429) for
+  no benefit — you never swap toward an account that's out of room. Cadence
+  now tightens only as the account you're *actually using* approaches its
+  limit. (Rolls up the 0.5.13 cadence change plus a formatting fix that had
+  left CI red.)
+
+## [0.5.12] - 2026-09-08
+
+### Fixed
+- **No more "Where is use_default?" dialog.** usagio registers its bundle id
+  with the notification system, so the OS no longer tries to open a
+  nonexistent app named "use_default" when a notification fires.
+
+## [0.5.11] - 2026-09-08
+
+### Changed
+- **`usagio list` matches the menu order.** The CLI now sorts accounts by the
+  same priority the menu bar uses (soonest weekly reset / most headroom first)
+  instead of insertion order.
+
+## [0.5.10] - 2026-09-08
+
+### Added
+- **Self-healing watchdog.** The poll loop watches its own file-descriptor use
+  and keychain health, respawning the credential watcher (or restarting the
+  app) before a resource leak or a wedged keychain can break switching.
+
+## [0.5.9] - 2026-09-08
+
+### Fixed
+- **Fixed the file-descriptor leak that broke switching.** The credential
+  watcher used a kqueue backend that held one open descriptor *per watched
+  file* and descended `~/.claude` (whose `tasks/` and `plugins/` trees grow
+  without bound), eventually exhausting the process's descriptors until every
+  `security(1)` keychain call failed with EMFILE — silently breaking account
+  switching, auto-swap, and refresh. Switched to the coalesced FSEvents
+  backend (no per-file descriptor cost) and raised the descriptor ceiling.
+
+## [0.5.8] - 2026-09-08
+
+### Fixed
+- **Codex `/login` is one-time again.** usagio no longer mints a token for the
+  active Codex account — doing so rotated (and invalidated) Codex's single-use
+  refresh token and forced a re-login. (Companion to the 0.5.5 Claude fix.)
+- Stop printing `Unload failed: 5: Input/output error` during `usagio install`.
+
+## [0.5.7] - 2026-09-08
+
+### Changed
+- **Account detail submenu redesigned for readability.** Dropped the emoji
+  glyphs and the hard-to-read grey text in the per-account detail rows.
+
+## [0.5.6] - 2026-09-08
+
+### Fixed
+- **Linux build runs on Ubuntu 22.04 LTS.** The release binary is now built on
+  ubuntu-22.04 (glibc 2.35) rather than a newer image, so it runs on 22.04
+  without a glibc-version error.
+
+## [0.5.5] - 2026-09-08
+
+### Fixed
+- **Claude `/login` is one-time again.** usagio no longer mints a token for the
+  active Claude account — doing so rotated (and invalidated) Claude Code's
+  single-use refresh token, forcing recurring re-logins. Capturing an account
+  once now keeps its login valid.
+
+## [0.5.4] - 2026-09-08
+
+### Fixed
+- Defect batch across the menu bar, autostart, and release packaging.
+
+## [0.5.3] - 2026-09-08
+
+### Added
+- **Compact menu rows.** Accounts render as compact rows grouped by provider,
+  each with a per-account detail submenu.
+
+### Fixed
+- **macOS autostart actually starts.** The LaunchAgent is bootstrapped
+  immediately after its plist is written, so the menu-bar app comes up on
+  install instead of waiting for the next reboot.
+
 ## [0.5.2] - 2026-09-08
 
 Robustness + hardening round: background-thread panic supervision, HTTP
