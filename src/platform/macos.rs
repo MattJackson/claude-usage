@@ -20,8 +20,10 @@
 
 use super::*;
 use anyhow::{bail, Context, Result};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 pub struct MacOsPlatform {
     // Reachable through the `MenuBackend` trait method below; the compiler's
@@ -133,66 +135,112 @@ pub struct MacOsSecrets;
 // A locked keychain, or a SecurityAgent "Allow/Deny" dialog with no
 // interactive user around to dismiss it (the common case: usagio runs as a
 // headless menu-bar poller), makes `security(1)` block indefinitely. Every
-// `Command::new("security")` invocation in this module is routed through
-// `security_command` below, which wraps it in `timeout(1) SECURITY_TIMEOUT_SECS`
-// so the poll thread can never hang forever on a keychain call. `security(1)`
-// normally completes in well under 100ms; 5s is generous headroom while still
-// bounding the worst case.
-const SECURITY_TIMEOUT_SECS: &str = "5";
+// `security(1)` invocation in this module goes through `run_security`, which
+// spawns the process and enforces a SECURITY_TIMEOUT deadline NATIVELY —
+// polling `try_wait` and `kill`-ing the child if it overruns — so the poll
+// thread can never hang forever on a keychain call. `security(1)` normally
+// completes in well under 100ms; 5s is generous headroom while still bounding
+// the worst case.
+//
+// v0.5.15: replaced the old `timeout(1)`-wrapper approach. macOS does not ship
+// `/usr/bin/timeout` (it's GNU coreutils, only present if brew-installed
+// unprefixed), so on a stock Mac the wrapper silently fell back to a bare
+// `security` call with NO hang guard at all — exactly the machines most likely
+// to hit a locked keychain after sleep. The native guard has no external
+// dependency and behaves identically on every Mac.
+const SECURITY_TIMEOUT_SECS: u64 = 5;
+const SECURITY_TIMEOUT: Duration = Duration::from_secs(SECURITY_TIMEOUT_SECS);
 
-/// Exit code `timeout(1)` uses (GNU coreutils convention) to signal "the
-/// wrapped command was killed because it exceeded the deadline".
-const TIMEOUT_EXIT_CODE: i32 = 124;
+/// How often `run_with_timeout` polls the child for exit. `security(1)`
+/// finishes in well under 100ms, so a 10ms poll adds negligible latency to the
+/// normal path while keeping the kill-on-overrun responsive.
+const SECURITY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-static TIMEOUT_BINARY_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-static TIMEOUT_FALLBACK_LOGGED: std::sync::Once = std::sync::Once::new();
-
-/// Probes for a `timeout` binary on PATH (cached for the process lifetime).
-/// macOS does not ship `/usr/bin/timeout` — it's only present if coreutils
-/// was brew-installed (unprefixed, i.e. `brew install coreutils
-/// --with-default-names`, or a PATH that resolves `timeout` to `gtimeout`
-/// some other way).
-fn timeout_binary_available() -> bool {
-    *TIMEOUT_BINARY_AVAILABLE.get_or_init(|| {
-        Command::new("timeout")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
+/// Outcome of a `security(1)` invocation run under the native hang guard.
+struct SecurityRun {
+    /// True iff the call exceeded `SECURITY_TIMEOUT` and was killed. The
+    /// caller treats this like any other failure ("don't touch anything"),
+    /// but logs it distinctly so a locked keychain is diagnosable.
+    timed_out: bool,
+    /// The child's exit status, or `None` if it was killed for overrunning.
+    status: Option<ExitStatus>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
-/// Build a `security(1)` invocation. Wraps it in `timeout(1)
-/// SECURITY_TIMEOUT_SECS` when available so a locked keychain or an
-/// unattended SecurityAgent dialog can't hang the poll thread forever. Falls
-/// back to a bare `security` command (no hang guard) if `timeout` isn't on
-/// PATH — logs once at the first fallback use, then silently falls through
-/// on every subsequent call.
-fn security_command(args: &[&str]) -> Command {
-    if timeout_binary_available() {
-        let mut cmd = Command::new("timeout");
-        cmd.arg(SECURITY_TIMEOUT_SECS);
-        cmd.arg("security");
-        cmd.args(args);
-        cmd
-    } else {
-        TIMEOUT_FALLBACK_LOGGED.call_once(|| {
-            crate::logging::log(
-                "event=keychain_timeout_unavailable msg=\"'timeout' binary not on PATH; \
-                 security(1) calls run WITHOUT a hang guard\"",
-            );
-        });
-        let mut cmd = Command::new("security");
-        cmd.args(args);
-        cmd
+impl SecurityRun {
+    fn success(&self) -> bool {
+        self.status.map(|s| s.success()).unwrap_or(false)
+    }
+    fn code(&self) -> Option<i32> {
+        self.status.and_then(|s| s.code())
     }
 }
 
-/// True if `status` represents a `timeout(1)`-enforced kill (exit 124).
-/// Only meaningful when the command was actually run via `security_command`
-/// with the `timeout` wrapper in effect (see `timeout_binary_available`).
-fn is_timeout_exit(status: &std::process::ExitStatus) -> bool {
-    status.code() == Some(TIMEOUT_EXIT_CODE)
+/// Run `security(1)` with `args` under the native hang guard. stdout/stderr
+/// are captured; stdin is closed so an interactive prompt can't block on
+/// input while we wait.
+fn run_security(args: &[&str]) -> Result<SecurityRun> {
+    let child = Command::new("security")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning `security`")?;
+    run_with_timeout(child, SECURITY_TIMEOUT)
+}
+
+/// Wait for an already-spawned child up to `timeout`, killing it if it
+/// overruns. stdout/stderr are drained on dedicated threads so a child that
+/// fills a pipe buffer can't deadlock against the `try_wait` poll loop (and so
+/// the reader threads unblock as soon as a killed child's pipes close). Split
+/// out from `run_security` so it can be unit-tested with ordinary commands
+/// (`sleep`, `echo`) rather than the real keychain.
+fn run_with_timeout(mut child: Child, timeout: Duration) -> Result<SecurityRun> {
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().context("waiting on `security`")? {
+            Some(s) => break Some(s),
+            None => {
+                if Instant::now() >= deadline {
+                    // Overran: kill and reap. Reaping closes the child's pipe
+                    // write ends, so the reader threads' read_to_end returns
+                    // and the joins below can't hang.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(SECURITY_POLL_INTERVAL);
+            }
+        }
+    };
+
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    Ok(SecurityRun {
+        timed_out: status.is_none(),
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn real_get(service: &str, account: &str) -> Result<Option<String>> {
@@ -203,10 +251,9 @@ fn real_get(service: &str, account: &str) -> Result<Option<String>> {
     // it as "don't touch anything" rather than "assume gone" (which
     // would let a subsequent switch overwrite a still-valid token).
     // See H7 in the round-1 codeaudit findings.
-    let out = security_command(&["find-generic-password", "-s", service, "-a", account, "-w"])
-        .output()
+    let out = run_security(&["find-generic-password", "-s", service, "-a", account, "-w"])
         .context("running `security find-generic-password`")?;
-    let timed_out = is_timeout_exit(&out.status);
+    let timed_out = out.timed_out;
     let result = if timed_out {
         // robustness-01: locked keychain / unattended SecurityAgent dialog.
         // Distinct error branch, but still just an Err to the caller — same
@@ -216,8 +263,8 @@ fn real_get(service: &str, account: &str) -> Result<Option<String>> {
              (locked keychain or an unattended SecurityAgent dialog) for \
              service={service} account={account}",
         ))
-    } else if !out.status.success() {
-        match out.status.code() {
+    } else if !out.success() {
+        match out.code() {
             Some(44) => Ok(None),
             other => {
                 let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -267,10 +314,9 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
     // differently-ACL'd existing item ever happens.
     let mut timed_out = false;
     let result = (|| -> Result<()> {
-        let del = security_command(&["delete-generic-password", "-s", service, "-a", account])
-            .output()
+        let del = run_security(&["delete-generic-password", "-s", service, "-a", account])
             .context("running `security delete-generic-password` (pre-set)")?;
-        if is_timeout_exit(&del.status) {
+        if del.timed_out {
             timed_out = true;
             bail!(
                 "`security delete-generic-password` (pre-set) timed out after \
@@ -278,16 +324,16 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
                  dialog) for service={service} account={account}",
             );
         }
-        if !del.status.success() && del.status.code() != Some(44) {
+        if !del.success() && del.code() != Some(44) {
             let stderr = String::from_utf8_lossy(&del.stderr);
             bail!(
                 "`security delete-generic-password` (pre-set) failed \
                  (exit {:?}) for service={service} account={account}: {}",
-                del.status.code(),
+                del.code(),
                 stderr.trim(),
             );
         }
-        let out = security_command(&[
+        let out = run_security(&[
             "add-generic-password",
             "-s",
             service,
@@ -296,9 +342,8 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
             "-w",
             secret,
         ])
-        .output()
         .context("running `security add-generic-password`")?;
-        if is_timeout_exit(&out.status) {
+        if out.timed_out {
             timed_out = true;
             bail!(
                 "`security add-generic-password` timed out after {SECURITY_TIMEOUT_SECS}s \
@@ -306,7 +351,7 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
                  service={service} account={account}",
             );
         }
-        if !out.status.success() {
+        if !out.success() {
             bail!("`security add-generic-password` failed for service={service} account={account}");
         }
         Ok(())
@@ -331,10 +376,9 @@ fn real_delete(service: &str, account: &str) -> Result<()> {
     // (exit 44, benign) from every other failure. Collapsing all non-zero
     // to Ok(()) masked keychain-locked / permission errors, which then
     // let callers assume the delete "succeeded" and move on.
-    let out = security_command(&["delete-generic-password", "-s", service, "-a", account])
-        .output()
+    let out = run_security(&["delete-generic-password", "-s", service, "-a", account])
         .context("running `security delete-generic-password`")?;
-    if is_timeout_exit(&out.status) {
+    if out.timed_out {
         // robustness-01: same hang guard as real_get/real_set.
         crate::logging::log(&format!(
             "event=keychain_delete_timeout svc={service} acct={account}"
@@ -345,8 +389,8 @@ fn real_delete(service: &str, account: &str) -> Result<()> {
              service={service} account={account}",
         );
     }
-    if !out.status.success() {
-        match out.status.code() {
+    if !out.success() {
+        match out.code() {
             Some(44) => return Ok(()),
             other => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
@@ -870,38 +914,75 @@ mod tests {
         });
     }
 
-    /// robustness-01: `security_command` must actually wrap the invocation in
-    /// `timeout(1) SECURITY_TIMEOUT_SECS security <args...>` — never invokes
-    /// the real keychain (no `security` process launched or asserted on;
-    /// this only inspects the `std::process::Command` we're about to run).
+    /// Helper: spawn an arbitrary command with captured pipes so the
+    /// `run_with_timeout` tests can exercise the guard without the real
+    /// keychain. Mirrors how `run_security` configures stdio.
+    fn spawn_for_test(program: &str, args: &[&str]) -> Child {
+        Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn test child")
+    }
+
+    /// robustness-01: a command that finishes inside the deadline is NOT
+    /// reported as timed out, exposes its real exit status, and its stdout is
+    /// captured in full.
     #[test]
-    fn security_command_wraps_with_timeout_when_available() {
-        // Skip (rather than fail) on a machine with no `timeout` on PATH —
-        // in that mode `security_command` deliberately falls back to a bare
-        // `security` invocation, which is covered by the test below.
-        if !timeout_binary_available() {
-            eprintln!("skipping: no `timeout` binary on PATH in this test environment");
-            return;
-        }
-        let cmd = security_command(&["find-generic-password", "-s", "svc", "-a", "acct", "-w"]);
-        assert_eq!(cmd.get_program(), "timeout");
-        let args: Vec<_> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(
-            args,
-            vec![
-                SECURITY_TIMEOUT_SECS.to_string(),
-                "security".to_string(),
-                "find-generic-password".to_string(),
-                "-s".to_string(),
-                "svc".to_string(),
-                "-a".to_string(),
-                "acct".to_string(),
-                "-w".to_string(),
-            ]
+    fn run_with_timeout_captures_a_fast_success() {
+        let child = spawn_for_test("sh", &["-c", "printf hello"]);
+        let run = run_with_timeout(child, SECURITY_TIMEOUT).expect("run");
+        assert!(!run.timed_out);
+        assert!(run.success());
+        assert_eq!(run.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "hello");
+    }
+
+    /// robustness-01: a non-zero exit (e.g. `security`'s own "not found" code
+    /// 44) is surfaced as its real code, NEVER confused with a timeout.
+    #[test]
+    fn run_with_timeout_surfaces_nonzero_exit_not_as_timeout() {
+        let child = spawn_for_test("sh", &["-c", "exit 44"]);
+        let run = run_with_timeout(child, SECURITY_TIMEOUT).expect("run");
+        assert!(!run.timed_out);
+        assert!(!run.success());
+        assert_eq!(run.code(), Some(44));
+    }
+
+    /// robustness-01 (the whole point): a command that overruns the deadline
+    /// is killed and reported as timed out — the poll thread does NOT hang.
+    /// Bounds wall-clock so a regression that failed to kill would blow the
+    /// test's own time budget rather than pass.
+    #[test]
+    fn run_with_timeout_kills_an_overrunning_child() {
+        let started = Instant::now();
+        let child = spawn_for_test("sleep", &["30"]);
+        let run = run_with_timeout(child, Duration::from_millis(150)).expect("run");
+        assert!(
+            run.timed_out,
+            "a 30s sleep under a 150ms deadline must time out"
         );
+        assert!(run.status.is_none());
+        assert!(!run.success());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the child must be killed promptly, not waited out"
+        );
+    }
+
+    /// A child that writes more than a pipe buffer's worth of output must not
+    /// deadlock the try_wait loop against an undrained pipe — the dedicated
+    /// reader threads keep the pipe empty. 256 KiB comfortably exceeds the
+    /// typical 64 KiB pipe capacity.
+    #[test]
+    fn run_with_timeout_drains_large_output_without_deadlock() {
+        let child = spawn_for_test("sh", &["-c", "yes AAAAAAAA | head -c 262144"]);
+        let run = run_with_timeout(child, SECURITY_TIMEOUT).expect("run");
+        assert!(!run.timed_out);
+        assert!(run.success());
+        assert_eq!(run.stdout.len(), 262144);
     }
 
     /// v0.5.3 P0 #2: `launchctl_bootstrap_argv` MUST produce the exact
@@ -958,20 +1039,6 @@ mod tests {
                 "gui/501/com.mattjackson.usagio.menubar".to_string(),
             ],
         );
-    }
-
-    /// robustness-01: `is_timeout_exit` must key off exit code 124 (the
-    /// `timeout(1)` convention) specifically, and not treat every non-zero
-    /// exit — e.g. `security`'s own "not found" code 44 — as a timeout.
-    #[test]
-    fn is_timeout_exit_matches_only_exit_124() {
-        use std::os::unix::process::ExitStatusExt;
-        let timed_out = std::process::ExitStatus::from_raw(124 << 8);
-        let not_found = std::process::ExitStatus::from_raw(44 << 8);
-        let success = std::process::ExitStatus::from_raw(0);
-        assert!(is_timeout_exit(&timed_out));
-        assert!(!is_timeout_exit(&not_found));
-        assert!(!is_timeout_exit(&success));
     }
 
     /// SecretStore round-trip against the real login keychain. `#[ignore]`d by
