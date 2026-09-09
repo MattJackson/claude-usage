@@ -1,0 +1,16 @@
+# Statically link the MSVC C runtime into the Windows binary.
+#
+# WHY: a default `x86_64-pc-windows-msvc` build DYNAMICALLY links the Visual
+# C++ runtime (vcruntime140.dll) and the UCRT. Those DLLs ship with Visual
+# Studio / the "VC++ Redistributable" and are present on dev machines and CI
+# runners — but NOT on a clean Windows install (notably Windows Server SKUs).
+# There, `usagio.exe` fails to load at startup with a "the program can't start
+# because VCRUNTIME140.dll is missing" / entry-point error before `main` ever
+# runs — which is exactly what a clean-VM screenshot capture surfaced (an error
+# dialog instead of the menu). `+crt-static` links the CRT INTO the exe so it
+# is self-contained and launches on any Windows box with no redistributable.
+#
+# Scope: this key applies ONLY to the Windows MSVC target — macOS and Linux
+# builds are completely unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

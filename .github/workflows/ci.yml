@@ -55,6 +55,26 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --all-features
 
+      # A build that compiles is NOT proof the binary LOADS. usagio statically
+      # imports tray-icon/muda + the VC++ CRT; if any of those fail to resolve
+      # at process load (missing redistributable on a clean box, or a
+      # STATUS_ENTRYPOINT_NOT_FOUND symbol mismatch) the exe dies before `main`.
+      # Run the pure-CLI `--version` (no tray/display needed) so a load-time
+      # failure fails CI here with the exact DLL/entry-point in the log, instead
+      # of shipping a binary that only "works" on machines with the dev runtime.
+      # `dumpbin /dependents` additionally records the DLL imports so we can
+      # confirm the CRT is statically linked (no vcruntime140.dll import).
+      - name: Windows — binary must actually launch (load-time smoke test)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $exe = "target/release/usagio.exe"
+          $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find '**\dumpbin.exe' 2>$null | Select-Object -First 1
+          if ($dumpbin) { Write-Host "== dependents =="; & $dumpbin /dependents $exe }
+          Write-Host "== run --version =="
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "usagio.exe --version exited $LASTEXITCODE — the binary does not load on this runner" }
+
       - name: cargo test
         # --test-threads=1 required: several tests mutate process-global $HOME
         # to point at a tempdir via env_lock::scoped_env_var. Parallel runs
