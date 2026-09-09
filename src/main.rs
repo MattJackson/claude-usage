@@ -1687,44 +1687,44 @@ fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str
 // Claude Code's rotation is adopted instead — usagio never fights Claude Code
 // for the write, but it DOES rotate the token when nobody else is racing it.
 
-/// Outcome of one `active_refresh_cas` attempt.
+/// Outcome of one `active_refresh_adopt` pass.
 #[derive(Debug)]
 enum ActiveRefreshOutcome {
-    /// usagio held the sole write lease on the slot for the whole cycle:
-    /// POSTed `/token` and committed the new grant to the slot + state.json.
-    CasWon,
-    /// Claude Code rotated the slot WHILE our `/token` POST was in flight.
-    /// Our new grant is already stale (Anthropic's single-use refresh_token
-    /// semantics mean Claude Code's own refresh invalidated the token family
-    /// we just rotated); it is discarded and Claude Code's rotation is
-    /// adopted into `acct` instead.
-    CasLostAdoptedCcRotation,
-    /// Claude Code had already rotated the slot before this cycle started
-    /// (most likely while usagio wasn't running). No `/token` POST was
-    /// attempted; the rotation is adopted into `acct` and refresh is retried
-    /// next cycle if the adopted token still needs it.
-    SkippedKeychainAlreadyDrifted,
-    /// The read/refresh/write sequence failed outright (slot unreadable, the
-    /// refresh POST itself failed, or the commit write failed). `acct` is
-    /// left untouched; the caller keeps the existing cache for this cycle.
+    /// Read the slot Claude Code owns and synced our in-memory `acct` to
+    /// whatever it currently holds (whether it had drifted or was already in
+    /// sync). No token was minted.
+    Adopted,
+    /// The slot was unreadable/unparseable; `acct` is left untouched and the
+    /// caller keeps the existing cache for this cycle.
     RefreshFailed,
 }
 
-/// Compare-and-swap refresh for the ACTIVE account only. MUST be run entirely
-/// inside `with_state_lock` by the caller (see `refresh_usage_cache`) so it's
-/// atomic with respect to every other in-process caller of `with_state_lock`
-/// (switch, capture, the inactive-account merge). Cross-process safety comes
-/// from the OS-native slot itself being sequentially consistent: one
-/// `security` CLI invocation (or one file write) completes fully before the
-/// next caller can observe it, so "read, POST, read again, compare" can never
-/// observe a torn write.
+/// Sync the ACTIVE account's tokens FROM the slot Claude Code owns — usagio is
+/// a pure follower here and MUST NEVER mint a token for the active account.
 ///
-/// `provider` is used ONLY for `read_active_slot` / `mirror_rotated_token` —
-/// the actual `/token` POST goes through `oauth::refresh`, matching every
-/// other Claude refresh path in this file (v1 state is Claude-only). `acct`
-/// is the caller's just-reloaded in-memory copy; it is mutated in place to
-/// whichever tokens end up correct. This function does not save state.json —
-/// the caller does that once, after this returns.
+/// Why no `/token` POST: Anthropic's refresh tokens are **single-use**. Posting
+/// `refresh_token` rotates the whole token family *server-side* and permanently
+/// invalidates every other copy — including the one Claude Code is holding. The
+/// moment usagio refreshes the active account, Claude Code's next refresh comes
+/// back `invalid_grant` and it drops the user into a `/login`. This is
+/// irreversible: the damage is the POST itself, not any keychain write, so no
+/// amount of before/after compare-and-swap can undo it. (The prior "CAS"
+/// design POSTed and then tried to discard its own grant on a detected race —
+/// that never protected Claude Code, because Anthropic had already burned CC's
+/// token by the time we read the slot back.)
+///
+/// Claude Code refreshes the active account on its own cadence; usagio's only
+/// job is to read that slot and adopt whatever it holds, keeping our state.json
+/// in sync so a later `switch` writes back the correct (current) blob. The
+/// adopted access token is also what the usage fetch uses this cycle. If Claude
+/// Code is dormant and its cached access token has expired, the usage fetch
+/// simply fails and we keep the previous cache — a cosmetic staleness, never a
+/// login break.
+///
+/// MUST be run inside `with_state_lock` by the caller (see
+/// `refresh_usage_cache`). `acct` is the caller's just-reloaded in-memory copy;
+/// it is mutated in place. This function does not save state.json — the caller
+/// does that once, after this returns.
 fn active_refresh_cas(provider: &dyn Provider, acct: &mut Account) -> ActiveRefreshOutcome {
     let email = acct.email.clone().unwrap_or_default();
 
@@ -1732,128 +1732,49 @@ fn active_refresh_cas(provider: &dyn Provider, acct: &mut Account) -> ActiveRefr
         Ok(Some(b)) => b,
         Ok(None) => {
             logging::log(&format!(
-                "event=active_refresh_cas_failed account={email} reason=slot_empty"
+                "event=active_refresh_adopt_failed account={email} reason=slot_empty"
             ));
             return ActiveRefreshOutcome::RefreshFailed;
         }
         Err(e) => {
             logging::log(&format!(
-                "event=active_refresh_cas_failed account={email} reason=read_before:{e}"
+                "event=active_refresh_adopt_failed account={email} reason=read:{e}"
             ));
             return ActiveRefreshOutcome::RefreshFailed;
         }
     };
-    let before_acct = match Account::from_keychain_blob(&before) {
+    let cc_acct = match Account::from_keychain_blob(&before) {
         Ok(a) => a,
         Err(e) => {
             logging::log(&format!(
-                "event=active_refresh_cas_failed account={email} reason=parse_before:{e:#}"
+                "event=active_refresh_adopt_failed account={email} reason=parse:{e:#}"
             ));
             return ActiveRefreshOutcome::RefreshFailed;
         }
     };
 
-    if before_acct.access_token != acct.access_token {
-        // Claude Code rotated behind us since our last cycle — we are not
-        // the sole owner of the current generation. Adopt the rotation and
-        // skip refreshing this cycle; the token we just adopted is fresher
-        // than ours anyway, and racing a POST against it would only risk
-        // invalidating the very grant we just picked up.
-        let cc_prefix = logging::tok_prefix(&before_acct.access_token);
-        acct.set_tokens(
-            before_acct.access_token,
-            before_acct.refresh_token,
-            before_acct.expires_at,
-        );
-        acct.keychain_blob = before;
+    let drifted = cc_acct.access_token != acct.access_token;
+    let cc_prefix = logging::tok_prefix(&cc_acct.access_token);
+    acct.set_tokens(
+        cc_acct.access_token,
+        cc_acct.refresh_token,
+        cc_acct.expires_at,
+    );
+    acct.keychain_blob = before;
+    // The active slot is, by definition, what Claude Code is actively using —
+    // adopting it means we now hold a valid grant, so clear any stale flag.
+    acct.needs_relogin = false;
+    if drifted {
         logging::log(&format!(
-            "active refresh SKIPPED: keychain drifted (CC rotated), adopted {cc_prefix}.. \
-             (event=active_refresh_cas_skipped_drift account={email})"
+            "event=active_refresh_adopted account={email} adopted_at_prefix={cc_prefix}.. \
+             note=cc_rotated_since_last_cycle"
         ));
-        return ActiveRefreshOutcome::SkippedKeychainAlreadyDrifted;
-    }
-
-    // We're the sole owner of the current generation — POST /token.
-    let old_prefix = logging::tok_prefix(&acct.access_token);
-    if let Err(e) = oauth::refresh(acct) {
-        eprintln!("DEBUG active_refresh_cas refresh_http_error: {e:?}");
-        logging::log(&format!(
-            "event=active_refresh_cas_failed account={email} reason=refresh_http_error:{e}"
-        ));
-        return ActiveRefreshOutcome::RefreshFailed;
-    }
-    let new_grant_blob = acct.keychain_blob.clone();
-    let new_prefix = logging::tok_prefix(&acct.access_token);
-
-    let after = match provider.read_active_slot() {
-        Ok(v) => v,
-        Err(e) => {
-            // We can no longer tell whether we still own the generation.
-            // Refuse to write blindly — better to retry next cycle (our
-            // now-orphaned new grant is simply dropped; `acct` is left as it
-            // was before this call returns, via the caller's own reload).
-            logging::log(&format!(
-                "event=active_refresh_cas_failed account={email} reason=read_after:{e}"
-            ));
-            return ActiveRefreshOutcome::RefreshFailed;
-        }
-    };
-
-    if after.as_deref() == Some(before.as_str()) {
-        // Still sole owner: commit our new grant. `mirror_rotated_token`
-        // routes through `Platform::secrets()` (delete-then-add on macOS —
-        // see `MacOsSecrets::set` — or the credentials file on Linux/Windows).
-        if let Err(e) = provider.mirror_rotated_token(&new_grant_blob) {
-            logging::log(&format!(
-                "event=active_refresh_cas_failed account={email} reason=write_after:{e}"
-            ));
-            return ActiveRefreshOutcome::RefreshFailed;
-        }
-        logging::log(&format!(
-            "active refresh CAS OK: {old_prefix}.. -> {new_prefix}.. \
-             (event=active_refresh_cas_won account={email})"
-        ));
-        ActiveRefreshOutcome::CasWon
     } else {
-        // Claude Code rotated DURING our POST. Our new grant is already
-        // stale — discard it and adopt whatever Claude Code wrote instead.
-        match after.as_deref().map(Account::from_keychain_blob) {
-            Some(Ok(cc_acct)) => {
-                let cc_prefix = logging::tok_prefix(&cc_acct.access_token);
-                acct.set_tokens(
-                    cc_acct.access_token,
-                    cc_acct.refresh_token,
-                    cc_acct.expires_at,
-                );
-                acct.keychain_blob = after.unwrap();
-                logging::log(&format!(
-                    "active refresh CAS LOST: CC rotated during our POST, discarding our \
-                     grant, adopting {cc_prefix}.. (event=active_refresh_cas_lost \
-                     account={email} discarded_at_prefix={new_prefix} adopted_at_prefix={cc_prefix})"
-                ));
-            }
-            _ => {
-                // After-blob missing/unparseable: can't confirm Claude Code's
-                // side landed cleanly. Revert to the pre-refresh tokens
-                // (identical to `before_acct`, since that's the invariant we
-                // established above) rather than keeping our now-discarded
-                // new grant.
-                logging::log(&format!(
-                    "active refresh CAS LOST: CC rotated during our POST but the after-blob \
-                     could not be read/parsed; discarding our grant only (event=\
-                     active_refresh_cas_lost account={email} discarded_at_prefix={new_prefix} \
-                     adopted_at_prefix=<unreadable>)"
-                ));
-                acct.set_tokens(
-                    before_acct.access_token,
-                    before_acct.refresh_token,
-                    before_acct.expires_at,
-                );
-                acct.keychain_blob = before;
-            }
-        }
-        ActiveRefreshOutcome::CasLostAdoptedCcRotation
+        logging::log(&format!(
+            "event=active_refresh_in_sync account={email} at_prefix={cc_prefix}.."
+        ));
     }
+    ActiveRefreshOutcome::Adopted
 }
 
 // ---------------------------------------------------------------------------
@@ -2110,9 +2031,8 @@ fn refresh_usage_cache() -> RefreshOutcome {
                     continue;
                 }
                 Ok((Some(_), Some(fresh))) => {
-                    // CasWon / CasLostAdoptedCcRotation / SkippedDrift all
-                    // leave `fresh` holding the tokens to use for the usage
-                    // fetch below.
+                    // `Adopted` leaves `fresh` holding the tokens Claude Code
+                    // owns, which is what the usage fetch below uses.
                     acct = fresh;
                 }
                 Ok((Some(_), None)) | Ok((None, _)) => {
