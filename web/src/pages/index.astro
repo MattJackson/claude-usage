@@ -34,34 +34,21 @@ const description =
       </div>
 
       <!-- Product shot: rotating carousel of real menu-bar screenshots, one per OS -->
-      <div class="hero-shot fade-up" aria-hidden="false">
-        <div class="hero-carousel" id="hero-carousel">
-          <!-- TODO: real screenshot from screenshots CI workflow (feat/v052-screenshots-ci) -->
-          <img
-            class="hero-carousel-img is-active"
-            src="/hero-macos.png"
-            alt="usagio menu-bar view on macOS"
-            data-os="macOS"
-            width="1280" height="720" loading="eager"
-          />
-          <!-- TODO: real screenshot from screenshots CI workflow (feat/v052-screenshots-ci) -->
-          <img
-            class="hero-carousel-img"
-            src="/hero-windows.png"
-            alt="usagio menu-bar view on Windows"
-            data-os="Windows"
-            width="1280" height="720" loading="lazy"
-          />
-          <!-- TODO: real screenshot from screenshots CI workflow (feat/v052-screenshots-ci) -->
-          <img
-            class="hero-carousel-img"
-            src="/hero-linux.png"
-            alt="usagio menu-bar view on Linux"
-            data-os="Linux"
-            width="1280" height="720" loading="lazy"
-          />
-        </div>
-        <div class="hero-carousel-caption" id="hero-carousel-caption" aria-live="polite">macOS</div>
+      <div class="hero-shot fade-up" aria-hidden="true">
+        <pre class="hero-mock" role="img" aria-label="usagio menu preview">
+<span class="hm-provider">Claude</span>
+<span class="hm-active">  ✓ matt@work.com          <span class="hm-pct">47% / 89%</span></span>
+<span class="hm-row">    matt@personal.com      <span class="hm-pct">12% / 30%</span></span>
+
+<span class="hm-provider">Codex</span>
+<span class="hm-row">    matt@team.com           <span class="hm-pct">5% / 42%</span></span>
+<span class="hm-row">    matt@side.com         <span class="hm-locked">100% / 3h 12m</span></span>
+<span class="hm-sep">─────────────────────────────</span>
+<span class="hm-row">  Capture current login    ▸</span>
+<span class="hm-row">  Settings                 ▸</span>
+<span class="hm-row">  Refresh usage now</span>
+<span class="hm-row">  Quit</span>
+        </pre>
       </div>
     </div>
   </section>
@@ -338,38 +325,23 @@ const description =
     box-shadow: var(--shadow-lift);
     border: 1px solid var(--line);
   }
-  .hero-carousel {
-    position: absolute; inset: 0;
+  .hero-mock {
+    margin: 0;
+    padding: 1.4rem 1.6rem;
+    font-family: var(--font-mono);
+    font-size: 0.92rem;
+    line-height: 1.7;
+    color: var(--ink);
+    background: var(--bg);
+    white-space: pre;
+    overflow: auto;
   }
-  .hero-carousel-img {
-    position: absolute; inset: 0;
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    opacity: 0;
-    transition: opacity 900ms ease;
-  }
-  .hero-carousel-img.is-active {
-    opacity: 1;
-  }
-  .hero-carousel-caption {
-    position: absolute;
-    left: 50%;
-    bottom: 0.9rem;
-    transform: translateX(-50%);
-    background: rgba(23,23,26,0.6);
-    color: #fff;
-    font-size: var(--fs-xs);
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    padding: 0.3rem 0.85rem;
-    border-radius: 999px;
-    backdrop-filter: blur(6px);
-    -webkit-backdrop-filter: blur(6px);
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .hero-carousel-img { transition: none; }
-  }
+  .hm-provider { font-weight: 700; color: var(--ink); }
+  .hm-row      { color: var(--muted); }
+  .hm-active   { color: var(--ink); font-weight: 600; }
+  .hm-pct      { color: var(--muted); float: right; }
+  .hm-locked   { color: #d64545; float: right; }
+  .hm-sep      { color: var(--hairline-color, #d0d0d5); }
 
   /* ---- what's new in 0.5.0 ------------------------------------------- */
   .whats-new { padding: clamp(2rem, 5vw, 3rem) 0 clamp(2.5rem, 6vw, 3.5rem); }
@@ -623,26 +595,3 @@ const description =
   .cta-band-inner { display: grid; place-items: center; gap: 1.1rem; }
 </style>
 
-<script is:inline>
-  // Hero screenshot carousel. Cycles macOS -> Windows -> Linux every ~4s by
-  // toggling opacity via .is-active, and keeps the caption strip in sync.
-  // Respects reduced-motion by showing the first slide only.
-  (function () {
-    var root = document.getElementById('hero-carousel');
-    if (!root) return;
-    var slides = Array.prototype.slice.call(root.querySelectorAll('.hero-carousel-img'));
-    var caption = document.getElementById('hero-carousel-caption');
-    if (slides.length < 2) return;
-
-    var mql = window.matchMedia('(prefers-reduced-motion: reduce)');
-    if (mql.matches) return;
-
-    var index = 0;
-    setInterval(function () {
-      slides[index].classList.remove('is-active');
-      index = (index + 1) % slides.length;
-      slides[index].classList.add('is-active');
-      if (caption) caption.textContent = slides[index].getAttribute('data-os') || '';
-    }, 4000);
-  })();
-</script>
