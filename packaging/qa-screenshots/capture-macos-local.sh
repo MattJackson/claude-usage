@@ -178,6 +178,27 @@ for entry in "${VARIANTS[@]}"; do
   python3 "$POST" "$raw" "$OUT_DIR/macos-$name.png" \
     --anchor-x "$CROP_ANCHOR_X" --anchor-y "$CROP_ANCHOR_Y" \
     --crop-width-frac "$CROP_WIDTH_FRAC" --bg "$CROP_BG"
+  # Final tight crop: frame the menu bar + dropdown snugly at 3:2. 16:9 forced
+  # too much dead desktop on the sides; 3:2 sits close to the menu's own
+  # proportions so the menu dominates the frame with only a thin wallpaper
+  # margin, and the macOS menu bar strip stays visible at the top (top=0). The
+  # site containers are set to the same 3:2 so `object-fit:cover` never
+  # re-crops the menu bar off.
+  python3 - "$OUT_DIR/macos-$name.png" <<'PY'
+import sys
+from PIL import Image
+p = sys.argv[1]
+im = Image.open(p).convert("RGB")
+w, h = im.size
+top, bot = 0, round(h*0.70)                # keep menu bar; trim lower wallpaper
+ch = bot - top
+cw = round(ch * 3 / 2)                      # 3:2 width from the chosen height
+cx = round(w * 0.576)                       # center on the dropdown
+left = max(0, cx - cw // 2)
+right = min(w, left + cw)
+left = max(0, right - cw)                    # hold exact 3:2 if clamped at right
+im.crop((left, top, right, bot)).save(p)
+PY
   captured=$((captured + 1))
 done
 
