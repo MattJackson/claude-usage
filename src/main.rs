@@ -642,6 +642,15 @@ pub(crate) fn switch_to_provider_account(slug: &str, key: &str) -> Result<String
         bail!("switching is not supported for {slug}");
     }
     with_state_lock(|| {
+        // Absorb any lagging on-disk rotation for the OUTGOING account BEFORE we
+        // overwrite the vendor's credential file — the same guard Claude's
+        // `switch_to_guarded` applies (main.rs, `absorb_before_switch`). Without
+        // it, a single-use refresh token the vendor CLI rotated since our last
+        // poll is left at its stale (now-dead) value, and a later switch-BACK
+        // writes that dead token → forced interactive login, defeating the
+        // "capture once, never re-login" guarantee. absorb rewrites state.json
+        // under the reentrant lock, so load AFTER it to pick up the rotation.
+        credentials::absorb_before_switch(provider);
         let mut state = State::load()?;
         let acct = state
             .find_provider_account(slug, key)
@@ -652,7 +661,14 @@ pub(crate) fn switch_to_provider_account(slug: &str, key: &str) -> Result<String
             .write_active_account(&acct.secret_blob, &identity)
             .map_err(|e| anyhow!("switching {slug} account: {e}"))?;
         state.provider_accounts_mut(slug).active = Some(acct.key.clone());
-        state.save()?;
+        // The vendor credential file is already switched at this point; if
+        // recording it in state.json fails, say so explicitly rather than
+        // surfacing a bare io error that reads as "the whole switch failed"
+        // (matches the Claude sibling path's context).
+        state.save().context(
+            "the login was switched but recording it in state.json failed; \
+             run `usagio switch` again to reconcile the bookkeeping",
+        )?;
         Ok(acct.key)
     })
 }
@@ -1085,28 +1101,47 @@ fn mirror_inactive_rotation(
     provider: &'static dyn Provider,
     acct: &Account,
 ) -> Option<std::result::Result<(), String>> {
-    let vendor_identity = match provider.read_active_identity() {
-        Ok(Some(id)) => id,
-        _ => return None,
-    };
-    let matches = identity_matches(
-        acct.identity_uuid().as_deref(),
-        acct.email.as_deref(),
-        vendor_identity.uuid.as_deref(),
-        vendor_identity
-            .email
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-    );
-    if !matches {
-        return None;
-    }
-    Some(
-        provider
-            .mirror_rotated_token(&acct.keychain_blob)
-            .map_err(|e| e.to_string()),
-    )
+    // Serialize the identity-check + keychain write against a concurrent switch
+    // by holding the cross-process state lock across BOTH, and re-read the
+    // vendor identity INSIDE the lock. A switch (`usagio switch` in another
+    // process, or a menu switch on the main thread) holds the same lock across
+    // its ~/.claude.json + keychain writes, so we observe either the pre-switch
+    // identity (still matches → safe to mirror) or the post-switch identity
+    // (mismatch → skip) — never a torn in-between where this inactive account's
+    // rotated token would be written over the account a switch just committed,
+    // clobbering a valid active token. `ACTIVE_SLOT_LOCK` alone can't close this
+    // race: it's in-process only, and the racing switch is often a separate
+    // process. This lock is held across a `security(1)` write, but the mirror
+    // only runs when a rotation was actually detected (rare), and the switch
+    // path already holds the state lock across its own keychain write.
+    let outcome = with_state_lock(|| {
+        let vendor_identity = match provider.read_active_identity() {
+            Ok(Some(id)) => id,
+            _ => return Ok(None),
+        };
+        let matches = identity_matches(
+            acct.identity_uuid().as_deref(),
+            acct.email.as_deref(),
+            vendor_identity.uuid.as_deref(),
+            vendor_identity
+                .email
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+        );
+        if !matches {
+            return Ok(None);
+        }
+        Ok(Some(
+            provider
+                .mirror_rotated_token(&acct.keychain_blob)
+                .map_err(|e| e.to_string()),
+        ))
+    });
+    // On the Ok path, the inner Option is the mirror outcome; if we couldn't
+    // even acquire the lock / run the closure this cycle, skip (None) — the
+    // same "do nothing" treatment as a vendor-identity read miss.
+    outcome.unwrap_or_default()
 }
 
 /// If the account currently in the keychain is genuinely our active account,
@@ -1907,7 +1942,23 @@ fn provider_active_refresh(slug: &str, acct: &ProviderAccount) -> ProviderRefres
     match slug {
         #[cfg(feature = "codex")]
         "codex" => codex_active_refresh(acct),
-        _ => ProviderRefreshOutcome::Nothing,
+        // Reached only when a provider's `supports_active_refresh()` returned
+        // true (the caller `refresh_provider_active_account` gates on it) but
+        // no dispatch arm was added here — a wiring mistake that would silently
+        // let the active account's token rot. Fail loud in debug/test builds
+        // and log in release rather than returning a benign-looking Nothing.
+        _ => {
+            debug_assert!(
+                false,
+                "provider '{slug}' opted into supports_active_refresh() but has no \
+                 provider_active_refresh arm — its active token will never refresh"
+            );
+            crate::logging::log(&format!(
+                "event=active_refresh_unwired provider={slug} msg=\"supports_active_refresh \
+                 but no dispatch arm; active token not refreshed\""
+            ));
+            ProviderRefreshOutcome::Nothing
+        }
     }
 }
 
@@ -2163,14 +2214,18 @@ fn refresh_usage_cache() -> RefreshOutcome {
                 weekly_pct: cu.weekly_pct.map(|p| p as f32),
                 active_model: None,
             };
-            if let Err(e) = usage_log::append(&curr_snap) {
-                logging::log(&format!("usage_log: append failed for {email}: {e:#}"));
-            }
             if let Some(prev) = prev_snap {
                 let mut ns = acct.notif_state.clone();
                 let raw = notifications::evaluate(&prev, &curr_snap, &notif_cfg);
                 let mut kept = notifications::dedup_and_apply(&mut ns, &prev, &curr_snap, raw);
                 // Pace check (default off) — feeds through the same dedup path.
+                // Read pace (historical slope) BEFORE the append below: appending
+                // curr_snap advances the current-month file's mtime and would
+                // otherwise invalidate the usage-log cache mid-tick, forcing pace
+                // (and the next account's last_snapshot) to re-parse the whole
+                // month. curr_snap is passed to evaluate_pace explicitly, so the
+                // current point is still considered; only the historical read is
+                // reordered (v0.5.17 PERF).
                 let pace = usage_log::pace(&account_key);
                 if let Some(pt) =
                     notifications::evaluate_pace(pace.as_ref(), &curr_snap, &notif_cfg, Utc::now())
@@ -2187,6 +2242,11 @@ fn refresh_usage_cache() -> RefreshOutcome {
                 if ns != acct.notif_state {
                     new_notif_state = Some(ns);
                 }
+            }
+            // Append LAST: all reads for this account (last_snapshot above, pace
+            // in the prev block) have completed against the warm cache.
+            if let Err(e) = usage_log::append(&curr_snap) {
+                logging::log(&format!("usage_log: append failed for {email}: {e:#}"));
             }
         }
         updates.push((email.clone(), acct, cu, new_notif_state));
@@ -2324,6 +2384,7 @@ fn cmd_watch(args: &[String]) -> Result<()> {
                     outcome.rate_limited,
                     outcome.max_pct,
                     trigger,
+                    outcome.actionable,
                 );
                 if outcome.rate_limited {
                     logging::log(&format!("rate limited; backing off to {current}s"));
@@ -2401,28 +2462,34 @@ const WATCH_BACKSTOP_INTERVAL_SECS: u64 = 10;
 /// Compute the next poll interval. Priority order:
 ///   1. Rate-limited from Anthropic → exponential backoff (doubling,
 ///      capped at WATCH_MAX_INTERVAL_SECS). Overrides everything below.
-///   2. Any account at or above the trigger threshold → BACKSTOP (10s).
-///      The auto-swap should already have fired; this makes sure a
-///      transient failure doesn't leave us blind for a full base cycle.
-///   3. Any account inside the warning band (trigger - 15% ≤ pct <
-///      trigger) → WARNING (30s). Tight enough to catch the trigger
-///      point within ~30s regardless of usage-fetch jitter.
-///   4. Everyone comfortably below → BASE (whatever `--interval` was set
-///      to, default WATCH_INTERVAL_SECS = 150s).
+///   2. Active account at or above the trigger threshold AND a swap is
+///      actionable (an eligible target exists, even if currently
+///      cooldown-blocked) → BACKSTOP (10s). The auto-swap should already
+///      have fired; this makes sure a transient failure or a soon-clearing
+///      cooldown doesn't leave us blind for a full base cycle.
+///   3. Active account at/above trigger but NOT actionable (no eligible
+///      target at all — a single-account user, or every other account is
+///      full / needs_relogin / env-overridden) → BASE. There is nothing to
+///      catch, so polling every 10s for up to a week only risks HTTP 429;
+///      the reset-boundary cap still wakes us near the reset.
+///   4. Active account inside the warning band (trigger - 15% ≤ pct <
+///      trigger) → WARNING (30s), regardless of `actionable` — we tighten to
+///      catch the *crossing*, at which point a target may become relevant.
+///   5. Comfortably below → BASE (default WATCH_INTERVAL_SECS = 150s).
 ///
 /// `max_pct` is the ACTIVE account's `Row::max_pct()` — i.e.
 /// `max(session%, weekly%)` for the account currently logged in (v0.5.13,
 /// scoped down from the cross-account peak; see `cadence_max_pct`). It's
 /// weekly-aware: a weekly window pinned at 99% with a healthy session is just
-/// as "about to lock" as the reverse. Inactive accounts don't drive cadence —
-/// you never swap toward one that's out of room, so an inactive account at
-/// 100% is not a reason to keep polling at 10s.
+/// as "about to lock" as the reverse. `actionable` (v0.5.17) gates the
+/// backstop so a maxed account with nowhere to swap doesn't over-poll.
 fn next_interval(
     current: u64,
     base: u64,
     rate_limited: bool,
     max_pct: Option<f64>,
     trigger: f64,
+    actionable: bool,
 ) -> u64 {
     if rate_limited {
         return (current.max(base) * 2).min(WATCH_MAX_INTERVAL_SECS);
@@ -2431,7 +2498,11 @@ fn next_interval(
         return base;
     };
     if pct >= trigger {
-        WATCH_BACKSTOP_INTERVAL_SECS
+        if actionable {
+            WATCH_BACKSTOP_INTERVAL_SECS
+        } else {
+            base
+        }
     } else if pct >= trigger - WATCH_WARNING_BAND {
         WATCH_WARNING_INTERVAL_SECS
     } else {
@@ -2466,6 +2537,13 @@ pub(crate) struct CycleOutcome {
     pub swapped: Option<(String, String)>,
     pub rate_limited: bool,
     pub max_pct: Option<f64>,
+    /// Whether a swap is actionable this cycle: an eligible target exists for
+    /// the active account, even if a cooldown currently blocks it. Feeds
+    /// `next_interval` so the 10s backstop only engages when there is actually
+    /// something to catch — a maxed active account with no eligible target
+    /// (single-account user, or all others full/needs_relogin) falls back to
+    /// BASE instead of hammering the usage endpoint into HTTP 429 (v0.5.17).
+    pub actionable: bool,
 }
 
 /// True if `cand` is a strictly better place to be than the healthy `act`:
@@ -2473,8 +2551,18 @@ pub(crate) struct CycleOutcome {
 /// meaningful headroom lead. Used only on the proactive (active-not-in-trouble)
 /// path; the reactive path moves regardless of how the active account ranks.
 fn worth_returning_to(cand: &Row, act: &Row) -> bool {
+    // If the ACTIVE account's weekly reset is unknown, there is no
+    // use-it-or-lose-it basis to leave a healthy active account. Require a real
+    // headroom lead instead of the old behavior, which defaulted the unknown
+    // reset to MAX_UTC and so ranked ANY candidate with a known reset as
+    // "sooner" — forcing a needless proactive swap off a working account
+    // (v0.5.17). Only the active-unknown case changes; every act-known path
+    // (including a candidate whose own reset is unknown → treated as furthest)
+    // keeps its prior behavior.
+    let Some(ka) = act.weekly.resets_at else {
+        return cand.headroom() - act.headroom() >= PROACTIVE_HEADROOM_MARGIN;
+    };
     let kc = cand.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
-    let ka = act.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
     match kc.cmp(&ka) {
         std::cmp::Ordering::Less => true,
         std::cmp::Ordering::Greater => false,
@@ -2637,6 +2725,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
             swapped: None,
             rate_limited: refresh.rate_limited,
             max_pct: None,
+            actionable: false,
         });
     }
     let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
@@ -2645,9 +2734,17 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
 
     let active = state.active.clone();
     let mut swapped = None;
+    // Whether a swap is actionable this cycle (an eligible target exists,
+    // ignoring cooldown). Captured out here because the final CycleOutcome is
+    // built after the `if let Some(active_email)` block closes and `eval` is
+    // out of scope. Drives the cadence backstop gate — see next_interval.
+    let mut actionable = false;
 
     if let Some(active_email) = active.clone() {
         let eval = evaluate_swap(&rows, &active_email, trigger, ceiling, guard);
+        // A target that's merely cooldown-blocked still counts as actionable:
+        // we want the fast backstop so we swap the instant the cooldown clears.
+        actionable = eval.target_ignoring_cooldown.is_some();
         // v0.5.2 item 6: structured decision logging (+ a "stayed" notification)
         // fires every cycle the active account is at/above trigger, regardless
         // of what happens next — a swap, a cooldown-blocked would-be swap, or
@@ -2691,6 +2788,10 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                             swapped: None,
                             rate_limited: refresh.rate_limited,
                             max_pct,
+                            // A target existed (we're in the eval.target Some
+                            // arm); the swap failed transiently — keep the fast
+                            // backstop so the retry is prompt.
+                            actionable: true,
                         });
                     }
                 };
@@ -2703,6 +2804,9 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
                         swapped: None,
                         rate_limited: refresh.rate_limited,
                         max_pct,
+                        // A target existed but a concurrent switch won the CAS;
+                        // still actionable — retry promptly.
+                        actionable: true,
                     });
                 };
                 guard
@@ -2773,6 +2877,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
         swapped,
         rate_limited: refresh.rate_limited,
         max_pct,
+        actionable,
     })
 }
 

@@ -278,6 +278,12 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+// Test-only seam: lets `main_tests.rs` arm the cfg(test) mock keychain to fail
+// a `set`, so the apply_account rollback path is exercisable. Not compiled into
+// production builds.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use macos::arm_keychain_set_failure;
+
 /// Shared Unix chmod backing `Platform::secure_permissions` on both macOS and
 /// Linux: `0700` for a directory, `0600` for a file, based on the path's
 /// actual file type rather than a caller-supplied mode. Lives here (rather

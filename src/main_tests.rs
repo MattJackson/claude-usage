@@ -540,32 +540,38 @@ fn env_override_active_reads_shared_slug_map() {
 
 const TRIGGER_FOR_TESTS: f64 = 95.0;
 
+// All calls pass `actionable` explicitly. It only affects the at/above-trigger
+// arm; below the trigger the value is irrelevant, so these pre-v0.5.17 cases
+// pass `true` to preserve their original intent.
 #[test]
 fn next_interval_resets_to_base_when_not_limited_and_far_from_trigger() {
     // A clean cycle with everyone comfortably below the warning band
     // returns to the base cadence, even from a backed-off value.
     assert_eq!(
-        next_interval(600, 60, false, Some(50.0), TRIGGER_FOR_TESTS),
+        next_interval(600, 60, false, Some(50.0), TRIGGER_FOR_TESTS, true),
         60
     );
     assert_eq!(
-        next_interval(60, 60, false, Some(50.0), TRIGGER_FOR_TESTS),
+        next_interval(60, 60, false, Some(50.0), TRIGGER_FOR_TESTS, true),
         60
     );
     // No usage data yet → also base cadence.
-    assert_eq!(next_interval(60, 60, false, None, TRIGGER_FOR_TESTS), 60);
+    assert_eq!(
+        next_interval(60, 60, false, None, TRIGGER_FOR_TESTS, true),
+        60
+    );
 }
 
 #[test]
 fn next_interval_doubles_on_rate_limit_capped() {
     // Rate-limit override wins over adaptive cadence.
     assert_eq!(
-        next_interval(60, 60, true, Some(50.0), TRIGGER_FOR_TESTS),
+        next_interval(60, 60, true, Some(50.0), TRIGGER_FOR_TESTS, true),
         120
     );
     // Never below base even if `current` was stale-small.
     assert_eq!(
-        next_interval(1, 60, true, Some(50.0), TRIGGER_FOR_TESTS),
+        next_interval(1, 60, true, Some(50.0), TRIGGER_FOR_TESTS, true),
         120
     );
     // Capped at the max.
@@ -575,7 +581,8 @@ fn next_interval_doubles_on_rate_limit_capped() {
             60,
             true,
             Some(99.0),
-            TRIGGER_FOR_TESTS
+            TRIGGER_FOR_TESTS,
+            true
         ),
         WATCH_MAX_INTERVAL_SECS
     );
@@ -587,45 +594,74 @@ fn next_interval_tightens_to_warning_inside_the_band() {
     // the current `current` — this is exactly the case that let the user's
     // 94% + 150s wait miss the swap on v0.4.3.
     assert_eq!(
-        next_interval(150, 150, false, Some(94.9), TRIGGER_FOR_TESTS),
+        next_interval(150, 150, false, Some(94.9), TRIGGER_FOR_TESTS, true),
         30
     );
     assert_eq!(
-        next_interval(150, 150, false, Some(85.0), TRIGGER_FOR_TESTS),
+        next_interval(150, 150, false, Some(85.0), TRIGGER_FOR_TESTS, true),
         30
     );
     assert_eq!(
-        next_interval(150, 150, false, Some(80.001), TRIGGER_FOR_TESTS),
+        next_interval(150, 150, false, Some(80.001), TRIGGER_FOR_TESTS, true),
         30
     );
     // Exactly at the band-lower edge (trigger - 15 = 80.0) still tightens.
     assert_eq!(
-        next_interval(150, 150, false, Some(80.0), TRIGGER_FOR_TESTS),
+        next_interval(150, 150, false, Some(80.0), TRIGGER_FOR_TESTS, true),
         30
     );
     // 1 tick below the band — back to base.
     assert_eq!(
-        next_interval(150, 150, false, Some(79.9), TRIGGER_FOR_TESTS),
+        next_interval(150, 150, false, Some(79.9), TRIGGER_FOR_TESTS, true),
         150
+    );
+    // Warning band ignores `actionable` — we tighten to catch the crossing
+    // even when no swap target exists yet.
+    assert_eq!(
+        next_interval(150, 150, false, Some(90.0), TRIGGER_FOR_TESTS, false),
+        30
     );
 }
 
 #[test]
-fn next_interval_tightens_to_backstop_at_or_above_trigger() {
-    // At or above the trigger: 10s BACKSTOP cadence. The auto-swap should
-    // already have fired; this makes sure a transient failure doesn't
-    // leave us blind for a full base cycle.
+fn next_interval_tightens_to_backstop_at_or_above_trigger_when_actionable() {
+    // At or above the trigger AND a swap is actionable: 10s BACKSTOP cadence.
+    // The auto-swap should already have fired; this makes sure a transient
+    // failure or a soon-clearing cooldown doesn't leave us blind for a full
+    // base cycle.
     assert_eq!(
-        next_interval(150, 150, false, Some(95.0), TRIGGER_FOR_TESTS),
+        next_interval(150, 150, false, Some(95.0), TRIGGER_FOR_TESTS, true),
         10
     );
     assert_eq!(
-        next_interval(150, 150, false, Some(99.9), TRIGGER_FOR_TESTS),
+        next_interval(150, 150, false, Some(99.9), TRIGGER_FOR_TESTS, true),
         10
     );
     assert_eq!(
-        next_interval(150, 150, false, Some(100.0), TRIGGER_FOR_TESTS),
+        next_interval(150, 150, false, Some(100.0), TRIGGER_FOR_TESTS, true),
         10
+    );
+}
+
+#[test]
+fn next_interval_stays_at_base_at_or_above_trigger_when_not_actionable() {
+    // v0.5.17: a maxed ACTIVE account with NO eligible swap target (single
+    // account, or every other account full/needs_relogin) must NOT pin the
+    // 10s backstop — that only hammers the usage endpoint into HTTP 429 for a
+    // week with nothing to catch. Fall back to BASE; the reset-boundary cap
+    // still wakes us near the reset.
+    assert_eq!(
+        next_interval(150, 150, false, Some(95.0), TRIGGER_FOR_TESTS, false),
+        150
+    );
+    assert_eq!(
+        next_interval(150, 150, false, Some(100.0), TRIGGER_FOR_TESTS, false),
+        150
+    );
+    // Rate-limit backoff still overrides regardless of actionable.
+    assert_eq!(
+        next_interval(150, 150, true, Some(100.0), TRIGGER_FOR_TESTS, false),
+        300
     );
 }
 
@@ -648,7 +684,7 @@ fn cadence_max_pct_folds_weekly_not_just_session() {
     let m = cadence_max_pct(&rows, Some("active@e.com"));
     assert_eq!(m, Some(99.0));
     assert_eq!(
-        next_interval(150, 150, false, m, TRIGGER_FOR_TESTS),
+        next_interval(150, 150, false, m, TRIGGER_FOR_TESTS, true),
         10,
         "active session=0/weekly=99 at trigger=95 must hit BACKSTOP cadence"
     );
@@ -666,7 +702,7 @@ fn cadence_max_pct_ignores_inactive_maxed_accounts() {
     let m = cadence_max_pct(&rows, Some("active@e.com"));
     assert_eq!(m, Some(40.0));
     assert_eq!(
-        next_interval(150, 150, false, m, TRIGGER_FOR_TESTS),
+        next_interval(150, 150, false, m, TRIGGER_FOR_TESTS, true),
         150,
         "a healthy active account keeps BASE cadence despite an inactive 100% account"
     );
@@ -1249,16 +1285,11 @@ fn mock_claude_blob(access: &str, refresh: &str, expires_at: i64) -> String {
     .to_string()
 }
 
-// TODO(v0.5.2): fix mock-server bootstrap race — this test flakes on macOS
-// CI with "parsing token response: Failed to read JSON: Invalid argument
-// (os error 22)". The mock server's `stream.read(&mut buf)` handler may
-// complete before ureq has finished writing the request headers, or ureq
-// reads the response before Content-Length bytes have all arrived. The
-// three sibling CAS tests (`_lost`, `_skipped_drift`) and the Codex CAS
-// tests exercise the same code path via a different, more robust harness
-// (Codex's mock server loops read/write). Marking `#[ignore]` unblocks
-// v0.5.1 release; real fix is either a read-loop-until-\r\n\r\n in the
-// mock server or switching to a proper HTTP framework like `httpmock`.
+// The mock-server bootstrap race that used to flake this path on macOS CI
+// ("parsing token response: Failed to read JSON: Invalid argument (os error
+// 22)") is fixed: `spawn_mock_token_server` now drains the full request before
+// responding and half-closes the write side gracefully (see its doc comment),
+// which is the read-loop-until-\r\n\r\n fix the old TODO called for.
 #[test]
 fn active_refresh_never_posts_token_for_active_account() {
     use crate::providers::claude::oauth;
@@ -1397,12 +1428,27 @@ fn refresh_usage_cache_still_refreshes_inactive_accounts() {
 }
 
 /// Minimal single-threaded mock token endpoint: accepts TCP connections,
-/// reads (and discards) the request, and replies with a fixed valid
-/// refresh-grant JSON body. Returns (base_url, hits) where `hits` is bumped
-/// once per accepted connection.
+/// reads the full request, and replies with a fixed valid refresh-grant JSON
+/// body. Returns (base_url, hits) where `hits` is bumped once per accepted
+/// connection.
+///
+/// The request is read to completion (request line + headers up to the blank
+/// line + any `Content-Length` body) BEFORE the response is written, and the
+/// write half is shut down explicitly after flushing. A prior version issued a
+/// single `stream.read(&mut buf)` and closed the socket as soon as it had
+/// written the response. Under parallel load that raced ureq's request write
+/// two ways: the single read could return before ureq finished sending the
+/// body (a request split across TCP segments), and closing the socket with
+/// unread inbound data still buffered makes the kernel send an RST, which ureq
+/// surfaces mid-response as `Transient("parsing token response: Failed to read
+/// JSON: Invalid argument (os error 22)")`. That dropped the refresh on the
+/// floor (kept-cache path) and flaked
+/// `refresh_usage_cache_still_refreshes_inactive_accounts` ~25-50% of full
+/// parallel runs. Draining the request first, then a graceful `shutdown(Write)`,
+/// closes both windows (the fix the old `active_refresh_*` TODO called for).
 fn spawn_mock_token_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{Shutdown, TcpListener};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1412,13 +1458,35 @@ fn spawn_mock_token_server() -> (String, std::sync::Arc<std::sync::atomic::Atomi
     let hits_thread = Arc::clone(&hits);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            // Read the request line so we can tell a /token POST apart from
-            // a usage GET; everything after it (headers/body) is discarded.
-            let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let is_token_post = request.starts_with("POST");
+            let Ok(stream) = stream else { break };
+            // Read the whole request before responding. `TcpStream` is `Read`
+            // + `Write` through a shared `&TcpStream`, so a `BufReader` borrow
+            // for the request and direct writes for the response can coexist.
+            let mut reader = BufReader::new(&stream);
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                continue;
+            }
+            // Consume headers up to the blank line, tracking Content-Length so
+            // the body is fully drained (avoids a close-with-unread-data RST).
+            let mut content_length = 0usize;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                    break;
+                }
+                if header == "\r\n" || header == "\n" {
+                    break;
+                }
+                if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            if content_length > 0 {
+                let mut body_buf = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body_buf);
+            }
+            let is_token_post = request_line.starts_with("POST");
             let body = if is_token_post {
                 hits_thread.fetch_add(1, Ordering::SeqCst);
                 serde_json::json!({
@@ -1442,8 +1510,13 @@ fn spawn_mock_token_server() -> (String, std::sync::Arc<std::sync::atomic::Atomi
                 body.len(),
                 body
             );
+            drop(reader);
+            let mut stream = stream;
             let _ = stream.write_all(resp.as_bytes());
             let _ = stream.flush();
+            // Graceful half-close: signal EOF to ureq once the full response is
+            // out, rather than dropping the socket abruptly.
+            let _ = stream.shutdown(Shutdown::Write);
         }
     });
     (format!("http://{addr}"), hits)
@@ -1733,3 +1806,61 @@ fn refresh_provider_active_account_codex_adopts_cli_rotation_without_posting() {
 // isolation above against `MockActiveSlotProvider` so no test here ever touches
 // the real OS keychain that `refresh_usage_cache` would resolve
 // `ClaudeProvider::read_active_slot()` to.
+
+// --- apply_account keychain-write-failure rollback (v0.5.17 codeaudit) --------
+//
+// The core "switching ALWAYS works, never a half-applied switch" guard:
+// apply_account writes ~/.claude.json FIRST, then the keychain LAST as the
+// commit point, and rolls ~/.claude.json back (returning Err) if the keychain
+// write fails. Before v0.5.17 the cfg(test) keychain mock always succeeded and
+// no failure-injection seam existed, so this rollback branch had ZERO coverage
+// — a regression dropping the rollback (leaving ~/.claude.json on the new
+// account while the keychain still holds the old) would have passed the suite.
+// macOS-only: exercises the Claude keychain path + the macos mock's seam.
+#[cfg(target_os = "macos")]
+#[test]
+fn apply_account_rolls_back_claude_json_when_keychain_write_fails() {
+    use crate::store::{Account, ScopedConfigDir};
+
+    // ScopedConfigDir isolates config_dir (logging::log resolves it); the HOME
+    // override points ~/.claude.json (claude_json_path uses $HOME) at the same
+    // tempdir. env_lock serializes the $HOME mutation against other tests.
+    let scd = ScopedConfigDir::new();
+    let home = scd.home();
+    crate::env_lock::scoped_env_var("HOME", Some(home.to_str().unwrap()), || {
+        let claude_json = home.join(".claude.json");
+        let prior = r#"{"oauthAccount":{"emailAddress":"old@example.com"},"other":"keep"}"#;
+        std::fs::write(&claude_json, prior).unwrap();
+
+        let acct = Account::from_keychain_blob(
+            r#"{"claudeAiOauth":{"accessToken":"new","refreshToken":"r","expiresAt":0}}"#,
+        )
+        .unwrap();
+        let identity = serde_json::json!({
+            "oauthAccount": { "emailAddress": "new@example.com" }
+        });
+
+        // Arm the mock keychain to fail the (single) set apply_account performs.
+        crate::platform::arm_keychain_set_failure();
+
+        let provider = crate::providers::get("claude").expect("claude provider registered");
+        let res = apply_account(
+            provider,
+            &acct,
+            &identity,
+            Some("old@example.com"),
+            "new@example.com",
+        );
+
+        assert!(
+            res.is_err(),
+            "a keychain write failure must fail the switch, never report success"
+        );
+        let after = std::fs::read_to_string(&claude_json).unwrap();
+        assert_eq!(
+            after, prior,
+            "~/.claude.json must be rolled back to its prior contents on keychain failure \
+             (no half-applied switch)"
+        );
+    });
+}

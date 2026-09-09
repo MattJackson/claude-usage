@@ -251,7 +251,16 @@ impl Provider for ClaudeProvider {
             Ok(r) => r
                 .into_json()
                 .map_err(|e| ProviderError::Other(format!("parsing token response: {e}")))?,
-            Err(ureq::Error::Status(401, _)) => return Err(ProviderError::Auth),
+            // Anthropic returns HTTP 400 invalid_grant for a dead/rotated
+            // (single-use) refresh token, HTTP 401 for a bad client. Both mean
+            // "this grant needs re-auth", so both map to Auth — NOT the generic
+            // Other, which a caller would treat as a retryable transient and
+            // spin on forever without ever surfacing needs_relogin. Mirrors the
+            // free-function `oauth::ensure_fresh` path's 400→InvalidGrant
+            // handling for the (currently test-only) uniform trait refresh path.
+            Err(ureq::Error::Status(400, _)) | Err(ureq::Error::Status(401, _)) => {
+                return Err(ProviderError::Auth)
+            }
             Err(ureq::Error::Status(429, _)) => {
                 return Err(ProviderError::RateLimited {
                     retry_after_secs: None,

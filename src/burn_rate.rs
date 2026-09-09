@@ -133,18 +133,25 @@ pub fn format_menu_row(est: &BurnRateEstimate) -> String {
                 format_short_duration(m)
             )
         }
-        Some(_) => unreachable!(),
-        None if est.reset_at.is_some() => {
-            // Empty falls before reset: figure out how much before.
-            let reset = est.reset_at.unwrap();
-            let before = reset - est.empty_at;
-            format!(
-                "{name} · {:.0}% · empty in ~{empty_str} · {} before reset",
-                est.current_pct,
-                format_short_duration(before)
-            )
+        // Not safe this cycle: either the renderer supplied a non-positive
+        // margin (empty falls at/before the reset) or it supplied none. Both
+        // render the same "how long before reset" tail when a reset is known,
+        // else the plain empty line. Folding the non-positive-margin case in
+        // here (rather than a separate `unreachable!()`) means a caller that
+        // populates `margin` with a non-positive Duration renders correctly
+        // instead of panicking on the main-thread render tick.
+        _ => {
+            if let Some(reset) = est.reset_at {
+                let before = reset - est.empty_at;
+                format!(
+                    "{name} · {:.0}% · empty in ~{empty_str} · {} before reset",
+                    est.current_pct,
+                    format_short_duration(before)
+                )
+            } else {
+                format!("{name} · {:.0}% · empty in ~{empty_str}", est.current_pct)
+            }
         }
-        None => format!("{name} · {:.0}% · empty in ~{empty_str}", est.current_pct),
     }
 }
 
@@ -373,6 +380,35 @@ mod tests {
             s.contains("empty in ~40m") && s.contains("before reset"),
             "{s}"
         );
+    }
+
+    /// Regression: a caller that populates `margin` with a NON-positive
+    /// Duration (empty falls exactly at, or past, the reset) must render the
+    /// before-reset tail rather than panicking. Previously this hit an
+    /// `unreachable!()` on the main-thread render tick.
+    #[test]
+    fn format_menu_row_non_positive_margin_does_not_panic() {
+        let now = Utc::now();
+        // Exact tie: empty_at == reset_at → margin == 0 (not > zero).
+        let est = BurnRateEstimate {
+            window: Window::Weekly,
+            current_pct: 80.0,
+            rate_pct_per_hour: 20.0,
+            confidence: 0.9,
+            empty_at: now + Duration::hours(3),
+            reset_at: Some(now + Duration::hours(3)),
+            margin: Some(Duration::zero()),
+        };
+        let s = format_menu_row(&est);
+        assert!(s.contains("before reset"), "{s}");
+
+        // Negative margin: empty projected past the reset.
+        let est_neg = BurnRateEstimate {
+            margin: Some(Duration::minutes(-30)),
+            ..est
+        };
+        let s2 = format_menu_row(&est_neg);
+        assert!(s2.contains("before reset"), "{s2}");
     }
 
     #[test]

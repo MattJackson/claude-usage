@@ -98,6 +98,20 @@ pub struct NotifState {
 /// enabled via `NotificationConfig`, not which numbers are checked.
 const THRESHOLDS: [u8; 2] = [70, 90];
 
+/// The menu-bar "Threshold alerts (…)" checkbox label, derived from
+/// `THRESHOLDS` so the UI can never drift from the numbers actually checked.
+/// Length-agnostic: if the ladder gains/loses a rung the label follows. Both
+/// the macOS and cross-platform menu renderers call this rather than
+/// hard-coding "70% / 90%".
+pub(crate) fn threshold_alert_label() -> String {
+    let pcts = THRESHOLDS
+        .iter()
+        .map(|t| format!("{t}%"))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    format!("Threshold alerts ({pcts})")
+}
+
 // ---------------------------------------------------------------------------
 // Pure algebra: evaluate + dedup_and_apply
 // ---------------------------------------------------------------------------

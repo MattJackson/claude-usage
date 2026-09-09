@@ -885,6 +885,29 @@ pub fn save_state_safe(state: &State) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).context("renaming state.json");
     }
+    // Durability: the tmp file's data was fsync'd in write_private, but the
+    // rename itself (the directory entry) is not durable until the containing
+    // directory is fsync'd. Without this, a crash right after this returns can
+    // leave the directory pointing at neither the old nor the new file. Best-
+    // effort — the rename already gives readers an atomic old-or-new view, so a
+    // fsync hiccup must not fail a legitimate save (same philosophy as the
+    // rolling-backup step above).
+    if let Err(e) = fsync_dir(&dir) {
+        crate::logging::log(&format!("state.json: parent dir fsync failed: {e:#}"));
+    }
+    Ok(())
+}
+
+/// fsync a directory so a preceding `rename` into it is durable across a crash.
+/// Opening a directory read-only and calling `sync_all` is the portable-on-unix
+/// way to flush its entries; on non-unix it's a no-op (the atomic-replace still
+/// holds for readers, only crash-durability is best-effort there).
+#[cfg(unix)]
+fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1227,7 +1250,14 @@ pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
         .truncate(true)
         .mode(0o600)
         .open(path)?;
-    f.write_all(bytes)
+    f.write_all(bytes)?;
+    // Flush the data to disk before the handle drops. For the state.json
+    // atomic-replace path this is what makes the tmp file's contents durable
+    // BEFORE `save_state_safe` renames it into place — without it a crash can
+    // leave a zero-length / half-written state.json that fails to parse on the
+    // next load. write_private only ever handles small secret/state blobs, so
+    // the fsync cost is negligible and durability is the right default here.
+    f.sync_all()
 }
 
 #[cfg(not(unix))]

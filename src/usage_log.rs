@@ -64,10 +64,6 @@ impl AccountKey {
             account: account.into(),
         }
     }
-
-    fn matches(&self, s: &Snapshot) -> bool {
-        s.provider == self.provider && s.account == self.account
-    }
 }
 
 /// Weighted linear regression on `weekly_pct` within the current window.
@@ -173,13 +169,38 @@ pub fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
 // mtime-keyed cache (H9)
 // ---------------------------------------------------------------------------
 
-/// Per-month cached full parse. Keyed by (year, month) so the whole cache
+/// A month's snapshots pre-grouped by account, in file (chronological) order.
+/// v0.5.17 (PERF): the cache used to hand back the whole month's flat
+/// `Vec<Snapshot>`, and every `read_range_cached` call re-scanned + cloned ALL
+/// of it — every account's rows — just to pull one account's window. Since the
+/// month file interleaves every account's rows and grows all month, that was
+/// O(accounts × month_rows) per poll tick (last_snapshot + pace, per account)
+/// plus two more full scans per account per menu redraw. Indexing by
+/// `AccountKey` once at parse time makes each read O(that account's rows).
+#[derive(Default)]
+struct MonthIndex {
+    by_account: HashMap<AccountKey, Vec<Snapshot>>,
+}
+
+impl MonthIndex {
+    fn build(snaps: Vec<Snapshot>) -> Self {
+        let mut by_account: HashMap<AccountKey, Vec<Snapshot>> = HashMap::new();
+        for snap in snaps {
+            by_account
+                .entry(AccountKey::new(snap.provider.clone(), snap.account.clone()))
+                .or_default()
+                .push(snap);
+        }
+        Self { by_account }
+    }
+}
+
+/// Per-month cached parse. Keyed by (year, month) so the whole cache
 /// invalidates a month at a time. Only month files that read_range would
 /// have opened anyway are cached — no proactive scan.
-/// Key: (year, month). Value: (mtime at parse time, all snapshots).
-/// R2-PERF-03: value wrapped in Arc so a cache hit is a refcount bump
-/// rather than a full Vec<Snapshot> clone. Callers iterate immutably.
-type MonthCacheEntry = (SystemTime, Arc<Vec<Snapshot>>);
+/// Value: (mtime at parse time, the account-indexed snapshots). The index is
+/// wrapped in `Arc` so a cache hit is a refcount bump, not a clone.
+type MonthCacheEntry = (SystemTime, Arc<MonthIndex>);
 
 #[derive(Default)]
 struct MonthCache {
@@ -206,10 +227,13 @@ fn read_range_cached(
     let end = (to.year(), to.month());
     loop {
         let path = month_path_ym(dir, y, m);
-        let all = load_month_cached(&path, y, m);
-        for snap in all.iter() {
-            if snap.ts >= from && snap.ts <= to && account.matches(snap) {
-                out.push(snap.clone());
+        let index = load_month_cached(&path, y, m);
+        // Only this account's rows are scanned, not the whole month's.
+        if let Some(rows) = index.by_account.get(account) {
+            for snap in rows {
+                if snap.ts >= from && snap.ts <= to {
+                    out.push(snap.clone());
+                }
             }
         }
         if (y, m) == end {
@@ -232,26 +256,26 @@ fn read_range_cached(
 /// Return all snapshots in month file `path`, using the cached copy when its
 /// mtime matches. Missing file yields an empty vec (cached as UNIX_EPOCH so
 /// a later create-and-write invalidates it).
-fn load_month_cached(path: &Path, year: i32, month: u32) -> Arc<Vec<Snapshot>> {
+fn load_month_cached(path: &Path, year: i32, month: u32) -> Arc<MonthIndex> {
     let mtime = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
     if let Ok(mut cache) = month_cache().lock() {
-        if let Some((stamp, snaps)) = cache.months.get(&(year, month)) {
+        if let Some((stamp, index)) = cache.months.get(&(year, month)) {
             if *stamp == mtime {
-                return Arc::clone(snaps);
+                return Arc::clone(index);
             }
         }
-        // Cache miss / stale — parse and store.
-        let parsed = Arc::new(parse_month(path));
+        // Cache miss / stale — parse, index by account, and store.
+        let index = Arc::new(MonthIndex::build(parse_month(path)));
         cache
             .months
-            .insert((year, month), (mtime, Arc::clone(&parsed)));
-        return parsed;
+            .insert((year, month), (mtime, Arc::clone(&index)));
+        return index;
     }
     // Fallback if lock is poisoned: skip cache.
-    Arc::new(parse_month(path))
+    Arc::new(MonthIndex::build(parse_month(path)))
 }
 
 fn parse_month(path: &Path) -> Vec<Snapshot> {
@@ -427,7 +451,9 @@ fn read_range(
                     continue;
                 }
                 if let Ok(snap) = serde_json::from_str::<Snapshot>(&line) {
-                    if snap.ts >= from && snap.ts <= to && account.matches(&snap) {
+                    let account_matches =
+                        snap.provider == account.provider && snap.account == account.account;
+                    if snap.ts >= from && snap.ts <= to && account_matches {
                         out.push(snap);
                     }
                 }

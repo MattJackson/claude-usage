@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.17] - 2026-09-09
+
+Correctness + robustness round from a full-codebase audit (all findings
+verified against the source; each fix design was refuted on two models before
+landing).
+
+### Fixed
+- **Codex switch no longer forces a re-login on switch-back.** Switching Codex
+  accounts now absorbs the outgoing account's on-disk token rotation *before*
+  overwriting `~/.codex/auth.json` — the same guard the Claude path already had.
+  Without it, a single-use refresh token the Codex CLI had rotated could be left
+  stale and a later switch-back would write a dead token, dropping you into
+  `codex login`. (The core "capture once, never re-login" guarantee, now upheld
+  for Codex too.)
+- **Auto-swap can't clobber a valid token via a race.** The inactive-account
+  token-rotation mirror now runs under the same cross-process state lock a
+  switch holds and re-checks identity inside it, so a concurrent `usagio switch`
+  can never be interleaved to leave the keychain on one account and the identity
+  on another.
+- **Codex switch reports a half-applied switch honestly** instead of a bare
+  "switch failed" when the vendor file was updated but recording it in
+  state.json failed.
+- **No needless swap off a healthy account.** `worth_returning_to` no longer
+  treats an unknown weekly-reset as "infinitely far" and proactively swaps away
+  from a working active account.
+- **The menu-bar burn-rate row can't panic** on a non-positive "safe margin"
+  value.
+- **`state.json` writes are crash-durable** (the temp file and its directory are
+  fsync'd around the atomic rename), so a crash right after a switch can't leave
+  a truncated, unparseable state file.
+- **The manual "Refresh usage now" action can't get stuck** if its worker thread
+  panics (a drop-guard always clears the in-flight flag).
+
+### Changed
+- **Adaptive poll cadence no longer over-polls a maxed account with nowhere to
+  go.** When the active account is at/above the swap trigger but there's no
+  eligible account to switch to (a single-account user, or all others
+  full/needs-relogin), the poll falls back to the base interval instead of the
+  10-second backstop — the backstop is reserved for when a swap is actually
+  actionable. Stops a stream of usage requests (and the HTTP 429s they cause)
+  when there's nothing to catch.
+- **The "Threshold alerts" menu label is derived from the actual threshold
+  constants**, so it can never drift from the percentages that really fire.
+
+## [0.5.16] - 2026-09-09
+
+### Fixed
+- **Hardened the keychain hang guard so it can't be defeated.** The native
+  `security(1)` timeout now kills the whole process group on overrun (not just
+  the direct child) and reaps cleanly on the error path, so a hung keychain call
+  and any descendant can't wedge the poll thread. Re-enabled the real-keychain
+  round-trip tests as genuine end-to-end coverage of the switch path.
+
 ## [0.5.15] - 2026-09-09
 
 ### Fixed

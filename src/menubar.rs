@@ -894,12 +894,19 @@ fn poll_loop() {
         // Fetch usage + auto-swap; this writes cached usage to state.json, which
         // the main-thread timer reads back to render. This is the ONLY thing that
         // hits the network, so ordinary use can never rate-limit.
-        let (rate_limited, max_pct_opt, trigger) = {
+        let (rate_limited, max_pct_opt, trigger, actionable) = {
             let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
             run_cycle(&mut g)
         };
         let prev = current;
-        current = next_interval(current, base, rate_limited, max_pct_opt, trigger);
+        current = next_interval(
+            current,
+            base,
+            rate_limited,
+            max_pct_opt,
+            trigger,
+            actionable,
+        );
         if rate_limited {
             crate::logging::log(&format!("rate limited; backing off to {current}s"));
         } else if current != prev && current < base {
@@ -1154,17 +1161,17 @@ fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
 /// caller's adaptive-cadence math has everything it needs. The menubar
 /// poller uses the trigger the user actually configured (via `Settings ▸
 /// Auto-swap`), matching what `watch_cycle` itself dispatched on.
-fn run_cycle(guard: &mut SwapGuard) -> (bool, Option<f64>, f64) {
+fn run_cycle(guard: &mut SwapGuard) -> (bool, Option<f64>, f64, bool) {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
     match watch_cycle(trigger, TARGET_CEILING_PCT, guard) {
-        Ok(o) => (o.rate_limited, o.max_pct, trigger),
+        Ok(o) => (o.rate_limited, o.max_pct, trigger, o.actionable),
         Err(e) => {
             crate::logging::log(&format!("menubar poll failed: {e}"));
-            (false, None, trigger)
+            (false, None, trigger, false)
         }
     }
 }
@@ -1713,7 +1720,7 @@ fn build_menu(snap: &Snapshot) -> Menu {
     let notifications = Submenu::with_id("settings:notifications", "Notifications", true);
     let _ = notifications.append(&CheckMenuItem::with_id(
         "notifications:threshold",
-        "Threshold alerts (70% / 90%)",
+        crate::notifications::threshold_alert_label(),
         true,
         snap.notification_config.threshold_enabled,
         None,
@@ -2767,11 +2774,24 @@ fn handle_refresh_now() {
     let guard = shared_swap_guard();
     try_start_refresh(move || {
         std::thread::spawn(move || {
-            let (rate_limited, _max_pct, _trigger) = {
+            // Reset the in-flight flag on EVERY exit path — including a panic
+            // inside run_cycle. Without this drop guard a panic would leave
+            // REFRESH_IN_FLIGHT stuck `true`, permanently wedging the manual
+            // "Refresh usage now" action (every later click hits the
+            // already-running branch) until the app restarts. The background
+            // poll_loop has a catch_unwind supervisor; this spawned thread
+            // does not, so the guard is how the flag stays panic-safe.
+            struct InFlightGuard;
+            impl Drop for InFlightGuard {
+                fn drop(&mut self) {
+                    REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _reset = InFlightGuard;
+            let (rate_limited, _max_pct, _trigger, _actionable) = {
                 let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
                 run_cycle(&mut g)
             };
-            REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
             if rate_limited {
                 notify("Refresh: rate limited, backing off");
             } else {
@@ -3257,7 +3277,7 @@ mod cross_platform {
         let notifications = vec![
             checkbox(
                 "notifications:threshold",
-                "Threshold alerts (70% / 90%)",
+                crate::notifications::threshold_alert_label(),
                 true,
                 snap.notification_config.threshold_enabled,
             ),
