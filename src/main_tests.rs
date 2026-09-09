@@ -629,34 +629,60 @@ fn next_interval_tightens_to_backstop_at_or_above_trigger() {
     );
 }
 
-// --- peak_max_pct (v0.5.2 item 3: weekly-aware adaptive cadence) ---
+// --- cadence_max_pct (v0.5.13: cadence scoped to the active account) ---
+
+/// Like `row()` but with a caller-chosen email so active-scoping can be tested.
+fn row_for(email: &str, session: Option<f64>, weekly: Option<f64>) -> Row {
+    Row {
+        email: email.to_string(),
+        ..row(session, weekly)
+    }
+}
 
 #[test]
-fn peak_max_pct_folds_weekly_not_just_session() {
-    // Regression case from the addendum: session=0%, weekly=99%, trigger=95%
-    // must fold to Some(99.0) — a weekly-only approach to the trigger used to
-    // be invisible to the old session-only fold (`max_session_pct`), leaving
-    // the daemon at BASE cadence right as an account was about to lock.
-    let rows = vec![row(Some(0.0), Some(99.0))];
-    assert_eq!(peak_max_pct(&rows), Some(99.0));
+fn cadence_max_pct_folds_weekly_not_just_session() {
+    // Regression case from the v0.5.2 addendum, preserved: the ACTIVE account
+    // at session=0%, weekly=99%, trigger=95% must fold to Some(99.0) — a
+    // weekly-only approach to the trigger must still tighten cadence.
+    let rows = vec![row_for("active@e.com", Some(0.0), Some(99.0))];
+    let m = cadence_max_pct(&rows, Some("active@e.com"));
+    assert_eq!(m, Some(99.0));
     assert_eq!(
-        next_interval(150, 150, false, peak_max_pct(&rows), TRIGGER_FOR_TESTS),
+        next_interval(150, 150, false, m, TRIGGER_FOR_TESTS),
         10,
-        "session=0/weekly=99 at trigger=95 must hit BACKSTOP cadence"
+        "active session=0/weekly=99 at trigger=95 must hit BACKSTOP cadence"
     );
 }
 
 #[test]
-fn peak_max_pct_ignores_rows_without_data() {
-    let mut no_data = row(Some(80.0), Some(80.0));
-    no_data.fetched_at = None;
-    assert_eq!(peak_max_pct(&[no_data]), None);
+fn cadence_max_pct_ignores_inactive_maxed_accounts() {
+    // The v0.5.13 fix: a healthy ACTIVE account and an inactive account pinned
+    // at 100% weekly must NOT pin the cadence at the 10s backstop. Only the
+    // active account (15%) drives cadence → BASE, not BACKSTOP.
+    let rows = vec![
+        row_for("active@e.com", Some(15.0), Some(40.0)),
+        row_for("maxed@e.com", Some(100.0), Some(100.0)),
+    ];
+    let m = cadence_max_pct(&rows, Some("active@e.com"));
+    assert_eq!(m, Some(40.0));
+    assert_eq!(
+        next_interval(150, 150, false, m, TRIGGER_FOR_TESTS),
+        150,
+        "a healthy active account keeps BASE cadence despite an inactive 100% account"
+    );
 }
 
 #[test]
-fn peak_max_pct_takes_the_max_across_accounts() {
-    let rows = vec![row(Some(10.0), Some(20.0)), row(Some(50.0), Some(96.0))];
-    assert_eq!(peak_max_pct(&rows), Some(96.0));
+fn cadence_max_pct_none_without_active_or_data() {
+    let rows = vec![row_for("a@e.com", Some(80.0), Some(80.0))];
+    // No active account set.
+    assert_eq!(cadence_max_pct(&rows, None), None);
+    // Active account present but no usage data yet.
+    let mut no_data = row_for("a@e.com", Some(80.0), Some(80.0));
+    no_data.fetched_at = None;
+    assert_eq!(cadence_max_pct(&[no_data], Some("a@e.com")), None);
+    // Active email doesn't match any row.
+    assert_eq!(cadence_max_pct(&rows, Some("ghost@e.com")), None);
 }
 
 // --- cap_sleep_to_reset_boundary (v0.5.2 item 4: wake right after a reset) ---

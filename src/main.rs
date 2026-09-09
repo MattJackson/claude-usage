@@ -2356,20 +2356,31 @@ fn cmd_watch(args: &[String]) -> Result<()> {
     }
 }
 
-/// Peak `Row::max_pct()` (session OR weekly, whichever is tighter) across all
-/// `rows` with data, or `None` if none have any yet — feeds `next_interval`'s
-/// adaptive cadence. v0.5.2 item 3: renamed from folding `session.pct` alone
-/// (`max_session_pct`) to folding `max_pct()`, so a weekly-only approach to
-/// the trigger tightens cadence exactly like a session-only one always did.
-/// Regression case: session=0%, weekly=99%, trigger=95% must fold to
-/// `Some(99.0)` (and thus BACKSTOP cadence), not `Some(0.0)` (BASE cadence).
-fn peak_max_pct(rows: &[Row]) -> Option<f64> {
+/// The ACTIVE account's `Row::max_pct()` (session OR weekly, whichever is
+/// tighter), or `None` if there's no active account or it has no data yet —
+/// feeds `next_interval`'s adaptive cadence.
+///
+/// v0.5.13: scoped from "peak across ALL accounts" (`peak_max_pct`) to the
+/// active account alone. The cadence backstop exists to catch the moment an
+/// account crosses the trigger so the auto-swap fires promptly — but the only
+/// account you ever swap AWAY from is the active one, and it's the only one
+/// that climbs on its own (inactive accounts aren't being spent). An inactive
+/// account already pinned at 100% (e.g. a weekly limit that won't reset for
+/// days) is not actionable: you never swap TO an account that's out of room.
+/// Folding it into the peak pinned the poll cadence at the 10s BACKSTOP for
+/// days at a stretch, which hammered the usage endpoint into HTTP 429s for no
+/// benefit. Scoping to the active account preserves the original
+/// user-reported miss-fix (active at 94% must tighten so it doesn't lock
+/// before the next poll — see `next_interval`) while dropping the waste.
+///
+/// Still weekly-aware: `Row::max_pct()` folds `max(session%, weekly%)`, so an
+/// active account at session=0%/weekly=99% correctly yields `Some(99.0)` and
+/// thus BACKSTOP cadence.
+fn cadence_max_pct(rows: &[Row], active: Option<&str>) -> Option<f64> {
+    let active = active?;
     rows.iter()
-        .filter(|r| r.has_data())
-        .fold(None::<f64>, |acc, r| {
-            let p = r.max_pct();
-            Some(acc.map_or(p, |a| a.max(p)))
-        })
+        .find(|r| r.email == active && r.has_data())
+        .map(Row::max_pct)
 }
 
 /// Threshold band widths for `next_interval`'s adaptive cadence.
@@ -2399,11 +2410,13 @@ const WATCH_BACKSTOP_INTERVAL_SECS: u64 = 10;
 ///   4. Everyone comfortably below → BASE (whatever `--interval` was set
 ///      to, default WATCH_INTERVAL_SECS = 150s).
 ///
-/// `max_pct` (v0.5.2 item 3, renamed from `max_session_pct`) is the peak of
-/// `Row::max_pct()` — i.e. `max(session%, weekly%)` — across all accounts,
-/// NOT session-only. A weekly window pinned at 99% with a healthy session is
-/// just as "about to lock" as the reverse, so folding session alone used to
-/// let a weekly-only approach ride out the full base cadence.
+/// `max_pct` is the ACTIVE account's `Row::max_pct()` — i.e.
+/// `max(session%, weekly%)` for the account currently logged in (v0.5.13,
+/// scoped down from the cross-account peak; see `cadence_max_pct`). It's
+/// weekly-aware: a weekly window pinned at 99% with a healthy session is just
+/// as "about to lock" as the reverse. Inactive accounts don't drive cadence —
+/// you never swap toward one that's out of room, so an inactive account at
+/// 100% is not a reason to keep polling at 10s.
 fn next_interval(
     current: u64,
     base: u64,
@@ -2443,12 +2456,12 @@ fn prune_swap_guard(guard: &mut SwapGuard) {
 }
 
 /// Result of one poll: the swap it made (if any), the rate-limited flag, and
-/// the peak `Row::max_pct()` (session OR weekly, whichever is tighter) across
-/// all accounts this cycle (used by `next_interval` to tighten the poll
-/// cadence on approach to the trigger threshold — see the user-reported miss
-/// where 94% + 150s wait produced a lock before the next poll). Renamed from
-/// `max_session_pct` (v0.5.2 item 3): folding session alone missed a
-/// weekly-only approach to the trigger.
+/// the ACTIVE account's `Row::max_pct()` (session OR weekly, whichever is
+/// tighter) this cycle (used by `next_interval` to tighten the poll cadence
+/// on approach to the trigger threshold — see the user-reported miss where
+/// 94% + 150s wait produced a lock before the next poll). v0.5.13: scoped to
+/// the active account (see `cadence_max_pct`) so an inactive, already-maxed
+/// account can't pin the cadence at the 10s backstop indefinitely.
 pub(crate) struct CycleOutcome {
     pub swapped: Option<(String, String)>,
     pub rate_limited: bool,
@@ -2627,7 +2640,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
         });
     }
     let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
-    let max_pct = peak_max_pct(&rows);
+    let max_pct = cadence_max_pct(&rows, state.active.as_deref());
     append_history(&rows, state.active.as_deref());
 
     let active = state.active.clone();
