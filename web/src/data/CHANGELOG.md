@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.19] - 2026-09-09
+
+### Fixed
+- **Windows: `usagio.exe` now launches.** The binary was dying at process load
+  with `STATUS_ENTRYPOINT_NOT_FOUND` (0xC0000139) before `main` on every clean
+  Windows box (and CI). Root cause: usagio imports ComCtl32 **v6**-only symbols
+  (`SetWindowSubclass`, `RemoveWindowSubclass`, `DefSubclassProc`,
+  `TaskDialogIndirect`, via `tray-icon`/`rfd`) but embedded no application
+  manifest, so the loader bound the base `System32\comctl32.dll` (v5.82) which
+  doesn't export them. A `build.rs` now embeds a manifest declaring a dependency
+  on `Microsoft.Windows.Common-Controls` v6, so the loader activates ComCtl32 v6
+  and the binary loads. macOS and Linux are unaffected. The CI Windows
+  load-time smoke test (`usagio.exe --version`) is now blocking, so this can't
+  regress.
+
 ## [0.5.18] - 2026-09-09
 
 ### Fixed

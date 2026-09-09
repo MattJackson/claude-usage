@@ -1,6 +1,6 @@
 [package]
 name = "usagio"
-version = "0.5.18"
+version = "0.5.19"
 edition = "2021"
 rust-version = "1.88"
 description = "Track usage / limits across every AI coding CLI you use, and switch between accounts."
@@ -127,6 +127,14 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "c
 # nothing and keeps the binary launchable on every Windows box.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 notify-rust = "4"
+
+# Windows application manifest (see build.rs). Embeds a dependency on
+# ComCtl32 v6 so the loader can resolve tray-icon/rfd's comctl32 v6 imports
+# (SetWindowSubclass/TaskDialogIndirect/…) at startup instead of dying with
+# STATUS_ENTRYPOINT_NOT_FOUND. Gated to a Windows HOST — the release + CI
+# Windows builds run on windows-latest, matching build.rs's `#[cfg(windows)]`.
+[target.'cfg(windows)'.build-dependencies]
+embed-manifest = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
