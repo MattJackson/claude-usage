@@ -784,8 +784,32 @@ pub fn save_state_safe(state: &State) -> Result<()> {
     let path = state_path()?;
 
     // (1) Overwrite protection.
-    if let Ok(old_bytes) = std::fs::read(&path) {
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&old_bytes) {
+    //
+    // If the existing state.json can't be READ (non-NotFound I/O error) or can't
+    // be PARSED (corruption / partial write), the guard below can't run — and
+    // that must NOT be silent: a corrupt or unreadable file is exactly when a
+    // stale/empty in-memory state could otherwise wipe accounts. Log it loudly
+    // so the situation is diagnosable (the rolling backup still preserves the old
+    // bytes in the parse-fail case, so the accounts are recoverable from
+    // backups/, but the operator needs to know the safety net was bypassed).
+    let existing = std::fs::read(&path);
+    if let Err(ref e) = existing {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            crate::logging::log(&format!(
+                "save_state: could not read existing state.json for overwrite protection \
+                 ({e}); guard AND rolling backup SKIPPED for this write"
+            ));
+        }
+    }
+    if let Ok(old_bytes) = existing {
+        let parsed = serde_json::from_slice::<serde_json::Value>(&old_bytes);
+        if let Err(ref e) = parsed {
+            crate::logging::log(&format!(
+                "save_state: existing state.json is unparseable ({e}); overwrite-protection \
+                 guard SKIPPED — writing anyway (the unparseable file is rolled to backups/ first)"
+            ));
+        }
+        if let Ok(v) = parsed {
             let old = State::from_value(&v);
             let new_keys: HashSet<String> = state
                 .accounts
@@ -1039,6 +1063,30 @@ pub fn stash_pre_restore(config_dir: &Path) -> Result<Option<PathBuf>> {
         }
     }
     Ok(Some(dst))
+}
+
+/// Roll back a [`stash_pre_restore`]: move the stashed pre-restore file back to
+/// the live `state.json` path. Used when the restore *write* fails after the
+/// stash already renamed the live file aside — without this, `state.json` is
+/// left MISSING and `State::load` would silently treat the user as having zero
+/// accounts (audit finding 11). Overwrites any partial `state.json` a failed
+/// write may have left behind, and re-enforces `0600`.
+pub fn unstash_pre_restore(stash: &Path) -> Result<()> {
+    let live = state_path()?;
+    if std::fs::rename(stash, &live).is_err() {
+        // Cross-filesystem fallback (mirrors stash_pre_restore).
+        let bytes =
+            std::fs::read(stash).context("reading pre-restore stash for rollback")?;
+        write_private(&live, &bytes).context("restoring live state.json from stash")?;
+        let _ = std::fs::remove_file(stash);
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(())
 }
 
 /// Build a token-free serialisation of `state` suitable for a diagnostic

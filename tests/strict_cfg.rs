@@ -110,11 +110,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("src/menubar.rs", 2503),
     // src/menubar.rs — `mod cross_platform`: the Linux/Windows renderer
     // (`platform::MenuBackend`-based). Never compiled alongside `mac_style`.
-    ("src/menubar.rs", 3079),
+    ("src/menubar.rs", 3095),
     // src/menubar.rs — `tests::mac_style_tests`: exercises
     // `mac_style::attributed` (NSAttributedString attribute inspection)
     // directly; needs the same `objc2*` crates as `mac_style` itself.
-    ("src/menubar.rs", 5050),
+    ("src/menubar.rs", 5066),
 ];
 
 fn src_root() -> PathBuf {
