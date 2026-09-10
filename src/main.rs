@@ -2116,6 +2116,27 @@ fn refresh_usage_cache() -> RefreshOutcome {
         if acct.needs_relogin {
             continue;
         }
+        // Locked accounts don't change until their reset — skip the network
+        // refresh entirely, keeping the (accurate) locked cache. The
+        // reset-boundary wake (`menubar::next_reset_wake_secs`) brings the
+        // poller back at expiry, when `is_locked_until_reset` flips false and
+        // the account refreshes to its fresh post-reset reading. This is the
+        // primary rate-limit guard: a shelf of 100%-locked accounts polled
+        // every cycle exhausts the shared tenant's request budget and
+        // 429-starves the accounts that actually need refreshing (what froze
+        // an unlocked account at a stale reading). The ACTIVE account is never
+        // skipped — its live reading must stay current.
+        let is_the_active_account = state.active.as_deref() == Some(email.as_str());
+        if !is_the_active_account {
+            if let Some(cu) = &acct.cached_usage {
+                if countdown::is_locked_until_reset(&cached_to_account_usage(cu), Utc::now()) {
+                    logging::log(&format!(
+                        "poll: {email} locked until reset; skipping refresh (event=refresh_skip_locked account={email})"
+                    ));
+                    continue;
+                }
+            }
+        }
         // The ACTIVE account gets the compare-and-swap treatment (see the
         // `active_refresh_cas` doc above): usagio DOES rotate its token, but
         // the read-refresh-read sequence is run entirely under the state
@@ -2345,6 +2366,26 @@ fn row_to_account_usage(r: &Row) -> countdown::AccountUsage {
         weekly_pct: r.weekly.pct,
         weekly_reset: r.weekly.resets_at,
         fetched_at: r.fetched_at.and_then(|t| DateTime::from_timestamp(t, 0)),
+    }
+}
+
+/// Parse a cached-usage snapshot into the `countdown::AccountUsage` the lock
+/// predicates operate on (RFC3339 reset strings → `DateTime<Utc>`, epoch
+/// seconds → `DateTime`). Used by `refresh_usage_cache` to decide, per
+/// account, whether the account is locked-until-reset and can skip its network
+/// refresh this cycle.
+fn cached_to_account_usage(cu: &CachedUsage) -> countdown::AccountUsage {
+    let parse = |s: &Option<String>| {
+        s.as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+    };
+    countdown::AccountUsage {
+        session_pct: cu.session_pct,
+        session_reset: parse(&cu.session_reset),
+        weekly_pct: cu.weekly_pct,
+        weekly_reset: parse(&cu.weekly_reset),
+        fetched_at: DateTime::from_timestamp(cu.fetched_at, 0),
     }
 }
 
