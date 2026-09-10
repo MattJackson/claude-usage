@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend swap only: the menu is feature- and pixel-identical to 0.5.23 — same
   layout, grouping, icons, and behavior. macOS is unchanged (its NSMenu styler
   still uses muda's `ns_menu()`). Surfaced and got two upstream muri fixes
-  (`MenuId::new`, `compat::tray_icon::menu` re-export) landed in muri 0.9.2.
+  (`MenuId::new`, `compat::tray_icon::menu` re-export) landed in muri 0.9.3.
 
 ## [0.5.23] - 2026-09-10
 

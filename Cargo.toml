@@ -120,7 +120,7 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "c
 # needs muda's `ns_menu()`, which the facade doesn't expose. Pinned exact per
 # muri's own migration guidance (§7): pre-1.0 minor bumps may break. 0.9.1
 # lands the `MenuId::new` + `compat::tray_icon::menu` drop-in fixes (muri #4/#5).
-muri = { version = "=0.9.2", features = ["muda-compat"] }
+muri = { version = "=0.9.3", features = ["muda-compat"] }
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status
