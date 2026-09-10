@@ -25,8 +25,8 @@ use chrono::{DateTime, Utc};
 // clicks) while muri's tray runs passively (`TrayIconBuilder::build()` spawns a
 // live OS tray). The tray menu itself is now rendered through the SAME muri
 // `muda-compat` facade (`muri::compat::tray_icon`) Windows/Linux already use —
-// macOS no longer builds a native `NSMenu` (the old `mac_style` styler and its
-// `tray-icon`/`muda` backend were removed in the 0.6.0 muri migration).
+// macOS renders the tray menu through muri's compat facade too, not a native
+// `NSMenu` — the only macOS-specific machinery left is the run loop below.
 #[cfg(target_os = "macos")]
 use {
     block2::RcBlock,
@@ -49,8 +49,8 @@ use crate::{
 };
 
 /// Exact title of the disabled section row inserted when a provider's env
-/// override is active. A named constant so `build_menu` and the tests
-/// asserting on the visible menu content can't drift out of sync.
+/// override is active. A named constant so `menu_tree_from_snapshot` and the
+/// tests asserting on the visible menu content can't drift out of sync.
 pub(crate) const ENV_OVERRIDE_ROW_TITLE: &str = "env override active — swap disabled";
 
 /// One rate-limit / quota window as displayed under an account's submenu. `id`
@@ -100,12 +100,12 @@ pub(crate) struct ProviderSection {
     provider_id: &'static str,
     display_name: &'static str,
     supports_switching: bool,
-    /// Gates the "Launch client" row (H3, v0.5.0 codeaudit). Independent of
+    /// Gates the "Launch client" row. Independent of
     /// `supports_switching` — a provider can have one wired without the
     /// other; the row must not appear (and error on click) for a provider
     /// whose `launch_client` is still the `Unsupported` trait default.
     supports_launch: bool,
-    /// Gates the "Remove…" row (H3, v0.5.0 codeaudit). Defaults `true` for
+    /// Gates the "Remove…" row. Defaults `true` for
     /// every current provider — removing a captured account is a generic
     /// state.json operation — but stays explicit so a provider needing extra
     /// cleanup can opt out until that's wired.
@@ -119,9 +119,8 @@ pub(crate) struct ProviderSection {
     accounts: Vec<AcctView>,
 }
 
-/// One row directly under "Capture current login ▸" (v0.5.2 item 8 flattened
-/// the old "Paste API key ▸" sub-submenu API-key providers used to render
-/// under). `installed` is a best-effort probe used to grey out rows whose
+/// One row directly under "Capture current login ▸". `installed` is a
+/// best-effort probe used to grey out rows whose
 /// credential store isn't present on this host; the row stays clickable so
 /// errors surface honestly. `capture_mode` decides the click-id prefix
 /// (`capture:` vs `apikey:`) that routes to the right handler in
@@ -139,8 +138,8 @@ struct Snapshot {
     sections: Vec<ProviderSection>,
     /// Render order for the flat main-list block sequence: `(section index,
     /// account index within that section)` pairs, spanning ALL providers —
-    /// see `flat_account_order`'s doc for the sort. `build_menu` /
-    /// `menu_tree_from_snapshot` iterate this instead of nesting
+    /// see `flat_account_order`'s doc for the sort. `menu_tree_from_snapshot`
+    /// iterates this instead of nesting
     /// `for sec in sections { for a in sec.accounts }`, which used to
     /// silently re-impose provider-declaration order on top of any
     /// per-account priority (the "account order keeps changing" report).
@@ -150,8 +149,8 @@ struct Snapshot {
     capture_creds: Vec<RegisteredProvider>,
     /// Providers whose `capture_mode == ApiKey` and `supports_usage == true`:
     /// rendered directly under "Capture current login ▸", after
-    /// `capture_creds` (v0.5.2 item 8 flattened the "Paste API key ▸"
-    /// sub-submenu these used to live under).
+    /// `capture_creds`. API-key providers render as direct children of
+    /// "Capture current login ▸", same as creds-on-disk ones.
     capture_api_key: Vec<RegisteredProvider>,
     autoswap: bool,
     threshold: f64,
@@ -188,8 +187,8 @@ fn severity_with(p: Option<f64>, bands: SeverityBands) -> Option<Severity> {
 /// label (`.plain`, via `menu_label`/`plain_text`). The bold / color / tab-stop
 /// / checkmark / icon directives are retained purely as the pure, unit-tested
 /// output of `main_row`/`account_header_row` (the tests assert on them), so the
-/// whole struct is `allow(dead_code)` on every target — the old native `NSMenu`
-/// styler that consumed them (`mac_style`) is gone.
+/// whole struct is `allow(dead_code)` on every target — the styler that used to
+/// consume them is gone, and muri's compat layer does alignment/coloring now.
 #[allow(dead_code)]
 struct RowStyle {
     /// The exact plain title set on the item; used to find it in the menu.
@@ -202,11 +201,9 @@ struct RowStyle {
     colors: Vec<(usize, usize, Severity)>,
     /// If set, right-align everything after the first `\t` at a tab stop,
     /// battery-menu style. Requires the plain title to contain a `\t`. The
-    /// concrete x (points) is NOT stored here — `TabX::MenuRight` is resolved
-    /// to a menu-wide point value at install time by
-    /// `mac_style::compute_menu_right_x`, which measures every row's actual
-    /// rendered width so the tab stop always clears the widest label instead
-    /// of relying on a fixed magic number (v0.5.1).
+    /// concrete x is NOT stored here — it's a `TabX` *intent*. Vestigial now
+    /// that muri's compat layer lays out the two-column `label\tvalue` form
+    /// itself (see the struct doc); retained only as tested pure output.
     tab_x_kind: Option<TabX>,
     /// If set, attach the 16px provider icon (looked up by slug in
     /// `crate::icons::png16_for`) to the native menu item via `setImage:`. Only
@@ -264,10 +261,8 @@ enum TabX {
     /// `max(label_width + trailing_width)` over every `MenuRight` row, plus
     /// a small safety pad — so the tab stop always clears the widest label
     /// instead of a fixed constant that silently misaligns past its bound.
-    /// Resolved to a concrete point value by
-    /// `mac_style::compute_menu_right_x` at install time; the
-    /// `cross_platform` (Linux/Windows) renderer has no tab-stop concept at
-    /// all and never reads this — it falls back to a plain ` · ` separator.
+    /// Vestigial: muri's compat layer now resolves the two-column layout from
+    /// the `label\tvalue` title directly, so nothing reads this intent.
     MenuRight,
 }
 
@@ -353,8 +348,8 @@ const PROVIDER_COL: usize = 10;
 /// for `locked · <countdown>` and colored red — the user is being told *when*
 /// the account is next usable, not *how used* it is.
 ///
-/// v0.5.2: no longer called by any production render path — `build_menu`/
-/// `menu_tree_from_snapshot` now use `account_header_row`'s `{provider} ·
+/// No longer called by any production render path — `menu_tree_from_snapshot`
+/// uses `account_header_row`'s `{provider} ·
 /// {email}` block-header format instead of this padded flat-list format (the
 /// per-account BLOCK redesign, item 1). Kept `#[allow(dead_code)]` rather
 /// than deleted: it's a well-tested pure function capturing the padded
@@ -408,17 +403,17 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
     }
 }
 
-/// v0.5.2 menu redesign: the header row of one account's BLOCK — `{provider}
+/// The header row of one account's BLOCK — `{provider}
 /// · {email}\t{sa} / {sb}` (or `\t<locked countdown>` when the account is
 /// fully consumed, same rule `main_row` uses). Provider grouping is no longer
 /// a separate visual concept (no section header, no per-provider HR) — each
 /// account is its own top-level block, separated from its neighbors by
-/// `PredefinedMenuItem::separator()` (see `build_menu`), so the provider name
+/// `PredefinedMenuItem::separator()` (see `menu_tree_from_snapshot`), so the provider name
 /// has to live INSIDE this row instead of a shared header above a group of
 /// rows. Otherwise identical to `main_row`: same locked/colored/bold/
 /// checkmark rules, same `TabX::MenuRight` participation (so the block
-/// headers and the Quit row all share one right-aligned column via
-/// `mac_style::compute_menu_right_x`) — just a different label format
+/// headers and the Quit row all share one right-aligned column) — just a
+/// different label format
 /// (`main_row`'s padded `{provider:<10}{email}` was designed for a flat list
 /// where the provider name was the ONLY thing distinguishing rows at a
 /// glance; the block header can afford the more readable `·` separator since
@@ -426,7 +421,7 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
 /// beneath it).
 /// The trailing run (after the `\t`) for an account's block header, plus its
 /// color spans RELATIVE to the start of that trailing run (the caller adds
-/// its own label-length offset). v0.5.2 item 7 nuance, built directly off
+/// its own label-length offset). Built directly off
 /// `countdown::compute_display` so the three states it can report each get
 /// their own trailing shape instead of the old binary
 /// "locked countdown OR `sa / sb`" split:
@@ -498,9 +493,8 @@ fn trailing_for_account(
 /// Indent applied to each account row so it visually reads as sitting under
 /// its provider-group header row (`provider_group_header_row`). Two spaces
 /// works well with menu-font kerning and keeps the trailing tab column aligned
-/// across every provider. v0.5.3 menu redesign — provider grouping is BACK,
-/// so the account row no longer carries `{provider} · ` and instead sits
-/// under a bold header row.
+/// across every provider. The account row carries no `{provider} · ` prefix;
+/// it sits under a bold provider-group header row instead.
 // Empty under muri: muri reserves a leading gutter (icon/checkmark column) that
 // already nests account rows under the provider header, so the old two-space
 // text indent (a native-NSMenu-era hack) now stacks on top of that gutter and
@@ -513,11 +507,10 @@ const ACCOUNT_INDENT: &str = "";
 /// placeholder, or plain `sa / sb`). Provider grouping is BACK as a visual
 /// concept: this row now sits under a bold `provider_group_header_row` and
 /// no longer prefixes `{provider} · ` — the group header carries the provider.
-/// The row itself is also the LABEL of a submenu (see `build_menu` /
+/// The row itself is also the LABEL of a submenu (see
 /// `menu_tree_from_snapshot`) whose children are the details + action rows
-/// the flat v0.5.2 shape used to inline. Same `TabX::MenuRight` participation
-/// as the Quit row (so the trailing column lines up via
-/// `mac_style::compute_menu_right_x`).
+/// the flat shape used to inline. Same `TabX::MenuRight` participation as the
+/// Quit row (so the trailing column lines up).
 fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
     let label = format!("{ACCOUNT_INDENT}{}", a.display);
     let base = u16len(&label) + 1; // + '\t'
@@ -537,7 +530,7 @@ fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
 }
 
 /// The single severity tint for a row's trailing value segment, reduced from
-/// its per-span `colors`. muri's compat `set_value_color` (#19) takes ONE color
+/// its per-span `colors`. muri's compat `set_value_color` takes ONE color
 /// for the whole `\t` value segment, so usagio's finer per-percentage spans
 /// (session could be amber while weekly is red) collapse to the most severe
 /// band present — the one the user most needs to see. `None` when the row has
@@ -552,16 +545,14 @@ fn row_value_severity(style: &RowStyle) -> Option<Severity> {
         })
 }
 
-/// v0.5.3 menu redesign: the bold provider-group header row that precedes a
-/// provider's account rows. Plain title is just the provider's display name
-/// (e.g. "Claude"), bold, disabled (`enabled: false` at the muda layer so it
-/// reads as a group heading, not a click target), and carries the per-provider
-/// 16px icon — moved off the individual account rows in this release because
-/// the icon now belongs to the GROUP, not to each account inside it. When the
-/// provider's env override is active, this row also hosts the "env override
-/// active — swap disabled" child (see `build_menu` / `menu_tree_from_snapshot`)
-/// so a provider-wide fact renders once at the group level instead of on every
-/// affected account (v0.5.2 attached it per-account).
+/// The bold provider-group header row that precedes a provider's account rows.
+/// Plain title is just the provider's display name (e.g. "Claude"), bold,
+/// disabled (`enabled: false` so it reads as a group heading, not a click
+/// target), and carries the per-provider 16px icon — the icon belongs to the
+/// GROUP, not to each account inside it. When the provider's env override is
+/// active, this row also hosts the "env override active — swap disabled" child
+/// (see `menu_tree_from_snapshot`) so a provider-wide fact renders once at the
+/// group level instead of on every affected account.
 fn provider_group_header_row(sec: &ProviderSection) -> RowStyle {
     RowStyle {
         bold: true,
@@ -571,12 +562,11 @@ fn provider_group_header_row(sec: &ProviderSection) -> RowStyle {
     }
 }
 
-/// All styling directives for the current menu, derived from the same snapshot
-/// `build_menu` renders. The native walk applies each by matching `.plain`.
-/// Plain title used both when we build the Quit row and when the style
-/// walker matches it. Keep the two in lockstep — a mismatch (e.g. a
-/// forgotten `\t`) means the walker finds no match and the item renders
-/// as plain "Quit<tab>usagio vX.Y.Z" without alignment or grey.
+/// The plain title of the Quit row, kept in one place so the builder and the
+/// tests asserting on it can't drift. The `\t` splits "Quit" from the trailing
+/// version label; muri's compat layer lays that out as a right-aligned second
+/// column (see `plain_text`), so a forgotten `\t` would collapse it to a flat
+/// "Quit usagio vX.Y.Z".
 fn quit_row_plain() -> String {
     format!("Quit\tusagio v{}", env!("CARGO_PKG_VERSION"))
 }
@@ -591,13 +581,12 @@ fn active_account(snap: &Snapshot) -> Option<(&ProviderSection, &AcctView)> {
     None
 }
 
-/// Entry point dispatched by `usagio menubar` (see `main.rs`). macOS drives a
-/// native `NSApplication` run loop with attributedTitle NSMenu styling;
-/// Linux/Windows route through the cross-platform `platform::MenuBackend`
-/// trait instead (`cross_platform::run`, near the end of this file) —
-/// richer per-row coloring / right-aligned tab stops aren't representable
-/// through the generic `MenuTree`, so those platforms get a plain (but fully
-/// functional) muda/tray-icon menu.
+/// Entry point dispatched by `usagio menubar` (see `main.rs`). Every platform
+/// renders the tray menu through the same `cross_platform::menu_tree_from_snapshot`
+/// + `platform::render::render_menu` pipeline. macOS drives its own
+/// `NSApplication`/`NSTimer` run loop (below) to pump events; Linux/Windows
+/// drive the menu event loop via the `platform::MenuBackend` trait instead
+/// (`cross_platform::run`, near the end of this file).
 #[cfg(not(target_os = "macos"))]
 pub fn run() -> Result<()> {
     cross_platform::run()
@@ -632,7 +621,7 @@ pub fn run() -> Result<()> {
     // custom-popup left-click suppression is no longer wired here — and muri
     // has no `ns_status_item` anchor either, so `build_popover_host` returns
     // `None` under the muri backend (the experimental, off-by-default popover
-    // is inert until muri exposes an equivalent). See the report note.
+    // is inert until muri exposes an equivalent).
     // `build()` spawns a live OS tray passively (muri 0.9.2+) — no muri run
     // loop needed; usagio keeps its own `NSApplication`/`NSTimer` below.
     let tray = builder
@@ -849,7 +838,7 @@ fn popover_model(snap: &Snapshot) -> crate::ui::PopoverModel {
 /// The `SwapGuard` shared by every in-process caller of `run_cycle` — the
 /// long-lived poller (`poll_loop`) and the one-off "Refresh usage now" click
 /// (`handle_refresh_now`) — so anti-thrash cooldown/no-return windows apply
-/// to BOTH, not just poll-triggered swaps (concurrency-04, v0.5.2 codeaudit).
+/// to BOTH, not just poll-triggered swaps.
 /// Before this, `handle_refresh_now` spawned its own throwaway
 /// `SwapGuard::default()`: a manual click could swap right past a cooldown
 /// the poller had just started, or bounce straight back into an account the
@@ -937,7 +926,7 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// escapes it, the bare `std::thread::spawn(poll_loop)` this replaces would
 /// let the whole background thread die silently — permanently disabling
 /// polling, auto-swap, notifications, and credential sync for the rest of
-/// the app's lifetime (errors-02, v0.5.2 codeaudit) with no user-visible
+/// the app's lifetime with no user-visible
 /// symptom beyond stale menu numbers. Instead: log the panic, back off, and
 /// respawn — self-healing by default. Only a genuine panic-loop (more than
 /// `MAX_PANICS_PER_WINDOW` in `PANIC_LOOP_WINDOW_SECS`) falls through to a
@@ -1240,7 +1229,7 @@ fn flat_account_order(sections: &[ProviderSection], now: DateTime<Utc>) -> Vec<(
     idx
 }
 
-/// v0.5.3 menu redesign: partition `snap.account_order` by provider,
+/// Partition `snap.account_order` by provider,
 /// preserving the within-provider order the global comparator produced, then
 /// sort provider groups alphabetically by display name so a two-provider menu
 /// always reads Claude → Codex regardless of `providers::all()` registration
@@ -1340,8 +1329,7 @@ fn build_snapshot() -> Snapshot {
     // Claude's accounts live in `st.accounts` (its own dedicated slot); every
     // other provider's captured accounts live in `st.providers[slug]` (state
     // v2 — see `store.rs`'s `State` doc). Build one flat `Row` list tagged by
-    // `provider_id` from both, same as before this changed from "always
-    // Claude" to "Claude + whichever providers have captured accounts".
+    // `provider_id` from both.
     let mut rows: Vec<Row> = st.accounts.iter().map(row_from_account).collect();
     for (slug, pa) in &st.providers {
         rows.extend(
@@ -1579,19 +1567,14 @@ fn window_reset_row(w: &WindowView) -> String {
 }
 
 /// Non-clickable informational rows shown inside an account submenu — reset
-/// windows, burn-rate / cost estimates, and the "updated Xm ago" footer (or
-/// the has_data / no-usage-endpoint fallbacks). Shared by
-/// `build_account_block` (which renders each as an `enabled: true` `noop`
-/// item so it reads as normal text rather than muda's greyed-out disabled
-/// look) and `menu_styles` (which marks each `disabled_but_white` so the
-/// native walk explicitly paints `NSColor::labelColor()`) — pulling this out
-/// keeps the two lists from drifting apart, the same trick `quit_row_plain`
-/// uses for the Quit row.
+/// windows (or the has_data / no-usage-endpoint fallbacks). The account submenu
+/// builder renders each as an `enabled: true` `noop` item so it reads as normal
+/// text rather than muri's greyed-out disabled look. Kept as its own function
+/// so the builder and the unit tests asserting on the row text can't drift.
 ///
-/// Deliberately excludes the burn-rate / cost-estimate / "updated" footer
-/// rows (`build_account_block` appends those separately): those touch the
-/// on-disk usage log via `crate::usage_log`, and `menu_styles` — the other
-/// caller of this function — must stay pure (no disk I/O) so it's safe to
+/// Deliberately excludes the burn-rate / cost-estimate / "updated" footer rows
+/// (`account_extra_info_rows` yields those separately): those touch the on-disk
+/// usage log, and this function must stay pure (no disk I/O) so it's safe to
 /// call from a unit test without a `ScopedConfigDir`.
 fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     let mut rows = Vec::new();
@@ -1612,15 +1595,10 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
 /// The disk-derived informational rows for an account's submenu, in render
 /// order: burn-rate estimate (`🔥`), cost estimate (`💰`), and the "updated Xm
 /// ago" footer. Split out from `submenu_info_rows` — which must stay
-/// disk-I/O-free so the pure `menu_styles` can call it from a unit test —
-/// because these read the on-disk usage log via `crate::burn_rate` /
-/// `crate::cost_tracking`. Shared by every renderer that lays out the submenu
-/// (the macOS `build_account_submenu` and its `mac_style::install_menu`
-/// style-augmentation, plus the cross-platform `build_account_submenu_item`)
-/// so the row TEXT stays byte-for-byte identical across them: the macOS
-/// attributed-title walk matches these rows by their exact plain string, and a
-/// glyph added on one path but not the other would leave the row unstyled
-/// (greyed) on macOS.
+/// disk-I/O-free so it's callable from a unit test without a `ScopedConfigDir`
+/// — because these read the on-disk usage log via `crate::burn_rate` /
+/// `crate::cost_tracking`. `build_account_submenu_item` appends them after the
+/// `submenu_info_rows` block.
 fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     let mut rows = Vec::new();
     if sec.supports_usage && a.has_data && !a.windows.is_empty() {
@@ -1646,12 +1624,12 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     rows
 }
 
-/// Which optional rows `build_account_block` should append for `sec`'s
+/// Which optional rows `build_account_submenu_item` should append for `sec`'s
 /// account `a`. Pure over `ProviderSection`/`AcctView` fields, with no
 /// `muda`/`tray_icon` types involved, so this decision is unit-testable
 /// without a live main-thread `NSApplication` (a bare `muda::Menu` can only
 /// be constructed on the main thread, which `cargo test`'s worker threads
-/// aren't). H3, v0.5.0 codeaudit: `supports_switching` used to be the only
+/// aren't). `supports_switching` used to be the only
 /// gate consulted, for BOTH the Switch and Launch rows, and Remove had no
 /// gate at all.
 #[derive(Debug, PartialEq, Eq)]
@@ -1752,8 +1730,7 @@ fn menu_signature(snap: &Snapshot) -> String {
             // the first minute after each poll — folding it in forced a full
             // `install_menu` on every 0.75s tick (defeating the whole cache).
             // Real underlying freshness is already captured by `a.has_data`
-            // and each window's pct+reset above. See H8 in the round-1
-            // codeaudit findings.
+            // and each window's pct+reset above.
         }
         s.push_str("] ");
     }
@@ -1939,7 +1916,7 @@ fn handle_backup_save_with(dialog: &dyn crate::platform::FileDialog) {
 /// overwriting it, so the restore itself is reversible even if the user
 /// picked a very old backup.
 ///
-/// H2 (v0.5.0 codeaudit): this used to (1) stash the live state — full OAuth
+/// This used to (1) stash the live state — full OAuth
 /// tokens, non-redacted — to a `/tmp` sidecar, a world-writable shared
 /// directory, and (2) bypass `save_state_safe`'s drop-protection guard and
 /// the cross-process state lock entirely, gating the write on nothing but an
@@ -2028,8 +2005,8 @@ fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
 }
 
 /// Build the confirmation question shown before a restore that would drop
-/// accounts. Names the specific dropped emails (H2, v0.5.0 codeaudit — the
-/// prior wording was "will drop 2 account(s)", which told the user nothing
+/// accounts. Names the specific dropped emails (the prior wording was
+/// "will drop 2 account(s)", which told the user nothing
 /// about *which* accounts they were about to lose).
 fn restore_drop_confirmation(dropped: &[String]) -> String {
     format!("Restoring will drop {}. Continue?", dropped.join(", "))
@@ -2051,7 +2028,7 @@ static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// still running notifies instead of spawning another thread. See
 /// `try_start_refresh` for the testable core.
 fn handle_refresh_now() {
-    // Shares `poll_loop`'s `SwapGuard` (concurrency-04, v0.5.2 codeaudit)
+    // Shares `poll_loop`'s `SwapGuard`
     // instead of a throwaway `SwapGuard::default()` — see
     // `shared_swap_guard`'s doc for why a manual click and the background
     // poller must never reason about anti-thrash cooldown independently.
@@ -2178,9 +2155,8 @@ fn handle_switch(slug: &str, key: &str) {
     // State v2 (codex-switch-e2e): dispatch by provider slug instead of
     // hard-gating on Claude — `capabilities().supports_switching` already
     // keeps the "Switch to this account" row from being built for a
-    // non-switching provider (`build_account_block`, H3 in the v0.5.0
-    // codeaudit), and `switch_to_provider_account` itself re-checks that
-    // capability as belt-and-suspenders against a stray/future click id
+    // non-switching provider, and `switch_to_provider_account` itself
+    // re-checks that capability as belt-and-suspenders against a stray click id
     // shaped like `switch:<slug>:<key>` reaching this function directly.
     let result = if slug == CLAUDE_SLUG {
         switch_to(key)
@@ -2292,7 +2268,7 @@ fn set_autoswap(enabled: bool) {
 
 /// Flip one Settings ▸ Notifications ▸ per-trigger checkbox. `trigger` is one
 /// of "threshold" / "resetback" / "pace" (the three click-id suffixes
-/// `build_menu` wires up) — reads-then-flips the on-disk value so a stale
+/// `menu_tree_from_snapshot` wires up) — reads-then-flips the on-disk value so a stale
 /// menu snapshot can't clobber a setting changed elsewhere in the meantime.
 fn toggle_notification_trigger(trigger: &str) {
     let r = with_state_lock(|| {
@@ -2371,8 +2347,7 @@ mod cross_platform {
     use crate::platform::{MenuItem as PMenuItem, MenuTree};
 
     /// A `RowStyle`'s plain title. The `\t` is passed THROUGH so muri's
-    /// muda-compat two-column tab-stop layout (muri #12) right-aligns the
-    /// trailing value column, matching the 0.5.x native menu.
+    /// muda-compat two-column layout right-aligns the trailing value column.
     fn plain_text(style: &RowStyle) -> String {
         style.plain.clone()
     }
@@ -2387,7 +2362,7 @@ mod cross_platform {
     }
 
     /// A plain (non-account) submenu: never the active account, no value tint.
-    /// Only account header rows carry `active`/`value_color` (muri #18/#19);
+    /// Only account header rows carry `active`/`value_color`;
     /// the Settings / Capture / provider-group submenus are structural.
     fn plain_submenu(label: impl Into<String>, items: Vec<PMenuItem>) -> PMenuItem {
         PMenuItem::Submenu {
@@ -2399,16 +2374,12 @@ mod cross_platform {
         }
     }
 
-    /// A non-clickable informational submenu row. `enabled: false` so the
-    /// muda/GTK/Win32 renderer draws it as static text with no hover highlight
-    /// — it mirrors the macOS treatment where the same rows are DISABLED (see
-    /// `build_account_submenu`). muda has no rich-text, so unlike macOS these
-    /// can't be re-tinted to stay full-contrast; a disabled row's native grey
-    /// is the closest structural match to "info, not an action".
+    /// An informational submenu row (reset windows, burn-rate, "updated Xm
+    /// ago"). Rendered `enabled: true` with a no-op click id: a disabled row
+    /// draws greyed/dimmed, which the maintainer flagged as unreadable, and
+    /// muri has no rich-text to re-tint a disabled row back to full contrast —
+    /// so full-contrast + a harmless no-op click wins over a dimmed row.
     fn noop_info(label: impl Into<String>) -> PMenuItem {
-        // Enabled (not disabled): a disabled item renders greyed/dimmed on GTK
-        // and Windows just as on macOS, which the maintainer flagged as
-        // unreadable. Full-contrast wins; the click is a harmless no-op.
         PMenuItem::Action {
             id: "noop".to_string(),
             label: label.into(),
@@ -2446,11 +2417,9 @@ mod cross_platform {
         }
     }
 
-    /// Cross-platform counterpart to `build_account_submenu` — one
-    /// `PMenuItem::Submenu` whose label is the compact account row and whose
-    /// children are the details + action rows the flat v0.5.2 shape used to
-    /// inline. v0.5.3 menu redesign — provider grouping is back and each
-    /// account is a submenu again.
+    /// One account's block: a `PMenuItem::Submenu` whose label is the compact
+    /// account row and whose children are the detail + action rows. Each
+    /// provider group holds one such submenu per account.
     fn build_account_submenu_item(sec: &ProviderSection, a: &AcctView) -> PMenuItem {
         let mut items = Vec::new();
         for row in submenu_info_rows(sec, a) {
@@ -2490,10 +2459,10 @@ mod cross_platform {
             label: plain_text(&header),
             icon_png: None,
             items,
-            // muri #18: the active account renders bold + leading checkmark.
+            // The active account renders bold + leading checkmark.
             // `account_header_row` already folds `a.active` into `bold`.
             active: header.bold,
-            // muri #19: tint the trailing `S% / W%` value segment per severity.
+            // Tint the trailing `S% / W%` value segment per severity.
             value_color: row_value_severity(&header).map(value_color_of),
         }
     }
@@ -2852,7 +2821,7 @@ mod tests {
 
     #[test]
     fn shared_swap_guard_returns_the_same_arc_every_call() {
-        // concurrency-04 (v0.5.2 codeaudit): `poll_loop` and
+        // `poll_loop` and
         // `handle_refresh_now` must reason about anti-thrash cooldown/
         // no-return through ONE `SwapGuard`, not a throwaway
         // `SwapGuard::default()` per call site. `Arc::ptr_eq` pins that both
@@ -2880,7 +2849,7 @@ mod tests {
 
     #[test]
     fn panic_payload_message_handles_str_string_and_other() {
-        // `poll_loop_supervisor` (errors-02, v0.5.2 codeaudit) logs whatever
+        // `poll_loop_supervisor` logs whatever
         // `catch_unwind` hands back — almost always a `&str` (`panic!("...")`)
         // or `String` (`format!(...)`-built panic message), but a custom
         // payload type must still produce SOME loggable string instead of
@@ -2947,15 +2916,10 @@ mod tests {
         drop(g);
     }
 
-    // NOTE: M2's `restore_old_account_count` helper + its two tests were
-    // deleted at aggregation time. The M2 concern (State::load failure
-    // silently becoming "0 accounts" and skipping the drop-warning prompt)
-    // is fully subsumed by H2's restructure: the new Restore flow runs
-    // under `with_state_lock`, delegates the drop-detection to
-    // `crate::store::accounts_dropped_by(&new_state)` (which propagates
-    // load errors via `?`), and the outer `Err(e) => notify(...)` arm
-    // surfaces the abort message to the user. Tests for the H2 path live
-    // in store_tests.rs and menubar's Restore… test block above.
+    // The Restore drop-detection path (State::load failure must not silently
+    // become "0 accounts" and skip the drop-warning prompt) is tested via
+    // `crate::store::accounts_dropped_by` in store_tests.rs and menubar's
+    // Restore… test block above, not here.
 
     #[test]
     fn severity_bands_defaults() {
@@ -3241,9 +3205,10 @@ mod tests {
         assert!(section_headline_rows(&base.sections[0]).is_empty());
 
         // With the override on, the section prepends the disabled row that
-        // `build_menu` adds verbatim (`ENV_OVERRIDE_ROW_TITLE`). muda's Menu
-        // requires the main thread on macOS, so we assert on the pure
-        // helper `build_menu` shares with us instead of building the menu.
+        // `menu_tree_from_snapshot` adds verbatim (`ENV_OVERRIDE_ROW_TITLE`).
+        // muri's compat Menu requires the main thread on macOS, so we assert on
+        // the pure helper `menu_tree_from_snapshot` shares with us instead of
+        // building the menu.
         let mut flagged = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
         flagged.sections[0].env_override_active = true;
         let rows = section_headline_rows(&flagged.sections[0]);
@@ -3504,7 +3469,7 @@ mod tests {
     fn account_header_row_flat_shape_matches_spec_when_not_locked() {
         // v0.5.2 per-account BLOCK header: "{provider} · {email}\t{n}% / {n}%"
         // — replaces `main_row`'s padded flat-list format as the string every
-        // production render path (`build_menu`/`menu_tree_from_snapshot`) now
+        // production render path (`menu_tree_from_snapshot`) now
         // uses for a block's first row.
         let sec = header_test_section("Claude");
         let a = acct("you@work.com", Some(42.0), Some(61.0), false);
@@ -3896,7 +3861,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // H3 (v0.5.0 codeaudit) — capability-gated menu rows. `supports_switching`
+    // Capability-gated menu rows. `supports_switching`
     // used to be the sole gate for BOTH the "Switch to this account" row AND
     // the "Launch client" row, and "Remove…" had no gate at all. A provider
     // like Codex (usage-only, no switching, no launch wired) would still get
@@ -3981,7 +3946,7 @@ mod tests {
 
     #[test]
     fn codex_capabilities_advertise_switching_but_not_launch() {
-        // H3 (v0.5.0 codeaudit) is now closed: state v2 (`State::providers`)
+        // State v2 (`State::providers`)
         // gives Codex somewhere to persist a second account, and
         // `main.rs`/`menubar.rs` dispatch a switch by provider slug, so
         // `write_active_account` is reachable from the live app —
@@ -4237,7 +4202,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // H2 (v0.5.0 codeaudit) — Restore… drop-confirmation wording + store-level
+    // Restore… drop-confirmation wording + store-level
     // wiring. `handle_backup_restore_dialog` itself opens a native file panel
     // and a native `rfd::MessageDialog` confirm prompt, neither of which is
     // unit-testable; these tests cover the pure logic it's built from.

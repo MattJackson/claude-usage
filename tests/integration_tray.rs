@@ -41,7 +41,7 @@ fn one_pixel_icon() -> Icon {
 }
 
 #[test]
-#[ignore = "requires a real (or Xvfb) X server + GTK/libayatana-appindicator3; run with `cargo test --all-features -- --ignored`, or under CI's Ubuntu-only xvfb-run step"]
+#[ignore = "requires a real (or Xvfb) X server + GTK, plus a reachable D-Bus session bus for ksni; run with `cargo test --all-features -- --ignored`, or under CI's Ubuntu-only xvfb-run + dbus-run-session step"]
 fn tray_icon_initializes_sets_icon_and_menu_then_tears_down_cleanly() {
     // 1. GTK actually starts. This is the first real runtime dependency:
     //    without a display (or Xvfb providing one), or without the GTK

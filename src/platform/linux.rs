@@ -3,10 +3,10 @@
 //! Every Linux-specific decision lives in this file — nothing outside
 //! `src/platform/linux.rs` should ever need `#[cfg(target_os = "linux")]`.
 //!
-//! - **Tray icon / menu**: rendered through muri 0.9's `muda-compat` facade
-//!   (`muri::compat::{muda, tray_icon}`) as of the 0.6.0 muri swap — macOS
-//!   still uses the real `tray-icon`/`muda` (its NSMenu styler needs muda's
-//!   `ns_menu()`), but Linux/Windows go through muri. The facade preserves the
+//! - **Tray icon / menu**: rendered through muri's `muda-compat` facade
+//!   (`muri::compat::{muda, tray_icon}`) as of the 0.6.0 muri swap. All three
+//!   platforms go through this facade — there is no real `tray-icon`/`muda`
+//!   dependency or native NSMenu styler anymore. The facade preserves the
 //!   passive tray-icon model (build returns immediately; menu clicks arrive on
 //!   the global `MenuEvent::receiver()` channel), so the GTK main loop still
 //!   has to be pumped on the thread that created the tray icon (see the module
@@ -195,8 +195,8 @@ fn desktop_exec_quote(s: &str) -> String {
 /// into its whitespace-separated tokens, honoring double-quoted spans (and
 /// their `\"`, `\\`, `` \` ``, `\$` escapes) the way `install()` wrote them —
 /// so a path with a space (e.g. `"/home/user/My Apps/usagio"`) round-trips as
-/// ONE token instead of splitting on the internal space (platform-01, v0.5.2
-/// audit). Whitespace outside quotes always separates tokens; quoted spans
+/// ONE token instead of splitting on the internal space. Whitespace outside
+/// quotes always separates tokens; quoted spans
 /// may appear mid-token (`foo"bar baz"qux` -> `foobar bazqux`) though
 /// `desktop_exec_quote` itself never produces that shape — this just doesn't
 /// assume otherwise.
@@ -306,7 +306,7 @@ impl Autostart for LinuxAutostart {
             .lines()
             .find_map(|l| l.strip_prefix("Exec="))
             .context("usagio.desktop has no Exec= line")?;
-        // platform-01 (v0.5.2 audit): quote-aware split, matching the
+        // Quote-aware split, matching the
         // quote-aware writer (`desktop_exec_quote`) `install()` used to
         // produce this line. `split_whitespace()` used to break a quoted
         // path containing a space (e.g. `"/home/user/My Apps/usagio"`) into
@@ -378,7 +378,7 @@ fn fallback_load(dir: &Path) -> Result<Map<String, Value>> {
     }
 }
 
-/// robustness-03 (v0.5.1 audit): write the whole fallback secrets map
+/// Write the whole fallback secrets map
 /// atomically — tmp file at final mode 0600 from creation (no umask window),
 /// then `rename` into place — mirroring `store::write_private` /
 /// `codex::write_auth_json_atomically`. Previously this was a plain
@@ -550,8 +550,8 @@ impl SecretStore for LinuxSecrets {
 // MenuBackend — tray-icon + a GTK main loop
 // ---------------------------------------------------------------------------
 
-/// `tray_icon::TrayIcon` wraps an `Rc<RefCell<..>>` (and, transitively, a raw
-/// `AppIndicator` pointer) on Linux — it is not `Send`. But `MenuBackend` and
+/// muri's compat `TrayIcon` wraps an `Rc<RefCell<..>>` (and, transitively, a
+/// ksni/GTK handle) on Linux — it is not `Send`. But `MenuBackend` and
 /// `MenuHandle` both require `Send` (+`Sync` for the backend) so the rest of
 /// the crate can hold a `Box<dyn Platform>` in a `OnceLock` without caring
 /// which OS it's on. The two requirements are reconciled like this:
@@ -923,7 +923,7 @@ mod tests {
         assert_eq!(desktop_exec_quote("has\"quote"), "\"has\\\"quote\"");
     }
 
-    // --- Exec= quote-aware split (platform-01, v0.5.2 audit) --------------
+    // --- Exec= quote-aware split ------------------------------------------
 
     #[test]
     fn desktop_exec_split_round_trips_path_with_spaces() {
@@ -1036,7 +1036,7 @@ mod tests {
         );
     }
 
-    /// robustness-03 (v0.5.1 audit): `fallback_write` must go through a
+    /// `fallback_write` must go through a
     /// tmp-file + rename, like every other secret-bearing file in the crate
     /// — never leaving a `.secrets.json.tmp.*` orphan behind, and never a
     /// half-written `secrets.json` an interrupted write could produce.

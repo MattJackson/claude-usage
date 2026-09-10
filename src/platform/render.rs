@@ -60,8 +60,8 @@ fn decode_menu_icon(bytes: &[u8]) -> Option<Icon> {
 }
 
 /// Map the platform-agnostic [`ValueColor`] (severity band) to muri's `Color`
-/// for `Submenu::set_value_color` (muri #19). Red = "about to hit the wall",
-/// Amber = "approaching it".
+/// for `Submenu::set_value_color`. Red = "about to hit the wall", Amber =
+/// "approaching it".
 fn muri_color(c: ValueColor) -> Color {
     match c {
         ValueColor::Red => Color::SystemRed,
@@ -157,9 +157,9 @@ fn append_children(container: &dyn Container, items: &[MenuItem]) {
                 ..
             } => {
                 let sub = Submenu::new(label, true);
-                // muri #18/#19: the active account renders bold + leading
-                // checkmark, and its trailing `S% / W%` value segment is tinted
-                // per severity — the 0.5.x look, driven off usagio's RowStyle.
+                // The active account renders bold + leading checkmark, and its
+                // trailing `S% / W%` value segment is tinted per severity,
+                // driven off usagio's `RowStyle`.
                 sub.set_active(*active);
                 sub.set_value_color((*value_color).map(muri_color));
                 append_children(&sub, items);

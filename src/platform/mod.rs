@@ -11,11 +11,13 @@
 //! Linux, Win32 dispatch on Windows), it should use `block_on` inside the impl
 //! rather than infecting the trait surface.
 
-// Trait / MenuTree / MenuItem / MenuBackend / list / delete / etc. are
-// v0.5.0 scaffolding for Linux (ksni) + Windows (Win32) menu backends —
-// wired when those platforms land. macOS still drives the NSMenu path
-// directly through `crate::menubar`. File-level allow so the shape stays
-// reviewed as a whole rather than being pruned one method at a time.
+// The `Platform` / `MenuTree` / `MenuBackend` trait set is implemented by all
+// three platforms (`macos.rs` / `linux.rs` / `windows.rs`). macOS drives its
+// own main-thread `NSApplication` run loop instead of `MenuBackend::run_event_loop`
+// (see `menubar::run`'s macOS branch) but shares the same `MenuTree` +
+// `platform::render::render_menu` content path as Linux/Windows. File-level
+// allow so the trait shape stays reviewed as a whole rather than pruned one
+// unused-on-some-target method at a time.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -90,8 +92,9 @@ pub trait MenuHandle: Send {
     fn set_menu(&self, menu: MenuTree) -> Result<()>;
 }
 
-/// Provider-agnostic dropdown tree. The backend translates to NSMenu / muda /
-/// ksni. Kept small and imperative so backends have room to render natively.
+/// Provider-agnostic dropdown tree. `platform::render::render_menu` translates
+/// it to a live muri (`muda-compat`) menu — the same translator on every OS.
+/// Kept small and imperative so the renderer has room to lay it out natively.
 #[derive(Debug, Clone)]
 pub struct MenuTree {
     pub items: Vec<MenuItem>,
