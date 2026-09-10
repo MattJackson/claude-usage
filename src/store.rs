@@ -1075,8 +1075,7 @@ pub fn unstash_pre_restore(stash: &Path) -> Result<()> {
     let live = state_path()?;
     if std::fs::rename(stash, &live).is_err() {
         // Cross-filesystem fallback (mirrors stash_pre_restore).
-        let bytes =
-            std::fs::read(stash).context("reading pre-restore stash for rollback")?;
+        let bytes = std::fs::read(stash).context("reading pre-restore stash for rollback")?;
         write_private(&live, &bytes).context("restoring live state.json from stash")?;
         let _ = std::fs::remove_file(stash);
     } else {

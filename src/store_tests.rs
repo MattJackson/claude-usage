@@ -720,8 +720,13 @@ fn unstash_pre_restore_rolls_the_live_state_back_exactly() {
     let original = std::fs::read(&live).unwrap();
 
     let dir = config_dir().unwrap();
-    let stash = stash_pre_restore(&dir).unwrap().expect("live state existed");
-    assert!(!live.exists(), "stash should have moved the live file aside");
+    let stash = stash_pre_restore(&dir)
+        .unwrap()
+        .expect("live state existed");
+    assert!(
+        !live.exists(),
+        "stash should have moved the live file aside"
+    );
 
     unstash_pre_restore(&stash).expect("rollback must restore the stashed state");
 
@@ -731,7 +736,10 @@ fn unstash_pre_restore_rolls_the_live_state_back_exactly() {
         original,
         "rolled-back state.json must match the pre-restore bytes exactly"
     );
-    assert!(!stash.exists(), "the stash file should be consumed by the rollback");
+    assert!(
+        !stash.exists(),
+        "the stash file should be consumed by the rollback"
+    );
     // The recovered accounts load correctly (not the zero-account default).
     assert!(State::load()
         .unwrap()
