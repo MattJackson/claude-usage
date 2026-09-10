@@ -23,6 +23,9 @@ STATE="$HOME/.config/usagio/state.json"; mkdir -p "$HOME/.config/usagio"
 shot(){ gnome-screenshot -f "$1" 2>/dev/null || import -window root "$1" 2>/dev/null || scrot "$1" 2>/dev/null; }
 
 W=$(xdotool getdisplaygeometry 2>/dev/null | awk '{print $1}'); W=${W:-1920}
+# Best-known x-offset (from screen right edge) of the usagio appindicator icon,
+# tuned from the first-fixture probe sweep. y is the panel mid-line (~15px).
+CLICK_DX="${CLICK_DX:-88}"
 first=1
 for name in $FIX; do
   log "=== fixture $name ==="
@@ -38,21 +41,32 @@ for name in $FIX; do
     "$AWS" s3 cp /tmp/_wins.txt "$S3/_wins.txt" 2>/dev/null || true
   fi
 
-  # usagio's appindicator sits among the top-right status icons in the GNOME
-  # panel (panel height ~ 27px). Click a few candidate x-offsets from the right
-  # until a menu (a new override-redirect window) appears, then screenshot.
-  clicked=0
-  for dx in 300 340 260 380 220 420; do
-    xdotool mousemove $((W-dx)) 12 click 1 2>/dev/null || true
-    sleep 1
-    # A GNOME popup menu shows as a new window; detect via wmctrl/xdotool count.
-    if xdotool search --onlyvisible --class gjs 2>/dev/null | grep -q . || \
-       xdotool getmouselocation 2>/dev/null | grep -q .; then
-      clicked=1
-    fi
-    # Capture regardless; we pick the good ones on the Mac side.
-    break
-  done
+  # A standalone gnome-shell (no session manager) with no open windows starts
+  # in the Activities OVERVIEW. Press Escape (twice, with the pointer settled on
+  # the desktop) to drop to the plain desktop before shooting.
+  xdotool mousemove 960 540 2>/dev/null || true
+  xdotool key Escape 2>/dev/null || true; sleep 1
+  xdotool key Escape 2>/dev/null || true; sleep 1
+
+  # usagio's appindicator sits at the FAR top-right of the GNOME panel (the
+  # observed icon "U 47%" centered near x≈W-85, y≈15). appindicator menus are
+  # Clutter actors, invisible to xdotool search, so we can't detect the open
+  # menu — instead, for the FIRST fixture, sweep candidate x-offsets and upload
+  # a probe shot per offset so the winning click position can be read off S3.
+  if [ "$first" = 1 ]; then
+    for dx in 60 75 88 100 115 130; do
+      xdotool key Escape 2>/dev/null || true; sleep 1
+      xdotool mousemove $((W-dx)) 15 2>/dev/null || true
+      xdotool click 1 2>/dev/null || true; sleep 2
+      shot "/tmp/probe-$dx.png"
+      "$AWS" s3 cp "/tmp/probe-$dx.png" "$S3/_probe-dx-$dx.png" 2>/dev/null || true
+    done
+    xdotool key Escape 2>/dev/null || true; sleep 1
+  fi
+
+  # Best-known offset for the real shot: click the usagio icon to open its menu.
+  xdotool mousemove $((W-CLICK_DX)) 15 2>/dev/null || true
+  xdotool click 1 2>/dev/null || true; sleep 2
 
   shot "/tmp/linux-$name-full.png"
   "$AWS" s3 cp "/tmp/linux-$name-full.png" "$S3/linux-$name-full.png" 2>/dev/null || true

@@ -37,6 +37,26 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(mut c) = self.0.take() {
+            // Kill the child's whole process GROUP, not just the direct child.
+            // MCP servers are commonly `npx`/`node` (or `uvx`/`python`) wrappers
+            // that spawn their own children; `Child::kill` signals only the
+            // direct child, leaving those grandchildren orphaned and running
+            // (H5 reaped the direct child but not its tree). The child is
+            // spawned with `process_group(0)` on unix, so its PGID == its PID;
+            // sending SIGKILL to `-PID` reaps the entire subtree. The direct
+            // `kill()`/`wait()` still runs to reap the child itself (and is the
+            // only cleanup on non-unix, where process groups aren't set up).
+            #[cfg(unix)]
+            {
+                let pgid = c.id() as i32;
+                // SAFETY: kill(2) with a negative pid targets that process
+                // group. `pgid` is this child's own pid — which is its pgid
+                // because it was spawned with process_group(0) — so this can
+                // only ever signal processes usagio itself spawned.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -78,14 +98,20 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
         serde_json::from_value(config.clone()).map_err(|e| format!("bad stdio config: {}", e))?;
 
     let start = Instant::now();
-    let mut child = Command::new(&cfg.command)
-        .args(&cfg.args)
+    let mut cmd = Command::new(&cfg.command);
+    cmd.args(&cfg.args)
         .envs(&cfg.env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn: {}", e))?;
+        .stderr(Stdio::null());
+    // Put the server in its own process group so ChildGuard's Drop can SIGKILL
+    // the whole tree (npx → node → real server), not just the direct child.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("spawn: {}", e))?;
 
     // Pull the stdio handles out BEFORE handing the child to ChildGuard so the
     // guard doesn't need to be re-borrowed for each I/O op (avoids a two-mut

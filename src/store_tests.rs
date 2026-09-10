@@ -707,6 +707,54 @@ fn stash_pre_restore_is_noop_when_no_live_state() {
     assert!(stash_pre_restore(&dir).unwrap().is_none());
 }
 
+#[test]
+fn unstash_pre_restore_rolls_the_live_state_back_exactly() {
+    // Audit finding 11: if a restore WRITE fails after stash_pre_restore has
+    // already moved state.json aside, unstash_pre_restore must put the original
+    // back so state.json is never left MISSING (which State::load would read as
+    // zero accounts). Round-trip: stash removes the live file, unstash restores
+    // it byte-for-byte, owner-only.
+    let _g = ScopedConfigDir::new();
+    make_state_with(&["keep@e.com"]).save().unwrap();
+    let live = config_dir().unwrap().join("state.json");
+    let original = std::fs::read(&live).unwrap();
+
+    let dir = config_dir().unwrap();
+    let stash = stash_pre_restore(&dir)
+        .unwrap()
+        .expect("live state existed");
+    assert!(
+        !live.exists(),
+        "stash should have moved the live file aside"
+    );
+
+    unstash_pre_restore(&stash).expect("rollback must restore the stashed state");
+
+    assert!(live.exists(), "state.json must exist again after rollback");
+    assert_eq!(
+        std::fs::read(&live).unwrap(),
+        original,
+        "rolled-back state.json must match the pre-restore bytes exactly"
+    );
+    assert!(
+        !stash.exists(),
+        "the stash file should be consumed by the rollback"
+    );
+    // The recovered accounts load correctly (not the zero-account default).
+    assert!(State::load()
+        .unwrap()
+        .accounts
+        .iter()
+        .any(|a| a.email.as_deref() == Some("keep@e.com")));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&live).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rolled-back state.json must stay owner-only");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // M1 — notification_config parse failures must not be silent.
 // ---------------------------------------------------------------------------

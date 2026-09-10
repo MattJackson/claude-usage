@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.23] - 2026-09-10
+
+### Fixed
+- **Account switching never rotates the live CLI's refresh token.** usagio no
+  longer POSTs `/token` for the *active* account on a switch or `token` command;
+  it adopts the vendor CLI's current token instead. Single-use refresh tokens
+  rotate server-side, so minting one for the account the real CLI is using would
+  invalidate the CLI's own copy and force a re-login — breaking the "capture
+  once, never re-login" guarantee.
+- **A failed restore can no longer wipe your accounts.** "Restore…" moves the
+  live `state.json` aside before writing the restored one; if that write failed,
+  `state.json` was left missing and usagio read zero accounts on next load. The
+  pre-restore state is now rolled back automatically on write failure (and if the
+  rollback itself fails, the error names the backup file to recover from).
+- **Corrupt/unreadable `state.json` no longer silently bypasses the
+  overwrite-protection guard.** usagio now logs loudly when the guard (and rolling
+  backup) is skipped, so an account-drop can't slip through unnoticed.
+- **MCP context-ledger servers are fully cleaned up.** usagio now kills the
+  server's whole process group, so wrapper commands (`npx`/`node`, `uvx`/`python`)
+  don't leave orphaned child processes behind.
+
+### Security
+- **History files are created owner-only (0600).** Per-account usage history under
+  `~/.config/usagio` no longer inherits a world-readable umask.
+
 ## [0.5.22] - 2026-09-09
 
 ### Changed

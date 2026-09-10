@@ -38,7 +38,9 @@ impl Provider for FireworksProvider {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            supports_usage: true,
+            // STUB: no capture/usage path wired yet — false hides it from the
+            // onboarding menu (partition_capture_providers) until it is real.
+            supports_usage: false,
             supports_switching: false,
             supports_launch: false,
             supports_remove: true,
@@ -82,7 +84,7 @@ mod tests {
     #[test]
     fn capabilities_are_locked() {
         let caps = FireworksProvider.capabilities();
-        assert!(caps.supports_usage);
+        assert!(!caps.supports_usage); // stub: hidden until capture is wired
         assert!(!caps.supports_switching);
         // Fireworks is the sole API-key provider that keys accounts by email
         // (via GET /v1/accounts) — the flag must stay on so the menu wires

@@ -293,11 +293,34 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
-// Test-only seam: lets `main_tests.rs` arm the cfg(test) mock keychain to fail
-// a `set`, so the apply_account rollback path is exercisable. Not compiled into
-// production builds.
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) use macos::arm_keychain_set_failure;
+// Test-only failure-injection seam, shared by ALL platforms' `SecretStore::set`
+// (macOS mock, Linux keyring/fallback, Windows Credential Manager). Lets
+// `main_tests.rs` arm the next `set` to fail so the apply_account rollback path
+// (never a half-applied switch) is exercisable on every CI platform, not just
+// macOS. Not compiled into production builds.
+#[cfg(test)]
+pub(crate) mod test_secret_seam {
+    use std::cell::Cell;
+    thread_local! {
+        // THREAD-LOCAL, one-shot: `apply_account` (and its `set`) runs
+        // synchronously on the arming test's own thread, so a parallel test's
+        // `set` on another thread can never consume this failure.
+        static FAIL_NEXT_SET: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn arm_set_failure() {
+        FAIL_NEXT_SET.with(|f| f.set(true));
+    }
+    /// Consume the armed failure (true at most once per `arm_set_failure`).
+    pub(crate) fn take_set_failure() -> bool {
+        FAIL_NEXT_SET.with(|f| f.replace(false))
+    }
+}
+
+/// Arm the `cfg(test)` secret store to fail its next `set` on this thread.
+#[cfg(test)]
+pub(crate) fn arm_keychain_set_failure() {
+    test_secret_seam::arm_set_failure();
+}
 
 /// Shared Unix chmod backing `Platform::secure_permissions` on both macOS and
 /// Linux: `0700` for a directory, `0600` for a file, based on the path's
