@@ -496,6 +496,13 @@ impl SecretStore for LinuxSecrets {
     }
 
     fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
+        // Shared test seam: a test can arm the next set to fail so the
+        // apply_account rollback path is exercisable on Linux (not just macOS).
+        // Checked before any keyring/fallback I/O so no real write happens.
+        #[cfg(test)]
+        if super::test_secret_seam::take_set_failure() {
+            bail!("injected secret-store set failure (test seam)");
+        }
         let dir = xdg_config_home().join("usagio");
         set_impl(
             || keyring::Entry::new(service, account)?.set_password(secret),

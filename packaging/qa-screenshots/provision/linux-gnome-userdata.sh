@@ -2,25 +2,37 @@
 exec >/var/log/usagio-gnome.log 2>&1
 set -x
 S3="@@S3_URI@@"; VER="@@VERSION@@"; FIX="@@FIXTURES@@"
-push(){ /usr/local/bin/aws s3 cp /var/log/usagio-gnome.log "$S3/_userdata.log" 2>/dev/null || true; }
+push(){ command -v aws >/dev/null 2>&1 && aws s3 cp /var/log/usagio-gnome.log "$S3/_userdata.log" 2>/dev/null || true; }
+note(){ echo "$(date -Is) STAGE: $*"; push; }
 
-for i in $(seq 1 120); do fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; sleep 5; done
+for i in $(seq 1 150); do fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; sleep 5; done
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y --no-install-recommends \
-  gnome-session gnome-shell gnome-shell-extension-ubuntu-appindicators gnome-screenshot \
-  gnome-settings-daemon dbus-x11 xserver-xorg-core xserver-xorg-video-dummy xserver-xorg-legacy \
-  xinit x11-xserver-utils xdotool scrot imagemagick fonts-dejavu-core adwaita-icon-theme \
-  gnome-themes-extra ubuntu-wallpapers libayatana-appindicator3-1 libwebkit2gtk-4.1-0 \
-  libxdo3 curl ca-certificates unzip
+apt-get update -y || true
 
-curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/a.zip
-( cd /tmp && unzip -q a.zip && ./aws/install )
-push
+# awscli FIRST so we have logging/uploads even if the GNOME install has trouble.
+apt-get install -y awscli curl ca-certificates || snap install aws-cli --classic || true
+note "awscli=$(command -v aws) ver=$(aws --version 2>&1 | head -1)"
+
+# GNOME + Xorg-dummy stack. Bulk install, then retry the CORE bits individually
+# so one unavailable package name can't abort everything (the previous failure).
+GPKGS="gnome-session gnome-shell gnome-screenshot gnome-settings-daemon dbus-x11 \
+xserver-xorg-core xserver-xorg-video-dummy xserver-xorg-legacy xinit x11-xserver-utils \
+xdotool scrot imagemagick fonts-dejavu-core adwaita-icon-theme gnome-themes-extra \
+ubuntu-wallpapers libayatana-appindicator3-1 libwebkit2gtk-4.1-0 libxdo3 \
+libgl1-mesa-dri libglx-mesa0 libegl-mesa0 mesa-utils \
+gnome-shell-extension-appindicator gnome-shell-extension-ubuntu-appindicators"
+apt-get install -y --no-install-recommends $GPKGS || note "bulk apt had failures; retrying core"
+for p in gnome-session gnome-shell gnome-screenshot gnome-settings-daemon dbus-x11 \
+  xserver-xorg-core xserver-xorg-video-dummy xserver-xorg-legacy xdotool imagemagick scrot \
+  ubuntu-wallpapers libayatana-appindicator3-1 libwebkit2gtk-4.1-0 libxdo3 \
+  gnome-shell-extension-appindicator; do
+  dpkg -s "$p" >/dev/null 2>&1 || apt-get install -y --no-install-recommends "$p" || note "MISSING $p"
+done
+note "gnome-session=$(command -v gnome-session) Xorg=$(command -v Xorg) shot=$(command -v gnome-screenshot)"
 
 curl -fsSL -o /tmp/usagio.deb "https://github.com/MattJackson/usagio/releases/download/$VER/usagio_${VER#v}_amd64.deb"
 apt-get install -y /tmp/usagio.deb || { apt-get -f install -y; dpkg -i /tmp/usagio.deb; apt-get -f install -y; }
-/usr/bin/usagio --version; push
+note "usagio=$(/usr/bin/usagio --version 2>&1 | head -1)"
 
 id usagioqa || useradd -m -s /bin/bash usagioqa
 loginctl enable-linger usagioqa || true
@@ -55,22 +67,38 @@ XORG
 echo 'allowed_users=anybody' >/etc/X11/Xwrapper.config
 echo 'needs_root_rights=yes' >>/etc/X11/Xwrapper.config
 
-/usr/local/bin/aws s3 cp "$S3/linux-gnome-capture.sh" /home/usagioqa/run-capture.sh
+aws s3 cp "$S3/linux-gnome-capture.sh" /home/usagioqa/run-capture.sh
 chmod +x /home/usagioqa/run-capture.sh
 chown usagioqa:usagioqa /home/usagioqa/run-capture.sh
 
+note "starting Xorg + gnome-session"
 Xorg :99 -config /etc/X11/xorg-dummy.conf -noreset vt8 >/var/log/xorg99.log 2>&1 &
-sleep 6
+sleep 8
 U=$(id -u usagioqa)
 install -d -m700 -o usagioqa -g usagioqa /run/user/$U
-su - usagioqa -c "export DISPLAY=:99 XDG_RUNTIME_DIR=/run/user/$U LIBGL_ALWAYS_SOFTWARE=1 GDK_BACKEND=x11; dbus-run-session -- bash -lc 'gnome-session --session=ubuntu >/tmp/gnome-session.log 2>&1 & sleep 35; export S3=\"$S3\" FIX=\"$FIX\"; /home/usagioqa/run-capture.sh >/tmp/run-capture.log 2>&1'" &
 
-for i in $(seq 1 45); do
+# DIAGNOSTIC PROBE: run gnome-shell --x11 directly (no gnome-session) for ~18s and
+# capture its own stderr — that's the crash reason gnome-session hides ("Oh no").
+# Also dump glxinfo so we can see whether GLX/swrast is actually available.
+ENVX="DISPLAY=:99 XDG_RUNTIME_DIR=/run/user/$U LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe MESA_LOADER_DRIVER_OVERRIDE=llvmpipe GDK_BACKEND=x11"
+su - usagioqa -c "export $ENVX; { echo '== glxinfo =='; glxinfo 2>&1 | head -25; echo '== gnome-shell --x11 probe =='; dbus-run-session -- timeout 18 gnome-shell --x11 --replace; echo \"shell exit=\$?\"; } >/tmp/shell-probe.log 2>&1" || true
+aws s3 cp /tmp/shell-probe.log "$S3/_shell-probe.log" 2>/dev/null || true
+note "shell probe uploaded"
+
+# Launch gnome-shell DIRECTLY as the X11 compositor (NOT via gnome-session).
+# The probe above proved `gnome-shell --x11 --replace` starts fine on the dummy
+# display, whereas `gnome-session --session=ubuntu` fails its required-component
+# check (no GDM/display-manager) and shows the "Oh no, something has gone wrong"
+# screen. gnome-shell alone renders the top panel + loads the appindicator
+# extension (enabled by run-capture.sh), which is all we need for the tray shot.
+su - usagioqa -c "export $ENVX; dbus-run-session -- bash -lc 'gnome-shell --x11 --replace >/tmp/gnome-session.log 2>&1 & sleep 30; export S3=\"$S3\" FIX=\"$FIX\"; /home/usagioqa/run-capture.sh >/tmp/run-capture.log 2>&1'" &
+
+for i in $(seq 1 50); do
   sleep 20
-  /usr/local/bin/aws s3 cp /var/log/usagio-gnome.log "$S3/_userdata.log" 2>/dev/null || true
-  /usr/local/bin/aws s3 cp /var/log/xorg99.log "$S3/_xorg.log" 2>/dev/null || true
-  { echo "== gnome-session =="; cat /tmp/gnome-session.log 2>/dev/null; echo "== run-capture =="; cat /tmp/run-capture.log 2>/dev/null; } >/tmp/sess.log 2>/dev/null || true
-  /usr/local/bin/aws s3 cp /tmp/sess.log "$S3/_session.log" 2>/dev/null || true
-  /usr/local/bin/aws s3 ls "$S3/_done" >/dev/null 2>&1 && break
+  aws s3 cp /var/log/usagio-gnome.log "$S3/_userdata.log" 2>/dev/null || true
+  aws s3 cp /var/log/xorg99.log "$S3/_xorg.log" 2>/dev/null || true
+  { echo "== gnome-session =="; cat /tmp/gnome-session.log 2>/dev/null; echo "== run-capture =="; cat /tmp/run-capture.log 2>/dev/null; echo "== journal (gnome/mutter) =="; journalctl -a --no-pager 2>/dev/null | grep -iE 'gnome-shell|mutter|gnome-session' | tail -40; } >/tmp/sess.log 2>/dev/null || true
+  aws s3 cp /tmp/sess.log "$S3/_session.log" 2>/dev/null || true
+  aws s3 ls "$S3/_done" >/dev/null 2>&1 && break
 done
-push
+note "userdata end"

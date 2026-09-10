@@ -465,6 +465,13 @@ impl SecretStore for WindowsSecrets {
     }
 
     fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
+        // Shared test seam: a test can arm the next set to fail so the
+        // apply_account rollback path is exercisable on Windows (not just macOS).
+        // Checked before touching the real Credential Manager.
+        #[cfg(test)]
+        if super::test_secret_seam::take_set_failure() {
+            bail!("injected secret-store set failure (test seam)");
+        }
         let entry =
             keyring::Entry::new(service, account).context("opening Credential Manager entry")?;
         entry.set_password(secret).with_context(|| {

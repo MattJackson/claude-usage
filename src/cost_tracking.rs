@@ -138,7 +138,9 @@ pub enum Verdict {
     Upgrade,
 }
 
-// See CycleCost above — the verdict panel wiring lands in v0.5.0.
+// See CycleCost above. Built-but-unwired scaffolding: the verdict/recommendations
+// panel that will consume this is not yet rendered in the menu, so it's
+// #[allow(dead_code)] until that UI lands.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct SubscriptionVerdict {
@@ -152,7 +154,7 @@ pub struct SubscriptionVerdict {
     pub recoverable_dollars: f64,
 }
 
-#[allow(dead_code)] // wired into v0.5.0 recommendations panel
+#[allow(dead_code)] // consumed by the not-yet-rendered recommendations panel
 pub fn subscription_verdict(
     account: &AccountKey,
     cycles_to_analyze: usize,
@@ -291,12 +293,46 @@ mod tests {
         }
     }
 
-    // Fixture-based full estimate — requires usage_log fixture harness; wired in
-    // tests/integration when the crate lands.
     #[test]
-    #[ignore]
-    fn estimate_cycle_cost_via_public_api() {
-        let acc = AccountKey::default();
-        let _ = estimate_cycle_cost(&acc, CLAUDE_MAX_100_WEEKLY_TOKENS);
+    fn estimate_cycle_cost_is_none_without_usage_history() {
+        // Public-API contract: with no recorded snapshots for the account there
+        // is nothing to estimate from, so the estimate is `None` (not a zero-
+        // cost `Some`). Exercises the real usage_log read path under a scoped
+        // config dir.
+        let _g = crate::store::ScopedConfigDir::new();
+        assert!(
+            estimate_cycle_cost(&AccountKey::default(), CLAUDE_MAX_100_WEEKLY_TOKENS).is_none()
+        );
+    }
+
+    #[test]
+    fn estimate_cycle_cost_uses_latest_weekly_snapshot() {
+        // Happy path: a single weekly snapshot at 50% of a known plan cap yields
+        // a weekly-window estimate whose split input+output tokens equal ~50% of
+        // that cap. This is the assertion the old `#[ignore]`d, assertion-free
+        // `..._via_public_api` test was supposed to make.
+        let _g = crate::store::ScopedConfigDir::new();
+        let key = AccountKey::new("claude", "cost@example.com");
+        usage_log::append(&usage_log::Snapshot {
+            ts: chrono::Utc::now(),
+            provider: "claude".into(),
+            account: "cost@example.com".into(),
+            session_pct: None,
+            weekly_pct: Some(50.0),
+            active_model: None,
+        })
+        .expect("seed snapshot");
+
+        let est = estimate_cycle_cost(&key, CLAUDE_MAX_100_WEEKLY_TOKENS)
+            .expect("a weekly snapshot must yield an estimate");
+        assert_eq!(est.window, Window::Weekly);
+        let consumed = est.estimated_input_tokens + est.estimated_output_tokens;
+        let expected = CLAUDE_MAX_100_WEEKLY_TOKENS / 2;
+        // Allow ±2 tokens for the input/output split rounding.
+        assert!(
+            consumed.abs_diff(expected) <= 2,
+            "consumed {consumed} should be ~50% of cap ({expected})"
+        );
+        assert!(est.estimated_usd > 0.0, "a nonzero spend must be estimated");
     }
 }
