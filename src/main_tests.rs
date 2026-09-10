@@ -1816,8 +1816,9 @@ fn refresh_provider_active_account_codex_adopts_cli_rotation_without_posting() {
 // no failure-injection seam existed, so this rollback branch had ZERO coverage
 // — a regression dropping the rollback (leaving ~/.claude.json on the new
 // account while the keychain still holds the old) would have passed the suite.
-// macOS-only: exercises the Claude keychain path + the macos mock's seam.
-#[cfg(target_os = "macos")]
+// Runs on every platform: the failure seam now lives in platform/mod.rs and is
+// honored by all three SecretStore::set impls (macOS mock, Linux keyring, Windows
+// Credential Manager), so the rollback guarantee is enforced in CI everywhere.
 #[test]
 fn apply_account_rolls_back_claude_json_when_keychain_write_fails() {
     use crate::store::{Account, ScopedConfigDir};

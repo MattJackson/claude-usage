@@ -492,11 +492,11 @@ impl SecretStore for MacOsSecrets {
     }
 
     fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
-        // Failure-injection seam: a test can arm the next `set` to fail so the
-        // apply_account keychain-write-failure ROLLBACK path (the guard behind
-        // "never a half-applied switch") is actually exercisable — the mock
-        // otherwise always succeeds and left that branch uncovered.
-        if in_memory::take_set_failure() {
+        // Failure-injection seam (shared across platforms): a test can arm the
+        // next `set` to fail so the apply_account keychain-write-failure ROLLBACK
+        // path (the guard behind "never a half-applied switch") is exercisable —
+        // the mock otherwise always succeeds and left that branch uncovered.
+        if super::test_secret_seam::take_set_failure() {
             bail!("injected keychain set failure (test seam)");
         }
         in_memory::set(service, account, secret);
@@ -521,29 +521,10 @@ impl SecretStore for MacOsSecrets {
 /// how the real keychain persists across calls within a process).
 #[cfg(test)]
 mod in_memory {
-    use std::cell::Cell;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
     static STORE: Mutex<Option<HashMap<(String, String), String>>> = Mutex::new(None);
-
-    thread_local! {
-        /// One-shot "make the next `set` fail" flag for the rollback test.
-        /// THREAD-LOCAL, not a process global: `apply_account` (and thus its
-        /// `keychain_write` → `set`) runs synchronously on the arming test's
-        /// own thread, so a parallel test's `set` on another thread can never
-        /// consume this failure — no cross-test contamination.
-        static FAIL_NEXT_SET: Cell<bool> = const { Cell::new(false) };
-    }
-
-    pub(super) fn arm_set_failure() {
-        FAIL_NEXT_SET.with(|f| f.set(true));
-    }
-
-    /// Consume the armed failure (true at most once per `arm_set_failure`).
-    pub(super) fn take_set_failure() -> bool {
-        FAIL_NEXT_SET.with(|f| f.replace(false))
-    }
 
     fn with_store<T>(f: impl FnOnce(&mut HashMap<(String, String), String>) -> T) -> T {
         let mut guard = STORE.lock().unwrap_or_else(|e| e.into_inner());
@@ -566,15 +547,6 @@ mod in_memory {
     pub(super) fn delete(service: &str, account: &str) {
         with_store(|m| m.remove(&(service.to_string(), account.to_string())));
     }
-}
-
-/// Arm the `cfg(test)` mock keychain to fail its next `set`. Lets a crate test
-/// (e.g. the apply_account rollback test in `main_tests.rs`) exercise the
-/// keychain-write-failure branch that the always-succeeding mock otherwise
-/// leaves uncovered.
-#[cfg(test)]
-pub(crate) fn arm_keychain_set_failure() {
-    in_memory::arm_set_failure();
 }
 
 // ---- Autostart -----------------------------------------------------------

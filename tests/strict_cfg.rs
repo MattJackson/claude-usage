@@ -61,12 +61,6 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Linux/Windows dependency graph. Goes away when the popover becomes the
     // macOS default and the feature gate is dropped (Phase 2/3).
     ("src/main.rs", 32),
-    // src/main_tests.rs — `apply_account_rolls_back_claude_json_when_keychain_write_fails`:
-    // the keychain-write-failure rollback test (v0.5.17 codeaudit #11). macOS-
-    // only because it drives the Claude keychain path through the macOS mock's
-    // failure-injection seam (`crate::platform::arm_keychain_set_failure`), which
-    // only exists under `cfg(all(test, target_os = "macos"))`.
-    ("src/main_tests.rs", 1820),
     // src/menubar.rs — `use std::cell::RefCell` (macOS thread-local NSMenu
     // context storage; only reachable via mac_style).
     ("src/menubar.rs", 15),
