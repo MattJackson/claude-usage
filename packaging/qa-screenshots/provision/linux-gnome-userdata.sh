@@ -2,7 +2,7 @@
 exec >/var/log/usagio-gnome.log 2>&1
 set -x
 S3="@@S3_URI@@"; VER="@@VERSION@@"; FIX="@@FIXTURES@@"
-push(){ /usr/local/bin/aws s3 cp /var/log/usagio-gnome.log "$S3/_userdata.log" 2>/dev/null || true; }
+push(){ aws s3 cp /var/log/usagio-gnome.log "$S3/_userdata.log" 2>/dev/null || true; }
 
 for i in $(seq 1 120); do fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; sleep 5; done
 export DEBIAN_FRONTEND=noninteractive
@@ -12,10 +12,8 @@ apt-get install -y --no-install-recommends \
   gnome-settings-daemon dbus-x11 xserver-xorg-core xserver-xorg-video-dummy xserver-xorg-legacy \
   xinit x11-xserver-utils xdotool scrot imagemagick fonts-dejavu-core adwaita-icon-theme \
   gnome-themes-extra ubuntu-wallpapers libayatana-appindicator3-1 libwebkit2gtk-4.1-0 \
-  libxdo3 curl ca-certificates unzip
-
-curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/a.zip
-( cd /tmp && unzip -q a.zip && ./aws/install )
+  libxdo3 curl ca-certificates awscli
+command -v aws && aws --version
 push
 
 curl -fsSL -o /tmp/usagio.deb "https://github.com/MattJackson/usagio/releases/download/$VER/usagio_${VER#v}_amd64.deb"
@@ -55,7 +53,7 @@ XORG
 echo 'allowed_users=anybody' >/etc/X11/Xwrapper.config
 echo 'needs_root_rights=yes' >>/etc/X11/Xwrapper.config
 
-/usr/local/bin/aws s3 cp "$S3/linux-gnome-capture.sh" /home/usagioqa/run-capture.sh
+aws s3 cp "$S3/linux-gnome-capture.sh" /home/usagioqa/run-capture.sh
 chmod +x /home/usagioqa/run-capture.sh
 chown usagioqa:usagioqa /home/usagioqa/run-capture.sh
 
@@ -67,10 +65,10 @@ su - usagioqa -c "export DISPLAY=:99 XDG_RUNTIME_DIR=/run/user/$U LIBGL_ALWAYS_S
 
 for i in $(seq 1 45); do
   sleep 20
-  /usr/local/bin/aws s3 cp /var/log/usagio-gnome.log "$S3/_userdata.log" 2>/dev/null || true
-  /usr/local/bin/aws s3 cp /var/log/xorg99.log "$S3/_xorg.log" 2>/dev/null || true
+  aws s3 cp /var/log/usagio-gnome.log "$S3/_userdata.log" 2>/dev/null || true
+  aws s3 cp /var/log/xorg99.log "$S3/_xorg.log" 2>/dev/null || true
   { echo "== gnome-session =="; cat /tmp/gnome-session.log 2>/dev/null; echo "== run-capture =="; cat /tmp/run-capture.log 2>/dev/null; } >/tmp/sess.log 2>/dev/null || true
-  /usr/local/bin/aws s3 cp /tmp/sess.log "$S3/_session.log" 2>/dev/null || true
-  /usr/local/bin/aws s3 ls "$S3/_done" >/dev/null 2>&1 && break
+  aws s3 cp /tmp/sess.log "$S3/_session.log" 2>/dev/null || true
+  aws s3 ls "$S3/_done" >/dev/null 2>&1 && break
 done
 push
