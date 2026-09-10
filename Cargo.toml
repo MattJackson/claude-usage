@@ -115,7 +115,7 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "c
 # break. 0.9.1 landed the `MenuId::new` + `compat::tray_icon::menu` drop-ins
 # (muri #4/#5); 0.9.2 made `build()` spawn a live tray + render the tray icon
 # (muri #6/#7); 0.9.3 renders a text `set_title` on the macOS status item (#8).
-muri = { version = "=0.9.5", features = ["muda-compat"] }
+muri = { version = "=0.9.6", features = ["muda-compat"] }
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status
