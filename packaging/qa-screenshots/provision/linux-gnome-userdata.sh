@@ -19,6 +19,7 @@ GPKGS="gnome-session gnome-shell gnome-screenshot gnome-settings-daemon dbus-x11
 xserver-xorg-core xserver-xorg-video-dummy xserver-xorg-legacy xinit x11-xserver-utils \
 xdotool scrot imagemagick fonts-dejavu-core adwaita-icon-theme gnome-themes-extra \
 ubuntu-wallpapers libayatana-appindicator3-1 libwebkit2gtk-4.1-0 libxdo3 \
+libgl1-mesa-dri libglx-mesa0 libegl-mesa0 mesa-utils \
 gnome-shell-extension-appindicator gnome-shell-extension-ubuntu-appindicators"
 apt-get install -y --no-install-recommends $GPKGS || note "bulk apt had failures; retrying core"
 for p in gnome-session gnome-shell gnome-screenshot gnome-settings-daemon dbus-x11 \
@@ -75,7 +76,7 @@ Xorg :99 -config /etc/X11/xorg-dummy.conf -noreset vt8 >/var/log/xorg99.log 2>&1
 sleep 8
 U=$(id -u usagioqa)
 install -d -m700 -o usagioqa -g usagioqa /run/user/$U
-su - usagioqa -c "export DISPLAY=:99 XDG_RUNTIME_DIR=/run/user/$U LIBGL_ALWAYS_SOFTWARE=1 GDK_BACKEND=x11; dbus-run-session -- bash -lc 'gnome-session --session=ubuntu >/tmp/gnome-session.log 2>&1 & sleep 40; export S3=\"$S3\" FIX=\"$FIX\"; /home/usagioqa/run-capture.sh >/tmp/run-capture.log 2>&1'" &
+su - usagioqa -c "export DISPLAY=:99 XDG_RUNTIME_DIR=/run/user/$U LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe MESA_LOADER_DRIVER_OVERRIDE=llvmpipe GDK_BACKEND=x11; dbus-run-session -- bash -lc 'gnome-session --session=ubuntu >/tmp/gnome-session.log 2>&1 & sleep 45; export S3=\"$S3\" FIX=\"$FIX\"; /home/usagioqa/run-capture.sh >/tmp/run-capture.log 2>&1'" &
 
 for i in $(seq 1 50); do
   sleep 20
