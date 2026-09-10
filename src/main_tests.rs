@@ -57,7 +57,10 @@ fn truncate_long_string_adds_ellipsis() {
 
 #[test]
 fn humanize_until_past_is_now() {
-    assert_eq!(humanize_until(Utc::now() - Duration::hours(1)), "now");
+    // Sub-minute / already-past reads "<1m", never "now"/"0m" — a countdown
+    // flooring to 0 looked like it had already reset when it hadn't.
+    assert_eq!(humanize_until(Utc::now() - Duration::hours(1)), "<1m");
+    assert_eq!(humanize_until(Utc::now() + Duration::seconds(30)), "<1m");
 }
 
 #[test]
@@ -625,21 +628,21 @@ fn next_interval_tightens_to_warning_inside_the_band() {
 
 #[test]
 fn next_interval_tightens_to_backstop_at_or_above_trigger_when_actionable() {
-    // At or above the trigger AND a swap is actionable: 10s BACKSTOP cadence.
+    // At or above the trigger AND a swap is actionable: BACKSTOP cadence.
     // The auto-swap should already have fired; this makes sure a transient
     // failure or a soon-clearing cooldown doesn't leave us blind for a full
-    // base cycle.
+    // base cycle. Floor is 30s (never faster) — see WATCH_BACKSTOP_INTERVAL_SECS.
     assert_eq!(
         next_interval(150, 150, false, Some(95.0), TRIGGER_FOR_TESTS, true),
-        10
+        WATCH_BACKSTOP_INTERVAL_SECS
     );
     assert_eq!(
         next_interval(150, 150, false, Some(99.9), TRIGGER_FOR_TESTS, true),
-        10
+        WATCH_BACKSTOP_INTERVAL_SECS
     );
     assert_eq!(
         next_interval(150, 150, false, Some(100.0), TRIGGER_FOR_TESTS, true),
-        10
+        WATCH_BACKSTOP_INTERVAL_SECS
     );
 }
 
@@ -685,7 +688,7 @@ fn cadence_max_pct_folds_weekly_not_just_session() {
     assert_eq!(m, Some(99.0));
     assert_eq!(
         next_interval(150, 150, false, m, TRIGGER_FOR_TESTS, true),
-        10,
+        WATCH_BACKSTOP_INTERVAL_SECS,
         "active session=0/weekly=99 at trigger=95 must hit BACKSTOP cadence"
     );
 }

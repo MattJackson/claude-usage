@@ -857,6 +857,28 @@ fn shared_swap_guard() -> std::sync::Arc<std::sync::Mutex<SwapGuard>> {
         .clone()
 }
 
+/// Settle margin (seconds) after a window's reset instant before the poller
+/// wakes to refresh it — the vendor's usage counter needs a beat to roll over.
+const RESET_SETTLE_SECS: u64 = 5;
+
+/// Seconds until the soonest upcoming session/weekly reset across all accounts,
+/// plus [`RESET_SETTLE_SECS`]. `None` when no account has a known future reset.
+/// Lets `poll_loop` wake at the reset boundary (refresh + swap immediately)
+/// rather than waiting out the cadence — the reason a just-reset account showed
+/// a stale near-100% instead of its fresh 0%.
+fn next_reset_wake_secs() -> Option<u64> {
+    let now = now_utc();
+    build_snapshot()
+        .sections
+        .iter()
+        .flat_map(|s| s.accounts.iter())
+        .flat_map(|a| [a.session_reset_at, a.weekly_reset_at])
+        .flatten()
+        .filter(|dt| *dt > now)
+        .map(|dt| (dt - now).num_seconds().max(0) as u64 + RESET_SETTLE_SECS)
+        .min()
+}
+
 fn poll_loop() {
     let guard = shared_swap_guard();
     let base = WATCH_INTERVAL_SECS;
@@ -894,7 +916,16 @@ fn poll_loop() {
                  event=cadence prev={prev}s new={current}s max_pct={max_pct:.1} trigger={trigger:.0}"
             ));
         }
-        std::thread::sleep(Duration::from_secs(current));
+        // Wake right after the soonest upcoming window reset (+ a settle
+        // margin) if that's sooner than the normal cadence — so a session/
+        // weekly reset refreshes usage and fires any now-unblocked swap
+        // immediately, instead of showing stale "99%" until the next poll. A
+        // single targeted boundary wake, so it may dip below the cadence floor.
+        let sleep_secs = match next_reset_wake_secs() {
+            Some(w) if w < current => w.max(RESET_SETTLE_SECS),
+            _ => current,
+        };
+        std::thread::sleep(Duration::from_secs(sleep_secs));
     }
 }
 
@@ -1554,16 +1585,21 @@ pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<&'static str> 
     rows
 }
 
-/// Human-facing "{Label} resets in X" copy for a window row inside an account
-/// submenu. Percentages are deliberately NOT shown here (item 3 of the
-/// redesign moved them to the main-list row via `main_row`) — this row is
-/// purely about *when* the window refreshes.
-fn window_reset_row(w: &WindowView) -> String {
+/// One window's line inside an account submenu. Percentages live in the header
+/// row, so these lines answer only what the header's bare countdown can't:
+/// WHICH window is the constraint and WHEN it frees. A maxed window reads
+/// `<Label> limit reached · resets in <X>`; a healthy one `<Label> resets in
+/// <X>`. Returns `None` for a healthy window with no known reset (nothing useful
+/// to show — this replaces the old "no reset info yet" placeholder that read
+/// like an error).
+fn window_status_row(w: &WindowView) -> Option<String> {
     let label = stat_display_label(w);
-    if w.reset.is_empty() {
-        format!("{label}: no reset info yet")
-    } else {
-        format!("{label} resets in {}", w.reset)
+    let locked = w.pct.is_some_and(|p| p >= 100.0);
+    match (locked, w.reset.is_empty()) {
+        (true, false) => Some(format!("{label} limit reached · resets in {}", w.reset)),
+        (true, true) => Some(format!("{label} limit reached")),
+        (false, false) => Some(format!("{label} resets in {}", w.reset)),
+        (false, true) => None,
     }
 }
 
@@ -1581,8 +1617,19 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     let mut rows = Vec::new();
     if sec.supports_usage {
         if a.has_data && !a.windows.is_empty() {
-            for w in &a.windows {
-                rows.push(window_reset_row(w));
+            // A window at 100% is the binding lock — lead with it (that's the
+            // "what's locked / when does it unlock" the header's bare countdown
+            // can't convey); otherwise keep window order (session before weekly).
+            // Stable sort preserves that order among the non-locked windows.
+            let mut ordered: Vec<&WindowView> = a.windows.iter().collect();
+            ordered.sort_by_key(|w| u8::from(!w.pct.is_some_and(|p| p >= 100.0)));
+            for w in ordered {
+                if let Some(row) = window_status_row(w) {
+                    rows.push(row);
+                }
+            }
+            if rows.is_empty() {
+                rows.push("no data yet".to_string());
             }
         } else {
             rows.push("no data yet".to_string());
