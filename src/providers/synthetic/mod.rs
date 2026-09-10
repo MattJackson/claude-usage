@@ -34,7 +34,9 @@ impl Provider for SyntheticProvider {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            supports_usage: true,
+            // STUB: no capture/usage path wired yet — false hides it from the
+            // onboarding menu (partition_capture_providers) until it is real.
+            supports_usage: false,
             supports_switching: false,
             supports_launch: false,
             supports_remove: true,
@@ -77,7 +79,7 @@ mod tests {
     #[test]
     fn capabilities_are_locked() {
         let caps = SyntheticProvider.capabilities();
-        assert!(caps.supports_usage);
+        assert!(!caps.supports_usage); // stub: hidden until capture is wired
         assert!(!caps.supports_switching);
         assert!(!caps.supports_email_capture);
         assert_eq!(caps.secret_backend, SecretBackend::Keychain);

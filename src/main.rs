@@ -198,11 +198,10 @@ fn run() -> Result<()> {
     raise_nofile_limit();
 
     // Populate the provider registry once, before any command handler runs.
-    // Cheap (a `Vec::push` per feature-gated provider) and idempotent, so
-    // handlers that never touch the registry (today: all of them) pay
-    // nothing meaningful. Later phases route `menubar::run` through
-    // `providers::get`, at which point this call is load-bearing — do it
-    // here so it always precedes the dispatch below.
+    // Cheap (a `Vec::push` per feature-gated provider) and idempotent. This is
+    // load-bearing: `menubar::run` and the switch/refresh/capture handlers
+    // resolve providers via `providers::get`/`providers::all`, so `init()` must
+    // precede the dispatch below (and the `providers::all()` call right after).
     providers::init();
 
     let provider_slugs: Vec<&'static str> =

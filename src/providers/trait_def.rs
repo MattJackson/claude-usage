@@ -8,9 +8,11 @@
 //! Provider trait scaffolding.
 //!
 //! This is the core-agents-refactor v1 trait definition: one `Box<dyn Provider>`
-//! per module, registered by `providers::init()` in `mod.rs`. Nothing calls
-//! into these types yet — the trait, error, and shared value types simply
-//! exist so the per-provider modules can start landing in later phases.
+//! per module, registered by `providers::init()` in `mod.rs`. The trait is
+//! live and dispatched in production: `menubar` (account list, capture menu,
+//! switch/refresh) and the `main` command handlers resolve providers via
+//! `providers::get(slug)` / `providers::all()` and call `capabilities()`,
+//! capture, and active-refresh through this surface.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
