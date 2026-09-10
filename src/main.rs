@@ -816,21 +816,40 @@ fn prepare_switch(
         .find(email)
         .cloned()
         .with_context(|| format!("no account matches '{email}'"))?;
-    // Reactive refresh with a clear signal on hard failure. If the refresh
-    // token has been invalidated (single-use / rotated elsewhere / revoked),
-    // bail with a distinctive error so the menu / CLI can prompt a fresh
-    // login instead of silently overwriting the keychain with a stale token
-    // that `claude` will then reject.
-    match ensure_fresh_with_fallback(provider, email, &mut acct) {
-        Ok(_) => {}
-        Err(oauth::RefreshError::InvalidGrant) => {
-            flag_needs_relogin(email);
-            bail!(
-                "account {email} needs re-login (refresh token rejected); run \
-                 `claude /login` for it or click the account row in the menu"
-            );
+    if state.active.as_deref() == Some(email) {
+        // GUARANTEE: usagio must NEVER POST /token for the ACTIVE account.
+        // Anthropic/OpenAI refresh tokens are single-use — a POST rotates the
+        // whole family server-side and invalidates the copy the live vendor CLI
+        // holds, forcing a `/login`. Switching TO the already-active account
+        // (e.g. `usagio switch <active>` to relaunch, or clicking the active
+        // row) must therefore ADOPT the vendor slot's current token, exactly
+        // like the poll loop's active path — never mint one. See
+        // `active_refresh_cas`'s doc.
+        if matches!(
+            active_refresh_cas(provider, &mut acct),
+            ActiveRefreshOutcome::RefreshFailed
+        ) {
+            logging::log(&format!(
+                "switch: active account {email} slot unreadable; keeping stored \
+                 token (never POST /token for the active account)"
+            ));
         }
-        Err(e) => bail!("token refresh for {email} failed: {e}"),
+    } else {
+        // Inactive account: usagio owns its token, so a reactive refresh is
+        // safe. On a hard failure (single-use token rotated elsewhere / revoked)
+        // bail with a distinctive error so the menu / CLI can prompt a fresh
+        // login instead of writing a stale token that `claude` will reject.
+        match ensure_fresh_with_fallback(provider, email, &mut acct) {
+            Ok(_) => {}
+            Err(oauth::RefreshError::InvalidGrant) => {
+                flag_needs_relogin(email);
+                bail!(
+                    "account {email} needs re-login (refresh token rejected); run \
+                     `claude /login` for it or click the account row in the menu"
+                );
+            }
+            Err(e) => bail!("token refresh for {email} failed: {e}"),
+        }
     }
     let (identity, backfilled) = resolve_identity(provider, &acct)?;
     Ok((acct, identity, backfilled))
@@ -1233,16 +1252,35 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
     // already been superseded on disk.
     let provider = providers::get(CLAUDE_SLUG)
         .ok_or_else(|| anyhow!("internal: provider '{CLAUDE_SLUG}' not registered"))?;
-    let refreshed = match ensure_fresh_with_fallback(provider, &email, &mut acct) {
-        Ok(b) => b,
-        Err(oauth::RefreshError::InvalidGrant) => {
-            flag_needs_relogin(&email);
-            bail!(
-                "account {email} needs re-login (refresh token rejected); run \
-                 `claude /login` for it or click the account row in the menu"
-            );
+    let refreshed = if state.active.as_deref() == Some(email.as_str()) {
+        // GUARANTEE: never POST /token for the ACTIVE account (single-use refresh
+        // token would invalidate the live vendor CLI's copy → forced re-login).
+        // `usagio token` for the active account ADOPTS the vendor slot's current
+        // token instead of minting one; a script gets the same bearer the vendor
+        // CLI is using. If the slot is unreadable we return the stored token
+        // rather than POST. See `active_refresh_cas`'s doc.
+        match active_refresh_cas(provider, &mut acct) {
+            ActiveRefreshOutcome::Adopted => true,
+            ActiveRefreshOutcome::RefreshFailed => {
+                logging::log(&format!(
+                    "token: active account {email} slot unreadable; returning stored \
+                     token (never POST /token for the active account)"
+                ));
+                false
+            }
         }
-        Err(e) => bail!("token refresh for {email} failed: {e}"),
+    } else {
+        match ensure_fresh_with_fallback(provider, &email, &mut acct) {
+            Ok(b) => b,
+            Err(oauth::RefreshError::InvalidGrant) => {
+                flag_needs_relogin(&email);
+                bail!(
+                    "account {email} needs re-login (refresh token rejected); run \
+                     `claude /login` for it or click the account row in the menu"
+                );
+            }
+            Err(e) => bail!("token refresh for {email} failed: {e}"),
+        }
     };
     let token = acct.access_token.clone();
     // Phase 2 (locked): persist a rotation without clobbering a fresher one.
