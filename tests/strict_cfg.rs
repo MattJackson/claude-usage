@@ -77,37 +77,37 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("src/menubar.rs", 30),
     // src/menubar.rs — `pub fn run()`, non-macOS branch: dispatches to
     // `cross_platform::run` (the `platform::MenuBackend`-based event loop).
-    ("src/menubar.rs", 590),
+    ("src/menubar.rs", 591),
     // src/menubar.rs — `pub fn run()`, macOS branch: the native
     // `NSApplication` run loop driving a passive muri tray.
-    ("src/menubar.rs", 595),
+    ("src/menubar.rs", 596),
     // src/menubar.rs — `build_popover_host`: macOS + `custom-popup`-only.
     // Inert under the muri backend (muri exposes no NSStatusItem anchor), but
     // still references `crate::ui::popover::PopoverHost` / `MainThreadMarker`
     // (macOS-only deps). Off-by-default feature. Goes away when the popover is
     // the macOS default (or muri grows a status-item anchor).
-    ("src/menubar.rs", 726),
+    ("src/menubar.rs", 727),
     // src/menubar.rs — `popover_model`: macOS + `custom-popup`-only. Folds a
     // `Snapshot` into the toolkit-neutral `ui::PopoverModel` (references
     // `crate::ui`, compiled only on macOS under `custom-popup`).
-    ("src/menubar.rs", 752),
+    ("src/menubar.rs", 753),
     // src/menubar.rs — inside the shared `mod cross_platform` menu builder,
     // `use platform::MenuHandle`: only the non-macOS `run`/`redraw_loop`
     // (below) consume it; macOS drives the handle-free `NSTimer` loop instead.
-    ("src/menubar.rs", 2345),
+    ("src/menubar.rs", 2346),
     // src/menubar.rs — `initial_icon_bytes`: the tray needs decodable icon
     // bytes on Linux/Windows; macOS is happy with a text-only title, so only
     // the non-macOS backend calls this.
-    ("src/menubar.rs", 2621),
+    ("src/menubar.rs", 2622),
     // src/menubar.rs — `redraw_loop`: the non-macOS background redraw ticker
     // (pushes through the `Send` `MenuHandle`); macOS ticks on its own
     // main-thread `NSTimer` instead.
-    ("src/menubar.rs", 2636),
+    ("src/menubar.rs", 2637),
     // src/menubar.rs — `cross_platform::run`: the Linux/Windows
     // `platform::MenuBackend` event loop. Never compiled alongside the macOS
     // `NSApplication` run above. (The menu *content* builders in this module
     // are NOT gated — they compile on every platform and feed macOS too.)
-    ("src/menubar.rs", 2663),
+    ("src/menubar.rs", 2664),
 ];
 
 fn src_root() -> PathBuf {
