@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-10
+
+### Changed
+- **Windows/Linux tray menu now renders through [muri](https://crates.io/crates/muri)
+  0.9.1's `muda-compat` facade** instead of muda/tray-icon. This is an internal
+  backend swap only: the menu is feature- and pixel-identical to 0.5.23 — same
+  layout, grouping, icons, and behavior. macOS is unchanged (its NSMenu styler
+  still uses muda's `ns_menu()`). Surfaced and got two upstream muri fixes
+  (`MenuId::new`, `compat::tray_icon::menu` re-export) landed in muri 0.9.1.
+
 ## [0.5.23] - 2026-09-10
 
 ### Fixed
