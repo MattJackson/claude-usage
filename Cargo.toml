@@ -67,6 +67,12 @@ vertex-ai = []
 
 [dependencies]
 anyhow = "1"
+# Decodes the bundled 16x16 provider PNGs (all 8-bit RGBA) into the raw RGBA
+# the muri `muda-compat` `IconMenuItem` wants for provider group-header icons
+# (see `platform::render`). Pure Rust, no system libpng. Common to all targets:
+# the single IR→muri menu renderer in `src/platform/render.rs` is compiled on
+# macOS/Linux/Windows alike.
+png = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
@@ -195,11 +201,6 @@ objc2-app-kit = { version = "0.3", features = [
     "NSEvent",            # mouseDown dispatch on row views
 ] }
 block2 = "0.6"
-# Decodes the bundled 16x16 provider PNGs (all 8-bit RGBA) into the raw RGBA
-# the muri `muda-compat` `IconMenuItem` wants for provider group-header icons
-# (see `menubar::decode_menu_icon`). Pure Rust, no system libpng. Same crate/
-# version the Linux tray path already uses.
-png = "0.18"
 
 # Linux platform impl deps. Only pulled in when building for Linux — cargo
 # skips these on macOS/Windows targets. See src/platform/linux.rs for the
@@ -226,9 +227,6 @@ keyring = { version = "3", default-features = false, features = ["async-secret-s
 # feature above) and a pure-Rust crypto backend (`crypto-rust`, no system
 # OpenSSL needed to cross-compile).
 secret-service = { version = "4", default-features = false, features = ["rt-async-io-crypto-rust"] }
-# Decodes the bundled 16x16 provider PNGs into the raw RGBA tray-icon needs.
-# Pure Rust, no system libpng dependency.
-png = "0.18"
 # File dialogs (Backups Save/Restore in the tray menu) via the
 # xdg-desktop-portal — works across GNOME/KDE/Sway. The portal round-trip
 # uses rfd's own dlopen'd libdbus binding (no link-time C dep); "wayland" is

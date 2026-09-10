@@ -630,151 +630,13 @@ thread_local! {
     static TRAY_STATE: std::cell::RefCell<Option<TrayState>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Decode PNG bytes (the format every bundled provider icon and tray icon
-/// ships as, see `src/icons.rs`) into raw RGBA + dimensions. Pure Rust (the
-/// `png` crate), so it cross-compiles without a system libpng.
-fn decode_png_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let mut reader = decoder
-        .read_info()
-        .context("decoding PNG header for a tray/menu icon")?;
-    let buf_size = reader
-        .output_buffer_size()
-        .context("PNG output buffer size overflow")?;
-    let mut buf = vec![0u8; buf_size];
-    let info = reader
-        .next_frame(&mut buf)
-        .context("decoding PNG frame for a tray/menu icon")?;
-    let bytes = &buf[..info.buffer_size()];
-    let rgba = match info.color_type {
-        png::ColorType::Rgba => bytes.to_vec(),
-        png::ColorType::Rgb => {
-            // as_chunks::<3>() is what clippy prefers over chunks_exact(3);
-            // it returns a slice of fixed-size arrays so the compiler can
-            // elide the bounds check inside the closure below.
-            let (chunks, _rem) = bytes.as_chunks::<3>();
-            chunks
-                .iter()
-                .flat_map(|c| [c[0], c[1], c[2], 255])
-                .collect()
-        }
-        other => {
-            bail!("unsupported PNG color type for a tray/menu icon: {other:?} (need RGB or RGBA)")
-        }
-    };
-    Ok((rgba, info.width, info.height))
-}
-
+/// Decode the tray icon's PNG into a muri tray `Icon` (raw RGBA). Menu-item
+/// icons and the IR→muri walk both live in the shared
+/// `crate::platform::render` now — this is the one Linux-local decode, for the
+/// tray-icon slot specifically (a distinct `Icon` type from the menu one).
 fn decode_tray_icon(bytes: &[u8]) -> Result<tray::Icon> {
-    let (rgba, w, h) = decode_png_rgba(bytes)?;
+    let (rgba, w, h) = crate::platform::render::decode_png_rgba(bytes)?;
     tray::Icon::from_rgba(rgba, w, h).context("building a tray icon from decoded PNG")
-}
-
-fn decode_menu_icon(bytes: &[u8]) -> Result<muda::Icon> {
-    let (rgba, w, h) = decode_png_rgba(bytes)?;
-    muda::Icon::from_rgba(rgba, w, h).context("building a menu-item icon from decoded PNG")
-}
-
-/// `muda::{Menu, Submenu}` both have an inherent `append(&dyn IsMenuItem)`
-/// method but share no common trait that exposes it, so this bridges the two
-/// for the recursive `MenuTree` walk below.
-trait NativeMenuContainer {
-    fn append_native(&self, item: &dyn muda::IsMenuItem);
-}
-impl NativeMenuContainer for muda::Menu {
-    fn append_native(&self, item: &dyn muda::IsMenuItem) {
-        let _ = self.append(item);
-    }
-}
-impl NativeMenuContainer for muda::Submenu {
-    fn append_native(&self, item: &dyn muda::IsMenuItem) {
-        let _ = self.append(item);
-    }
-}
-
-/// Translate the cross-platform `MenuTree` (from `mod.rs`) into a native
-/// `tray-icon`/`muda` menu. Only ever called from the GTK thread — the
-/// `muda` item types (`Rc`-backed) aren't `Send` either, which is fine since
-/// nothing here escapes past the caller in `apply_handle_msg`.
-fn build_native_menu(tree: &MenuTree) -> muda::Menu {
-    let menu = muda::Menu::new();
-    append_children(&menu, &tree.items);
-    menu
-}
-
-fn append_children(container: &dyn NativeMenuContainer, items: &[MenuItem]) {
-    use muda::{
-        CheckMenuItem, IconMenuItem, MenuItem as NativeMenuItem, PredefinedMenuItem, Submenu,
-    };
-    for item in items {
-        match item {
-            MenuItem::Action {
-                id,
-                label,
-                icon_png,
-                enabled,
-                checked,
-                checkable,
-            } => {
-                if *checkable {
-                    container.append_native(&CheckMenuItem::with_id(
-                        id.as_str(),
-                        label,
-                        *enabled,
-                        *checked,
-                        None,
-                    ));
-                } else if let Some(icon_bytes) = icon_png {
-                    match decode_menu_icon(icon_bytes) {
-                        Ok(icon) => container.append_native(&IconMenuItem::with_id(
-                            id.as_str(),
-                            label,
-                            *enabled,
-                            Some(icon),
-                            None,
-                        )),
-                        Err(_) => container.append_native(&NativeMenuItem::with_id(
-                            id.as_str(),
-                            label,
-                            *enabled,
-                            None,
-                        )),
-                    }
-                } else {
-                    container.append_native(&NativeMenuItem::with_id(
-                        id.as_str(),
-                        label,
-                        *enabled,
-                        None,
-                    ));
-                }
-            }
-            MenuItem::Static { label, icon_png } => {
-                // Disabled label row; if it carries an icon (provider group
-                // header), render it as a disabled IconMenuItem so the provider
-                // mark shows next to the name — matching macOS.
-                if let Some(icon) = icon_png.as_ref().and_then(|b| decode_menu_icon(b).ok()) {
-                    container.append_native(&IconMenuItem::with_id(
-                        "noop",
-                        label,
-                        false,
-                        Some(icon),
-                        None,
-                    ));
-                } else {
-                    container.append_native(&NativeMenuItem::with_id("noop", label, false, None));
-                }
-            }
-            MenuItem::Separator => {
-                container.append_native(&PredefinedMenuItem::separator());
-            }
-            MenuItem::Submenu { label, items, .. } => {
-                let sub = Submenu::new(label, true);
-                append_children(&sub, items);
-                container.append_native(&sub);
-            }
-        }
-    }
 }
 
 fn apply_handle_msg(tray: &tray::TrayIcon, msg: HandleMsg) {
@@ -794,7 +656,7 @@ fn apply_handle_msg(tray: &tray::TrayIcon, msg: HandleMsg) {
             tray.set_title(Some(title));
         }
         HandleMsg::SetMenu(tree) => {
-            let native = build_native_menu(&tree);
+            let native = crate::platform::render::render_menu(&tree);
             tray.set_menu(Some(Box::new(native)));
         }
     }

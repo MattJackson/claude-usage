@@ -125,7 +125,26 @@ pub enum MenuItem {
         label: String,
         icon_png: Option<Vec<u8>>,
         items: Vec<MenuItem>,
+        /// Render this row as the *active* account — bold with a leading
+        /// checkmark (the 0.5.x active-account affordance). Maps to muri's
+        /// `Submenu::set_active` (muri #18). Always `false` for non-account
+        /// submenus (provider-group / Settings).
+        active: bool,
+        /// Severity tint for the trailing `\t` value segment (the `S% / W%`
+        /// percentages), if any. Maps to muri's `Submenu::set_value_color`
+        /// (muri #19). `None` leaves the value segment the default label color.
+        value_color: Option<ValueColor>,
     },
+}
+
+/// Severity tint for a submenu row's trailing value segment. Platform-agnostic
+/// so the generic `MenuTree` never names the renderer's color type; each
+/// backend maps it to muri's `Color` (`SystemRed` / `SystemOrange`). Mirrors
+/// `menubar::Severity`'s two bands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueColor {
+    Red,
+    Amber,
 }
 
 /// **Threading invariant**: `create_status_item` and `run_event_loop` MUST
@@ -292,6 +311,12 @@ mod linux;
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+
+// The single IR→muri menu translator, shared by every platform's tray backend
+// (macOS's bespoke run loop in `menubar`, plus the Linux/Windows `MenuBackend`
+// impls). muri renders identically on all three, so there is exactly one
+// `MenuTree` → live-menu path.
+pub(crate) mod render;
 
 // Test-only failure-injection seam, shared by ALL platforms' `SecretStore::set`
 // (macOS mock, Linux keyring/fallback, Windows Credential Manager). Lets

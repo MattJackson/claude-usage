@@ -30,10 +30,8 @@ use chrono::{DateTime, Utc};
 #[cfg(target_os = "macos")]
 use {
     block2::RcBlock,
-    muri::compat::tray_icon::menu::{
-        CheckMenuItem, IconMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
-    },
-    muri::compat::tray_icon::{Icon, TrayIconBuilder},
+    muri::compat::tray_icon::menu::MenuEvent,
+    muri::compat::tray_icon::TrayIconBuilder,
     objc2::MainThreadMarker,
     objc2_app_kit::{NSApplication, NSApplicationActivationPolicy},
     objc2_foundation::NSTimer,
@@ -538,6 +536,21 @@ fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
     }
 }
 
+/// The single severity tint for a row's trailing value segment, reduced from
+/// its per-span `colors`. muri's compat `set_value_color` (#19) takes ONE color
+/// for the whole `\t` value segment, so usagio's finer per-percentage spans
+/// (session could be amber while weekly is red) collapse to the most severe
+/// band present — the one the user most needs to see. `None` when the row has
+/// no colored spans (a healthy account, or a non-value row).
+fn row_value_severity(style: &RowStyle) -> Option<Severity> {
+    style.colors.iter().fold(None, |worst, (_, _, sev)| {
+        match (worst, sev) {
+            (Some(Severity::Red), _) | (_, Severity::Red) => Some(Severity::Red),
+            _ => Some(Severity::Amber),
+        }
+    })
+}
+
 /// v0.5.3 menu redesign: the bold provider-group header row that precedes a
 /// provider's account rows. Plain title is just the provider's display name
 /// (e.g. "Claude"), bold, disabled (`enabled: false` at the muda layer so it
@@ -624,7 +637,9 @@ pub fn run() -> Result<()> {
     let tray = builder
         .build()
         .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
-    tray.set_menu(Some(Box::new(build_menu(&initial))));
+    tray.set_menu(Some(Box::new(crate::platform::render::render_menu(
+        &cross_platform::menu_tree_from_snapshot(&initial),
+    ))));
     let _ = tray.set_tooltip(Some(tooltip_for(&initial)));
 
     // custom-popup: build the NSPopover host anchored to the status-item button
@@ -669,7 +684,9 @@ pub fn run() -> Result<()> {
             // is the right-click fallback (the popover rebuilds its own content
             // from a fresh snapshot each time it's shown); with it OFF this is
             // the sole UI.
-            tray.set_menu(Some(Box::new(build_menu(&snap))));
+            tray.set_menu(Some(Box::new(crate::platform::render::render_menu(
+                &cross_platform::menu_tree_from_snapshot(&snap),
+            ))));
             let _ = tray.set_tooltip(Some(tooltip_for(&snap)));
             *last_sig.borrow_mut() = sig;
         }
@@ -1547,231 +1564,6 @@ pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<&'static str> 
     rows
 }
 
-/// macOS-only: builds the native `tray_icon::menu::Menu` tree directly (the
-/// NSMenu attributedTitle styling walk in `apply_menu_styles` below needs a
-/// live native menu to mutate). Linux/Windows build the equivalent tree via
-/// `cross_platform::menu_tree_from_snapshot` instead, which emits the
-/// generic `platform::MenuTree` the `MenuBackend` trait consumes.
-/// muri 0.9.5's `muda-compat` facade renders a `label\tvalue` item as a
-/// grow-left label plus a **right-aligned trailing column** (muri #12 — the
-/// same NSMenu tab-stop the old native menu used), so we pass the `\t` THROUGH
-/// to get the native two-column layout. (Earlier muri lacked tab-stop support,
-/// so this replaced `\t` with an inline ` · `; 0.9.5 restored the column.)
-#[cfg(target_os = "macos")]
-fn menu_label(plain: &str) -> String {
-    plain.to_string()
-}
-
-/// Decode a bundled 16px provider PNG into a muri (`muda-compat`) menu-item
-/// `Icon` (raw RGBA). Best-effort: a non-RGBA or undecodable PNG yields `None`
-/// and the row falls back to text-only. The shipped provider icons are all
-/// 8-bit RGBA (PNG color type 6), so the RGB-expansion branch the Linux decoder
-/// carries isn't needed here.
-#[cfg(target_os = "macos")]
-fn decode_menu_icon(bytes: &[u8]) -> Option<Icon> {
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let mut reader = decoder.read_info().ok()?;
-    let buf_size = reader.output_buffer_size()?;
-    let mut buf = vec![0u8; buf_size];
-    let info = reader.next_frame(&mut buf).ok()?;
-    if info.color_type != png::ColorType::Rgba {
-        return None;
-    }
-    buf.truncate(info.buffer_size());
-    Icon::from_rgba(buf, info.width, info.height).ok()
-}
-
-#[cfg(target_os = "macos")]
-fn build_menu(snap: &Snapshot) -> Menu {
-    let menu = Menu::new();
-
-    // v0.5.0 menu redesign: the two "resets in X" status header rows are gone
-    // (item 1) — the same numbers now live inline in each account's own row.
-    if snap.sections.is_empty() {
-        add(
-            &menu,
-            MenuItem::with_id("none", "Capture a login below to begin", false, None),
-        );
-    }
-
-    // v0.5.3 menu redesign: provider grouping is BACK. Each provider that has
-    // captured accounts contributes one bold header row (or a submenu with the
-    // env-override marker child, when its env override is active) followed by
-    // one submenu-labelled row per account — the submenu's label IS the
-    // account row, its children are the details + action rows the flat
-    // v0.5.2 shape used to inline. A `PredefinedMenuItem::separator()` sits
-    // BETWEEN provider groups (not between individual accounts). Within-
-    // provider account order still comes from `snap.account_order` (the same
-    // soonest-expiring / priority global comparator); provider groups are
-    // sorted alphabetically by display name for stability (see
-    // `provider_grouped_order`).
-    let groups = provider_grouped_order(snap);
-    let mut first_group = true;
-    for (si, account_idxs) in &groups {
-        let sec = &snap.sections[*si];
-        if !first_group {
-            let _ = menu.append(&PredefinedMenuItem::separator());
-        }
-        first_group = false;
-        build_provider_group(&menu, sec);
-        for ai in account_idxs {
-            let a = &sec.accounts[*ai];
-            build_account_submenu(&menu, sec, a);
-        }
-    }
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
-    // Capture current login ▸ FIRST, then Settings ▸. Every registered
-    // provider that can still capture a new login renders as a DIRECT child
-    // — creds-on-disk providers first, then API-key providers (v0.5.2 item 8
-    // flattened the "Paste API key ▸" sub-submenu these used to live under).
-    // A provider stops appearing here once it has a captured account (item
-    // 9 of the original redesign: capture is for NEW accounts only) — that
-    // account renders in the main list above instead.
-    let capture = Submenu::with_id("capture", "Capture current login", true);
-    if snap.capture_creds.is_empty() && snap.capture_api_key.is_empty() {
-        let _ = capture.append(&MenuItem::with_id(
-            "noop",
-            "(no providers registered)",
-            false,
-            None,
-        ));
-    } else {
-        for reg in snap.capture_creds.iter().chain(snap.capture_api_key.iter()) {
-            let title = if reg.installed {
-                reg.display_name.to_string()
-            } else {
-                format!("{} (not installed)", reg.display_name)
-            };
-            // Row stays clickable even when we think it's not installed —
-            // the actual capture call surfaces the real error. Click id
-            // prefix ("capture:" vs "apikey:") is what routes to the right
-            // handler — see `handle_click` — not menu position.
-            let prefix = match reg.capture_mode {
-                CaptureMode::CredsOnDisk => "capture",
-                CaptureMode::ApiKey => "apikey",
-            };
-            let _ = capture.append(&MenuItem::with_id(
-                format!("{prefix}:{}", reg.provider_id),
-                title,
-                true,
-                None,
-            ));
-        }
-    }
-    let _ = menu.append(&capture);
-
-    // Settings ▸: "Refresh usage now" first, then a separator, then
-    // everything else alphabetical by display label (v0.5.2 item 9 —
-    // flattens the old "Advanced ▸" grouping; Backups moves up to a direct
-    // Settings child alongside Auto-swap and Notifications).
-    let settings = Submenu::with_id("settings", "Settings", true);
-    let _ = settings.append(&MenuItem::with_id(
-        "refresh:now",
-        "Refresh usage now",
-        true,
-        None,
-    ));
-    let _ = settings.append(&PredefinedMenuItem::separator());
-
-    // Auto-swap ▸ (item 5 consolidation): the top-level "Auto-swap enabled"
-    // checkbox is gone — Off doubles as disable, and picking a threshold
-    // enables auto-swap AND sets it, so this one submenu is the sole control
-    // surface.
-    let cur = if snap.autoswap {
-        snap.threshold.round() as i32
-    } else {
-        0
-    };
-    let autoswap_menu = Submenu::with_id("settings:autoswap", "Auto-swap", true);
-    let _ = autoswap_menu.append(&CheckMenuItem::with_id(
-        "autoswap:off",
-        "Off",
-        true,
-        cur == 0,
-        None,
-    ));
-    for t in [70i32, 85, 95, 98] {
-        let _ = autoswap_menu.append(&CheckMenuItem::with_id(
-            format!("autoswap:{t}"),
-            format!("{t}%"),
-            true,
-            cur == t,
-            None,
-        ));
-    }
-    let _ = autoswap_menu.append(&PredefinedMenuItem::separator());
-    let _ = autoswap_menu.append(&MenuItem::with_id(
-        "autoswap:now",
-        "Switch to best account now",
-        true,
-        None,
-    ));
-
-    let backups = Submenu::with_id("settings:backups", "Backups", true);
-    let _ = backups.append(&MenuItem::with_id("backup:save", "Save…", true, None));
-    let _ = backups.append(&MenuItem::with_id("backup:restore", "Restore…", true, None));
-
-    let notifications = Submenu::with_id("settings:notifications", "Notifications", true);
-    let _ = notifications.append(&CheckMenuItem::with_id(
-        "notifications:threshold",
-        crate::notifications::threshold_alert_label(),
-        true,
-        snap.notification_config.threshold_enabled,
-        None,
-    ));
-    let _ = notifications.append(&CheckMenuItem::with_id(
-        "notifications:resetback",
-        "Window reset alerts",
-        true,
-        snap.notification_config.reset_back_enabled,
-        None,
-    ));
-    let _ = notifications.append(&CheckMenuItem::with_id(
-        "notifications:pace",
-        "Weekly pace projection (experimental)",
-        true,
-        snap.notification_config.pace_enabled,
-        None,
-    ));
-
-    // Alphabetical: Auto-swap, Backups, Notifications.
-    let _ = settings.append(&autoswap_menu);
-    let _ = settings.append(&backups);
-    let _ = settings.append(&notifications);
-
-    let _ = menu.append(&settings);
-
-    // Context Ledger is intentionally CLI-only (`usagio context`). It was
-    // previously a submenu here that shelled out via osascript to a new
-    // Terminal window — but that path needed macOS Automation permission
-    // that most users hadn't granted, so clicks were doing nothing. The
-    // menu's job is account usage, not diagnostics; the CLI stays available
-    // for the rare "wait, what's Claude injecting?" moment.
-
-    // The "Launch at login" checkbox used to live here, backed by
-    // `osascript -e 'tell application "System Events" to make login item …'`.
-    // On every brew upgrade the binary hash changes → macOS treats it as a
-    // new app → it re-prompts "usagio wants access to control System
-    // Events" on the next poll. That path was redundant with `usagio
-    // install` (which registers a proper launchd LaunchAgent), so we removed
-    // the toggle in 0.4.3 and rely on the CLI for autostart. To clean out
-    // the stale System Events entry a prior version installed, remove
-    // "usagio" from System Settings → General → Login Items → Open at Login.
-
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    // Quit on the left, version grey + right-aligned on the same row using
-    // the same attributedTitle + right tab-stop machinery the account rows
-    // already use for `S% / W%`. The style walker matches on the plain
-    // title, so QUIT_ROW_PLAIN below MUST equal what we build here.
-    add(
-        &menu,
-        MenuItem::with_id("quit", menu_label(&quit_row_plain()), true, None),
-    );
-
-    menu
-}
-
 /// Human-facing "{Label} resets in X" copy for a window row inside an account
 /// submenu. Percentages are deliberately NOT shown here (item 3 of the
 /// redesign moved them to the main-list row via `main_row`) — this row is
@@ -1879,123 +1671,6 @@ fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRo
     }
 }
 
-/// v0.5.3 menu redesign: emit the bold provider-group header row (see
-/// `provider_group_header_row`). When the provider's env override is active,
-/// the header becomes a `Submenu` whose single child is the "env override
-/// active — swap disabled" marker (from `section_headline_rows`), so the
-/// provider-wide fact renders once at the group level instead of on every
-/// account. Otherwise the header is a plain disabled `MenuItem` — the bold /
-/// icon styling is applied by the native attributedTitle walker matching on
-/// `provider_group_header_row`'s plain title.
-#[cfg(target_os = "macos")]
-fn build_provider_group(menu: &Menu, sec: &ProviderSection) {
-    let head = provider_group_header_row(sec).plain;
-    let headlines = section_headline_rows(sec);
-    if headlines.is_empty() {
-        // Disabled header row carrying the provider's 16px icon, attached via
-        // `IconMenuItem` exactly like the cross_platform (Windows/Linux)
-        // `Static` path. NOTE: muri 0.9.3 drops a raw-RGBA `IconMenuItem` icon
-        // in translation (facade divergence D6 / spec 02 §4.5 — only a
-        // `NativeIcon`/SF-Symbol maps through), so today this renders text-only
-        // on every muri surface, including Windows/Linux; it will light up once
-        // muri encodes raw-RGBA menu icons the way it already does the tray icon.
-        match crate::icons::png16_for(sec.provider_id).and_then(decode_menu_icon) {
-            Some(icon) => {
-                let _ = menu.append(&IconMenuItem::with_id(
-                    "noop",
-                    head,
-                    false,
-                    Some(icon),
-                    None,
-                ));
-            }
-            None => add(menu, MenuItem::with_id("noop", head, false, None)),
-        }
-        return;
-    }
-    // Env-override present: expose the marker as the sole child of a submenu
-    // whose title is the provider name.
-    let sub = Submenu::with_id(format!("provider:{}", sec.provider_id), head, true);
-    for title in headlines {
-        let _ = sub.append(&MenuItem::with_id(
-            format!("envoverride:{}", sec.provider_id),
-            title,
-            false,
-            None,
-        ));
-    }
-    let _ = menu.append(&sub);
-}
-
-/// v0.5.3 menu redesign: each account becomes a `Submenu` whose title is the
-/// compact `account_header_row` (indented `<email>\t<trailing>`) and whose
-/// children are the details + action rows the flat v0.5.2 shape used to
-/// inline directly in the top-level menu (reset countdowns, burn rate, cost,
-/// "updated Xm ago", then Switch/Active, Launch, Remove). Cross-platform
-/// counterpart: `cross_platform::build_account_submenu_item`.
-#[cfg(target_os = "macos")]
-fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
-    let head = menu_label(&account_header_row(sec, a).plain);
-    // Submenu id is intentionally `noop` so a click on the LABEL (which on
-    // some platforms fires as an event too) is a no-op — the actual actions
-    // live on the children below.
-    let sub = Submenu::with_id("noop", head, true);
-
-    // Informational rows (reset windows, then burn-rate / cost / "updated"):
-    // rendered ENABLED (`enabled: true`) with a no-op click id. macOS draws a
-    // DISABLED menu item's title dimmed to grey *regardless* of any
-    // attributed foreground color — the disabled appearance overrides
-    // `NSColor::labelColor()` — so a disabled row here is unreadable, not
-    // merely un-hoverable. Readability wins: these render at full contrast; the
-    // cost is a hover highlight on a row that does nothing (clicks route to the
-    // `("noop", …)` arm in `handle_click`). Eliminating the hover *and* keeping
-    // full contrast isn't possible with a native NSMenu — that's a goal for the
-    // custom-popup UI (see docs/design/custom-tray-popup.md).
-    for row in submenu_info_rows(sec, a) {
-        let _ = sub.append(&MenuItem::with_id("noop", row, true, None));
-    }
-    for row in account_extra_info_rows(sec, a) {
-        let _ = sub.append(&MenuItem::with_id("noop", row, true, None));
-    }
-
-    // Action rows: Switch/Active, Launch, Remove. Gated per H3 (v0.5.0
-    // codeaudit) — see `account_submenu_rows`.
-    let rows = account_submenu_rows(sec, a);
-    let _ = sub.append(&PredefinedMenuItem::separator());
-    match rows.switch_row {
-        Some(true) => {
-            let _ = sub.append(&MenuItem::with_id("noop", "✓ Active", false, None));
-        }
-        Some(false) => {
-            let _ = sub.append(&MenuItem::with_id(
-                format!("switch:{}:{}", sec.provider_id, a.key),
-                "Switch to this account",
-                true,
-                None,
-            ));
-        }
-        None => {}
-    }
-    if rows.launch_row {
-        let _ = sub.append(&MenuItem::with_id(
-            format!("launch:{}:{}", sec.provider_id, a.key),
-            "Launch client",
-            true,
-            None,
-        ));
-    }
-    if rows.remove_row {
-        let _ = sub.append(&MenuItem::with_id(
-            format!("remove:{}:{}", sec.provider_id, a.key),
-            "Remove…",
-            true,
-            None,
-        ));
-    }
-
-    let _ = menu.append(&sub);
-}
-
 /// A stable fingerprint of everything the menu renders. When it's unchanged we
 /// skip `set_menu`, so an open menu is never dismissed by a no-op poll.
 ///
@@ -2099,12 +1774,6 @@ fn menu_signature(snap: &Snapshot) -> String {
     }
     s.push_str(&format!("as={} th={:.0}", snap.autoswap, snap.threshold));
     s
-}
-
-/// macOS-only: `build_menu` helper (see its doc comment for why it's mac-only).
-#[cfg(target_os = "macos")]
-fn add(menu: &Menu, item: MenuItem) {
-    let _ = menu.append(&item);
 }
 
 fn title_for(snap: &Snapshot) -> String {
@@ -2685,35 +2354,48 @@ fn confirm(question: &str) -> bool {
 // registers a proper launchd LaunchAgent (no osascript, no prompt).
 
 // ---------------------------------------------------------------------------
-// Cross-platform (Linux/Windows) renderer — muda/tray-icon via the
-// `platform::MenuBackend` trait, so the GTK/Win32 event-loop pump and the
-// thread-confinement rules `tray_icon`'s native menu types need live once in
-// `platform::{linux,windows}` (already built + tested there) instead of
-// being duplicated here. macOS keeps its native NSMenu attributedTitle
-// renderer (`mac_style` above, driven by `run` at the top of this file):
-// richer per-row coloring and right-aligned tab stops aren't representable
-// through the generic `platform::MenuTree`, so macOS is intentionally NOT
-// routed through this module.
-#[cfg(not(target_os = "macos"))]
+// The single menu builder, shared by every platform. It emits the generic,
+// Send-able `platform::MenuTree` (content only — rows, submenus, ids, active /
+// value-color directives); `platform::render::render_menu` turns that into a
+// live muri menu on each platform's UI thread. muri renders identically on
+// macOS/Windows/Linux, so there is exactly ONE description of the menu and ONE
+// IR→muri translator — no per-OS menu builder. The `run()` + redraw pump at the
+// end of this module are the only Linux/Windows-specific pieces (the
+// `MenuBackend`/channel plumbing); macOS drives the same `menu_tree_from_snapshot`
+// from its own main-thread loop at the top of this file.
 mod cross_platform {
     use super::*;
-    use crate::platform::{MenuHandle, MenuItem as PMenuItem, MenuTree};
+    use crate::platform::{MenuItem as PMenuItem, MenuTree};
+    #[cfg(not(target_os = "macos"))]
+    use crate::platform::MenuHandle;
 
-    /// Cross-platform separator used in place of macOS's right-aligned tab
-    /// stop — muda has no rich-text / tab-stop support, so `S% / W%` etc.
-    /// just sit inline after this separator instead of being right-aligned.
-    /// Per-row red/amber severity coloring is dropped for the same reason
-    /// (see the module doc above) — the countdown / percentage TEXT is
-    /// still there, just not colored.
-    const SEP: &str = " · ";
-
-    /// A `RowStyle`'s plain title. The `\t` is passed THROUGH so muri 0.9.5's
+    /// A `RowStyle`'s plain title. The `\t` is passed THROUGH so muri's
     /// muda-compat two-column tab-stop layout (muri #12) right-aligns the
-    /// trailing value column on Windows/Linux too, matching the native menu.
-    /// (`SEP` is retained as the documented fallback separator.)
+    /// trailing value column, matching the 0.5.x native menu.
     fn plain_text(style: &RowStyle) -> String {
-        let _ = SEP;
         style.plain.clone()
+    }
+
+    /// Map usagio's severity band to the platform-agnostic `ValueColor` the
+    /// menu tree carries (backends translate it to muri's `Color`).
+    fn value_color_of(sev: Severity) -> crate::platform::ValueColor {
+        match sev {
+            Severity::Red => crate::platform::ValueColor::Red,
+            Severity::Amber => crate::platform::ValueColor::Amber,
+        }
+    }
+
+    /// A plain (non-account) submenu: never the active account, no value tint.
+    /// Only account header rows carry `active`/`value_color` (muri #18/#19);
+    /// the Settings / Capture / provider-group submenus are structural.
+    fn plain_submenu(label: impl Into<String>, items: Vec<PMenuItem>) -> PMenuItem {
+        PMenuItem::Submenu {
+            label: label.into(),
+            icon_png: None,
+            items,
+            active: false,
+            value_color: None,
+        }
     }
 
     /// A non-clickable informational submenu row. `enabled: false` so the
@@ -2802,48 +2484,55 @@ mod cross_platform {
                 true,
             ));
         }
+        let header = account_header_row(sec, a);
         PMenuItem::Submenu {
-            label: plain_text(&account_header_row(sec, a)),
+            label: plain_text(&header),
             icon_png: None,
             items,
+            // muri #18: the active account renders bold + leading checkmark.
+            // `account_header_row` already folds `a.active` into `bold`.
+            active: header.bold,
+            // muri #19: tint the trailing `S% / W%` value segment per severity.
+            value_color: row_value_severity(&header).map(value_color_of),
         }
     }
 
-    /// Cross-platform counterpart to `build_provider_group` — one static (or
-    /// submenu-when-env-overridden) row carrying the provider's display name.
+    /// The provider-group header row: the provider's display name plus its
+    /// 16px icon, disabled (a heading, not a click target). Becomes a submenu
+    /// carrying the "env override active — swap disabled" marker when that
+    /// provider's env override is on. Label comes from
+    /// `provider_group_header_row` so the header text has a single source.
     fn build_provider_group_item(sec: &ProviderSection) -> PMenuItem {
-        // The provider's 16px icon on its group-header row (v0.5.22) — the
-        // Windows/Linux counterpart to the macOS `apply_menu_styles` `setImage`
-        // walk. A `None` (no bundled icon for the slug) renders text-only.
+        let label = provider_group_header_row(sec).plain;
         let icon_png = crate::icons::png16_for(sec.provider_id).map(|b| b.to_vec());
         let headlines = section_headline_rows(sec);
         if headlines.is_empty() {
-            return PMenuItem::Static {
-                label: sec.display_name.to_string(),
-                icon_png,
-            };
+            return PMenuItem::Static { label, icon_png };
         }
         let children: Vec<PMenuItem> = headlines
             .into_iter()
             .map(|title| action(format!("envoverride:{}", sec.provider_id), title, false))
             .collect();
         PMenuItem::Submenu {
-            label: sec.display_name.to_string(),
+            label,
             icon_png,
             items: children,
+            active: false,
+            value_color: None,
         }
     }
 
-    /// Cross-platform counterpart to `build_menu` — same structure, same
-    /// click ids (`handle_click` doesn't care which renderer produced them),
-    /// generic `platform::MenuTree` shape instead of a native
-    /// `tray_icon::menu::Menu`. v0.5.3 menu redesign: provider grouping is
-    /// back. Each provider that has captured accounts contributes a static
-    /// (or env-override submenu) header row, followed by one
-    /// `PMenuItem::Submenu` per account whose children are the details +
-    /// action rows. `PMenuItem::Separator` sits between provider groups,
-    /// not between individual accounts.
-    fn menu_tree_from_snapshot(snap: &Snapshot) -> MenuTree {
+    /// THE menu builder — one generic `platform::MenuTree` describing the
+    /// whole tray dropdown, used by every platform (macOS's main-thread loop
+    /// and the Linux/Windows redraw pump both call this, then hand the result
+    /// to `platform::render::render_menu`). Same click ids `handle_click`
+    /// parses regardless of renderer. v0.5.3 menu redesign: provider grouping
+    /// — each provider with captured accounts contributes a static (or
+    /// env-override submenu) header row, followed by one `PMenuItem::Submenu`
+    /// per account whose children are the details + action rows.
+    /// `PMenuItem::Separator` sits between provider groups, not between
+    /// individual accounts.
+    pub(super) fn menu_tree_from_snapshot(snap: &Snapshot) -> MenuTree {
         let mut items = Vec::new();
         if snap.sections.is_empty() {
             items.push(action("none", "Capture a login below to begin", false));
@@ -2884,11 +2573,7 @@ mod cross_platform {
                 capture_items.push(action(format!("{prefix}:{}", reg.provider_id), title, true));
             }
         }
-        items.push(PMenuItem::Submenu {
-            label: "Capture current login".to_string(),
-            icon_png: None,
-            items: capture_items,
-        });
+        items.push(plain_submenu("Capture current login", capture_items));
 
         // Settings ▸: Refresh usage now, then a separator, then everything
         // else alphabetical (Auto-swap, Backups, Notifications) — item 9
@@ -2940,27 +2625,11 @@ mod cross_platform {
         let settings_items = vec![
             action("refresh:now", "Refresh usage now", true),
             PMenuItem::Separator,
-            PMenuItem::Submenu {
-                label: "Auto-swap".to_string(),
-                icon_png: None,
-                items: autoswap_items,
-            },
-            PMenuItem::Submenu {
-                label: "Backups".to_string(),
-                icon_png: None,
-                items: backups,
-            },
-            PMenuItem::Submenu {
-                label: "Notifications".to_string(),
-                icon_png: None,
-                items: notifications,
-            },
+            plain_submenu("Auto-swap", autoswap_items),
+            plain_submenu("Backups", backups),
+            plain_submenu("Notifications", notifications),
         ];
-        items.push(PMenuItem::Submenu {
-            label: "Settings".to_string(),
-            icon_png: None,
-            items: settings_items,
-        });
+        items.push(plain_submenu("Settings", settings_items));
 
         items.push(PMenuItem::Separator);
         items.push(action(
@@ -2979,6 +2648,7 @@ mod cross_platform {
     /// this reuses the active account's provider icon, falling back to
     /// Claude's (always bundled, regardless of which provider Cargo features
     /// are enabled — see `icons::png16_for`).
+    #[cfg(not(target_os = "macos"))]
     fn initial_icon_bytes(_snap: &Snapshot) -> &'static [u8] {
         // The tray/notification-area icon is usagio's own brand mark on every
         // platform that shows an icon here (Windows/Linux). The active account's
@@ -2993,6 +2663,7 @@ mod cross_platform {
     /// `run_event_loop` thread instead of on it — `create_status_item` and
     /// `run_event_loop` must share a thread (see `MenuBackend`'s doc in
     /// `platform/mod.rs`), so this can't run on the main thread here.
+    #[cfg(not(target_os = "macos"))]
     fn redraw_loop(handle: Box<dyn MenuHandle>, initial: Snapshot) {
         let mut last_sig = menu_signature(&initial);
         let mut last_title = title_for(&initial);
@@ -3019,6 +2690,7 @@ mod cross_platform {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub(super) fn run() -> Result<()> {
         providers::init();
         let backend = crate::platform().menu();
