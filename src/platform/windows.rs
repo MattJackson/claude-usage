@@ -284,10 +284,14 @@ impl MenuBackend for WindowsMenu {
     ) -> Result<Box<dyn MenuHandle>> {
         let icon = decode_icon(initial_icon)?;
         let menu = Menu::new();
-        let tray = TrayIconBuilder::new()
+        let mut builder = TrayIconBuilder::new()
             .with_icon(icon)
             .with_tooltip(windows_tooltip(initial_title))
-            .with_menu(Box::new(menu))
+            .with_menu(Box::new(menu));
+        if let Some(theme) = crate::menubar::forced_theme() {
+            builder = builder.with_theme(theme);
+        }
+        let tray = builder
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
 
