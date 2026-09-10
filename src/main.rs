@@ -245,7 +245,7 @@ fn run() -> Result<()> {
     match effective_first_arg(&args, &exe) {
         None => cmd_list(&[]),
         Some("list") | Some("ls") => cmd_list(&args[1..]),
-        Some("capture") | Some("add") => cmd_capture(),
+        Some("capture") | Some("add") => cmd_capture(&args[1..]),
         Some("switch") | Some("use") => cmd_switch(args.get(1).map(String::as_str), None),
         Some("start") => cmd_switch(args.get(1).map(String::as_str), Some(Launch::Fresh)),
         Some("continue") | Some("cont") | Some("c") => {
@@ -288,7 +288,7 @@ fn print_help() {
          USAGE:\n  \
          usagio                   Show cached usage for every account (default)\n  \
          usagio list --refresh    Fetch usage now, then show it\n  \
-         usagio capture           Save the account you're currently logged into\n  \
+         usagio capture [prov]    Save the account you're logged into (default claude; e.g. `capture codex`)\n  \
          usagio switch [email]    Make <email> the active login (no launch)\n  \
          usagio start [email]     Switch, then launch a fresh `claude`\n  \
          usagio continue [email]  Switch, then launch `claude --continue`\n  \
@@ -323,13 +323,32 @@ enum Launch {
 // capture — snapshot the current keychain login, keyed by its email
 // ---------------------------------------------------------------------------
 
-fn cmd_capture() -> Result<()> {
-    let (email, existed) = capture_current()?;
-    if existed {
-        println!("Refreshed {email} — it's the active login.");
-    } else {
-        println!("Captured {email} — it's the active login.");
+fn cmd_capture(args: &[String]) -> Result<()> {
+    // Mirror the menu's `menubar::handle_capture` dispatch exactly — the CLI is
+    // the headless twin of the "Capture ▸ <provider>" menu items, sharing the
+    // same `capture_current` / `capture_current_generic` code. Claude uses the
+    // dedicated `state.accounts` bucket; every other registered provider uses
+    // the generic `state.providers[slug]` slot. No arg defaults to Claude
+    // (back-compat with the original Claude-only `usagio capture`).
+    let slug = args.first().map(String::as_str).unwrap_or(CLAUDE_SLUG);
+    if slug == CLAUDE_SLUG {
+        let (email, existed) = capture_current()?;
+        println!(
+            "{} {email} — it's the active login.",
+            if existed { "Refreshed" } else { "Captured" }
+        );
+        return Ok(());
     }
+    // Validate the provider up front for a clean error (and its display name)
+    // before touching the keychain — same guard the menu path applies.
+    let provider = provider_by_slug(slug)?;
+    let (key, existed) = capture_current_generic(slug)?;
+    println!(
+        "{} {} {key} — it's the active {} login.",
+        if existed { "Refreshed" } else { "Captured" },
+        provider.display_name(),
+        slug
+    );
     Ok(())
 }
 

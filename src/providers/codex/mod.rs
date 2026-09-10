@@ -89,6 +89,63 @@ pub struct CodexProvider;
 /// tokens issued by the standard ChatGPT-plan OAuth flow the CLI uses.
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
+/// Parse the ChatGPT usage endpoint body into rate-limit windows. Pure (no
+/// network / clock beyond `Utc::now` for the reset offset) so both JSON shapes
+/// are unit-tested.
+///
+/// The backend has shipped two shapes. The CURRENT one nests `rate_limit`
+/// (singular), whose `primary_window`/`secondary_window` objects each carry
+/// `used_percent` and `reset_after_seconds`. An OLDER one used `rate_limits`
+/// (plural), whose `primary`/`secondary` objects carried `resets_in_seconds`.
+/// This accepts either shape (and `used` as a `used_percent` alias) so a
+/// backend rollout or a plan-specific variant can't silently blank the reading
+/// — the mismatch that made a captured Codex account render no usage at all.
+/// An absent/`null` window (e.g. a free plan's `secondary_window`) is skipped.
+fn parse_usage_windows(body: &serde_json::Value) -> Vec<UsageWindow> {
+    let mut windows: Vec<UsageWindow> = Vec::new();
+    let Some(rl) = body
+        .get("rate_limit")
+        .or_else(|| body.get("rate_limits"))
+        .and_then(|v| v.as_object())
+    else {
+        return windows;
+    };
+    for (keys, id, label) in [
+        (["primary_window", "primary"], "primary", "5h"),
+        (["secondary_window", "secondary"], "secondary", "7d"),
+    ] {
+        let Some(w) = keys
+            .iter()
+            .find_map(|k| rl.get(*k).and_then(|v| v.as_object()))
+        else {
+            continue;
+        };
+        let utilization = w
+            .get("used_percent")
+            .and_then(|x| x.as_f64())
+            .or_else(|| w.get("used").and_then(|x| x.as_f64()));
+        // R2-P1 (round-2 codeaudit): use checked_add_signed so a hostile /
+        // buggy vendor JSON with a reset offset near i64::MAX (or otherwise
+        // producing an out-of-range year) doesn't panic the refresh loop.
+        // Also clamp to ~400d, matching notifications::evaluate_pace.
+        let resets_at = w
+            .get("reset_after_seconds")
+            .or_else(|| w.get("resets_in_seconds"))
+            .and_then(|x| x.as_i64())
+            .and_then(|s| {
+                let capped = s.clamp(0, 60 * 60 * 24 * 400);
+                Utc::now().checked_add_signed(chrono::Duration::seconds(capped))
+            });
+        windows.push(UsageWindow {
+            id: id.to_string(),
+            label: label.to_string(),
+            utilization,
+            resets_at,
+        });
+    }
+    windows
+}
+
 impl Provider for CodexProvider {
     fn provider_id(&self) -> &'static str {
         "codex"
@@ -292,41 +349,8 @@ impl Provider for CodexProvider {
             Err(e) => return Err(ProviderError::Transient(e.to_string())),
         };
 
-        let mut windows: Vec<UsageWindow> = Vec::new();
-        if let Some(rl) = body.get("rate_limits").and_then(|v| v.as_object()) {
-            for id in ["primary", "secondary"] {
-                if let Some(w) = rl.get(id).and_then(|v| v.as_object()) {
-                    let utilization = w
-                        .get("used_percent")
-                        .and_then(|x| x.as_f64())
-                        .or_else(|| w.get("used").and_then(|x| x.as_f64()));
-                    // R2-P1 (round-2 codeaudit): use checked_add_signed so a
-                    // hostile / buggy vendor JSON with resets_in_seconds near
-                    // i64::MAX (or otherwise producing an out-of-range year)
-                    // doesn't panic the refresh loop. Also clamp to ~400d,
-                    // matching notifications::evaluate_pace.
-                    let resets_at = w
-                        .get("resets_in_seconds")
-                        .and_then(|x| x.as_i64())
-                        .and_then(|s| {
-                            let capped = s.clamp(0, 60 * 60 * 24 * 400);
-                            Utc::now().checked_add_signed(chrono::Duration::seconds(capped))
-                        });
-                    windows.push(UsageWindow {
-                        id: id.to_string(),
-                        label: if id == "primary" {
-                            "5h".to_string()
-                        } else {
-                            "7d".to_string()
-                        },
-                        utilization,
-                        resets_at,
-                    });
-                }
-            }
-        }
         Ok(UsageSnapshot {
-            windows,
+            windows: parse_usage_windows(&body),
             fetched_at: Utc::now(),
         })
     }
@@ -704,6 +728,73 @@ pub(super) fn jwt_payload_claims(jwt: &str) -> Option<serde_json::Map<String, Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_usage_current_shape_rate_limit_singular() {
+        // The live 2026 shape: `rate_limit` → `primary_window`/`secondary_window`,
+        // `used_percent` + `reset_after_seconds`.
+        let body = serde_json::json!({
+            "rate_limit": {
+                "primary_window": { "used_percent": 42.0, "reset_after_seconds": 3600 },
+                "secondary_window": { "used_percent": 79.0, "reset_after_seconds": 604800 }
+            }
+        });
+        let w = parse_usage_windows(&body);
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].id, "primary");
+        assert_eq!(w[0].label, "5h");
+        assert_eq!(w[0].utilization, Some(42.0));
+        assert!(w[0].resets_at.is_some());
+        assert_eq!(w[1].id, "secondary");
+        assert_eq!(w[1].label, "7d");
+        assert_eq!(w[1].utilization, Some(79.0));
+    }
+
+    #[test]
+    fn parse_usage_legacy_shape_rate_limits_plural() {
+        // The older shape must still parse (backward tolerance).
+        let body = serde_json::json!({
+            "rate_limits": {
+                "primary": { "used": 10.0, "resets_in_seconds": 60 },
+                "secondary": { "used_percent": 20.0, "resets_in_seconds": 120 }
+            }
+        });
+        let w = parse_usage_windows(&body);
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].utilization, Some(10.0)); // `used` alias
+        assert_eq!(w[1].utilization, Some(20.0));
+    }
+
+    #[test]
+    fn parse_usage_free_plan_null_secondary_yields_only_primary() {
+        // A free plan returns `secondary_window: null` — skip it, keep primary.
+        let body = serde_json::json!({
+            "rate_limit": {
+                "primary_window": { "used_percent": 0.0, "reset_after_seconds": 300 },
+                "secondary_window": serde_json::Value::Null
+            }
+        });
+        let w = parse_usage_windows(&body);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].id, "primary");
+        assert_eq!(w[0].utilization, Some(0.0));
+    }
+
+    #[test]
+    fn parse_usage_missing_container_is_empty_not_panic() {
+        assert!(parse_usage_windows(&serde_json::json!({})).is_empty());
+        assert!(parse_usage_windows(&serde_json::json!({ "rate_limit": null })).is_empty());
+    }
+
+    #[test]
+    fn parse_usage_absurd_reset_offset_does_not_panic() {
+        let body = serde_json::json!({
+            "rate_limit": { "primary_window": { "used_percent": 5.0, "reset_after_seconds": i64::MAX } }
+        });
+        let w = parse_usage_windows(&body);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].resets_at.is_some()); // clamped, not overflowed
+    }
 
     #[test]
     fn identity_and_capabilities_are_locked() {
