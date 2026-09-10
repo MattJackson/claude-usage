@@ -42,13 +42,14 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-// muri 0.9 `muda-compat` facade replaces `tray-icon`/`muda` for the Windows
-// tray menu (0.6.0 swap). Menu-item types come from `muri::compat::muda`
-// (the facade has no `tray_icon::menu` re-export the way real `tray-icon`
-// does `pub use muda as menu`); the tray types come from
-// `muri::compat::tray_icon`. `Icon` is the same type in both facade modules.
-use muri::compat::muda::{
-    CheckMenuItem, IconMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem as NativeMenuItem,
+// muri 0.9's `muda-compat` facade replaces `tray-icon`/`muda` for the Windows
+// tray menu (0.6.0 swap). A pure drop-in: `muri::compat::tray_icon` re-exports
+// the menu module (`pub use muda as menu`, muri 0.9.1) exactly as real
+// `tray-icon` does, so these import paths are byte-for-byte the originals with
+// only the crate root retargeted. `Icon` is the same type in both facade
+// modules.
+use muri::compat::tray_icon::menu::{
+    CheckMenuItem, IconMenuItem, IsMenuItem, Menu, MenuEvent, MenuId, MenuItem as NativeMenuItem,
     PredefinedMenuItem, Submenu,
 };
 use muri::compat::tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -230,19 +231,21 @@ fn build_item(item: &MenuItem) -> Result<Box<dyn IsMenuItem>> {
             checkable,
             ..
         } => {
-            // muri's `MenuId` has no `new()` constructor (real muda does), but
-            // `with_id` takes `impl Into<MenuId>` and `MenuId: From<&str>`, so
-            // pass the id as a string slice — same as `linux.rs`.
             if *checkable {
                 Box::new(CheckMenuItem::with_id(
-                    id.as_str(),
+                    MenuId::new(id),
                     label,
                     *enabled,
                     *checked,
                     None,
                 ))
             } else {
-                Box::new(NativeMenuItem::with_id(id.as_str(), label, *enabled, None))
+                Box::new(NativeMenuItem::with_id(
+                    MenuId::new(id),
+                    label,
+                    *enabled,
+                    None,
+                ))
             }
         }
         MenuItem::Static { label, icon_png } => {

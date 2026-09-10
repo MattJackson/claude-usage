@@ -114,11 +114,13 @@ tiktoken-rs = { version = "0.7", optional = true }
 # backend per OS (no GTK on Linux, no Cocoa duplicate deps on macOS).
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "common-controls-v6"] }
 # muri (0.6.0 swap): the Windows/Linux tray menu is rendered through muri's
-# `muda-compat` facade (`muri::compat::{muda, tray_icon}`) instead of the real
+# `muda-compat` facade (`muri::compat::tray_icon`, which mirrors real
+# `tray-icon` including its `menu` re-export) instead of the real
 # `tray-icon`/`muda`. macOS keeps `tray-icon` (below) because its NSMenu styler
 # needs muda's `ns_menu()`, which the facade doesn't expose. Pinned exact per
-# muri's own migration guidance (§7): pre-1.0 minor bumps may break.
-muri = { version = "=0.9.0", features = ["muda-compat"] }
+# muri's own migration guidance (§7): pre-1.0 minor bumps may break. 0.9.1
+# lands the `MenuId::new` + `compat::tray_icon::menu` drop-in fixes (muri #4/#5).
+muri = { version = "=0.9.1", features = ["muda-compat"] }
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status

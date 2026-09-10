@@ -37,14 +37,13 @@
 
 use super::*;
 use anyhow::{bail, Context, Result};
-// muri 0.9 `muda-compat` facade replaces `tray-icon`/`muda` for the Linux tray
-// menu (0.6.0 swap). Menu-item types come from `muri::compat::muda` — the
-// facade's `muri::compat::tray_icon` has no `menu` submodule the way real
-// `tray-icon` does (`pub use muda as menu`), so the old `tray_icon::menu::…`
-// paths below now resolve through `muda::…`; the tray types keep resolving
-// through the `tray` alias. `Icon` is the same type in both facade modules.
-use muri::compat::muda;
+// muri 0.9's `muda-compat` facade replaces `tray-icon`/`muda` for the Linux
+// tray menu (0.6.0 swap). Both aliases route through `muri::compat::tray_icon`,
+// which mirrors real `tray-icon`'s surface — including the `menu` re-export
+// (`pub use muda as menu`, muri 0.9.1) that the item types come from. `Icon`
+// is the same type in both facade modules.
 use muri::compat::tray_icon as tray;
+use muri::compat::tray_icon::menu as muda;
 use serde_json::{Map, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
