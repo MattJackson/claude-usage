@@ -2,23 +2,36 @@
 exec >/var/log/usagio-gnome.log 2>&1
 set -x
 S3="@@S3_URI@@"; VER="@@VERSION@@"; FIX="@@FIXTURES@@"
-push(){ aws s3 cp /var/log/usagio-gnome.log "$S3/_userdata.log" 2>/dev/null || true; }
+push(){ command -v aws >/dev/null 2>&1 && aws s3 cp /var/log/usagio-gnome.log "$S3/_userdata.log" 2>/dev/null || true; }
+note(){ echo "$(date -Is) STAGE: $*"; push; }
 
-for i in $(seq 1 120); do fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; sleep 5; done
+for i in $(seq 1 150); do fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; sleep 5; done
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y --no-install-recommends \
-  gnome-session gnome-shell gnome-shell-extension-ubuntu-appindicators gnome-screenshot \
-  gnome-settings-daemon dbus-x11 xserver-xorg-core xserver-xorg-video-dummy xserver-xorg-legacy \
-  xinit x11-xserver-utils xdotool scrot imagemagick fonts-dejavu-core adwaita-icon-theme \
-  gnome-themes-extra ubuntu-wallpapers libayatana-appindicator3-1 libwebkit2gtk-4.1-0 \
-  libxdo3 curl ca-certificates awscli
-command -v aws && aws --version
-push
+apt-get update -y || true
+
+# awscli FIRST so we have logging/uploads even if the GNOME install has trouble.
+apt-get install -y awscli curl ca-certificates || snap install aws-cli --classic || true
+note "awscli=$(command -v aws) ver=$(aws --version 2>&1 | head -1)"
+
+# GNOME + Xorg-dummy stack. Bulk install, then retry the CORE bits individually
+# so one unavailable package name can't abort everything (the previous failure).
+GPKGS="gnome-session gnome-shell gnome-screenshot gnome-settings-daemon dbus-x11 \
+xserver-xorg-core xserver-xorg-video-dummy xserver-xorg-legacy xinit x11-xserver-utils \
+xdotool scrot imagemagick fonts-dejavu-core adwaita-icon-theme gnome-themes-extra \
+ubuntu-wallpapers libayatana-appindicator3-1 libwebkit2gtk-4.1-0 libxdo3 \
+gnome-shell-extension-appindicator gnome-shell-extension-ubuntu-appindicators"
+apt-get install -y --no-install-recommends $GPKGS || note "bulk apt had failures; retrying core"
+for p in gnome-session gnome-shell gnome-screenshot gnome-settings-daemon dbus-x11 \
+  xserver-xorg-core xserver-xorg-video-dummy xserver-xorg-legacy xdotool imagemagick scrot \
+  ubuntu-wallpapers libayatana-appindicator3-1 libwebkit2gtk-4.1-0 libxdo3 \
+  gnome-shell-extension-appindicator; do
+  dpkg -s "$p" >/dev/null 2>&1 || apt-get install -y --no-install-recommends "$p" || note "MISSING $p"
+done
+note "gnome-session=$(command -v gnome-session) Xorg=$(command -v Xorg) shot=$(command -v gnome-screenshot)"
 
 curl -fsSL -o /tmp/usagio.deb "https://github.com/MattJackson/usagio/releases/download/$VER/usagio_${VER#v}_amd64.deb"
 apt-get install -y /tmp/usagio.deb || { apt-get -f install -y; dpkg -i /tmp/usagio.deb; apt-get -f install -y; }
-/usr/bin/usagio --version; push
+note "usagio=$(/usr/bin/usagio --version 2>&1 | head -1)"
 
 id usagioqa || useradd -m -s /bin/bash usagioqa
 loginctl enable-linger usagioqa || true
@@ -57,13 +70,14 @@ aws s3 cp "$S3/linux-gnome-capture.sh" /home/usagioqa/run-capture.sh
 chmod +x /home/usagioqa/run-capture.sh
 chown usagioqa:usagioqa /home/usagioqa/run-capture.sh
 
+note "starting Xorg + gnome-session"
 Xorg :99 -config /etc/X11/xorg-dummy.conf -noreset vt8 >/var/log/xorg99.log 2>&1 &
-sleep 6
+sleep 8
 U=$(id -u usagioqa)
 install -d -m700 -o usagioqa -g usagioqa /run/user/$U
-su - usagioqa -c "export DISPLAY=:99 XDG_RUNTIME_DIR=/run/user/$U LIBGL_ALWAYS_SOFTWARE=1 GDK_BACKEND=x11; dbus-run-session -- bash -lc 'gnome-session --session=ubuntu >/tmp/gnome-session.log 2>&1 & sleep 35; export S3=\"$S3\" FIX=\"$FIX\"; /home/usagioqa/run-capture.sh >/tmp/run-capture.log 2>&1'" &
+su - usagioqa -c "export DISPLAY=:99 XDG_RUNTIME_DIR=/run/user/$U LIBGL_ALWAYS_SOFTWARE=1 GDK_BACKEND=x11; dbus-run-session -- bash -lc 'gnome-session --session=ubuntu >/tmp/gnome-session.log 2>&1 & sleep 40; export S3=\"$S3\" FIX=\"$FIX\"; /home/usagioqa/run-capture.sh >/tmp/run-capture.log 2>&1'" &
 
-for i in $(seq 1 45); do
+for i in $(seq 1 50); do
   sleep 20
   aws s3 cp /var/log/usagio-gnome.log "$S3/_userdata.log" 2>/dev/null || true
   aws s3 cp /var/log/xorg99.log "$S3/_xorg.log" 2>/dev/null || true
@@ -71,4 +85,4 @@ for i in $(seq 1 45); do
   aws s3 cp /tmp/sess.log "$S3/_session.log" 2>/dev/null || true
   aws s3 ls "$S3/_done" >/dev/null 2>&1 && break
 done
-push
+note "userdata end"
