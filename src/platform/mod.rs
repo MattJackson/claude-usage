@@ -11,11 +11,13 @@
 //! Linux, Win32 dispatch on Windows), it should use `block_on` inside the impl
 //! rather than infecting the trait surface.
 
-// Trait / MenuTree / MenuItem / MenuBackend / list / delete / etc. are
-// v0.5.0 scaffolding for Linux (ksni) + Windows (Win32) menu backends —
-// wired when those platforms land. macOS still drives the NSMenu path
-// directly through `crate::menubar`. File-level allow so the shape stays
-// reviewed as a whole rather than being pruned one method at a time.
+// The `Platform` / `MenuTree` / `MenuBackend` trait set is implemented by all
+// three platforms (`macos.rs` / `linux.rs` / `windows.rs`). macOS drives its
+// own main-thread `NSApplication` run loop instead of `MenuBackend::run_event_loop`
+// (see `menubar::run`'s macOS branch) but shares the same `MenuTree` +
+// `platform::render::render_menu` content path as Linux/Windows. File-level
+// allow so the trait shape stays reviewed as a whole rather than pruned one
+// unused-on-some-target method at a time.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -90,8 +92,9 @@ pub trait MenuHandle: Send {
     fn set_menu(&self, menu: MenuTree) -> Result<()>;
 }
 
-/// Provider-agnostic dropdown tree. The backend translates to NSMenu / muda /
-/// ksni. Kept small and imperative so backends have room to render natively.
+/// Provider-agnostic dropdown tree. `platform::render::render_menu` translates
+/// it to a live muri (`muda-compat`) menu — the same translator on every OS.
+/// Kept small and imperative so the renderer has room to lay it out natively.
 #[derive(Debug, Clone)]
 pub struct MenuTree {
     pub items: Vec<MenuItem>,
@@ -125,7 +128,26 @@ pub enum MenuItem {
         label: String,
         icon_png: Option<Vec<u8>>,
         items: Vec<MenuItem>,
+        /// Render this row as the *active* account — bold with a leading
+        /// checkmark (the 0.5.x active-account affordance). Maps to muri's
+        /// `Submenu::set_active` (muri #18). Always `false` for non-account
+        /// submenus (provider-group / Settings).
+        active: bool,
+        /// Severity tint for the trailing `\t` value segment (the `S% / W%`
+        /// percentages), if any. Maps to muri's `Submenu::set_value_color`
+        /// (muri #19). `None` leaves the value segment the default label color.
+        value_color: Option<ValueColor>,
     },
+}
+
+/// Severity tint for a submenu row's trailing value segment. Platform-agnostic
+/// so the generic `MenuTree` never names the renderer's color type; each
+/// backend maps it to muri's `Color` (`SystemRed` / `SystemOrange`). Mirrors
+/// `menubar::Severity`'s two bands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueColor {
+    Red,
+    Amber,
 }
 
 /// **Threading invariant**: `create_status_item` and `run_event_loop` MUST
@@ -292,6 +314,12 @@ mod linux;
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+
+// The single IR→muri menu translator, shared by every platform's tray backend
+// (macOS's bespoke run loop in `menubar`, plus the Linux/Windows `MenuBackend`
+// impls). muri renders identically on all three, so there is exactly one
+// `MenuTree` → live-menu path.
+pub(crate) mod render;
 
 // Test-only failure-injection seam, shared by ALL platforms' `SecretStore::set`
 // (macOS mock, Linux keyring/fallback, Windows Credential Manager). Lets

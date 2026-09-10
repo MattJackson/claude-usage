@@ -307,11 +307,11 @@ foreach ($name in $Fixtures) {
   # tray-icon shows the menu on left-click on Windows. Move first (some shells
   # need a hover to register the icon), then click.
   [Win32]::LeftClick($ix, $iy)
-  Start-Sleep -Milliseconds 1200
-  # If the left click only activated/toggled, a right-click still brings up the
-  # context menu. Harmless if the menu is already open (it just reopens).
-  [Win32]::RightClick($ix, $iy)
   Start-Sleep -Seconds 1
+  # NOTE: muri (0.6.0+) opens its menu on left-click and, per its native-dismiss
+  # behavior, closes on any click OUTSIDE the open menu. The old fallback
+  # right-click at the tray point now lands outside the open menu and DISMISSES
+  # it before the screenshot — so it's removed. Left-click alone opens it.
 
   # Full desktop (menu open) — for debugging + crop derivation.
   Capture-FullScreen $full

@@ -3,11 +3,14 @@
 //! Every Linux-specific decision lives in this file — nothing outside
 //! `src/platform/linux.rs` should ever need `#[cfg(target_os = "linux")]`.
 //!
-//! - **Tray icon**: the same `tray-icon` crate macOS/Windows use. On Linux
-//!   it's backed by `libappindicator`/`libayatana-appindicator3`, itself a
-//!   GTK status-icon wrapper, so an actual GTK main loop has to be pumped on
-//!   the thread that created the tray icon (see the module doc on
-//!   `LinuxMenu` below for how that's threaded through the `Send`-bound
+//! - **Tray icon / menu**: rendered through muri's `muda-compat` facade
+//!   (`muri::compat::{muda, tray_icon}`) as of the 0.6.0 muri swap. All three
+//!   platforms go through this facade — there is no real `tray-icon`/`muda`
+//!   dependency or native NSMenu styler anymore. The facade preserves the
+//!   passive tray-icon model (build returns immediately; menu clicks arrive on
+//!   the global `MenuEvent::receiver()` channel), so the GTK main loop still
+//!   has to be pumped on the thread that created the tray icon (see the module
+//!   doc on `LinuxMenu` below for how that's threaded through the `Send`-bound
 //!   trait objects the rest of the crate holds onto).
 //! - **Secrets**: `keyring`'s Secret Service backend (GNOME Keyring / KWallet
 //!   over D-Bus), falling back to a permissions-protected file when no
@@ -34,6 +37,13 @@
 
 use super::*;
 use anyhow::{bail, Context, Result};
+// muri 0.9's `muda-compat` facade replaces `tray-icon`/`muda` for the Linux
+// tray menu (0.6.0 swap). Both aliases route through `muri::compat::tray_icon`,
+// which mirrors real `tray-icon`'s surface — including the `menu` re-export
+// (`pub use muda as menu`, muri 0.9.1) that the item types come from. `Icon`
+// is the same type in both facade modules.
+use muri::compat::tray_icon as tray;
+use muri::compat::tray_icon::menu as muda;
 use serde_json::{Map, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -185,8 +195,8 @@ fn desktop_exec_quote(s: &str) -> String {
 /// into its whitespace-separated tokens, honoring double-quoted spans (and
 /// their `\"`, `\\`, `` \` ``, `\$` escapes) the way `install()` wrote them —
 /// so a path with a space (e.g. `"/home/user/My Apps/usagio"`) round-trips as
-/// ONE token instead of splitting on the internal space (platform-01, v0.5.2
-/// audit). Whitespace outside quotes always separates tokens; quoted spans
+/// ONE token instead of splitting on the internal space. Whitespace outside
+/// quotes always separates tokens; quoted spans
 /// may appear mid-token (`foo"bar baz"qux` -> `foobar bazqux`) though
 /// `desktop_exec_quote` itself never produces that shape — this just doesn't
 /// assume otherwise.
@@ -296,7 +306,7 @@ impl Autostart for LinuxAutostart {
             .lines()
             .find_map(|l| l.strip_prefix("Exec="))
             .context("usagio.desktop has no Exec= line")?;
-        // platform-01 (v0.5.2 audit): quote-aware split, matching the
+        // Quote-aware split, matching the
         // quote-aware writer (`desktop_exec_quote`) `install()` used to
         // produce this line. `split_whitespace()` used to break a quoted
         // path containing a space (e.g. `"/home/user/My Apps/usagio"`) into
@@ -368,7 +378,7 @@ fn fallback_load(dir: &Path) -> Result<Map<String, Value>> {
     }
 }
 
-/// robustness-03 (v0.5.1 audit): write the whole fallback secrets map
+/// Write the whole fallback secrets map
 /// atomically — tmp file at final mode 0600 from creation (no umask window),
 /// then `rename` into place — mirroring `store::write_private` /
 /// `codex::write_auth_json_atomically`. Previously this was a plain
@@ -540,8 +550,8 @@ impl SecretStore for LinuxSecrets {
 // MenuBackend — tray-icon + a GTK main loop
 // ---------------------------------------------------------------------------
 
-/// `tray_icon::TrayIcon` wraps an `Rc<RefCell<..>>` (and, transitively, a raw
-/// `AppIndicator` pointer) on Linux — it is not `Send`. But `MenuBackend` and
+/// muri's compat `TrayIcon` wraps an `Rc<RefCell<..>>` (and, transitively, a
+/// ksni/GTK handle) on Linux — it is not `Send`. But `MenuBackend` and
 /// `MenuHandle` both require `Send` (+`Sync` for the backend) so the rest of
 /// the crate can hold a `Box<dyn Platform>` in a `OnceLock` without caring
 /// which OS it's on. The two requirements are reconciled like this:
@@ -609,7 +619,7 @@ enum HandleMsg {
 }
 
 struct TrayState {
-    tray: tray_icon::TrayIcon,
+    tray: tray::TrayIcon,
     rx: std::sync::mpsc::Receiver<HandleMsg>,
 }
 
@@ -620,155 +630,16 @@ thread_local! {
     static TRAY_STATE: std::cell::RefCell<Option<TrayState>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Decode PNG bytes (the format every bundled provider icon and tray icon
-/// ships as, see `src/icons.rs`) into raw RGBA + dimensions. Pure Rust (the
-/// `png` crate), so it cross-compiles without a system libpng.
-fn decode_png_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let mut reader = decoder
-        .read_info()
-        .context("decoding PNG header for a tray/menu icon")?;
-    let buf_size = reader
-        .output_buffer_size()
-        .context("PNG output buffer size overflow")?;
-    let mut buf = vec![0u8; buf_size];
-    let info = reader
-        .next_frame(&mut buf)
-        .context("decoding PNG frame for a tray/menu icon")?;
-    let bytes = &buf[..info.buffer_size()];
-    let rgba = match info.color_type {
-        png::ColorType::Rgba => bytes.to_vec(),
-        png::ColorType::Rgb => {
-            // as_chunks::<3>() is what clippy prefers over chunks_exact(3);
-            // it returns a slice of fixed-size arrays so the compiler can
-            // elide the bounds check inside the closure below.
-            let (chunks, _rem) = bytes.as_chunks::<3>();
-            chunks
-                .iter()
-                .flat_map(|c| [c[0], c[1], c[2], 255])
-                .collect()
-        }
-        other => {
-            bail!("unsupported PNG color type for a tray/menu icon: {other:?} (need RGB or RGBA)")
-        }
-    };
-    Ok((rgba, info.width, info.height))
+/// Decode the tray icon's PNG into a muri tray `Icon` (raw RGBA). Menu-item
+/// icons and the IR→muri walk both live in the shared
+/// `crate::platform::render` now — this is the one Linux-local decode, for the
+/// tray-icon slot specifically (a distinct `Icon` type from the menu one).
+fn decode_tray_icon(bytes: &[u8]) -> Result<tray::Icon> {
+    let (rgba, w, h) = crate::platform::render::decode_png_rgba(bytes)?;
+    tray::Icon::from_rgba(rgba, w, h).context("building a tray icon from decoded PNG")
 }
 
-fn decode_tray_icon(bytes: &[u8]) -> Result<tray_icon::Icon> {
-    let (rgba, w, h) = decode_png_rgba(bytes)?;
-    tray_icon::Icon::from_rgba(rgba, w, h).context("building a tray icon from decoded PNG")
-}
-
-fn decode_menu_icon(bytes: &[u8]) -> Result<tray_icon::menu::Icon> {
-    let (rgba, w, h) = decode_png_rgba(bytes)?;
-    tray_icon::menu::Icon::from_rgba(rgba, w, h)
-        .context("building a menu-item icon from decoded PNG")
-}
-
-/// `tray_icon::menu::{Menu, Submenu}` both have an inherent `append(&dyn
-/// IsMenuItem)` method but share no common trait that exposes it, so this
-/// bridges the two for the recursive `MenuTree` walk below.
-trait NativeMenuContainer {
-    fn append_native(&self, item: &dyn tray_icon::menu::IsMenuItem);
-}
-impl NativeMenuContainer for tray_icon::menu::Menu {
-    fn append_native(&self, item: &dyn tray_icon::menu::IsMenuItem) {
-        let _ = self.append(item);
-    }
-}
-impl NativeMenuContainer for tray_icon::menu::Submenu {
-    fn append_native(&self, item: &dyn tray_icon::menu::IsMenuItem) {
-        let _ = self.append(item);
-    }
-}
-
-/// Translate the cross-platform `MenuTree` (from `mod.rs`) into a native
-/// `tray-icon`/`muda` menu. Only ever called from the GTK thread — the
-/// `muda` item types (`Rc`-backed) aren't `Send` either, which is fine since
-/// nothing here escapes past the caller in `apply_handle_msg`.
-fn build_native_menu(tree: &MenuTree) -> tray_icon::menu::Menu {
-    let menu = tray_icon::menu::Menu::new();
-    append_children(&menu, &tree.items);
-    menu
-}
-
-fn append_children(container: &dyn NativeMenuContainer, items: &[MenuItem]) {
-    use tray_icon::menu::{
-        CheckMenuItem, IconMenuItem, MenuItem as NativeMenuItem, PredefinedMenuItem, Submenu,
-    };
-    for item in items {
-        match item {
-            MenuItem::Action {
-                id,
-                label,
-                icon_png,
-                enabled,
-                checked,
-                checkable,
-            } => {
-                if *checkable {
-                    container.append_native(&CheckMenuItem::with_id(
-                        id.as_str(),
-                        label,
-                        *enabled,
-                        *checked,
-                        None,
-                    ));
-                } else if let Some(icon_bytes) = icon_png {
-                    match decode_menu_icon(icon_bytes) {
-                        Ok(icon) => container.append_native(&IconMenuItem::with_id(
-                            id.as_str(),
-                            label,
-                            *enabled,
-                            Some(icon),
-                            None,
-                        )),
-                        Err(_) => container.append_native(&NativeMenuItem::with_id(
-                            id.as_str(),
-                            label,
-                            *enabled,
-                            None,
-                        )),
-                    }
-                } else {
-                    container.append_native(&NativeMenuItem::with_id(
-                        id.as_str(),
-                        label,
-                        *enabled,
-                        None,
-                    ));
-                }
-            }
-            MenuItem::Static { label, icon_png } => {
-                // Disabled label row; if it carries an icon (provider group
-                // header), render it as a disabled IconMenuItem so the provider
-                // mark shows next to the name — matching macOS.
-                if let Some(icon) = icon_png.as_ref().and_then(|b| decode_menu_icon(b).ok()) {
-                    container.append_native(&IconMenuItem::with_id(
-                        "noop",
-                        label,
-                        false,
-                        Some(icon),
-                        None,
-                    ));
-                } else {
-                    container.append_native(&NativeMenuItem::with_id("noop", label, false, None));
-                }
-            }
-            MenuItem::Separator => {
-                container.append_native(&PredefinedMenuItem::separator());
-            }
-            MenuItem::Submenu { label, items, .. } => {
-                let sub = Submenu::new(label, true);
-                append_children(&sub, items);
-                container.append_native(&sub);
-            }
-        }
-    }
-}
-
-fn apply_handle_msg(tray: &tray_icon::TrayIcon, msg: HandleMsg) {
+fn apply_handle_msg(tray: &tray::TrayIcon, msg: HandleMsg) {
     match msg {
         HandleMsg::SetIcon(bytes) => match decode_tray_icon(&bytes) {
             Ok(icon) => {
@@ -785,7 +656,7 @@ fn apply_handle_msg(tray: &tray_icon::TrayIcon, msg: HandleMsg) {
             tray.set_title(Some(title));
         }
         HandleMsg::SetMenu(tree) => {
-            let native = build_native_menu(&tree);
+            let native = crate::platform::render::render_menu(&tree);
             tray.set_menu(Some(Box::new(native)));
         }
     }
@@ -821,12 +692,12 @@ impl MenuBackend for LinuxMenu {
     ) -> Result<Box<dyn MenuHandle>> {
         self.ensure_gtk_init()?;
         let icon = decode_tray_icon(initial_icon)?;
-        let tray = tray_icon::TrayIconBuilder::new()
+        let tray = tray::TrayIconBuilder::new()
             .with_title(initial_title)
             // tray-icon's own Linux note: "the icon won't be visible unless
             // a menu is set. Setting an empty Menu is enough." The real menu
             // arrives via the first `set_menu` call.
-            .with_menu(Box::new(tray_icon::menu::Menu::new()))
+            .with_menu(Box::new(muda::Menu::new()))
             .with_icon(icon)
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create Linux tray icon: {e}"))?;
@@ -861,7 +732,7 @@ impl MenuBackend for LinuxMenu {
         let click_cb = Arc::clone(&self.click_cb);
         gtk::glib::source::timeout_add_local(std::time::Duration::from_millis(100), move || {
             // Menu-item clicks arrive on tray-icon's own global channel.
-            while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
                 if let Some(cb) = click_cb.lock().unwrap().as_ref() {
                     cb(&event.id.0);
                 }
@@ -1052,7 +923,7 @@ mod tests {
         assert_eq!(desktop_exec_quote("has\"quote"), "\"has\\\"quote\"");
     }
 
-    // --- Exec= quote-aware split (platform-01, v0.5.2 audit) --------------
+    // --- Exec= quote-aware split ------------------------------------------
 
     #[test]
     fn desktop_exec_split_round_trips_path_with_spaces() {
@@ -1165,7 +1036,7 @@ mod tests {
         );
     }
 
-    /// robustness-03 (v0.5.1 audit): `fallback_write` must go through a
+    /// `fallback_write` must go through a
     /// tmp-file + rename, like every other secret-bearing file in the crate
     /// — never leaving a `.secrets.json.tmp.*` orphan behind, and never a
     /// half-written `secrets.json` an interrupted write could produce.

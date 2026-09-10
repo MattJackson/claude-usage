@@ -142,6 +142,11 @@ impl PopoverHost {
     /// `persistent` selects `ApplicationDefined` behavior (stays open — used by
     /// the `USAGIO_POPOVER_SHOW_ON_LAUNCH` screenshot path) instead of the
     /// normal `.transient` (auto-dismiss on click-outside / focus loss).
+    // Currently uncalled: the 0.6.0 muri tray backend exposes no `NSStatusItem`
+    // anchor, so `menubar::build_popover_host` returns `None` and never
+    // constructs a host. Retained (behind the off-by-default `custom-popup`
+    // feature) for when muri grows a status-item anchor — see that fn's note.
+    #[allow(dead_code)]
     pub(crate) fn new(
         button: Retained<NSStatusBarButton>,
         on_click: Box<dyn Fn(&str)>,

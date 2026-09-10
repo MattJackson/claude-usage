@@ -1,6 +1,6 @@
 [package]
 name = "usagio"
-version = "0.5.23"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Track usage / limits across every AI coding CLI you use, and switch between accounts."
@@ -67,6 +67,12 @@ vertex-ai = []
 
 [dependencies]
 anyhow = "1"
+# Decodes the bundled 16x16 provider PNGs (all 8-bit RGBA) into the raw RGBA
+# the muri `muda-compat` `IconMenuItem` wants for provider group-header icons
+# (see `platform::render`). Pure Rust, no system libpng. Common to all targets:
+# the single IR→muri menu renderer in `src/platform/render.rs` is compiled on
+# macOS/Linux/Windows alike.
+png = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
@@ -75,7 +81,6 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 fs2 = "0.4"
-tray-icon = "0.24.2"
 # fsnotify (filesystem change notifications) for the credential-sync layer:
 # watches every provider's credential_paths and drives absorb_all_lagging +
 # refresh_inactive_if_stale in response to vendor-CLI rotations.
@@ -106,6 +111,17 @@ tiktoken-rs = { version = "0.7", optional = true }
 # `default-features = false` + explicit features picks the lightest working
 # backend per OS (no GTK on Linux, no Cocoa duplicate deps on macOS).
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "common-controls-v6"] }
+# muri (0.6.0 swap): EVERY platform's tray menu is now rendered through muri's
+# `muda-compat` facade (`muri::compat::tray_icon`, which mirrors real
+# `tray-icon` including its `menu` re-export) — the real `tray-icon`/`muda` are
+# gone. macOS drives an `NSApplication`/`NSTimer` run loop itself and hands the
+# passive muri tray a `muri::compat::tray_icon::menu::Menu` (see `src/menubar.rs`
+# `run`/`build_menu`); the old native `NSMenu` styler (`mac_style`) was deleted.
+# Pinned exact per muri's own migration guidance (§7): pre-1.0 minor bumps may
+# break. 0.9.1 landed the `MenuId::new` + `compat::tray_icon::menu` drop-ins
+# (muri #4/#5); 0.9.2 made `build()` spawn a live tray + render the tray icon
+# (muri #6/#7); 0.9.3 renders a text `set_title` on the macOS status item (#8).
+muri = { version = "=0.10.3", features = ["muda-compat"] }
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status
@@ -191,12 +207,9 @@ block2 = "0.6"
 # real impls (tray + GTK loop, Secret Service + file fallback, XDG autostart,
 # XDG paths).
 [target.'cfg(target_os = "linux")'.dependencies]
-# `tray-icon` (top-level dep, shared with macOS/Windows) is backed on Linux by
-# `libappindicator`/`libayatana-appindicator3`, itself a GTK status-icon
-# wrapper — an actual GTK main loop has to run on the thread that created the
-# tray icon. `gtk`/`glib` are pulled in only to drive that loop; tray-icon
-# owns the appindicator plumbing itself. Version pinned to what tray-icon
-# 0.24's own examples build against.
+# muri's Linux tray backend drives an actual GTK main loop on the thread that
+# created the tray icon. `gtk`/`glib` are pulled in only to drive that loop.
+# Version pinned to what the tray ecosystem's own examples build against.
 gtk = "0.18"
 # Per-account secret storage: prefers the Secret Service D-Bus daemon (GNOME
 # Keyring / KWallet) via keyring's pure-Rust `async-secret-service` backend
@@ -214,9 +227,6 @@ keyring = { version = "3", default-features = false, features = ["async-secret-s
 # feature above) and a pure-Rust crypto backend (`crypto-rust`, no system
 # OpenSSL needed to cross-compile).
 secret-service = { version = "4", default-features = false, features = ["rt-async-io-crypto-rust"] }
-# Decodes the bundled 16x16 provider PNGs into the raw RGBA tray-icon needs.
-# Pure Rust, no system libpng dependency.
-png = "0.18"
 # File dialogs (Backups Save/Restore in the tray menu) via the
 # xdg-desktop-portal — works across GNOME/KDE/Sway. The portal round-trip
 # uses rfd's own dlopen'd libdbus binding (no link-time C dep); "wayland" is
