@@ -158,16 +158,19 @@ jobs:
         run: cargo test --all-features platform::windows -- --ignored --test-threads=1
 
       # Ubuntu-only GUI smoke test: proves the real tray backend actually
-      # initializes at runtime (GTK starts, libayatana-appindicator3 links,
-      # tray_icon::TrayIcon can be built/mutated/dropped) — not just
-      # compiles. xvfb-run supplies a virtual X server for headless CI.
-      - name: Install xvfb
+      # initializes at runtime (GTK starts, and muri's ksni StatusNotifierItem
+      # registers on the session bus — the 0.6.0 muri backend, not the old
+      # appindicator path) — not just compiles. xvfb-run supplies a virtual X
+      # server for `gtk::init`; dbus-run-session supplies a throwaway session
+      # bus for ksni. `dbus-x11` provides dbus-run-session (installed with the
+      # Secret Service deps below, but pulled up here since this step needs it).
+      - name: Install xvfb + dbus
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get install -y xvfb
+        run: sudo apt-get install -y xvfb dbus-x11
 
-      - name: Linux tray init smoke test (xvfb-run)
+      - name: Linux tray init smoke test (xvfb + session bus)
         if: matrix.os == 'ubuntu-latest'
-        run: xvfb-run --auto-servernum cargo test --test integration_tray --all-features -- --ignored --test-threads=1
+        run: xvfb-run --auto-servernum dbus-run-session -- cargo test --test integration_tray --all-features -- --ignored --test-threads=1
 
       # Ubuntu-only: proves the Secret Service D-Bus path in LinuxSecrets
       # actually works against a real daemon (not just the offline-file
