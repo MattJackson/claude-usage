@@ -357,10 +357,27 @@ impl Appender {
     fn open(path: &Path) -> Result<Self> {
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p).ok();
+            // History files hold per-account usage snapshots (emails, usage %,
+            // timestamps) — private user data under ~/.config/usagio, which the
+            // rest of the store keeps owner-only. Harden the dir to 0700 so a
+            // fresh history dir isn't world-listable.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+            }
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        // Create new history files 0600 (owner-only) rather than inheriting the
+        // process umask (typically 0644 → world-readable). mode() only applies
+        // when create() actually makes the file; existing files keep their mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
         Ok(Appender {

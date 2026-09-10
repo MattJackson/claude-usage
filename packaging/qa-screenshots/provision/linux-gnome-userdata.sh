@@ -85,7 +85,13 @@ su - usagioqa -c "export $ENVX; { echo '== glxinfo =='; glxinfo 2>&1 | head -25;
 aws s3 cp /tmp/shell-probe.log "$S3/_shell-probe.log" 2>/dev/null || true
 note "shell probe uploaded"
 
-su - usagioqa -c "export $ENVX; dbus-run-session -- bash -lc 'gnome-session --session=ubuntu >/tmp/gnome-session.log 2>&1 & sleep 45; export S3=\"$S3\" FIX=\"$FIX\"; /home/usagioqa/run-capture.sh >/tmp/run-capture.log 2>&1'" &
+# Launch gnome-shell DIRECTLY as the X11 compositor (NOT via gnome-session).
+# The probe above proved `gnome-shell --x11 --replace` starts fine on the dummy
+# display, whereas `gnome-session --session=ubuntu` fails its required-component
+# check (no GDM/display-manager) and shows the "Oh no, something has gone wrong"
+# screen. gnome-shell alone renders the top panel + loads the appindicator
+# extension (enabled by run-capture.sh), which is all we need for the tray shot.
+su - usagioqa -c "export $ENVX; dbus-run-session -- bash -lc 'gnome-shell --x11 --replace >/tmp/gnome-session.log 2>&1 & sleep 30; export S3=\"$S3\" FIX=\"$FIX\"; /home/usagioqa/run-capture.sh >/tmp/run-capture.log 2>&1'" &
 
 for i in $(seq 1 50); do
   sleep 20
