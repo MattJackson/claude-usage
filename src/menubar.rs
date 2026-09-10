@@ -2806,14 +2806,26 @@ mod tests {
             theme_from_name("windows"),
             Some(ThemeSource::Windows(_))
         ));
-        assert!(matches!(theme_from_name("WIN"), Some(ThemeSource::Windows(_))));
-        assert!(matches!(theme_from_name("mac"), Some(ThemeSource::MacOs(_))));
+        assert!(matches!(
+            theme_from_name("WIN"),
+            Some(ThemeSource::Windows(_))
+        ));
+        assert!(matches!(
+            theme_from_name("mac"),
+            Some(ThemeSource::MacOs(_))
+        ));
         assert!(matches!(
             theme_from_name(" macos "),
             Some(ThemeSource::MacOs(_))
         ));
-        assert!(matches!(theme_from_name("gnome"), Some(ThemeSource::Gnome(_))));
-        assert!(matches!(theme_from_name("linux"), Some(ThemeSource::Gnome(_))));
+        assert!(matches!(
+            theme_from_name("gnome"),
+            Some(ThemeSource::Gnome(_))
+        ));
+        assert!(matches!(
+            theme_from_name("linux"),
+            Some(ThemeSource::Gnome(_))
+        ));
         assert!(matches!(
             theme_from_name("system"),
             Some(ThemeSource::System(_))
