@@ -582,11 +582,12 @@ fn active_account(snap: &Snapshot) -> Option<(&ProviderSection, &AcctView)> {
 }
 
 /// Entry point dispatched by `usagio menubar` (see `main.rs`). Every platform
-/// renders the tray menu through the same `cross_platform::menu_tree_from_snapshot`
-/// + `platform::render::render_menu` pipeline. macOS drives its own
-/// `NSApplication`/`NSTimer` run loop (below) to pump events; Linux/Windows
-/// drive the menu event loop via the `platform::MenuBackend` trait instead
-/// (`cross_platform::run`, near the end of this file).
+/// renders the tray menu through the same pipeline
+/// (`cross_platform::menu_tree_from_snapshot` then `platform::render::render_menu`).
+/// macOS drives its own `NSApplication`/`NSTimer` run loop (below) to pump
+/// events; Linux/Windows drive the menu event loop via the
+/// `platform::MenuBackend` trait instead (`cross_platform::run`, near the end
+/// of this file).
 #[cfg(not(target_os = "macos"))]
 pub fn run() -> Result<()> {
     cross_platform::run()
