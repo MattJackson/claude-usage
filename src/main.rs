@@ -253,7 +253,10 @@ fn run() -> Result<()> {
         }
         Some("token") => cmd_token(args.get(1).map(String::as_str)),
         Some("watch") => cmd_watch(&args[1..]),
-        Some("menubar") => menubar::run(),
+        Some("menubar") => {
+            menubar::set_theme_override_from_args(&args[1..]);
+            menubar::run()
+        }
         Some("report") => cmd_report(&args[1..]),
         Some("context") => cmd_context(&args[1..]),
         Some("install") => cmd_install(),
@@ -292,6 +295,7 @@ fn print_help() {
          usagio token [email]     Print a fresh access token\n  \
          usagio watch             Auto-swap at 95%, keep working (foreground)\n  \
          usagio menubar           Run the macOS menu-bar app (usage + auto-swap)\n  \
+         usagio menubar --theme <os>  Force an OEM look for a UI audit: windows|macos|gnome|system\n  \
          usagio install           Run the menu-bar app at every login (via launchd)\n  \
          usagio uninstall         Stop running the menu-bar app at login\n  \
          usagio report            Usage patterns by weekday / hour / account\n  \

@@ -690,13 +690,17 @@ impl MenuBackend for LinuxMenu {
     ) -> Result<Box<dyn MenuHandle>> {
         self.ensure_gtk_init()?;
         let icon = decode_tray_icon(initial_icon)?;
-        let tray = tray::TrayIconBuilder::new()
+        let mut builder = tray::TrayIconBuilder::new()
             .with_title(initial_title)
             // tray-icon's own Linux note: "the icon won't be visible unless
             // a menu is set. Setting an empty Menu is enough." The real menu
             // arrives via the first `set_menu` call.
             .with_menu(Box::new(muda::Menu::new()))
-            .with_icon(icon)
+            .with_icon(icon);
+        if let Some(theme) = crate::menubar::forced_theme() {
+            builder = builder.with_theme(theme);
+        }
+        let tray = builder
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create Linux tray icon: {e}"))?;
         let (tx, rx) = std::sync::mpsc::channel();
