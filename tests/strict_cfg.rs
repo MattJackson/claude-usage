@@ -114,7 +114,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // src/menubar.rs — `tests::mac_style_tests`: exercises
     // `mac_style::attributed` (NSAttributedString attribute inspection)
     // directly; needs the same `objc2*` crates as `mac_style` itself.
-    ("src/menubar.rs", 5045),
+    ("src/menubar.rs", 5050),
 ];
 
 fn src_root() -> PathBuf {

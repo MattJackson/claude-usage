@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tray_icon::menu::{
-    CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuId, MenuItem as NativeMenuItem,
+    CheckMenuItem, IconMenuItem, IsMenuItem, Menu, MenuEvent, MenuId, MenuItem as NativeMenuItem,
     PredefinedMenuItem, Submenu,
 };
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -201,6 +201,15 @@ fn decode_icon(bytes: &[u8]) -> Result<Icon> {
         .map_err(|e| anyhow::anyhow!("bad tray icon bytes: {e}"))
 }
 
+/// Decode a PNG into a menu-item icon (`tray_icon::menu::Icon`, distinct from the
+/// tray `Icon` above). Best-effort: a bad/undecodable PNG yields `None` and the
+/// row just renders text-only.
+fn decode_menu_icon(bytes: &[u8]) -> Option<tray_icon::menu::Icon> {
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    tray_icon::menu::Icon::from_rgba(img.into_raw(), w, h).ok()
+}
+
 /// Recursively translate one generic `MenuItem` into a native muda item.
 /// `icon_png` on `Action`/`Static`/`Submenu` rows is currently ignored
 /// (label-only rows) — no caller exercises per-row icons yet; wiring
@@ -232,7 +241,15 @@ fn build_item(item: &MenuItem) -> Result<Box<dyn IsMenuItem>> {
                 ))
             }
         }
-        MenuItem::Static { label, .. } => Box::new(NativeMenuItem::new(label, false, None)),
+        MenuItem::Static { label, icon_png } => {
+            // Disabled label row. When it carries an icon (a provider group
+            // header), render it as a disabled IconMenuItem so the provider mark
+            // shows next to the name — matching macOS.
+            match icon_png.as_ref().and_then(|b| decode_menu_icon(b)) {
+                Some(icon) => Box::new(IconMenuItem::new(label, false, Some(icon), None)),
+                None => Box::new(NativeMenuItem::new(label, false, None)),
+            }
+        }
         MenuItem::Separator => Box::new(PredefinedMenuItem::separator()),
         MenuItem::Submenu { label, items, .. } => {
             let sub = Submenu::new(label, true);

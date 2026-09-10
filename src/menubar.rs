@@ -3192,11 +3192,15 @@ mod cross_platform {
     /// Cross-platform counterpart to `build_provider_group` — one static (or
     /// submenu-when-env-overridden) row carrying the provider's display name.
     fn build_provider_group_item(sec: &ProviderSection) -> PMenuItem {
+        // The provider's 16px icon on its group-header row (v0.5.22) — the
+        // Windows/Linux counterpart to the macOS `apply_menu_styles` `setImage`
+        // walk. A `None` (no bundled icon for the slug) renders text-only.
+        let icon_png = crate::icons::png16_for(sec.provider_id).map(|b| b.to_vec());
         let headlines = section_headline_rows(sec);
         if headlines.is_empty() {
             return PMenuItem::Static {
                 label: sec.display_name.to_string(),
-                icon_png: None,
+                icon_png,
             };
         }
         let children: Vec<PMenuItem> = headlines
@@ -3205,7 +3209,7 @@ mod cross_platform {
             .collect();
         PMenuItem::Submenu {
             label: sec.display_name.to_string(),
-            icon_png: None,
+            icon_png,
             items: children,
         }
     }
@@ -3355,11 +3359,12 @@ mod cross_platform {
     /// this reuses the active account's provider icon, falling back to
     /// Claude's (always bundled, regardless of which provider Cargo features
     /// are enabled — see `icons::png16_for`).
-    fn initial_icon_bytes(snap: &Snapshot) -> &'static [u8] {
-        active_account(snap)
-            .and_then(|(sec, _)| crate::icons::png16_for(sec.provider_id))
-            .or_else(|| crate::icons::png16_for(CLAUDE_SLUG))
-            .unwrap_or(&[0u8; 0])
+    fn initial_icon_bytes(_snap: &Snapshot) -> &'static [u8] {
+        // The tray/notification-area icon is usagio's own brand mark on every
+        // platform that shows an icon here (Windows/Linux). The active account's
+        // PROVIDER icon belongs on the menu's group-header rows, not in the tray
+        // (user decision, v0.5.22) — so this no longer varies by active provider.
+        crate::icons::usagio_tray_icon()
     }
 
     /// Background redraw ticker: rebuilds the tray from cached state and

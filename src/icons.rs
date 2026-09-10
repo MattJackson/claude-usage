@@ -12,6 +12,17 @@
 //! section header row for each provider. A missing icon just leaves the row
 //! text-only — the menu still renders correctly.
 
+/// Bytes of the usagio brand mark (44px PNG), used as the Windows/Linux tray
+/// icon. usagio's own icon belongs in the tray/notification area; the active
+/// account's PROVIDER icon belongs on the menu's group-header rows (see
+/// `png16_for`). macOS shows a text title in the menu bar and doesn't use this —
+/// so it's dead code on the macOS build (the `cross_platform` tray path that
+/// calls it is `#[cfg(not(target_os = "macos"))]`).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn usagio_tray_icon() -> &'static [u8] {
+    include_bytes!("../assets/icons/usagio.png").as_slice()
+}
+
 /// Bytes of the 16px PNG for the provider identified by `slug`. Returns `None`
 /// if no icon is bundled for that slug. Pure function — safe to call from tests.
 pub fn png16_for(slug: &str) -> Option<&'static [u8]> {

@@ -733,8 +733,21 @@ fn append_children(container: &dyn NativeMenuContainer, items: &[MenuItem]) {
                     ));
                 }
             }
-            MenuItem::Static { label, .. } => {
-                container.append_native(&NativeMenuItem::with_id("noop", label, false, None));
+            MenuItem::Static { label, icon_png } => {
+                // Disabled label row; if it carries an icon (provider group
+                // header), render it as a disabled IconMenuItem so the provider
+                // mark shows next to the name — matching macOS.
+                if let Some(icon) = icon_png.as_ref().and_then(|b| decode_menu_icon(b).ok()) {
+                    container.append_native(&IconMenuItem::with_id(
+                        "noop",
+                        label,
+                        false,
+                        Some(icon),
+                        None,
+                    ));
+                } else {
+                    container.append_native(&NativeMenuItem::with_id("noop", label, false, None));
+                }
             }
             MenuItem::Separator => {
                 container.append_native(&PredefinedMenuItem::separator());
