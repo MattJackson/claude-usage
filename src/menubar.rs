@@ -503,7 +503,11 @@ fn trailing_for_account(
 /// across every provider. v0.5.3 menu redesign — provider grouping is BACK,
 /// so the account row no longer carries `{provider} · ` and instead sits
 /// under a bold header row.
-const ACCOUNT_INDENT: &str = "  ";
+// Empty under muri: muri reserves a leading gutter (icon/checkmark column) that
+// already nests account rows under the provider header, so the old two-space
+// text indent (a native-NSMenu-era hack) now stacks on top of that gutter and
+// produces a large left margin. Drop it and let muri's layout do the nesting.
+const ACCOUNT_INDENT: &str = "";
 
 /// v0.5.3 menu redesign: the row for one account — `<indent><email>\t<trailing>`
 /// where `<trailing>` is whatever `trailing_for_account` decides (locked
@@ -3832,7 +3836,7 @@ mod tests {
         let sec = header_test_section("Claude");
         let a = acct("you@work.com", Some(42.0), Some(61.0), false);
         let r = account_header_row(&sec, &a);
-        assert_eq!(r.plain, "  you@work.com\t42% / 61%");
+        assert_eq!(r.plain, "you@work.com\t42% / 61%");
         assert!(!r.checkmark, "inactive row: no leading checkmark");
         assert_eq!(r.tab_x_kind, Some(TabX::MenuRight));
     }
@@ -3855,7 +3859,7 @@ mod tests {
             // Session-locked + weekly-healthy nuance (v0.5.2 addendum #7):
             // trailing = "<countdown> / <weekly%>" so the user can still see
             // the healthy weekly headroom while the session countdown ticks.
-            assert_eq!(r.plain, "  matt@example.com\t1h 30m / 20%");
+            assert_eq!(r.plain, "matt@example.com\t1h 30m / 20%");
             assert!(r.bold, "active locked row is still bold");
             assert!(r.checkmark, "active row gets a leading checkmark");
             // countdown is red; weekly=20 sits below the severity bands so it
@@ -3874,7 +3878,7 @@ mod tests {
         let sec = header_test_section("Codex");
         let a = acct("hot@x.com", Some(96.0), Some(10.0), false);
         let r = account_header_row(&sec, &a);
-        assert_eq!(r.plain, "  hot@x.com\t96% / 10%");
+        assert_eq!(r.plain, "hot@x.com\t96% / 10%");
         assert_eq!(r.colors.len(), 1, "only the 96% session run is colored");
         let (off, len, sev) = r.colors[0];
         assert_eq!(sev, Severity::Red);
