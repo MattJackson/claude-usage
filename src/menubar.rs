@@ -543,12 +543,13 @@ fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
 /// band present — the one the user most needs to see. `None` when the row has
 /// no colored spans (a healthy account, or a non-value row).
 fn row_value_severity(style: &RowStyle) -> Option<Severity> {
-    style.colors.iter().fold(None, |worst, (_, _, sev)| {
-        match (worst, sev) {
+    style
+        .colors
+        .iter()
+        .fold(None, |worst, (_, _, sev)| match (worst, sev) {
             (Some(Severity::Red), _) | (_, Severity::Red) => Some(Severity::Red),
             _ => Some(Severity::Amber),
-        }
-    })
+        })
 }
 
 /// v0.5.3 menu redesign: the bold provider-group header row that precedes a
@@ -2365,9 +2366,9 @@ fn confirm(question: &str) -> bool {
 // from its own main-thread loop at the top of this file.
 mod cross_platform {
     use super::*;
-    use crate::platform::{MenuItem as PMenuItem, MenuTree};
     #[cfg(not(target_os = "macos"))]
     use crate::platform::MenuHandle;
+    use crate::platform::{MenuItem as PMenuItem, MenuTree};
 
     /// A `RowStyle`'s plain title. The `\t` is passed THROUGH so muri's
     /// muda-compat two-column tab-stop layout (muri #12) right-aligns the
