@@ -76,13 +76,22 @@ Xorg :99 -config /etc/X11/xorg-dummy.conf -noreset vt8 >/var/log/xorg99.log 2>&1
 sleep 8
 U=$(id -u usagioqa)
 install -d -m700 -o usagioqa -g usagioqa /run/user/$U
-su - usagioqa -c "export DISPLAY=:99 XDG_RUNTIME_DIR=/run/user/$U LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe MESA_LOADER_DRIVER_OVERRIDE=llvmpipe GDK_BACKEND=x11; dbus-run-session -- bash -lc 'gnome-session --session=ubuntu >/tmp/gnome-session.log 2>&1 & sleep 45; export S3=\"$S3\" FIX=\"$FIX\"; /home/usagioqa/run-capture.sh >/tmp/run-capture.log 2>&1'" &
+
+# DIAGNOSTIC PROBE: run gnome-shell --x11 directly (no gnome-session) for ~18s and
+# capture its own stderr — that's the crash reason gnome-session hides ("Oh no").
+# Also dump glxinfo so we can see whether GLX/swrast is actually available.
+ENVX="DISPLAY=:99 XDG_RUNTIME_DIR=/run/user/$U LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe MESA_LOADER_DRIVER_OVERRIDE=llvmpipe GDK_BACKEND=x11"
+su - usagioqa -c "export $ENVX; { echo '== glxinfo =='; glxinfo 2>&1 | head -25; echo '== gnome-shell --x11 probe =='; dbus-run-session -- timeout 18 gnome-shell --x11 --replace; echo \"shell exit=\$?\"; } >/tmp/shell-probe.log 2>&1" || true
+aws s3 cp /tmp/shell-probe.log "$S3/_shell-probe.log" 2>/dev/null || true
+note "shell probe uploaded"
+
+su - usagioqa -c "export $ENVX; dbus-run-session -- bash -lc 'gnome-session --session=ubuntu >/tmp/gnome-session.log 2>&1 & sleep 45; export S3=\"$S3\" FIX=\"$FIX\"; /home/usagioqa/run-capture.sh >/tmp/run-capture.log 2>&1'" &
 
 for i in $(seq 1 50); do
   sleep 20
   aws s3 cp /var/log/usagio-gnome.log "$S3/_userdata.log" 2>/dev/null || true
   aws s3 cp /var/log/xorg99.log "$S3/_xorg.log" 2>/dev/null || true
-  { echo "== gnome-session =="; cat /tmp/gnome-session.log 2>/dev/null; echo "== run-capture =="; cat /tmp/run-capture.log 2>/dev/null; } >/tmp/sess.log 2>/dev/null || true
+  { echo "== gnome-session =="; cat /tmp/gnome-session.log 2>/dev/null; echo "== run-capture =="; cat /tmp/run-capture.log 2>/dev/null; echo "== journal (gnome/mutter) =="; journalctl -a --no-pager 2>/dev/null | grep -iE 'gnome-shell|mutter|gnome-session' | tail -40; } >/tmp/sess.log 2>/dev/null || true
   aws s3 cp /tmp/sess.log "$S3/_session.log" 2>/dev/null || true
   aws s3 ls "$S3/_done" >/dev/null 2>&1 && break
 done
