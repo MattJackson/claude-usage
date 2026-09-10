@@ -3,11 +3,14 @@
 //! Every Linux-specific decision lives in this file — nothing outside
 //! `src/platform/linux.rs` should ever need `#[cfg(target_os = "linux")]`.
 //!
-//! - **Tray icon**: the same `tray-icon` crate macOS/Windows use. On Linux
-//!   it's backed by `libappindicator`/`libayatana-appindicator3`, itself a
-//!   GTK status-icon wrapper, so an actual GTK main loop has to be pumped on
-//!   the thread that created the tray icon (see the module doc on
-//!   `LinuxMenu` below for how that's threaded through the `Send`-bound
+//! - **Tray icon / menu**: rendered through muri 0.9's `muda-compat` facade
+//!   (`muri::compat::{muda, tray_icon}`) as of the 0.6.0 muri swap — macOS
+//!   still uses the real `tray-icon`/`muda` (its NSMenu styler needs muda's
+//!   `ns_menu()`), but Linux/Windows go through muri. The facade preserves the
+//!   passive tray-icon model (build returns immediately; menu clicks arrive on
+//!   the global `MenuEvent::receiver()` channel), so the GTK main loop still
+//!   has to be pumped on the thread that created the tray icon (see the module
+//!   doc on `LinuxMenu` below for how that's threaded through the `Send`-bound
 //!   trait objects the rest of the crate holds onto).
 //! - **Secrets**: `keyring`'s Secret Service backend (GNOME Keyring / KWallet
 //!   over D-Bus), falling back to a permissions-protected file when no
@@ -34,6 +37,14 @@
 
 use super::*;
 use anyhow::{bail, Context, Result};
+// muri 0.9 `muda-compat` facade replaces `tray-icon`/`muda` for the Linux tray
+// menu (0.6.0 swap). Menu-item types come from `muri::compat::muda` — the
+// facade's `muri::compat::tray_icon` has no `menu` submodule the way real
+// `tray-icon` does (`pub use muda as menu`), so the old `tray_icon::menu::…`
+// paths below now resolve through `muda::…`; the tray types keep resolving
+// through the `tray` alias. `Icon` is the same type in both facade modules.
+use muri::compat::muda;
+use muri::compat::tray_icon as tray;
 use serde_json::{Map, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -609,7 +620,7 @@ enum HandleMsg {
 }
 
 struct TrayState {
-    tray: tray_icon::TrayIcon,
+    tray: tray::TrayIcon,
     rx: std::sync::mpsc::Receiver<HandleMsg>,
 }
 
@@ -655,30 +666,29 @@ fn decode_png_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
     Ok((rgba, info.width, info.height))
 }
 
-fn decode_tray_icon(bytes: &[u8]) -> Result<tray_icon::Icon> {
+fn decode_tray_icon(bytes: &[u8]) -> Result<tray::Icon> {
     let (rgba, w, h) = decode_png_rgba(bytes)?;
-    tray_icon::Icon::from_rgba(rgba, w, h).context("building a tray icon from decoded PNG")
+    tray::Icon::from_rgba(rgba, w, h).context("building a tray icon from decoded PNG")
 }
 
-fn decode_menu_icon(bytes: &[u8]) -> Result<tray_icon::menu::Icon> {
+fn decode_menu_icon(bytes: &[u8]) -> Result<muda::Icon> {
     let (rgba, w, h) = decode_png_rgba(bytes)?;
-    tray_icon::menu::Icon::from_rgba(rgba, w, h)
-        .context("building a menu-item icon from decoded PNG")
+    muda::Icon::from_rgba(rgba, w, h).context("building a menu-item icon from decoded PNG")
 }
 
-/// `tray_icon::menu::{Menu, Submenu}` both have an inherent `append(&dyn
-/// IsMenuItem)` method but share no common trait that exposes it, so this
-/// bridges the two for the recursive `MenuTree` walk below.
+/// `muda::{Menu, Submenu}` both have an inherent `append(&dyn IsMenuItem)`
+/// method but share no common trait that exposes it, so this bridges the two
+/// for the recursive `MenuTree` walk below.
 trait NativeMenuContainer {
-    fn append_native(&self, item: &dyn tray_icon::menu::IsMenuItem);
+    fn append_native(&self, item: &dyn muda::IsMenuItem);
 }
-impl NativeMenuContainer for tray_icon::menu::Menu {
-    fn append_native(&self, item: &dyn tray_icon::menu::IsMenuItem) {
+impl NativeMenuContainer for muda::Menu {
+    fn append_native(&self, item: &dyn muda::IsMenuItem) {
         let _ = self.append(item);
     }
 }
-impl NativeMenuContainer for tray_icon::menu::Submenu {
-    fn append_native(&self, item: &dyn tray_icon::menu::IsMenuItem) {
+impl NativeMenuContainer for muda::Submenu {
+    fn append_native(&self, item: &dyn muda::IsMenuItem) {
         let _ = self.append(item);
     }
 }
@@ -687,14 +697,14 @@ impl NativeMenuContainer for tray_icon::menu::Submenu {
 /// `tray-icon`/`muda` menu. Only ever called from the GTK thread — the
 /// `muda` item types (`Rc`-backed) aren't `Send` either, which is fine since
 /// nothing here escapes past the caller in `apply_handle_msg`.
-fn build_native_menu(tree: &MenuTree) -> tray_icon::menu::Menu {
-    let menu = tray_icon::menu::Menu::new();
+fn build_native_menu(tree: &MenuTree) -> muda::Menu {
+    let menu = muda::Menu::new();
     append_children(&menu, &tree.items);
     menu
 }
 
 fn append_children(container: &dyn NativeMenuContainer, items: &[MenuItem]) {
-    use tray_icon::menu::{
+    use muda::{
         CheckMenuItem, IconMenuItem, MenuItem as NativeMenuItem, PredefinedMenuItem, Submenu,
     };
     for item in items {
@@ -768,7 +778,7 @@ fn append_children(container: &dyn NativeMenuContainer, items: &[MenuItem]) {
     }
 }
 
-fn apply_handle_msg(tray: &tray_icon::TrayIcon, msg: HandleMsg) {
+fn apply_handle_msg(tray: &tray::TrayIcon, msg: HandleMsg) {
     match msg {
         HandleMsg::SetIcon(bytes) => match decode_tray_icon(&bytes) {
             Ok(icon) => {
@@ -821,12 +831,12 @@ impl MenuBackend for LinuxMenu {
     ) -> Result<Box<dyn MenuHandle>> {
         self.ensure_gtk_init()?;
         let icon = decode_tray_icon(initial_icon)?;
-        let tray = tray_icon::TrayIconBuilder::new()
+        let tray = tray::TrayIconBuilder::new()
             .with_title(initial_title)
             // tray-icon's own Linux note: "the icon won't be visible unless
             // a menu is set. Setting an empty Menu is enough." The real menu
             // arrives via the first `set_menu` call.
-            .with_menu(Box::new(tray_icon::menu::Menu::new()))
+            .with_menu(Box::new(muda::Menu::new()))
             .with_icon(icon)
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create Linux tray icon: {e}"))?;
@@ -861,7 +871,7 @@ impl MenuBackend for LinuxMenu {
         let click_cb = Arc::clone(&self.click_cb);
         gtk::glib::source::timeout_add_local(std::time::Duration::from_millis(100), move || {
             // Menu-item clicks arrive on tray-icon's own global channel.
-            while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
                 if let Some(cb) = click_cb.lock().unwrap().as_ref() {
                     cb(&event.id.0);
                 }

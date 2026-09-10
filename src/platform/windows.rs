@@ -42,11 +42,16 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tray_icon::menu::{
-    CheckMenuItem, IconMenuItem, IsMenuItem, Menu, MenuEvent, MenuId, MenuItem as NativeMenuItem,
+// muri 0.9 `muda-compat` facade replaces `tray-icon`/`muda` for the Windows
+// tray menu (0.6.0 swap). Menu-item types come from `muri::compat::muda`
+// (the facade has no `tray_icon::menu` re-export the way real `tray-icon`
+// does `pub use muda as menu`); the tray types come from
+// `muri::compat::tray_icon`. `Icon` is the same type in both facade modules.
+use muri::compat::muda::{
+    CheckMenuItem, IconMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem as NativeMenuItem,
     PredefinedMenuItem, Submenu,
 };
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use muri::compat::tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 pub struct WindowsPlatform {
     menu: WindowsMenu,
@@ -201,13 +206,14 @@ fn decode_icon(bytes: &[u8]) -> Result<Icon> {
         .map_err(|e| anyhow::anyhow!("bad tray icon bytes: {e}"))
 }
 
-/// Decode a PNG into a menu-item icon (`tray_icon::menu::Icon`, distinct from the
-/// tray `Icon` above). Best-effort: a bad/undecodable PNG yields `None` and the
-/// row just renders text-only.
-fn decode_menu_icon(bytes: &[u8]) -> Option<tray_icon::menu::Icon> {
+/// Decode a PNG into a menu-item icon. Under the muri facade the menu icon and
+/// the tray `Icon` above are the same type (`muri::compat::muda::Icon`).
+/// Best-effort: a bad/undecodable PNG yields `None` and the row renders
+/// text-only.
+fn decode_menu_icon(bytes: &[u8]) -> Option<Icon> {
     let img = image::load_from_memory(bytes).ok()?.into_rgba8();
     let (w, h) = img.dimensions();
-    tray_icon::menu::Icon::from_rgba(img.into_raw(), w, h).ok()
+    Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
 /// Recursively translate one generic `MenuItem` into a native muda item.
@@ -224,21 +230,19 @@ fn build_item(item: &MenuItem) -> Result<Box<dyn IsMenuItem>> {
             checkable,
             ..
         } => {
+            // muri's `MenuId` has no `new()` constructor (real muda does), but
+            // `with_id` takes `impl Into<MenuId>` and `MenuId: From<&str>`, so
+            // pass the id as a string slice — same as `linux.rs`.
             if *checkable {
                 Box::new(CheckMenuItem::with_id(
-                    MenuId::new(id),
+                    id.as_str(),
                     label,
                     *enabled,
                     *checked,
                     None,
                 ))
             } else {
-                Box::new(NativeMenuItem::with_id(
-                    MenuId::new(id),
-                    label,
-                    *enabled,
-                    None,
-                ))
+                Box::new(NativeMenuItem::with_id(id.as_str(), label, *enabled, None))
             }
         }
         MenuItem::Static { label, icon_png } => {

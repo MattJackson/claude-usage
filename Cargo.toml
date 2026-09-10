@@ -75,6 +75,13 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 fs2 = "0.4"
+# tray-icon: as of the 0.6.0 muri swap this is the tray + NSMenu backend on
+# **macOS only** (the `mac_style` NSMenu styler needs muda's `ns_menu()`, which
+# the muri facade doesn't expose). Windows/Linux render their tray menu through
+# muri's `muda-compat` facade instead (see `muri` above). Kept as a plain
+# all-target dep rather than macOS-gated because its Linux backend (gtk) is a
+# separate dep group already, and gating it here would only churn the dep table
+# for no functional gain; it is simply unused on Windows/Linux now.
 tray-icon = "0.24.2"
 # fsnotify (filesystem change notifications) for the credential-sync layer:
 # watches every provider's credential_paths and drives absorb_all_lagging +
@@ -106,6 +113,12 @@ tiktoken-rs = { version = "0.7", optional = true }
 # `default-features = false` + explicit features picks the lightest working
 # backend per OS (no GTK on Linux, no Cocoa duplicate deps on macOS).
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "common-controls-v6"] }
+# muri (0.6.0 swap): the Windows/Linux tray menu is rendered through muri's
+# `muda-compat` facade (`muri::compat::{muda, tray_icon}`) instead of the real
+# `tray-icon`/`muda`. macOS keeps `tray-icon` (below) because its NSMenu styler
+# needs muda's `ns_menu()`, which the facade doesn't expose. Pinned exact per
+# muri's own migration guidance (§7): pre-1.0 minor bumps may break.
+muri = { version = "=0.9.0", features = ["muda-compat"] }
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status
