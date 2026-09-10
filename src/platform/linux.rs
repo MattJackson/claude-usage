@@ -630,13 +630,11 @@ thread_local! {
     static TRAY_STATE: std::cell::RefCell<Option<TrayState>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Decode the tray icon's PNG into a muri tray `Icon` (raw RGBA). Menu-item
-/// icons and the IR→muri walk both live in the shared
-/// `crate::platform::render` now — this is the one Linux-local decode, for the
-/// tray-icon slot specifically (a distinct `Icon` type from the menu one).
+/// Decode the tray icon's PNG into a muri tray `Icon`. muri owns PNG decoding
+/// (`Icon::from_png`, muri #24), so this is a thin wrapper that just adds
+/// error context for the tray-icon slot.
 fn decode_tray_icon(bytes: &[u8]) -> Result<tray::Icon> {
-    let (rgba, w, h) = crate::platform::render::decode_png_rgba(bytes)?;
-    tray::Icon::from_rgba(rgba, w, h).context("building a tray icon from decoded PNG")
+    tray::Icon::from_png(bytes).context("building a tray icon from PNG")
 }
 
 fn apply_handle_msg(tray: &tray::TrayIcon, msg: HandleMsg) {

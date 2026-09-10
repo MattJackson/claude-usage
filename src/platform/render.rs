@@ -13,50 +13,17 @@
 //! crosses any channel; muri is only ever constructed here, on the far side.
 
 use super::{MenuItem, MenuTree, ValueColor};
-use anyhow::{bail, Context, Result};
 use muri::compat::tray_icon::menu::{
     CheckMenuItem, Color, Icon, IconMenuItem, IsMenuItem, Menu, MenuItem as NativeMenuItem,
     PredefinedMenuItem, Submenu,
 };
 
-/// Decode PNG bytes (the format every bundled provider/tray icon ships as, see
-/// `src/icons.rs`) into raw RGBA + dimensions. Pure Rust (`png` crate), so it
-/// cross-compiles without a system libpng.
-pub(crate) fn decode_png_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let mut reader = decoder
-        .read_info()
-        .context("decoding PNG header for a tray/menu icon")?;
-    let buf_size = reader
-        .output_buffer_size()
-        .context("PNG output buffer size overflow")?;
-    let mut buf = vec![0u8; buf_size];
-    let info = reader
-        .next_frame(&mut buf)
-        .context("decoding PNG frame for a tray/menu icon")?;
-    let bytes = &buf[..info.buffer_size()];
-    let rgba = match info.color_type {
-        png::ColorType::Rgba => bytes.to_vec(),
-        png::ColorType::Rgb => {
-            let (chunks, _rem) = bytes.as_chunks::<3>();
-            chunks
-                .iter()
-                .flat_map(|c| [c[0], c[1], c[2], 255])
-                .collect()
-        }
-        other => {
-            bail!("unsupported PNG color type for a tray/menu icon: {other:?} (need RGB or RGBA)")
-        }
-    };
-    Ok((rgba, info.width, info.height))
-}
-
-/// A bundled provider PNG → a muri menu-item `Icon` (raw RGBA). Best-effort:
-/// an undecodable/unsupported PNG yields `None` and the row falls back to
-/// text-only.
+/// A bundled provider PNG → a muri menu-item `Icon`. muri owns PNG decoding now
+/// (`Icon::from_png`, muri #24) — usagio no longer hand-rolls a `png`-crate
+/// decode. Best-effort: an undecodable/unsupported PNG yields `None` and the
+/// row falls back to text-only.
 fn decode_menu_icon(bytes: &[u8]) -> Option<Icon> {
-    let (rgba, w, h) = decode_png_rgba(bytes).ok()?;
-    Icon::from_rgba(rgba, w, h).ok()
+    Icon::from_png(bytes).ok()
 }
 
 /// Map the platform-agnostic [`ValueColor`] (severity band) to muri's `Color`
@@ -157,10 +124,12 @@ fn append_children(container: &dyn Container, items: &[MenuItem]) {
                 ..
             } => {
                 let sub = Submenu::new(label, true);
-                // The active account renders bold + leading checkmark, and its
-                // trailing `S% / W%` value segment is tinted per severity,
-                // driven off usagio's `RowStyle`.
-                sub.set_active(*active);
+                // The active account renders bold (no checkmark, so no leading
+                // gutter/indent — muri's `GutterPolicy::Auto` drops the gutter
+                // on a surface with no checkmarks), and its trailing `S% / W%`
+                // value segment is tinted per severity, driven off usagio's
+                // `RowStyle`.
+                sub.set_bold(*active);
                 sub.set_value_color((*value_color).map(muri_color));
                 append_children(&sub, items);
                 container.append_item(&sub);
