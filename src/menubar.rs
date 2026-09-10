@@ -1548,17 +1548,14 @@ pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<&'static str> 
 /// live native menu to mutate). Linux/Windows build the equivalent tree via
 /// `cross_platform::menu_tree_from_snapshot` instead, which emits the
 /// generic `platform::MenuTree` the `MenuBackend` trait consumes.
-/// muri's `muda-compat` facade renders each item's label as a single
-/// left-aligned text segment — it has no tab-stop / right-align support (that
-/// lives in muri's richer `Segment` API, which the facade doesn't surface). The
-/// old native `NSMenu` right-aligned everything after a `\t` at a computed tab
-/// stop; under muri we drop the tab in favor of an inline ` · ` separator,
-/// matching the Windows/Linux `cross_platform` path (`plain_text`). Leaving the
-/// literal `\t` would reach muri's text shaper as U+0009 and render as a stray
-/// glyph, so the swap is both cosmetic parity and a correctness fix.
+/// muri 0.9.5's `muda-compat` facade renders a `label\tvalue` item as a
+/// grow-left label plus a **right-aligned trailing column** (muri #12 — the
+/// same NSMenu tab-stop the old native menu used), so we pass the `\t` THROUGH
+/// to get the native two-column layout. (Earlier muri lacked tab-stop support,
+/// so this replaced `\t` with an inline ` · `; 0.9.5 restored the column.)
 #[cfg(target_os = "macos")]
 fn menu_label(plain: &str) -> String {
-    plain.replace('\t', " · ")
+    plain.to_string()
 }
 
 /// Decode a bundled 16px provider PNG into a muri (`muda-compat`) menu-item
@@ -2706,11 +2703,13 @@ mod cross_platform {
     /// still there, just not colored.
     const SEP: &str = " · ";
 
-    /// A `RowStyle`'s plain title, with the macOS tab-stop swapped for `SEP`.
-    /// Reuses `main_row`/`quit_row_plain` (already OS-agnostic pure string
-    /// builders) instead of re-deriving the row text from scratch.
+    /// A `RowStyle`'s plain title. The `\t` is passed THROUGH so muri 0.9.5's
+    /// muda-compat two-column tab-stop layout (muri #12) right-aligns the
+    /// trailing value column on Windows/Linux too, matching the native menu.
+    /// (`SEP` is retained as the documented fallback separator.)
     fn plain_text(style: &RowStyle) -> String {
-        style.plain.replace('\t', SEP)
+        let _ = SEP;
+        style.plain.clone()
     }
 
     /// A non-clickable informational submenu row. `enabled: false` so the

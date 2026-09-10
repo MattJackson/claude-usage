@@ -90,28 +90,28 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // src/menubar.rs — `menu_label`: macOS-only helper that strips the `\t`
     // right-align marker (muri's facade has no tab stops) — the macOS
     // counterpart to `cross_platform::plain_text`.
-    ("src/menubar.rs", 1559),
+    ("src/menubar.rs", 1556),
     // src/menubar.rs — `decode_menu_icon`: macOS-only PNG→muri `Icon` decoder
     // for provider group-header icons (counterpart to the per-OS decoders in
     // `src/platform/{linux,windows}.rs`).
-    ("src/menubar.rs", 1569),
+    ("src/menubar.rs", 1566),
     // src/menubar.rs — `build_menu`: builds the macOS muri
     // `muri::compat::tray_icon::menu::Menu` handed to `tray.set_menu`.
     // Linux/Windows build the equivalent `platform::MenuTree` via
     // `cross_platform::menu_tree_from_snapshot`.
-    ("src/menubar.rs", 1583),
+    ("src/menubar.rs", 1580),
     // src/menubar.rs — `build_provider_group`: macOS-only counterpart to
     // `cross_platform::build_provider_group_item` (v0.5.3 menu redesign).
-    ("src/menubar.rs", 1889),
+    ("src/menubar.rs", 1886),
     // src/menubar.rs — `build_account_submenu`: macOS-only counterpart to
     // `cross_platform::build_account_submenu_item` (v0.5.3 menu redesign).
-    ("src/menubar.rs", 1935),
+    ("src/menubar.rs", 1932),
     // src/menubar.rs — `add`: `build_menu`/`build_provider_group`/
     // `build_account_submenu` helper (`muri::compat::…::Menu::append`).
-    ("src/menubar.rs", 2104),
+    ("src/menubar.rs", 2101),
     // src/menubar.rs — `mod cross_platform`: the Linux/Windows renderer
     // (`platform::MenuBackend`-based). Never compiled alongside the macOS run.
-    ("src/menubar.rs", 2696),
+    ("src/menubar.rs", 2693),
 ];
 
 fn src_root() -> PathBuf {
