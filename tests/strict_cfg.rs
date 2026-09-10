@@ -38,77 +38,75 @@ const NEEDLES: &[&str] = &[
 /// route through the `Platform` trait yet, and either a linked issue or a
 /// note explaining what would need to happen for the exception to go away.
 ///
-/// **v0.5.x menubar cross-OS wiring**: `src/menubar.rs` now renders on all
-/// three OSes — macOS keeps its native NSMenu attributedTitle renderer
-/// (`mac_style` module + `run`'s macOS branch); Linux/Windows route through
-/// `platform::MenuBackend` instead (`cross_platform` module). The macOS-only
-/// renderer needs `objc2`/`objc2-app-kit`/`objc2-foundation`/`block2` —
-/// real `[target.'cfg(target_os = "macos")'.dependencies]` in Cargo.toml
-/// that don't exist in the dependency graph on Linux/Windows — so those
-/// pieces must be real `#[cfg(target_os = "macos")]`, not something
-/// routable through a runtime trait call. Each entry below is grouped (one
-/// `mod`/fn per macOS-only or non-macOS-only cluster) to keep this list as
-/// short as the dependency-gating requirement allows.
-const ALLOWLIST: &[(&str, u32)] = &[
+/// **menubar cross-OS wiring**: `src/menubar.rs` builds the tray menu ONCE for
+/// every OS — a single `cross_platform::menu_tree_from_snapshot` produces the
+/// generic `platform::MenuTree`, and `platform::render::render_menu` turns that
+/// into a `muri::compat::tray_icon::menu::Menu` on each platform's UI thread
+/// (the old macOS native `NSMenu` styler `mod mac_style` and the separate
+/// per-OS menu builders were deleted in the 0.6.0 muri migration). What stays
+/// macOS-gated is only the run-loop machinery macOS drives itself: an
+/// `NSApplication`/`NSTimer` loop needing `objc2`/`objc2-app-kit`/
+/// `objc2-foundation`/`block2` — real
+/// `[target.'cfg(target_os = "macos")'.dependencies]` in Cargo.toml that don't
+/// exist in the dependency graph on Linux/Windows. The Linux/Windows
+/// `MenuBackend` event loop + redraw pump (`cross_platform::run`/`redraw_loop`,
+/// the `MenuHandle` channel) is the mirror-image non-macOS gate. Those pieces
+/// must be real `#[cfg(target_os = ...)]`, not something routable through a
+/// runtime trait call; the menu *content* builders in `mod cross_platform` are
+/// NOT gated (they compile everywhere and feed macOS too). Each entry below is
+/// grouped to keep this list as short as the dependency-gating requirement
+/// allows.
+/// Each entry is `(relative path, the trimmed source line the `cfg` guards)` —
+/// keyed on the *item* the attribute sits on, NOT a line number, so ordinary
+/// edits that shift line numbers don't desync this list (they did, repeatedly).
+/// A cfg site is allowed iff the first real line after it (skipping blank /
+/// comment / other-attribute lines) matches one of these verbatim. If a gated
+/// item's signature genuinely changes, the failure prints the new line to paste
+/// here.
+const ALLOWLIST: &[(&str, &str)] = &[
     // src/main.rs — the single gated `mod ui;` for the custom-popup NSPopover
-    // renderer (docs/design/custom-tray-popup.md, Phase 1). The `src/ui/`
-    // module is macOS-only AND behind the off-by-default `custom-popup`
-    // feature; gating the whole module at this one `mod` line (rather than
-    // scattering `cfg`s through `src/ui/*`) is the structure the design
-    // mandates. It isn't routable through the `Platform` trait: the module
-    // links `objc2-app-kit`'s NSPopover/NSView classes, real
-    // `[target.'cfg(target_os = "macos")'.dependencies]` absent from the
-    // Linux/Windows dependency graph. Goes away when the popover becomes the
-    // macOS default and the feature gate is dropped (Phase 2/3).
-    ("src/main.rs", 32),
-    // src/menubar.rs — `use std::cell::RefCell` (macOS thread-local NSMenu
-    // context storage; only reachable via mac_style).
-    ("src/menubar.rs", 15),
-    // src/menubar.rs — `objc2`/`objc2-app-kit`/`objc2-foundation`/`block2`
-    // imports for the macOS-only NSMenu renderer (see module doc above).
-    ("src/menubar.rs", 29),
-    // src/menubar.rs — `pub fn run()`, non-macOS branch: dispatches to
-    // `cross_platform::run` (the `platform::MenuBackend`-based renderer).
-    ("src/menubar.rs", 610),
-    // src/menubar.rs — `pub fn run()`, macOS branch: the native
-    // `NSApplication` run loop.
-    ("src/menubar.rs", 615),
-    // src/menubar.rs — `build_popover_host`: macOS + `custom-popup`-only.
-    // Builds the `ui::popover::PopoverHost` anchored to the NSStatusItem
-    // button (links `objc2-app-kit`'s NSPopover/NSStatusItem, macOS-only
-    // deps). Gated on the `custom-popup` feature too, so it's inert in the
-    // shipping default build. Goes away when the popover is the macOS default.
-    ("src/menubar.rs", 741),
-    // src/menubar.rs — `popover_model`: macOS + `custom-popup`-only. Folds a
-    // `Snapshot` into the toolkit-neutral `ui::PopoverModel` (references
-    // `crate::ui`, compiled only on macOS under `custom-popup`).
-    ("src/menubar.rs", 775),
-    // src/menubar.rs — `build_menu`: builds a native `tray_icon::menu::Menu`
-    // for the macOS `apply_menu_styles` NSMenu walk to mutate in place.
-    // Linux/Windows build the equivalent `platform::MenuTree` via
-    // `cross_platform::menu_tree_from_snapshot`.
-    ("src/menubar.rs", 1585),
-    // src/menubar.rs — `build_provider_group`: macOS-only counterpart to
-    // `cross_platform::build_provider_group_item` (v0.5.3 menu redesign).
-    ("src/menubar.rs", 1896),
-    // src/menubar.rs — `build_account_submenu`: macOS-only counterpart to
-    // `cross_platform::build_account_submenu_item` (v0.5.3 menu redesign).
-    ("src/menubar.rs", 1924),
-    // src/menubar.rs — `mod mac_style`: the NSMenu attributedTitle styling
-    // walk (`install_menu`/`color_for`/`attributed`/`apply_menu_styles`) plus
-    // the `objc2*` imports it needs. Grouped into one module so this whole
-    // cluster needs exactly one cfg site instead of one per function.
-    ("src/menubar.rs", 1994),
-    // src/menubar.rs — `add`: `build_menu`/`build_provider_group`/
-    // `build_account_submenu` helper (native `tray_icon::menu::Menu::append`).
-    ("src/menubar.rs", 2503),
-    // src/menubar.rs — `mod cross_platform`: the Linux/Windows renderer
-    // (`platform::MenuBackend`-based). Never compiled alongside `mac_style`.
-    ("src/menubar.rs", 3095),
-    // src/menubar.rs — `tests::mac_style_tests`: exercises
-    // `mac_style::attributed` (NSAttributedString attribute inspection)
-    // directly; needs the same `objc2*` crates as `mac_style` itself.
-    ("src/menubar.rs", 5066),
+    // renderer (docs/design/custom-tray-popup.md, Phase 1). macOS-only AND
+    // behind the off-by-default `custom-popup` feature; links `objc2-app-kit`'s
+    // NSPopover/NSView (real macOS-only deps), not routable through `Platform`.
+    ("src/main.rs", "mod ui;"),
+    // src/menubar.rs — `use std::cell::RefCell` (macOS run-loop tick's
+    // `last_sig`/`last_title` cells; only used by the macOS `run`).
+    ("src/menubar.rs", "use std::cell::RefCell;"),
+    // src/menubar.rs — `block2`/`objc2*`/`MenuEvent`/`TrayIconBuilder` imports
+    // for the macOS `NSApplication` run loop (real macOS-only deps).
+    ("src/menubar.rs", "use {"),
+    // src/menubar.rs — `pub fn run()` dispatcher, BOTH branches: non-macOS →
+    // `cross_platform::run` (MenuBackend loop); macOS → native `NSApplication`.
+    ("src/menubar.rs", "pub fn run() -> Result<()> {"),
+    // src/menubar.rs — `build_popover_host`: macOS + `custom-popup`-only
+    // (references `crate::ui::popover` / `MainThreadMarker`, macOS-only deps).
+    ("src/menubar.rs", "fn build_popover_host("),
+    // src/menubar.rs — `popover_model`: macOS + `custom-popup`-only (folds a
+    // `Snapshot` into `ui::PopoverModel`, compiled only on macOS under the feature).
+    (
+        "src/menubar.rs",
+        "fn popover_model(snap: &Snapshot) -> crate::ui::PopoverModel {",
+    ),
+    // src/menubar.rs — inside `mod cross_platform`, `use platform::MenuHandle`:
+    // only the non-macOS `run`/`redraw_loop` consume it; macOS drives the
+    // handle-free `NSTimer` loop instead.
+    ("src/menubar.rs", "use crate::platform::MenuHandle;"),
+    // src/menubar.rs — `initial_icon_bytes`: the tray needs decodable icon bytes
+    // on Linux/Windows; macOS is happy with a text-only title (non-macOS only).
+    (
+        "src/menubar.rs",
+        "fn initial_icon_bytes(_snap: &Snapshot) -> &'static [u8] {",
+    ),
+    // src/menubar.rs — `redraw_loop`: the non-macOS background redraw ticker
+    // (pushes through the `Send` `MenuHandle`); macOS ticks on its own NSTimer.
+    (
+        "src/menubar.rs",
+        "fn redraw_loop(handle: Box<dyn MenuHandle>, initial: Snapshot) {",
+    ),
+    // src/menubar.rs — `cross_platform::run`: the Linux/Windows MenuBackend
+    // event loop. Never compiled alongside the macOS `NSApplication` run. (The
+    // menu *content* builders in this module are NOT gated — they feed macOS too.)
+    ("src/menubar.rs", "pub(super) fn run() -> Result<()> {"),
 ];
 
 fn src_root() -> PathBuf {
@@ -139,10 +137,24 @@ fn no_scattered_target_os_cfg_outside_platform_module() {
     collect_rs_files(&root, &mut files);
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let allowlist: std::collections::HashSet<(PathBuf, u32)> = ALLOWLIST
+    let allowlist: std::collections::HashSet<(PathBuf, &str)> = ALLOWLIST
         .iter()
-        .map(|(rel, line)| (manifest_dir.join(rel), *line))
+        .map(|(rel, guarded)| (manifest_dir.join(rel), *guarded))
         .collect();
+
+    // The first "real" source line at or after `idx` — skipping blank lines,
+    // comments, and other attributes (`#[...]`). This is the item a `cfg`
+    // attribute guards, and what the allowlist keys on (line-number-independent).
+    let guarded_line = |lines: &[&str], idx: usize| -> Option<String> {
+        lines[idx..].iter().find_map(|l| {
+            let t = l.trim();
+            if t.is_empty() || t.starts_with("//") || t.starts_with("#[") || t.starts_with("#!") {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
+    };
 
     let mut violations = Vec::new();
     for path in &files {
@@ -151,23 +163,24 @@ fn no_scattered_target_os_cfg_outside_platform_module() {
         }
         let contents = fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-        for (lineno, line) in contents.lines().enumerate() {
+        let lines: Vec<&str> = contents.lines().collect();
+        for (lineno, line) in lines.iter().enumerate() {
             // Skip comment lines — a doc-comment example / rationale that
             // MENTIONS `#[cfg(target_os = ...)]` is not itself a violation.
-            let stripped = line.trim_start();
-            if stripped.starts_with("//") {
+            if line.trim_start().starts_with("//") {
                 continue;
             }
             if NEEDLES.iter().any(|needle| line.contains(needle)) {
-                let line_1based = (lineno + 1) as u32;
-                if allowlist.contains(&(path.clone(), line_1based)) {
+                let guarded = guarded_line(&lines, lineno + 1).unwrap_or_default();
+                if allowlist.contains(&(path.clone(), guarded.as_str())) {
                     continue;
                 }
                 violations.push(format!(
-                    "{}:{}: {}",
+                    "{}:{}: {}  (guards: {})",
                     path.display(),
-                    line_1based,
-                    line.trim()
+                    lineno + 1,
+                    line.trim(),
+                    guarded
                 ));
             }
         }

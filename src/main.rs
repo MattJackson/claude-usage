@@ -2465,7 +2465,7 @@ fn cmd_watch(args: &[String]) -> Result<()> {
 /// that climbs on its own (inactive accounts aren't being spent). An inactive
 /// account already pinned at 100% (e.g. a weekly limit that won't reset for
 /// days) is not actionable: you never swap TO an account that's out of room.
-/// Folding it into the peak pinned the poll cadence at the 10s BACKSTOP for
+/// Folding it into the peak pinned the poll cadence at the 30s BACKSTOP for
 /// days at a stretch, which hammered the usage endpoint into HTTP 429s for no
 /// benefit. Scoping to the active account preserves the original
 /// user-reported miss-fix (active at 94% must tighten so it doesn't lock
@@ -2491,10 +2491,16 @@ fn cadence_max_pct(rows: &[Row], active: Option<&str>) -> Option<f64> {
 /// so we can't miss more than ~30s of runway; above the trigger threshold
 /// (the auto-swap should already have fired, but if it hasn't for any
 /// reason — network flap, keychain unlocked mid-cycle — the backstop
-/// makes sure the next attempt is 10s away, not 150s).
+/// makes sure the next attempt is 30s away, not 150s).
+///
+/// 30s is the floor for BOTH tiers, deliberately: the usage endpoint is
+/// polled once per account per cycle, so with several near-maxed accounts a
+/// tighter floor multiplies into a request rate that Anthropic rate-limits
+/// (429). 30s catches a reset/swap-window within half a minute while keeping
+/// the aggregate request rate well under the limit even with many accounts.
 const WATCH_WARNING_BAND: f64 = 15.0;
 const WATCH_WARNING_INTERVAL_SECS: u64 = 30;
-const WATCH_BACKSTOP_INTERVAL_SECS: u64 = 10;
+const WATCH_BACKSTOP_INTERVAL_SECS: u64 = 30;
 
 /// Compute the next poll interval. Priority order:
 ///   1. Rate-limited from Anthropic → exponential backoff (doubling,
@@ -2569,14 +2575,14 @@ fn prune_swap_guard(guard: &mut SwapGuard) {
 /// on approach to the trigger threshold — see the user-reported miss where
 /// 94% + 150s wait produced a lock before the next poll). v0.5.13: scoped to
 /// the active account (see `cadence_max_pct`) so an inactive, already-maxed
-/// account can't pin the cadence at the 10s backstop indefinitely.
+/// account can't pin the cadence at the 30s backstop indefinitely.
 pub(crate) struct CycleOutcome {
     pub swapped: Option<(String, String)>,
     pub rate_limited: bool,
     pub max_pct: Option<f64>,
     /// Whether a swap is actionable this cycle: an eligible target exists for
     /// the active account, even if a cooldown currently blocks it. Feeds
-    /// `next_interval` so the 10s backstop only engages when there is actually
+    /// `next_interval` so the 30s backstop only engages when there is actually
     /// something to catch — a maxed active account with no eligible target
     /// (single-account user, or all others full/needs_relogin) falls back to
     /// BASE instead of hammering the usage endpoint into HTTP 429 (v0.5.17).
@@ -3668,8 +3674,11 @@ fn bar(pct: Option<f64>) -> String {
 
 fn humanize_until(dt: DateTime<Utc>) -> String {
     let secs = dt.timestamp() - Utc::now().timestamp();
-    if secs <= 0 {
-        return "now".to_string();
+    // Anything under a minute (incl. already-past) reads "<1m", never "0m" /
+    // "now" — a sub-minute countdown flooring to "0m" looked like it had
+    // already reset when it hadn't (and matches `countdown::format_countdown`).
+    if secs < 60 {
+        return "<1m".to_string();
     }
     let d = secs / 86400;
     let h = (secs % 86400) / 3600;
