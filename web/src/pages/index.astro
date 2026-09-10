@@ -54,14 +54,23 @@ const softwareApp = {
         <p class="hero-foot">Free &amp; open source · macOS · Linux · Windows</p>
       </div>
 
-      <!-- Product shot: a real screenshot of usagio's menu-bar dropdown, captured on macOS. -->
+      <!-- Product shot: real usagio menu captures, rotating macOS -> Windows -> Linux.
+           Pure-CSS crossfade (no JS); collapses to the macOS still under
+           prefers-reduced-motion. -->
       <div class="hero-shot fade-up">
-        <img
-          class="hero-img"
-          src="/hero-macos.png"
-          width="945" height="630"
-          alt="usagio's menu-bar dropdown open on macOS, showing session and weekly quota for several Claude and Codex accounts"
-        />
+        <div class="hero-rotator" role="group" aria-label="usagio's menu on macOS, Windows, and Linux">
+          <img class="hero-slide hero-slide-1" src="/hero-macos.png" width="945" height="630" loading="eager"
+            alt="usagio's menu open on macOS, showing session and weekly quota for several Claude and Codex accounts" />
+          <img class="hero-slide hero-slide-2" src="/screenshots/windows-menu-healthy.png" width="290" height="267" loading="eager"
+            alt="usagio's menu open on Windows, showing the same account list" />
+          <img class="hero-slide hero-slide-3" src="/screenshots/linux-menu-healthy.png" width="1600" height="900" loading="eager"
+            alt="usagio's menu open on Linux, showing the same account list" />
+          <span class="hero-os-badge" aria-hidden="true">
+            <span class="hero-os hero-os-1">macOS</span>
+            <span class="hero-os hero-os-2">Windows</span>
+            <span class="hero-os hero-os-3">Linux</span>
+          </span>
+        </div>
       </div>
     </div>
   </section>
@@ -374,6 +383,63 @@ const softwareApp = {
     width: 100%;
     height: 100%;
     object-fit: cover;
+  }
+  /* Rotating hero: three real per-OS menu captures crossfading in order
+     macOS -> Windows -> Linux. `contain` keeps each crisp despite differing
+     native sizes; a subtle panel fills the letterbox. */
+  .hero-rotator {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(160deg, #10131a, #1c2230);
+  }
+  .hero-slide {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    opacity: 0;
+    animation: heroCycle 13.5s infinite;
+  }
+  .hero-slide-1 { animation-delay: 0s; }
+  .hero-slide-2 { animation-delay: 4.5s; }
+  .hero-slide-3 { animation-delay: 9s; }
+  @keyframes heroCycle {
+    0%   { opacity: 0; }
+    4%   { opacity: 1; }
+    29%  { opacity: 1; }
+    33%  { opacity: 0; }
+    100% { opacity: 0; }
+  }
+  /* OS label chip, bottom-left, synced to the visible slide. */
+  .hero-os-badge {
+    position: absolute;
+    left: 0.85rem;
+    bottom: 0.85rem;
+    height: 1.6rem;
+  }
+  .hero-os {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    white-space: nowrap;
+    font: 600 0.72rem/1 var(--font-mono, ui-monospace, monospace);
+    letter-spacing: 0.02em;
+    color: #fff;
+    background: rgba(10, 13, 20, 0.66);
+    backdrop-filter: blur(6px);
+    padding: 0.4rem 0.6rem;
+    border-radius: 999px;
+    opacity: 0;
+    animation: heroCycle 13.5s infinite;
+  }
+  .hero-os-1 { animation-delay: 0s; }
+  .hero-os-2 { animation-delay: 4.5s; }
+  .hero-os-3 { animation-delay: 9s; }
+  @media (prefers-reduced-motion: reduce) {
+    .hero-slide, .hero-os { animation: none; }
+    .hero-slide-1, .hero-os-1 { opacity: 1; }
+    .hero-slide-2, .hero-slide-3, .hero-os-2, .hero-os-3 { opacity: 0; }
   }
   .hero-mock {
     margin: 0;
