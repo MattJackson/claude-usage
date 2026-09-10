@@ -133,6 +133,29 @@ fn is_blocking(
     }
 }
 
+/// Whether a usage refresh can be skipped this cycle because the account is
+/// locked: `true` iff some window is at/above the lock threshold with a reset
+/// still in the future (i.e. [`is_blocking`] fires for session or weekly).
+///
+/// While any window is locked with an unexpired reset, the account is
+/// unusable, so its usage cannot change until that reset — polling it only
+/// burns request budget (and risks the shared-tenant HTTP 429s that then
+/// starve the accounts we DO need to refresh). The reset-boundary wake
+/// (`menubar::next_reset_wake_secs`) brings the poller back exactly at expiry,
+/// at which point this returns `false` (the reset is now in the past) and the
+/// account refreshes to its fresh post-reset reading.
+///
+/// Returns `false` when the account is NOT locked (refresh normally), when a
+/// lock's reset has already passed (stale-after-reset — must refresh to
+/// correct the cache), and when a window is at the limit but its reset time is
+/// unknown (we can't prove when it unlocks, so we don't skip). The caller must
+/// never skip the ACTIVE account — its adopt/CAS keeps the vendor slot in sync
+/// regardless of lock state.
+pub fn is_locked_until_reset(u: &AccountUsage, now: DateTime<Utc>) -> bool {
+    is_blocking(u.session_pct, u.session_reset, now).is_some()
+        || is_blocking(u.weekly_pct, u.weekly_reset, now).is_some()
+}
+
 /// Mirrors `is_blocking`, but for the *already-reset* case: the reset time
 /// has passed (so `is_blocking` returns `None`), yet the cached pct is still
 /// at/above threshold because it was fetched before that reset happened.
@@ -318,6 +341,49 @@ mod tests {
             weekly_reset: wr.map(t),
             fetched_at: Some(t(fetched_at)),
         }
+    }
+
+    // ---- is_locked_until_reset (refresh-skip predicate) ----
+
+    #[test]
+    fn not_locked_is_not_skippable() {
+        // Both windows below threshold → must refresh (the pq.io case).
+        let u = usage(Some(83.0), Some(2000), Some(75.0), Some(5000));
+        assert!(!is_locked_until_reset(&u, t(1000)));
+    }
+
+    #[test]
+    fn session_locked_future_reset_is_skippable() {
+        let u = usage(Some(100.0), Some(2000), Some(50.0), Some(5000));
+        assert!(is_locked_until_reset(&u, t(1000)));
+    }
+
+    #[test]
+    fn weekly_locked_future_reset_is_skippable() {
+        let u = usage(Some(30.0), Some(2000), Some(100.0), Some(5000));
+        assert!(is_locked_until_reset(&u, t(1000)));
+    }
+
+    #[test]
+    fn locked_but_reset_already_passed_is_not_skippable() {
+        // Reset in the past: cache is stale-after-reset, must refresh.
+        let u = usage(Some(100.0), Some(500), Some(50.0), Some(400));
+        assert!(!is_locked_until_reset(&u, t(1000)));
+    }
+
+    #[test]
+    fn at_limit_without_reset_time_is_not_skippable() {
+        // We can't prove when it unlocks, so we don't skip.
+        let u = usage(Some(100.0), None, Some(100.0), None);
+        assert!(!is_locked_until_reset(&u, t(1000)));
+    }
+
+    #[test]
+    fn boundary_99_5_locked_is_skippable_99_4_is_not() {
+        let at = usage(Some(99.5), Some(2000), None, None);
+        assert!(is_locked_until_reset(&at, t(1000)));
+        let below = usage(Some(99.4), Some(2000), None, None);
+        assert!(!is_locked_until_reset(&below, t(1000)));
     }
 
     #[test]

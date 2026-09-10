@@ -937,6 +937,52 @@ fn next_reset_wake_secs() -> Option<u64> {
         .min()
 }
 
+/// Longest single uninterrupted `thread::sleep`. A cadence interval longer
+/// than this is slept in chunks no bigger than this so the loop re-evaluates
+/// promptly after a system suspend/resume rather than riding out a stale
+/// reading for the rest of a long interval. 30s = the backstop cadence.
+const SLEEP_CHUNK_SECS: u64 = 30;
+
+/// If the wall clock advances by more than the chunk we asked to sleep plus
+/// this slack, the machine was suspended across the chunk (system sleep, lid
+/// close, battery-death). We compare wall-clock deltas, not the monotonic
+/// sleep return, because that gap is the whole signal.
+const SUSPEND_GAP_SLACK_SECS: u64 = 8;
+
+/// Whether a chunk's *wall-clock* elapsed indicates the machine was suspended
+/// mid-sleep (so the poller should refresh immediately on resume instead of
+/// finishing a now-stale interval). Pure + testable; the sleep mechanics call
+/// it with real deltas.
+fn is_suspend_gap(intended_chunk_secs: u64, actual_elapsed_secs: u64) -> bool {
+    actual_elapsed_secs > intended_chunk_secs.saturating_add(SUSPEND_GAP_SLACK_SECS)
+}
+
+/// Sleep `total` seconds in chunks of at most [`SLEEP_CHUNK_SECS`], returning
+/// early (`true`) the moment a forward wall-clock jump reveals the machine was
+/// suspended across a chunk — so the next `run_cycle` refreshes right after
+/// resume instead of up to a full interval later (the battery-death / lid-close
+/// staleness). Returns `false` on an ordinary, uninterrupted sleep. Uses
+/// `SystemTime` wall-clock deltas since the monotonic sleep timer can itself
+/// pause across a suspend.
+fn sleep_bounded_detecting_suspend(total: u64) -> bool {
+    let mut remaining = total;
+    while remaining > 0 {
+        let chunk = remaining.min(SLEEP_CHUNK_SECS);
+        let before = std::time::SystemTime::now();
+        std::thread::sleep(Duration::from_secs(chunk));
+        let elapsed = before.elapsed().map(|d| d.as_secs()).unwrap_or(chunk);
+        if is_suspend_gap(chunk, elapsed) {
+            crate::logging::log(&format!(
+                "poll: wall-clock jumped {elapsed}s over a {chunk}s sleep — system resumed from \
+                 suspend; refreshing now (event=poll_wake_from_suspend gap_secs={elapsed})"
+            ));
+            return true;
+        }
+        remaining = remaining.saturating_sub(chunk);
+    }
+    false
+}
+
 fn poll_loop() {
     let guard = shared_swap_guard();
     let base = WATCH_INTERVAL_SECS;
@@ -983,7 +1029,13 @@ fn poll_loop() {
             Some(w) if w < current => w.max(RESET_SETTLE_SECS),
             _ => current,
         };
-        std::thread::sleep(Duration::from_secs(sleep_secs));
+        // Bounded, suspend-aware sleep: chunks the wait so a system resume
+        // (sleep / lid-close / battery-death) is caught within a chunk and the
+        // next iteration refreshes immediately, rather than showing a stale
+        // pre-sleep reading until the full interval elapses. The return value
+        // is intentionally unused here — the loop head already re-refreshes;
+        // early return just gets us there sooner.
+        let _resumed = sleep_bounded_detecting_suspend(sleep_secs);
     }
 }
 
@@ -2798,6 +2850,20 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::cell::Cell as StdCell;
+
+    #[test]
+    fn suspend_gap_detects_only_real_wall_clock_jumps() {
+        // Ordinary sleep: elapsed ~= chunk (allow scheduler jitter within slack).
+        assert!(!is_suspend_gap(30, 30));
+        assert!(!is_suspend_gap(30, 31));
+        assert!(!is_suspend_gap(30, 30 + SUSPEND_GAP_SLACK_SECS));
+        // A jump beyond chunk + slack means the machine was suspended.
+        assert!(is_suspend_gap(30, 30 + SUSPEND_GAP_SLACK_SECS + 1));
+        assert!(is_suspend_gap(30, 30 * 60)); // a 30-minute battery-death sleep
+                                              // A short final chunk still detects a suspend.
+        assert!(is_suspend_gap(5, 1800));
+        assert!(!is_suspend_gap(5, 5));
+    }
 
     #[test]
     fn theme_from_name_maps_os_aliases_and_rejects_unknown() {
