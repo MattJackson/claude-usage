@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.22] - 2026-09-09
+
+### Changed
+- **usagio's own icon now shows in the Windows/Linux tray** (previously it showed
+  the active provider's icon, e.g. Claude's mark). The active account's provider
+  icon now renders where it belongs — on the menu's group-header rows.
+- **Provider icons on the Windows/Linux menu group headers.** The "Claude" /
+  "Codex" group rows now carry the 16px provider icon (via muda `IconMenuItem`),
+  matching what macOS already drew. macOS is unchanged.
+
 ## [0.5.21] - 2026-09-09
 
 ### Fixed
