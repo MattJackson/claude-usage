@@ -17,23 +17,26 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-// macOS native NSMenu renderer deps. `objc2`/`objc2-app-kit`/`objc2-foundation`/
-// `block2` are `[target.'cfg(target_os = "macos")'.dependencies]` in
-// Cargo.toml — they don't exist in the dependency graph on Linux/Windows, so
-// this group needs real `#[cfg(target_os = "macos")]`, not just an
-// unused-import allow. `tray_icon::menu`/`TrayIconBuilder` compile
-// everywhere (top-level dep) but are grouped in here too since they're only
-// used by the macOS-only `run`/`build_menu`/`build_account_block`/
-// `install_menu` below — Linux/Windows render through `platform::MenuTree`
-// instead (see the `cross_platform` module near the end of this file).
+// macOS run-loop deps. `objc2`/`objc2-app-kit`/`objc2-foundation`/`block2` are
+// `[target.'cfg(target_os = "macos")'.dependencies]` in Cargo.toml — they don't
+// exist in the dependency graph on Linux/Windows, so this group needs real
+// `#[cfg(target_os = "macos")]`, not just an unused-import allow. macOS drives a
+// native `NSApplication` run loop + `NSTimer` tick (poll/relaunch/drain menu
+// clicks) while muri's tray runs passively (`TrayIconBuilder::build()` spawns a
+// live OS tray). The tray menu itself is now rendered through the SAME muri
+// `muda-compat` facade (`muri::compat::tray_icon`) Windows/Linux already use —
+// macOS no longer builds a native `NSMenu` (the old `mac_style` styler and its
+// `tray-icon`/`muda` backend were removed in the 0.6.0 muri migration).
 #[cfg(target_os = "macos")]
 use {
     block2::RcBlock,
+    muri::compat::tray_icon::menu::{
+        CheckMenuItem, IconMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
+    },
+    muri::compat::tray_icon::{Icon, TrayIconBuilder},
     objc2::MainThreadMarker,
     objc2_app_kit::{NSApplication, NSApplicationActivationPolicy},
     objc2_foundation::NSTimer,
-    tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
-    tray_icon::TrayIconBuilder,
 };
 
 use crate::countdown::{self, AccountUsage, BlockingWindow, DisplayState};
@@ -178,11 +181,18 @@ fn severity_with(p: Option<f64>, bands: SeverityBands) -> Option<Severity> {
 
 /// A styling directive for one menu row, matched to its native `NSMenuItem` by
 /// the plain title string. We build the muda menu with plain titles (so clicks
-/// and structure work exactly as before) then walk the native `NSMenu` and set
-/// `attributedTitle` on the rows named here. Offsets are **UTF-16 code units**
-/// (what `NSRange` uses); all our runs are ASCII so char == utf16 in practice,
-/// but the helpers stay correct if an email ever isn't.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// and structure work exactly as before) then style each row. Offsets are
+/// **UTF-16 code units** (what `NSRange` used); all our runs are ASCII so char
+/// == utf16 in practice, but the helpers stay correct if an email ever isn't.
+///
+/// As of the 0.6.0 muri migration NO renderer reads the styling fields any
+/// more — muri (`muda-compat`) draws its own surface and takes only the plain
+/// label (`.plain`, via `menu_label`/`plain_text`). The bold / color / tab-stop
+/// / checkmark / icon directives are retained purely as the pure, unit-tested
+/// output of `main_row`/`account_header_row` (the tests assert on them), so the
+/// whole struct is `allow(dead_code)` on every target — the old native `NSMenu`
+/// styler that consumed them (`mac_style`) is gone.
+#[allow(dead_code)]
 struct RowStyle {
     /// The exact plain title set on the item; used to find it in the menu.
     plain: String,
@@ -553,43 +563,6 @@ fn quit_row_plain() -> String {
     format!("Quit\tusagio v{}", env!("CARGO_PKG_VERSION"))
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn menu_styles(snap: &Snapshot) -> Vec<RowStyle> {
-    let mut styles = Vec::new();
-    // v0.5.3: provider grouping is back — each provider contributes one bold
-    // header row carrying the 16px icon, then one row per account (compact,
-    // NO `{provider} · ` prefix). The account row is the label of a submenu
-    // holding the reset windows, burn-rate/cost, "updated …" and action rows
-    // (Switch/Launch/Remove). Info-row styles inside the submenu still get
-    // the `disabled_but_white` treatment so they read as normal (not muda's
-    // greyed-out disabled look).
-    for (si, _) in provider_grouped_order(snap) {
-        let sec = &snap.sections[si];
-        styles.push(provider_group_header_row(sec));
-        for a in &sec.accounts {
-            styles.push(account_header_row(sec, a));
-            for row in submenu_info_rows(sec, a) {
-                styles.push(RowStyle {
-                    disabled_but_white: true,
-                    ..RowStyle::plain_row(row)
-                });
-            }
-        }
-    }
-    // Quit row: "Quit\tusagio vX.Y.Z" — right-align the trailing run at the
-    // menu's computed right edge and paint everything from the tab onward
-    // in secondaryLabelColor (macOS's disabled-text grey) while the row
-    // itself stays clickable.
-    let quit_plain = quit_row_plain();
-    let grey_from = u16len("Quit") + 1; // +1 for the '\t'
-    styles.push(RowStyle {
-        tab_x_kind: Some(TabX::MenuRight),
-        grey_tail_from: Some(grey_from),
-        ..RowStyle::plain_row(quit_plain)
-    });
-    styles
-}
-
 /// Locate the active section + account (if any) in the snapshot.
 fn active_account(snap: &Snapshot) -> Option<(&ProviderSection, &AcctView)> {
     for sec in &snap.sections {
@@ -636,17 +609,18 @@ pub fn run() -> Result<()> {
     // Build the tray on the main thread and keep it alive for the app's lifetime.
     let initial = build_snapshot();
     let builder = TrayIconBuilder::new().with_title(title_for(&initial));
-    // custom-popup ON: suppress the native menu on LEFT click so left-click
-    // opens the NSPopover instead (see the tick below). The native NSMenu is
-    // still installed and still opens on RIGHT click, as the shipping fallback
-    // until the popover reaches parity (docs/design/custom-tray-popup.md). When
-    // the feature is OFF, behavior is byte-for-byte unchanged.
-    #[cfg(feature = "custom-popup")]
-    let builder = builder.with_menu_on_left_click(false);
+    // NOTE: the muri (`muda-compat`) `TrayIconBuilder` has no
+    // `with_menu_on_left_click` (that was a real `tray-icon` control), so the
+    // custom-popup left-click suppression is no longer wired here — and muri
+    // has no `ns_status_item` anchor either, so `build_popover_host` returns
+    // `None` under the muri backend (the experimental, off-by-default popover
+    // is inert until muri exposes an equivalent). See the report note.
+    // `build()` spawns a live OS tray passively (muri 0.9.2+) — no muri run
+    // loop needed; usagio keeps its own `NSApplication`/`NSTimer` below.
     let tray = builder
         .build()
         .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
-    mac_style::install_menu(&tray, &initial);
+    tray.set_menu(Some(Box::new(build_menu(&initial))));
     let _ = tray.set_tooltip(Some(tooltip_for(&initial)));
 
     // custom-popup: build the NSPopover host anchored to the status-item button
@@ -655,7 +629,7 @@ pub fn run() -> Result<()> {
     #[cfg(feature = "custom-popup")]
     let popover = build_popover_host(&tray, mtm);
     #[cfg(feature = "custom-popup")]
-    let tray_rx = tray_icon::TrayIconEvent::receiver().clone();
+    let tray_rx = muri::compat::tray_icon::TrayIconEvent::receiver().clone();
     #[cfg(feature = "custom-popup")]
     let shown_on_launch = RefCell::new(false);
     // A retained clone for the tick closure (which takes `app` by move); the
@@ -687,11 +661,11 @@ pub fn run() -> Result<()> {
         let snap = build_snapshot();
         let sig = menu_signature(&snap);
         if *last_sig.borrow() != sig {
-            // Re-install the native NSMenu on change. With custom-popup ON this
+            // Re-render the muri tray menu on change. With custom-popup ON this
             // is the right-click fallback (the popover rebuilds its own content
             // from a fresh snapshot each time it's shown); with it OFF this is
-            // the sole UI, exactly as before.
-            mac_style::install_menu(&tray, &snap);
+            // the sole UI.
+            tray.set_menu(Some(Box::new(build_menu(&snap))));
             let _ = tray.set_tooltip(Some(tooltip_for(&snap)));
             *last_sig.borrow_mut() = sig;
         }
@@ -705,9 +679,9 @@ pub fn run() -> Result<()> {
         #[cfg(feature = "custom-popup")]
         if let Some(p) = &popover {
             while let Ok(ev) = tray_rx.try_recv() {
-                if let tray_icon::TrayIconEvent::Click {
-                    button: tray_icon::MouseButton::Left,
-                    button_state: tray_icon::MouseButtonState::Down,
+                if let muri::compat::tray_icon::TrayIconEvent::Click {
+                    button: muri::compat::tray_icon::MouseButton::Left,
+                    button_state: muri::compat::tray_icon::MouseButtonState::Down,
                     ..
                 } = ev
                 {
@@ -740,25 +714,17 @@ pub fn run() -> Result<()> {
 /// still shows, it just won't open a popup).
 #[cfg(all(target_os = "macos", feature = "custom-popup"))]
 fn build_popover_host(
-    tray: &tray_icon::TrayIcon,
+    tray: &muri::compat::tray_icon::TrayIcon,
     mtm: MainThreadMarker,
 ) -> Option<crate::ui::popover::PopoverHost> {
-    let status_item = tray.ns_status_item();
-    eprintln!("[popover] ns_status_item present={}", status_item.is_some());
-    let status_item = status_item?;
-    let button = status_item.button(mtm);
-    eprintln!("[popover] button present={}", button.is_some());
-    let button = button?;
-    // `USAGIO_POPOVER_SHOW_ON_LAUNCH` (screenshot/debug): keep the popover open
-    // (ApplicationDefined behavior) instead of auto-dismissing (Transient) so a
-    // `screencapture` can catch it.
-    let persistent = std::env::var("USAGIO_POPOVER_SHOW_ON_LAUNCH").is_ok();
-    Some(crate::ui::popover::PopoverHost::new(
-        button,
-        Box::new(handle_click),
-        persistent,
-        mtm,
-    ))
+    // The muri (`muda-compat`) tray does not expose the underlying
+    // `NSStatusItem` (`ns_status_item()` was a real `tray-icon` API), so there
+    // is no button to anchor the NSPopover to under the 0.6.0 muri backend.
+    // The experimental, off-by-default custom-popup is therefore inert until
+    // muri exposes a status-item anchor — return `None` so the tray still shows
+    // (it just opens muri's own menu/popup rather than this NSPopover).
+    let _ = (tray, mtm);
+    None
 }
 
 /// custom-popup: fold a `Snapshot` into the toolkit-neutral `ui::PopoverModel`
@@ -1582,6 +1548,38 @@ pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<&'static str> 
 /// live native menu to mutate). Linux/Windows build the equivalent tree via
 /// `cross_platform::menu_tree_from_snapshot` instead, which emits the
 /// generic `platform::MenuTree` the `MenuBackend` trait consumes.
+/// muri's `muda-compat` facade renders each item's label as a single
+/// left-aligned text segment — it has no tab-stop / right-align support (that
+/// lives in muri's richer `Segment` API, which the facade doesn't surface). The
+/// old native `NSMenu` right-aligned everything after a `\t` at a computed tab
+/// stop; under muri we drop the tab in favor of an inline ` · ` separator,
+/// matching the Windows/Linux `cross_platform` path (`plain_text`). Leaving the
+/// literal `\t` would reach muri's text shaper as U+0009 and render as a stray
+/// glyph, so the swap is both cosmetic parity and a correctness fix.
+#[cfg(target_os = "macos")]
+fn menu_label(plain: &str) -> String {
+    plain.replace('\t', " · ")
+}
+
+/// Decode a bundled 16px provider PNG into a muri (`muda-compat`) menu-item
+/// `Icon` (raw RGBA). Best-effort: a non-RGBA or undecodable PNG yields `None`
+/// and the row falls back to text-only. The shipped provider icons are all
+/// 8-bit RGBA (PNG color type 6), so the RGB-expansion branch the Linux decoder
+/// carries isn't needed here.
+#[cfg(target_os = "macos")]
+fn decode_menu_icon(bytes: &[u8]) -> Option<Icon> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().ok()?;
+    let buf_size = reader.output_buffer_size()?;
+    let mut buf = vec![0u8; buf_size];
+    let info = reader.next_frame(&mut buf).ok()?;
+    if info.color_type != png::ColorType::Rgba {
+        return None;
+    }
+    buf.truncate(info.buffer_size());
+    Icon::from_rgba(buf, info.width, info.height).ok()
+}
+
 #[cfg(target_os = "macos")]
 fn build_menu(snap: &Snapshot) -> Menu {
     let menu = Menu::new();
@@ -1767,12 +1765,7 @@ fn build_menu(snap: &Snapshot) -> Menu {
     // title, so QUIT_ROW_PLAIN below MUST equal what we build here.
     add(
         &menu,
-        MenuItem::with_id(
-            "quit",
-            format!("Quit\tusagio v{}", env!("CARGO_PKG_VERSION")),
-            true,
-            None,
-        ),
+        MenuItem::with_id("quit", menu_label(&quit_row_plain()), true, None),
     );
 
     menu
@@ -1898,7 +1891,25 @@ fn build_provider_group(menu: &Menu, sec: &ProviderSection) {
     let head = provider_group_header_row(sec).plain;
     let headlines = section_headline_rows(sec);
     if headlines.is_empty() {
-        add(menu, MenuItem::with_id("noop", head, false, None));
+        // Disabled header row carrying the provider's 16px icon, attached via
+        // `IconMenuItem` exactly like the cross_platform (Windows/Linux)
+        // `Static` path. NOTE: muri 0.9.3 drops a raw-RGBA `IconMenuItem` icon
+        // in translation (facade divergence D6 / spec 02 §4.5 — only a
+        // `NativeIcon`/SF-Symbol maps through), so today this renders text-only
+        // on every muri surface, including Windows/Linux; it will light up once
+        // muri encodes raw-RGBA menu icons the way it already does the tray icon.
+        match crate::icons::png16_for(sec.provider_id).and_then(decode_menu_icon) {
+            Some(icon) => {
+                let _ = menu.append(&IconMenuItem::with_id(
+                    "noop",
+                    head,
+                    false,
+                    Some(icon),
+                    None,
+                ));
+            }
+            None => add(menu, MenuItem::with_id("noop", head, false, None)),
+        }
         return;
     }
     // Env-override present: expose the marker as the sole child of a submenu
@@ -1923,7 +1934,7 @@ fn build_provider_group(menu: &Menu, sec: &ProviderSection) {
 /// counterpart: `cross_platform::build_account_submenu_item`.
 #[cfg(target_os = "macos")]
 fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
-    let head = account_header_row(sec, a).plain;
+    let head = menu_label(&account_header_row(sec, a).plain);
     // Submenu id is intentionally `noop` so a click on the LABEL (which on
     // some platforms fires as an event too) is a no-op — the actual actions
     // live on the children below.
@@ -1984,416 +1995,6 @@ fn build_account_submenu(menu: &Menu, sec: &ProviderSection, a: &AcctView) {
     let _ = menu.append(&sub);
 }
 
-/// macOS-only NSMenu attributedTitle styling. Grouped into one module (rather
-/// than gating `install_menu`/`color_for`/`attributed`/`apply_menu_styles`
-/// individually) so the `objc2`/`objc2-app-kit`/`objc2-foundation` imports
-/// they need — real Cargo target-specific dependencies that don't exist in
-/// the dependency graph on Linux/Windows (see the top-of-file import comment)
-/// — sit behind a single `#[cfg(target_os = "macos")]`. Linux/Windows never
-/// call into this module; they render through `cross_platform` instead.
-#[cfg(target_os = "macos")]
-mod mac_style {
-    use super::*;
-
-    /// Build the menu for `snap`, install it on the tray, then style the native
-    /// rows (bold active account, right-aligned trailing `n% / n%`, high
-    /// percentages colored) via `attributedTitle`. We take the `NSMenu` pointer
-    /// before moving the menu into `set_menu`: the menu is reference-counted and the
-    /// tray retains it, so the pointer stays valid for the walk. The attributed
-    /// titles persist until the next rebuild (muda only overwrites a title if we
-    /// call `set_text`, which we never do on these items).
-    pub(super) fn install_menu(tray: &tray_icon::TrayIcon, snap: &Snapshot) {
-        let menu = build_menu(snap);
-        let ns_menu = {
-            use tray_icon::menu::ContextMenu;
-            menu.ns_menu()
-        };
-        tray.set_menu(Some(Box::new(menu)));
-        let mut styles = menu_styles(snap);
-        // The burn-rate / cost / "updated" submenu rows are derived with disk
-        // I/O and so live outside the pure `menu_styles`. Now that they render
-        // as DISABLED items (no hover), they need the same `disabled_but_white`
-        // treatment as the reset rows or AppKit would grey them out — add those
-        // styles here (macOS install path only, where disk reads are fine).
-        for (si, _) in provider_grouped_order(snap) {
-            let sec = &snap.sections[si];
-            for a in &sec.accounts {
-                for row in account_extra_info_rows(sec, a) {
-                    styles.push(RowStyle {
-                        disabled_but_white: true,
-                        ..RowStyle::plain_row(row)
-                    });
-                }
-            }
-        }
-        let menu_right_x = compute_menu_right_x(ns_menu, &styles);
-        apply_menu_styles(ns_menu, &styles, menu_right_x);
-    }
-
-    use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
-    use objc2::AllocAnyThread;
-    use objc2_app_kit::{
-        NSAttributedStringNSStringDrawing, NSColor, NSControlStateValueOn, NSFont,
-        NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSMenu,
-        NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSTextAlignment, NSTextTab,
-        NSTextTabOptionKey,
-    };
-    use objc2_foundation::{
-        NSArray, NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange,
-        NSString,
-    };
-
-    fn color_for(sev: Severity) -> Retained<NSColor> {
-        match sev {
-            Severity::Amber => NSColor::systemOrangeColor(),
-            Severity::Red => NSColor::systemRedColor(),
-        }
-    }
-
-    /// Extra padding (points) added beyond the widest measured content width
-    /// before resolving the right-align tab stop. `NSAttributedString::size()`
-    /// measures glyph runs only — it knows nothing about the icon column,
-    /// checkmark/state column, or submenu-arrow column AppKit reserves — so a
-    /// positive pad here was meant to compensate. In practice the v0.5.1
-    /// value (28pt) overcompensated: it pushed the tab stop past the menu's
-    /// actual content edge, leaving a visible dead-space gap after the
-    /// trailing run on every row, worst on the un-inset Quit row ("Quit gaps
-    /// to the end", v0.5.2 item 2). Zero — i.e. trust `widest` (already
-    /// floored by the widest plain top-level row below) as the edge itself —
-    /// is what actually flushes right; a future report of text running too
-    /// close to the edge should look at raising this again, not assume the
-    /// old 28pt value was ever correct.
-    const RIGHT_ALIGN_PAD: f64 = 0.0;
-
-    /// v0.5.4 defect 1: minimum gap (points) between the widest label's
-    /// right edge and its row's trailing run's left edge. Without this the
-    /// tab stop could land right at the widest email's right edge, so a row
-    /// with a near-widest email (e.g. `matthew@getbusbar.com`) rendered with
-    /// ZERO space between the email and the `S% / W%` trailing. Two
-    /// menu-font space-widths (~12pt) reads as an obvious column gap without
-    /// blowing out the menu width on narrow menus.
-    pub(super) const MIN_LABEL_TRAILING_GAP: f64 = 12.0;
-
-    /// v0.5.4 defect 2: AppKit reserves ~14pt at the right edge of every
-    /// NSMenu that contains any submenu item, for the disclosure chevron.
-    /// Rows WITH a submenu render their trailing text flush against the tab
-    /// stop and the chevron sits in that reserved column; rows WITHOUT a
-    /// submenu render their trailing text at the same tab stop, leaving a
-    /// chevron-column-sized whitespace between their trailing and the
-    /// menu's true right edge — "text is not fully right aligned if the row
-    /// doesnt have a submenu" per the user report. `effective_tab_x` pushes
-    /// non-submenu rows' tab stop right by this width so both types
-    /// terminate at the same visual X. Empirically 14pt on macOS 14/15.
-    pub(super) const CHEVRON_COLUMN_WIDTH: f64 = 14.0;
-
-    /// Resolve the right-align tab stop for one row, adjusting for whether
-    /// AppKit will draw a disclosure chevron to the right of its trailing
-    /// run. See `CHEVRON_COLUMN_WIDTH`. Kept pure (no AppKit types) so
-    /// `#[cfg(test)]` can pin the arithmetic without touching NSMenu.
-    pub(super) fn effective_tab_x(base_x: f64, has_submenu: bool) -> f64 {
-        if has_submenu {
-            base_x
-        } else {
-            base_x + CHEVRON_COLUMN_WIDTH
-        }
-    }
-
-    /// The natural (unwrapped, single-line) width in points of `s` rendered
-    /// in `font`. Empty strings measure 0 without round-tripping through
-    /// AppKit. Uses `NSAttributedString::size()` — the `NSStringDrawing`
-    /// category's simple whole-string measurement — rather than
-    /// `boundingRectWithSize:options:`, which exists for constrained /
-    /// multi-line layout that a single menu-item row never needs.
-    fn measured_width(s: &str, font: &NSFont) -> f64 {
-        if s.is_empty() {
-            return 0.0;
-        }
-        let ns_text = NSString::from_str(s);
-        let full_len = ns_text.length();
-        let attr =
-            NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &ns_text);
-        // SAFETY: value type matches the font attribute key.
-        unsafe {
-            attr.addAttribute_value_range(NSFontAttributeName, font, NSRange::new(0, full_len));
-        }
-        let attr: Retained<NSAttributedString> = Retained::into_super(attr);
-        attr.size().width
-    }
-
-    /// Resolve `TabX::MenuRight` to a concrete point value for the CURRENT
-    /// snapshot: `max(label_width + trailing_width)` over every row that
-    /// wants the shared right-align tab stop, plus `RIGHT_ALIGN_PAD`. Using
-    /// one shared x for every row is what makes their trailing runs line up
-    /// in a column; computing it fresh per snapshot (rather than a fixed
-    /// constant) is what makes that column always land at the menu's actual
-    /// right edge regardless of how wide the longest email/label happens to
-    /// be. Each row is measured in the font it will actually render in
-    /// (`boldSystemFontOfSize` for bold/active rows, `menuFontOfSize`
-    /// otherwise) since bold glyphs are wider. No `MenuRight` rows → 0.0 (an
-    /// arbitrary, harmless x — nothing reads it).
-    ///
-    /// v0.5.2 item 2: `RIGHT_ALIGN_PAD` used to be 28pt, which reliably
-    /// undershot the true content edge and produced a visible gap after the
-    /// right-aligned column (worst offender: the Quit row, "flush right"
-    /// only in name). Rather than re-guessing a bigger magic constant, the
-    /// pad is now 0 — `widest` itself (measured content width, floored by
-    /// the widest plain top-level row below) IS the target x.
-    ///
-    /// Also floors the result at the widest PLAIN (non-tab) top-level item's
-    /// measured width (v0.5.2 fix for the v0.5.1 "Quit gaps to the end"
-    /// report): if some other top-level row — a checkbox, a `Settings ▸`
-    /// submenu title, the per-account env-override marker, an account
-    /// block's info row, … — is wider than every `MenuRight` row's own
-    /// label+trailing, THAT row is what actually determines the menu's
-    /// rendered width, and our right-aligned trailing text would land short
-    /// of the true right edge no matter how the tab-row math above comes
-    /// out. `ns_menu` is the same live pointer `apply_menu_styles` walks;
-    /// this call happens before that walk sets any attributed titles, so
-    /// every item's `.title()` is still its plain string.
-    fn compute_menu_right_x(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle]) -> f64 {
-        let mut widest = 0.0_f64;
-        for style in styles {
-            if style.tab_x_kind != Some(TabX::MenuRight) {
-                continue;
-            }
-            let Some((label, trailing)) = style.plain.split_once('\t') else {
-                continue;
-            };
-            let font = if style.bold || style.section_header {
-                NSFont::boldSystemFontOfSize(0.0)
-            } else {
-                NSFont::menuFontOfSize(0.0)
-            };
-            // v0.5.4 defect 1: enforce MIN_LABEL_TRAILING_GAP between the
-            // label's right edge and the trailing's left edge for EVERY row
-            // (not just where they happen to sum wider than a plain row).
-            let w = measured_width(label, &font)
-                + MIN_LABEL_TRAILING_GAP
-                + measured_width(trailing, &font);
-            if w > widest {
-                widest = w;
-            }
-        }
-        if !ns_menu.is_null() {
-            // SAFETY: called only on the main thread with a live NSMenu
-            // pointer from muda's ns_menu(), which the tray keeps retained —
-            // same precondition `apply_menu_styles` documents below.
-            let menu: &NSMenu = unsafe { &*(ns_menu as *const NSMenu) };
-            let font = NSFont::menuFontOfSize(0.0);
-            for item in menu.itemArray().iter() {
-                let title = item.title().to_string();
-                if title.contains('\t') {
-                    continue; // already covered by the tab-row loop above
-                }
-                let w = measured_width(&title, &font);
-                if w > widest {
-                    widest = w;
-                }
-            }
-        }
-        widest + RIGHT_ALIGN_PAD
-    }
-
-    /// Build the attributed title for one row from its `RowStyle`. Module-level
-    /// (not nested in `apply_menu_styles`) so `#[cfg(test)]` can exercise it
-    /// directly — e.g. asserting `disabled_but_white` produces a `labelColor`
-    /// foreground-color attribute over the full row. `pub(super)` (rather than
-    /// private) so the macOS-only tests at the bottom of this file's `tests`
-    /// module can call `mac_style::attributed(...)` directly. `resolved_tab_x`
-    /// is the menu-wide point value `compute_menu_right_x` produced for this
-    /// snapshot — `None` means "no tab stop on this row" regardless of what
-    /// `style.tab_x_kind` says (callers gate that); a test exercising a row
-    /// with no tab stop can just pass `None`.
-    pub(super) fn attributed(
-        style: &RowStyle,
-        resolved_tab_x: Option<f64>,
-    ) -> Retained<NSAttributedString> {
-        let ns_text = NSString::from_str(&style.plain);
-        // NSRange is UTF-16 code units — use NSString::length, not byte length.
-        let full_len = ns_text.length();
-        let attr =
-            NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &ns_text);
-
-        // Right-aligned trailing run at the menu-wide computed tab stop
-        // (battery-menu style).
-        if let Some(x) = resolved_tab_x {
-            let para = NSMutableParagraphStyle::new();
-            let opts: Retained<NSDictionary<NSTextTabOptionKey, AnyObject>> = NSDictionary::new();
-            // SAFETY: the options generic is the correct (empty) dictionary type.
-            let tab = unsafe {
-                NSTextTab::initWithTextAlignment_location_options(
-                    NSTextTab::alloc(),
-                    NSTextAlignment::Right,
-                    x,
-                    &opts,
-                )
-            };
-            let tabs = NSArray::from_retained_slice(&[tab]);
-            para.setTabStops(Some(&tabs));
-            // SAFETY: value type matches the paragraph-style attribute key.
-            unsafe {
-                attr.addAttribute_value_range(
-                    NSParagraphStyleAttributeName,
-                    &para,
-                    NSRange::new(0, full_len),
-                );
-            }
-        }
-
-        // Bold marks either the active account (via `main_row`) or a section
-        // header (via `section_header`). Both use the same appearance.
-        if style.bold || style.section_header {
-            // 0.0 => default menu font size.
-            let font = NSFont::boldSystemFontOfSize(0.0);
-            // SAFETY: value type matches the font attribute key.
-            unsafe {
-                attr.addAttribute_value_range(
-                    NSFontAttributeName,
-                    &font,
-                    NSRange::new(0, full_len),
-                );
-            }
-        }
-
-        // Optional grey trailing run (Quit row: version rendered in
-        // NSColor::secondaryLabelColor — the same tint disabled items use,
-        // without actually disabling the row).
-        if let Some(from) = style.grey_tail_from {
-            if from < full_len {
-                let grey = NSColor::secondaryLabelColor();
-                // SAFETY: value type matches the foreground-color attribute key.
-                unsafe {
-                    attr.addAttribute_value_range(
-                        NSForegroundColorAttributeName,
-                        &grey,
-                        NSRange::new(from, full_len - from),
-                    );
-                }
-            }
-        }
-
-        // v0.5.0: force the normal (non-disabled) text color over the WHOLE row
-        // for informational submenu rows that are `enabled: true` for
-        // click-routing purposes but must not look like muda's greyed-out
-        // disabled rows (item 3 of the redesign — "white but not clickable").
-        if style.disabled_but_white {
-            let normal = NSColor::labelColor();
-            // SAFETY: value type matches the foreground-color attribute key.
-            unsafe {
-                attr.addAttribute_value_range(
-                    NSForegroundColorAttributeName,
-                    &normal,
-                    NSRange::new(0, full_len),
-                );
-            }
-        }
-
-        // Tint high percentages (amber approaching, red near the wall).
-        for &(off, len, sev) in &style.colors {
-            if len == 0 || off >= full_len {
-                continue;
-            }
-            let end = (off + len).min(full_len);
-            let color = color_for(sev);
-            // SAFETY: value type matches the foreground-color attribute key.
-            unsafe {
-                attr.addAttribute_value_range(
-                    NSForegroundColorAttributeName,
-                    &color,
-                    NSRange::new(off, end - off),
-                );
-            }
-        }
-
-        Retained::into_super(attr)
-    }
-
-    /// Walk the native `NSMenu` (and its submenus) and set `attributedTitle` on any
-    /// item whose plain title matches a `RowStyle` — the mechanism muda's plain
-    /// string API can't reach (right-aligned tab stops and arbitrary colors).
-    /// `menu_right_x` is the point value `compute_menu_right_x` resolved for
-    /// this snapshot; every `TabX::MenuRight` row gets that same x so their
-    /// trailing runs line up in a column.
-    fn apply_menu_styles(ns_menu: *mut core::ffi::c_void, styles: &[RowStyle], menu_right_x: f64) {
-        if ns_menu.is_null() {
-            return;
-        }
-
-        /// Turn a bundled PNG's bytes into a 16×16 `NSImage`. Nil-safe: a corrupt
-        /// or unsupported blob returns `None` (the caller just skips setImage:).
-        fn image_from_bytes(bytes: &[u8]) -> Option<Retained<NSImage>> {
-            let data = NSData::with_bytes(bytes);
-            let img = NSImage::initWithData(NSImage::alloc(), &data)?;
-            // Force the drawn size to menu-item height (16pt); PNGs are already
-            // 16×16 but `NSImage`'s reported size is 72dpi-scaled, which reads too
-            // big at Retina. `usesSize` is not required here — NSMenuItem uses the
-            // image's `size` directly.
-            use objc2_foundation::NSSize;
-            img.setSize(NSSize {
-                width: 16.0,
-                height: 16.0,
-            });
-            Some(img)
-        }
-
-        /// Style every item whose plain title matches, descending into submenus.
-        /// `top_level` is true on the outermost NSMenu only; section-header styles
-        /// (unused in v0.5.0's flat main list, but the flag stays load-bearing for
-        /// any future disabled/bold top-level row) are suppressed inside submenus
-        /// so a plain-title collision with a submenu row doesn't inherit them.
-        fn walk(menu: &NSMenu, styles: &[RowStyle], top_level: bool, menu_right_x: f64) {
-            for item in menu.itemArray().iter() {
-                let title = item.title().to_string();
-                if let Some(style) = styles
-                    .iter()
-                    .find(|s| s.plain == title && (top_level || !s.section_header))
-                {
-                    // v0.5.4 defect 2: non-submenu rows (Quit, disabled
-                    // provider headers without env-override, etc.) need
-                    // their tab stop pushed right by the chevron column
-                    // width so their trailing text terminates at the same
-                    // visual X as the submenu-row trailing (which currently
-                    // sits flush against the chevron reserved column).
-                    let has_submenu = item.submenu().is_some();
-                    let resolved_tab_x = style
-                        .tab_x_kind
-                        .map(|_| effective_tab_x(menu_right_x, has_submenu));
-                    item.setAttributedTitle(Some(&attributed(style, resolved_tab_x)));
-                    // Per-provider 16px icon on section header rows. Look up by
-                    // slug; a missing PNG (or an unknown slug like `vertex-ai`) is
-                    // a no-op so a future provider without a bundled icon still
-                    // renders — just text-only.
-                    if let Some(slug) = style.icon_slug {
-                        if let Some(bytes) = crate::icons::png16_for(slug) {
-                            if let Some(img) = image_from_bytes(bytes) {
-                                item.setImage(Some(&img));
-                            }
-                        }
-                    }
-                    // Leading checkmark glyph for the active-account row (the
-                    // "✓ trailing glyph" spec). AppKit renders `state == On` as a
-                    // checkmark in the item's `stateColumn`.
-                    if style.checkmark {
-                        item.setState(NSControlStateValueOn);
-                    }
-                }
-                if let Some(sub) = item.submenu() {
-                    walk(&sub, styles, false, menu_right_x);
-                }
-            }
-        }
-
-        // SAFETY: called only on the main thread (the run-loop timer), with a live
-        // NSMenu pointer from muda's ns_menu() that the tray keeps retained.
-        let menu: &NSMenu = unsafe { &*(ns_menu as *const NSMenu) };
-        walk(menu, styles, true, menu_right_x);
-    }
-} // mod mac_style
-
-/// A submenu stat line and the span of its percentage (for coloring). Returns
-/// `(plain_title, Some((utf16_offset, utf16_len)))`; the offset locates the
-/// `NN%` so the native walk can tint just the number.
 /// A stable fingerprint of everything the menu renders. When it's unchanged we
 /// skip `set_menu`, so an open menu is never dismissed by a no-op poll.
 ///
@@ -4605,140 +4206,6 @@ mod tests {
     }
 
     #[test]
-    fn menu_styles_attaches_icon_slug_to_the_provider_group_header() {
-        // v0.5.3 restored provider grouping: the 16px icon moves from every
-        // account row onto the provider-group header row (bold, disabled,
-        // plain title = display name). No account row carries an icon
-        // anymore; the group header is the sole icon carrier.
-        let snap = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
-        let styles = menu_styles(&snap);
-        let header_style = styles
-            .iter()
-            .find(|s| s.plain == "Claude")
-            .expect("provider-group header row present");
-        assert_eq!(header_style.icon_slug, Some(CLAUDE_SLUG));
-        assert!(header_style.bold, "group header is bold");
-        // Account rows (the ones with a tab stop) must NOT carry an icon.
-        for s in styles.iter().filter(|s| s.tab_x_kind.is_some()) {
-            assert!(
-                s.icon_slug.is_none(),
-                "account row must not carry an icon: {}",
-                s.plain,
-            );
-        }
-        // The submenu info rows (no tab stop) also carry no icon.
-        for s in styles
-            .iter()
-            .filter(|s| s.tab_x_kind.is_none() && s.plain != "Claude")
-        {
-            assert!(
-                s.icon_slug.is_none(),
-                "unexpected icon on non-main row: {}",
-                s.plain,
-            );
-        }
-    }
-
-    #[test]
-    fn menu_styles_tab_stop_is_uniform_across_a_section() {
-        // v0.5.1: the concrete tab-stop x is resolved dynamically at install
-        // time (`mac_style::compute_menu_right_x`, from the actual rendered
-        // widths), not stored on `RowStyle` — so what a `RowStyle` carries,
-        // and what this test can pin without native AppKit calls, is just
-        // the *kind* of alignment it wants. Every main-list row in a section
-        // (and the Quit row) must request `TabX::MenuRight`, or the S%/W%
-        // columns wouldn't line up vertically. Vary email length across rows
-        // to prove the kind doesn't depend on content width either.
-        let short = acct("a@x.com", Some(10.0), Some(20.0), false);
-        let long = acct(
-            "a.very.long.email.address@example.com",
-            Some(30.0),
-            Some(40.0),
-            true,
-        );
-        let snap = Snapshot {
-            sections: vec![ProviderSection {
-                provider_id: CLAUDE_SLUG,
-                display_name: "Claude",
-                supports_switching: true,
-                supports_usage: true,
-                supports_launch: true,
-                supports_remove: true,
-                severity_bands: bands(),
-                env_override_active: false,
-                accounts: vec![long, short],
-            }],
-            account_order: vec![(0, 0), (0, 1)],
-            capture_creds: Vec::new(),
-            capture_api_key: Vec::new(),
-            autoswap: false,
-            threshold: 95.0,
-            notification_config: crate::notifications::NotificationConfig::default(),
-        };
-        let styles = menu_styles(&snap);
-        let tab_kinds: Vec<TabX> = styles.iter().filter_map(|s| s.tab_x_kind).collect();
-        assert!(
-            tab_kinds.len() >= 2,
-            "expected a tab stop on every main row plus Quit"
-        );
-        for kind in &tab_kinds {
-            assert_eq!(
-                *kind,
-                TabX::MenuRight,
-                "every row must request the shared menu-right alignment"
-            );
-        }
-    }
-
-    #[test]
-    fn menu_styles_marks_active_account_with_checkmark() {
-        // The active-account row sets `checkmark = true` so the native walk
-        // renders a leading ✓ glyph via `NSMenuItem::setState(.On)`. Inactive
-        // rows must not.
-        let mut inactive = acct("dev@x.com", Some(10.0), Some(20.0), false);
-        inactive.active = false;
-        let active = acct("active@x.com", Some(50.0), Some(60.0), true);
-        let snap = Snapshot {
-            sections: vec![ProviderSection {
-                provider_id: CLAUDE_SLUG,
-                display_name: "Claude",
-                supports_switching: true,
-                supports_usage: true,
-                supports_launch: true,
-                supports_remove: true,
-                severity_bands: bands(),
-                env_override_active: false,
-                accounts: vec![active, inactive],
-            }],
-            account_order: vec![(0, 0), (0, 1)],
-            capture_creds: Vec::new(),
-            capture_api_key: Vec::new(),
-            autoswap: false,
-            threshold: 95.0,
-            notification_config: crate::notifications::NotificationConfig::default(),
-        };
-        let styles = menu_styles(&snap);
-        // Only inspect the per-account main-list rows (they carry a tab
-        // stop; the Quit row is excluded by matching on the email instead).
-        let mut saw_active = false;
-        let mut saw_inactive = false;
-        for s in styles.iter().filter(|s| s.tab_x_kind.is_some()) {
-            if s.plain.contains("active@x.com") {
-                assert!(s.checkmark, "active row must carry the checkmark flag");
-                saw_active = true;
-            }
-            if s.plain.contains("dev@x.com") {
-                assert!(
-                    !s.checkmark,
-                    "inactive row must NOT carry the checkmark flag"
-                );
-                saw_inactive = true;
-            }
-        }
-        assert!(saw_active && saw_inactive, "both rows produced a style");
-    }
-
-    #[test]
     fn build_snapshot_omits_sections_for_providers_with_zero_accounts() {
         // No captured accounts → no section (the "no header, no rows" rule).
         // Uses the pure `partition_capture_providers` sibling to prove the
@@ -5057,153 +4524,6 @@ mod tests {
             api_key_after.is_empty(),
             "already captured → must NOT be offered under Paste API key ▸ anymore",
         );
-    }
-
-    // These two tests exercise `mac_style::attributed` directly (NSAttributedString
-    // attribute inspection) — nested in their own `#[cfg(target_os = "macos")]`
-    // module since `objc2_app_kit`/`objc2_foundation` aren't in the dependency
-    // graph on Linux/Windows (see the top-of-file import comment).
-    #[cfg(target_os = "macos")]
-    mod mac_style_tests {
-        use super::*;
-        use objc2_app_kit::NSForegroundColorAttributeName;
-
-        #[test]
-        fn disabled_but_white_row_gets_a_full_range_labelcolor_attribute() {
-            // The "white but not clickable" style: `disabled_but_white` must
-            // produce an `NSForegroundColorAttributeName` run spanning the ENTIRE
-            // row (offset 0, full length) — not disabled grey, not a partial span.
-            let style = RowStyle {
-                disabled_but_white: true,
-                ..RowStyle::plain_row("Session resets in 3h".to_string())
-            };
-            let attr = mac_style::attributed(&style, None);
-            let full_len = attr.length();
-            assert!(full_len > 0);
-            let mut effective = objc2_foundation::NSRange::new(0, 0);
-            let value = unsafe {
-                attr.attribute_atIndex_effectiveRange(
-                    NSForegroundColorAttributeName,
-                    0,
-                    &mut effective,
-                )
-            };
-            assert!(value.is_some(), "expected a foreground-color attribute");
-            assert_eq!(
-                effective,
-                objc2_foundation::NSRange::new(0, full_len),
-                "labelColor must span the whole row",
-            );
-        }
-
-        /// v0.5.4 defect 2: `effective_tab_x` MUST push non-submenu rows'
-        /// tab stop right by the chevron column width so their trailing
-        /// text terminates at the same visual X as a submenu row's. Pure
-        /// arithmetic — no AppKit round-trip needed.
-        #[test]
-        fn effective_tab_x_pushes_non_submenu_rows_right_by_chevron_width() {
-            let base = 200.0;
-            assert_eq!(mac_style::effective_tab_x(base, true), base);
-            assert_eq!(
-                mac_style::effective_tab_x(base, false),
-                base + mac_style::CHEVRON_COLUMN_WIDTH,
-            );
-            // Non-zero chevron adjustment — a defensive check so a future
-            // "chevron is 0pt on this platform" refactor can't silently
-            // reintroduce the user-visible short-right-alignment bug.
-            const _: () = assert!(mac_style::CHEVRON_COLUMN_WIDTH > 0.0);
-        }
-
-        /// v0.5.4 defect 1: `attributed` must produce a paragraph-style
-        /// right-align tab stop whose location is at least `label_width +
-        /// MIN_LABEL_TRAILING_GAP` past the label's right edge, so a near-
-        /// widest email row never renders with zero gap between the email
-        /// and its trailing `S% / W%`. Measures the actual label width in
-        /// the menu font and inspects the tab stop the style produced.
-        #[test]
-        fn attributed_row_has_a_minimum_gap_between_label_and_tab_stop() {
-            use objc2_app_kit::{NSFont, NSParagraphStyleAttributeName};
-            use objc2_foundation::NSRange;
-
-            let label = "  matthew@getbusbar.com";
-            let plain = format!("{label}\t47% / 89%");
-            let style = RowStyle {
-                tab_x_kind: Some(TabX::MenuRight),
-                ..RowStyle::plain_row(plain.clone())
-            };
-            let font = NSFont::menuFontOfSize(0.0);
-            // Test hook: pass a tab_x already at least MIN_GAP past the
-            // label's right edge (that is the invariant callers rely on;
-            // production computes it via `compute_menu_right_x` which now
-            // folds MIN_GAP into `widest`).
-            // Simulate what `compute_menu_right_x` would produce for a
-            // one-row menu with this row: label_width + MIN_GAP + trailing.
-            // Then assert the tab stop is at least label_width + MIN_GAP.
-            fn measured(s: &str, f: &objc2_app_kit::NSFont) -> f64 {
-                use objc2::AllocAnyThread;
-                use objc2_app_kit::{NSAttributedStringNSStringDrawing, NSFontAttributeName};
-                use objc2_foundation::{NSAttributedString, NSMutableAttributedString, NSString};
-                let s = NSString::from_str(s);
-                let attr = NSMutableAttributedString::initWithString(
-                    NSMutableAttributedString::alloc(),
-                    &s,
-                );
-                unsafe {
-                    attr.addAttribute_value_range(
-                        NSFontAttributeName,
-                        f,
-                        NSRange::new(0, s.length()),
-                    );
-                }
-                let attr: objc2::rc::Retained<NSAttributedString> =
-                    objc2::rc::Retained::into_super(attr);
-                attr.size().width
-            }
-            let label_w = measured(label, &font);
-            let trailing_w = measured("47% / 89%", &font);
-            let tab_x = label_w + mac_style::MIN_LABEL_TRAILING_GAP + trailing_w;
-
-            let attr = mac_style::attributed(&style, Some(tab_x));
-            let mut effective = NSRange::new(0, 0);
-            let value = unsafe {
-                attr.attribute_atIndex_effectiveRange(
-                    NSParagraphStyleAttributeName,
-                    0,
-                    &mut effective,
-                )
-            };
-            let obj = value.expect("expected a paragraph-style attribute");
-            let para: &objc2_app_kit::NSParagraphStyle =
-                unsafe { &*(objc2::rc::Retained::as_ptr(&obj) as *const _) };
-            let tabs = para.tabStops();
-            assert!(!tabs.is_empty(), "paragraph style must carry a tab stop");
-            let stop_loc = tabs.iter().next().unwrap().location();
-            assert!(
-                stop_loc >= label_w + mac_style::MIN_LABEL_TRAILING_GAP,
-                "tab stop {stop_loc} must be at least {}pt past label right edge {label_w}",
-                mac_style::MIN_LABEL_TRAILING_GAP,
-            );
-        }
-
-        #[test]
-        fn plain_row_with_no_disabled_but_white_has_no_forced_foreground_color() {
-            // A normal (non-info) row must NOT get the full-range labelColor
-            // treatment — only `disabled_but_white` rows opt into it.
-            let style = RowStyle::plain_row("Switch to this account".to_string());
-            let attr = mac_style::attributed(&style, None);
-            let mut effective = objc2_foundation::NSRange::new(0, 0);
-            let value = unsafe {
-                attr.attribute_atIndex_effectiveRange(
-                    NSForegroundColorAttributeName,
-                    0,
-                    &mut effective,
-                )
-            };
-            assert!(
-                value.is_none(),
-                "a plain row must not carry a forced foreground color",
-            );
-        }
     }
 
     // -----------------------------------------------------------------
