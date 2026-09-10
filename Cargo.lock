@@ -1718,9 +1718,9 @@ dependencies = [
 
 [[package]]
 name = "muri"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfdf86814a8a938986a32a768b6c607f626bf098ad92d7eb79ba54b7a4ffa62e"
+checksum = "be5adccaa616003c7cc541c8ba06c99855bcebf86588e74c743ca9f20bbe44bd"
 dependencies = [
  "block2",
  "crossbeam-channel",
