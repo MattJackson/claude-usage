@@ -42,11 +42,14 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tray_icon::menu::{
-    CheckMenuItem, IconMenuItem, IsMenuItem, Menu, MenuEvent, MenuId, MenuItem as NativeMenuItem,
-    PredefinedMenuItem, Submenu,
-};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+// muri 0.9's `muda-compat` facade replaces `tray-icon`/`muda` for the Windows
+// tray menu (0.6.0 swap). A pure drop-in: `muri::compat::tray_icon` re-exports
+// the menu module (`pub use muda as menu`, muri 0.9.1) exactly as real
+// `tray-icon` does, so these import paths are byte-for-byte the originals with
+// only the crate root retargeted. `Icon` is the same type in both facade
+// modules.
+use muri::compat::tray_icon::menu::{Menu, MenuEvent};
+use muri::compat::tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 pub struct WindowsPlatform {
     menu: WindowsMenu,
@@ -201,78 +204,6 @@ fn decode_icon(bytes: &[u8]) -> Result<Icon> {
         .map_err(|e| anyhow::anyhow!("bad tray icon bytes: {e}"))
 }
 
-/// Decode a PNG into a menu-item icon (`tray_icon::menu::Icon`, distinct from the
-/// tray `Icon` above). Best-effort: a bad/undecodable PNG yields `None` and the
-/// row just renders text-only.
-fn decode_menu_icon(bytes: &[u8]) -> Option<tray_icon::menu::Icon> {
-    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
-    let (w, h) = img.dimensions();
-    tray_icon::menu::Icon::from_rgba(img.into_raw(), w, h).ok()
-}
-
-/// Recursively translate one generic `MenuItem` into a native muda item.
-/// `icon_png` on `Action`/`Static`/`Submenu` rows is currently ignored
-/// (label-only rows) — no caller exercises per-row icons yet; wiring
-/// `IconMenuItem` through is deferred until one does.
-fn build_item(item: &MenuItem) -> Result<Box<dyn IsMenuItem>> {
-    Ok(match item {
-        MenuItem::Action {
-            id,
-            label,
-            enabled,
-            checked,
-            checkable,
-            ..
-        } => {
-            if *checkable {
-                Box::new(CheckMenuItem::with_id(
-                    MenuId::new(id),
-                    label,
-                    *enabled,
-                    *checked,
-                    None,
-                ))
-            } else {
-                Box::new(NativeMenuItem::with_id(
-                    MenuId::new(id),
-                    label,
-                    *enabled,
-                    None,
-                ))
-            }
-        }
-        MenuItem::Static { label, icon_png } => {
-            // Disabled label row. When it carries an icon (a provider group
-            // header), render it as a disabled IconMenuItem so the provider mark
-            // shows next to the name — matching macOS.
-            match icon_png.as_ref().and_then(|b| decode_menu_icon(b)) {
-                Some(icon) => Box::new(IconMenuItem::new(label, false, Some(icon), None)),
-                None => Box::new(NativeMenuItem::new(label, false, None)),
-            }
-        }
-        MenuItem::Separator => Box::new(PredefinedMenuItem::separator()),
-        MenuItem::Submenu { label, items, .. } => {
-            let sub = Submenu::new(label, true);
-            for child in items {
-                let native_child = build_item(child)?;
-                sub.append(native_child.as_ref())
-                    .map_err(|e| anyhow::anyhow!("submenu append: {e}"))?;
-            }
-            Box::new(sub)
-        }
-    })
-}
-
-fn build_native_menu(tree: &MenuTree) -> Result<Menu> {
-    let menu = Menu::new();
-    for item in &tree.items {
-        let native = build_item(item)?;
-        menu.append(native.as_ref())
-            .map_err(|e| anyhow::anyhow!("menu append: {e}"))?;
-    }
-    Ok(menu)
-}
-
 /// Drain the Win32 message queue for the calling thread without blocking.
 /// `tray-icon`'s hidden window needs its messages dispatched for mouse
 /// clicks / menu commands on the notification icon to turn into
@@ -338,7 +269,7 @@ fn apply_ui_cmd(tray: &TrayIcon, cmd: UiCmd) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("set_tooltip: {e}"))?;
         }
         UiCmd::SetMenu(tree) => {
-            let native = build_native_menu(&tree)?;
+            let native = crate::platform::render::render_menu(&tree);
             tray.set_menu(Some(Box::new(native)));
         }
     }
