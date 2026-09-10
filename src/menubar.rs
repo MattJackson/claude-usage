@@ -912,10 +912,7 @@ fn sleep_bounded_detecting_suspend(total: u64) -> bool {
         let chunk = remaining.min(SLEEP_CHUNK_SECS);
         let before = std::time::SystemTime::now();
         std::thread::sleep(Duration::from_secs(chunk));
-        let elapsed = before
-            .elapsed()
-            .map(|d| d.as_secs())
-            .unwrap_or(chunk);
+        let elapsed = before.elapsed().map(|d| d.as_secs()).unwrap_or(chunk);
         if is_suspend_gap(chunk, elapsed) {
             crate::logging::log(&format!(
                 "poll: wall-clock jumped {elapsed}s over a {chunk}s sleep — system resumed from \
@@ -2805,7 +2802,7 @@ mod tests {
         // A jump beyond chunk + slack means the machine was suspended.
         assert!(is_suspend_gap(30, 30 + SUSPEND_GAP_SLACK_SECS + 1));
         assert!(is_suspend_gap(30, 30 * 60)); // a 30-minute battery-death sleep
-        // A short final chunk still detects a suspend.
+                                              // A short final chunk still detects a suspend.
         assert!(is_suspend_gap(5, 1800));
         assert!(!is_suspend_gap(5, 5));
     }
