@@ -210,6 +210,10 @@ struct Snapshot {
     threshold: f64,
     /// Settings ▸ Notifications ▸ per-trigger enable checkboxes.
     notification_config: crate::notifications::NotificationConfig,
+    /// Settings ▸ Tray Icon: `None` = "at risk" (the agent closest to its
+    /// limit); `Some(slug)` pins the tray to one provider. Drives
+    /// `tray_target` / `title_for` / `tray_icon_bytes`.
+    tray_icon_mode: Option<String>,
 }
 
 /// How near a limit a percentage is, for at-a-glance coloring.
@@ -618,6 +622,62 @@ fn active_account(snap: &Snapshot) -> Option<(&ProviderSection, &AcctView)> {
         }
     }
     None
+}
+
+/// The highest window percentage across an account's windows (how close it is
+/// to *any* of its limits) — the "at risk" score. `None` when the account has
+/// no usage data yet (sorted below any real reading).
+fn acct_max_pct(a: &AcctView) -> Option<f64> {
+    a.windows
+        .iter()
+        .filter_map(|w| w.pct)
+        .fold(None, |acc, p| Some(acc.map_or(p, |m: f64| m.max(p))))
+}
+
+/// The account the tray icon/title should reflect, honoring
+/// `State.tray_icon_mode` (carried on the snapshot):
+///   - `None` — "at risk" (the default): across every provider's ACTIVE
+///     account, the one closest to a limit (highest [`acct_max_pct`]). This is
+///     the actionable signal — "which agent do I need to switch/worry about."
+///   - `Some(slug)` — pin the tray to that provider's active account. Falls
+///     back to "at risk" if the pinned provider has no captured/active account
+///     (e.g. it was removed), so the tray never goes blank on a stale setting.
+fn tray_target<'a>(
+    snap: &'a Snapshot,
+    mode: Option<&str>,
+) -> Option<(&'a ProviderSection, &'a AcctView)> {
+    if let Some(slug) = mode {
+        if let Some(sec) = snap.sections.iter().find(|s| s.provider_id == slug) {
+            if let Some(a) = sec
+                .accounts
+                .iter()
+                .find(|a| a.active)
+                .or_else(|| sec.accounts.first())
+            {
+                return Some((sec, a));
+            }
+        }
+        // Pinned provider absent → fall through to at-risk rather than blank.
+    }
+    snap.sections
+        .iter()
+        .filter_map(|sec| Some((sec, sec.accounts.iter().find(|a| a.active)?)))
+        .max_by(|(_, a), (_, b)| {
+            acct_max_pct(a)
+                .unwrap_or(-1.0)
+                .partial_cmp(&acct_max_pct(b).unwrap_or(-1.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+/// The tray icon bytes for the current [`tray_target`]: the target provider's
+/// 16px brand icon, so the menu bar shows *which* agent the percentage is for.
+/// Falls back to the usagio mark when there's no target or no bundled icon.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn tray_icon_bytes(snap: &Snapshot) -> &'static [u8] {
+    tray_target(snap, snap.tray_icon_mode.as_deref())
+        .and_then(|(sec, _)| crate::icons::png16_for(sec.provider_id))
+        .unwrap_or_else(crate::icons::usagio_tray_icon)
 }
 
 /// Entry point dispatched by `usagio menubar` (see `main.rs`). Every platform
@@ -1538,6 +1598,7 @@ fn build_snapshot() -> Snapshot {
         autoswap,
         threshold,
         notification_config: st.notification_config.clone(),
+        tray_icon_mode: st.tray_icon_mode.clone(),
     }
 }
 
@@ -1898,7 +1959,7 @@ fn menu_signature(snap: &Snapshot) -> String {
 }
 
 fn title_for(snap: &Snapshot) -> String {
-    match active_account(snap) {
+    match tray_target(snap, snap.tray_icon_mode.as_deref()) {
         // Session (5h) matters most day to day; fall back to weekly. Preserves
         // the v1 tray-title semantics — a full weekly can't silently replace
         // the low session number in the menu bar. Multi-window providers still
@@ -2004,6 +2065,7 @@ fn handle_click(id: &str) {
         ("notifications", Some(trigger @ ("threshold" | "resetback" | "pace")), None) => {
             toggle_notification_trigger(trigger)
         }
+        ("trayicon", Some(mode), None) => set_tray_icon_mode(mode),
         ("capture", Some(slug), None) => handle_capture(slug),
         ("apikey", Some(slug), None) => handle_apikey_capture(slug),
         ("switch", Some(slug), Some(key)) => handle_switch(slug, key),
@@ -2432,6 +2494,25 @@ fn set_autoswap(enabled: bool) {
     }
 }
 
+/// Settings ▸ Tray Icon selection. `"at-risk"` clears the pin (the default —
+/// tray follows the agent closest to its limit); any other value pins the tray
+/// to that provider slug. Reads-then-writes under the lock so a stale menu
+/// snapshot can't clobber a concurrent change.
+fn set_tray_icon_mode(mode: &str) {
+    let r = with_state_lock(|| {
+        let mut st = State::load()?;
+        st.tray_icon_mode = if mode == "at-risk" {
+            None
+        } else {
+            Some(mode.to_string())
+        };
+        st.save()
+    });
+    if let Err(e) = r {
+        notify(&format!("Could not save tray icon setting: {e}"));
+    }
+}
+
 /// Flip one Settings ▸ Notifications ▸ per-trigger checkbox. `trigger` is one
 /// of "threshold" / "resetback" / "pace" (the three click-id suffixes
 /// `menu_tree_from_snapshot` wires up) — reads-then-flips the on-disk value so a stale
@@ -2783,10 +2864,30 @@ mod cross_platform {
             action("backup:restore", "Restore…", true),
         ];
 
+        // Tray Icon ▸: "At risk" (default) or pin to one captured provider.
+        // `snap.sections` already holds only providers with a captured
+        // account, so the pinned options list exactly the agents the user has.
+        let cur_mode = snap.tray_icon_mode.as_deref();
+        let mut trayicon_items = vec![checkbox(
+            "trayicon:at-risk",
+            "At risk (closest to limit)",
+            true,
+            cur_mode.is_none(),
+        )];
+        for sec in &snap.sections {
+            trayicon_items.push(checkbox(
+                format!("trayicon:{}", sec.provider_id),
+                sec.display_name,
+                true,
+                cur_mode == Some(sec.provider_id),
+            ));
+        }
+
         let settings_items = vec![
             action("refresh:now", "Refresh usage now", true),
             PMenuItem::Separator,
             plain_submenu("Auto-swap", autoswap_items),
+            plain_submenu("Tray Icon", trayicon_items),
             plain_submenu("Backups", backups),
             plain_submenu("Notifications", notifications),
         ];
@@ -2810,12 +2911,14 @@ mod cross_platform {
     /// Claude's (always bundled, regardless of which provider Cargo features
     /// are enabled — see `icons::png16_for`).
     #[cfg(not(target_os = "macos"))]
-    fn initial_icon_bytes(_snap: &Snapshot) -> &'static [u8] {
-        // The tray/notification-area icon is usagio's own brand mark on every
-        // platform that shows an icon here (Windows/Linux). The active account's
-        // PROVIDER icon belongs on the menu's group-header rows, not in the tray
-        // (user decision, v0.5.22) — so this no longer varies by active provider.
-        crate::icons::usagio_tray_icon()
+    fn initial_icon_bytes(snap: &Snapshot) -> &'static [u8] {
+        // The tray icon reflects the current `tray_target` agent (Settings ▸
+        // Tray Icon: "at risk" or a pinned provider), so the menu bar shows
+        // WHICH agent the percentage is for. This reverses the earlier
+        // v0.5.22 "usagio mark only" choice now that multiple agents
+        // (Claude + Codex + …) can be captured and the tray must disambiguate.
+        // Falls back to the usagio mark when there's no target/icon.
+        tray_icon_bytes(snap)
     }
 
     /// Background redraw ticker: rebuilds the tray from cached state and
@@ -3022,7 +3125,93 @@ mod tests {
             autoswap: false,
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
+            tray_icon_mode: None,
         }
+    }
+
+    /// Build a two-provider snapshot for tray-target tests: a Claude section
+    /// and a Codex section, each with a single active account at the given
+    /// max %. `provider_id`/`display_name` are leaked `&'static` fixtures.
+    fn two_section_snap(
+        claude: AcctView,
+        codex_pct: Option<f64>,
+        tray_icon_mode: Option<String>,
+    ) -> Snapshot {
+        let mut codex = acct("cx@x", codex_pct, None, true);
+        codex.provider_id = "codex";
+        let mk = |id: &'static str, name: &'static str, a: AcctView| ProviderSection {
+            provider_id: id,
+            display_name: name,
+            supports_switching: true,
+            supports_usage: true,
+            supports_launch: false,
+            supports_remove: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![a],
+        };
+        Snapshot {
+            sections: vec![
+                mk(CLAUDE_SLUG, "Claude", claude),
+                mk("codex", "Codex", codex),
+            ],
+            account_order: vec![(0, 0), (1, 0)],
+            capture_creds: Vec::new(),
+            capture_api_key: Vec::new(),
+            autoswap: false,
+            threshold: 95.0,
+            notification_config: crate::notifications::NotificationConfig::default(),
+            tray_icon_mode,
+        }
+    }
+
+    #[test]
+    fn tray_target_at_risk_picks_highest_pct_agent() {
+        // Claude at 40%, Codex at 90% → at-risk picks Codex.
+        let snap = two_section_snap(acct("c@x", Some(40.0), Some(30.0), true), Some(90.0), None);
+        let (sec, _) = tray_target(&snap, None).expect("a target");
+        assert_eq!(sec.provider_id, "codex");
+        // Flip it: Claude 99% beats Codex 10%.
+        let snap = two_section_snap(acct("c@x", Some(99.0), Some(20.0), true), Some(10.0), None);
+        let (sec, _) = tray_target(&snap, None).expect("a target");
+        assert_eq!(sec.provider_id, CLAUDE_SLUG);
+    }
+
+    #[test]
+    fn tray_target_pinned_provider_wins_over_at_risk() {
+        // Codex is far more at-risk, but the tray is pinned to Claude.
+        let snap = two_section_snap(
+            acct("c@x", Some(10.0), Some(10.0), true),
+            Some(99.0),
+            Some("claude".to_string()),
+        );
+        let (sec, _) = tray_target(&snap, snap.tray_icon_mode.as_deref()).expect("a target");
+        assert_eq!(sec.provider_id, CLAUDE_SLUG);
+    }
+
+    #[test]
+    fn tray_target_pinned_missing_provider_falls_back_to_at_risk() {
+        // Pinned to a provider that isn't captured → fall back to at-risk (Codex).
+        let snap = two_section_snap(
+            acct("c@x", Some(10.0), Some(10.0), true),
+            Some(88.0),
+            Some("gemini-cli".to_string()),
+        );
+        let (sec, _) = tray_target(&snap, snap.tray_icon_mode.as_deref()).expect("a target");
+        assert_eq!(sec.provider_id, "codex");
+    }
+
+    #[test]
+    fn acct_max_pct_is_the_window_max() {
+        assert_eq!(
+            acct_max_pct(&acct("a", Some(40.0), Some(75.0), true)),
+            Some(75.0)
+        );
+        assert_eq!(
+            acct_max_pct(&acct("a", Some(80.0), Some(12.0), true)),
+            Some(80.0)
+        );
+        assert_eq!(acct_max_pct(&acct("a", None, None, true)), None);
     }
 
     #[test]
@@ -3494,6 +3683,7 @@ mod tests {
             autoswap: false,
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
+            tray_icon_mode: None,
         };
         let (sec, acc) = active_account(&snap).expect("active row found");
         assert_eq!(sec.provider_id, "codex");
@@ -4075,6 +4265,7 @@ mod tests {
             autoswap: false,
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
+            tray_icon_mode: None,
         };
         let groups = provider_grouped_order(&snap);
         assert_eq!(groups.len(), 2, "one entry per provider");
