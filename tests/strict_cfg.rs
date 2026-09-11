@@ -95,7 +95,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     // on Linux/Windows; macOS is happy with a text-only title (non-macOS only).
     (
         "src/menubar.rs",
-        "fn initial_icon_bytes(_snap: &Snapshot) -> &'static [u8] {",
+        "fn initial_icon_bytes(snap: &Snapshot) -> &'static [u8] {",
     ),
     // src/menubar.rs — `redraw_loop`: the non-macOS background redraw ticker
     // (pushes through the `Send` `MenuHandle`); macOS ticks on its own NSTimer.
