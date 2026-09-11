@@ -37,13 +37,11 @@
 
 use super::*;
 use anyhow::{bail, Context, Result};
-// muri 0.9's `muda-compat` facade replaces `tray-icon`/`muda` for the Linux
-// tray menu (0.6.0 swap). Both aliases route through `muri::compat::tray_icon`,
-// which mirrors real `tray-icon`'s surface — including the `menu` re-export
-// (`pub use muda as menu`, muri 0.9.1) that the item types come from. `Icon`
-// is the same type in both facade modules.
-use muri::compat::tray_icon as tray;
-use muri::compat::tray_icon::menu as muda;
+// muri 0.11: usagio targets the NATIVE muri tray API (customization lives
+// there; the muda-compat facade is now a frozen pure drop-in). The tray is a
+// native `Tray` spawned into a `Clone` `TrayHandle`; menu-item clicks arrive on
+// the process-global native `MenuEvent` channel.
+use muri::{Icon as MuriIcon, MenuEvent, Tray, TrayHandle};
 use serde_json::{Map, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -619,7 +617,7 @@ enum HandleMsg {
 }
 
 struct TrayState {
-    tray: tray::TrayIcon,
+    tray: TrayHandle,
     rx: std::sync::mpsc::Receiver<HandleMsg>,
 }
 
@@ -630,32 +628,22 @@ thread_local! {
     static TRAY_STATE: std::cell::RefCell<Option<TrayState>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Decode the tray icon's PNG into a muri tray `Icon`. muri owns PNG decoding
-/// (`Icon::from_png`, muri #24), so this is a thin wrapper that just adds
-/// error context for the tray-icon slot.
-fn decode_tray_icon(bytes: &[u8]) -> Result<tray::Icon> {
-    tray::Icon::from_png(bytes).context("building a tray icon from PNG")
+/// The tray icon PNG → a native muri `Icon`. muri decodes lazily at paint time,
+/// so this is just a wrapper.
+fn decode_tray_icon(bytes: &[u8]) -> MuriIcon {
+    MuriIcon::from_png(bytes.to_vec())
 }
 
-fn apply_handle_msg(tray: &tray::TrayIcon, msg: HandleMsg) {
+fn apply_handle_msg(tray: &TrayHandle, msg: HandleMsg) {
     match msg {
-        HandleMsg::SetIcon(bytes) => match decode_tray_icon(&bytes) {
-            Ok(icon) => {
-                if let Err(e) = tray.set_icon(Some(icon)) {
-                    crate::logging::log(&format!("linux tray: set_icon failed: {e}"));
-                }
-            }
-            Err(e) => crate::logging::log(&format!("linux tray: set_icon decode failed: {e:#}")),
-        },
+        HandleMsg::SetIcon(bytes) => tray.set_icon(decode_tray_icon(&bytes)),
         HandleMsg::SetTitle(title) => {
-            // tray-icon docs: tooltips are unsupported on Linux; the title
-            // (shown next to the icon, requires an icon to be set — which we
-            // always have) is the supported analog.
+            // The status-item title (shown next to the icon) is the Linux analog
+            // of a tooltip.
             tray.set_title(Some(title));
         }
         HandleMsg::SetMenu(tree) => {
-            let native = crate::platform::render::render_menu(&tree);
-            tray.set_menu(Some(Box::new(native)));
+            tray.set_menu(crate::platform::render::render_menu(&tree));
         }
     }
 }
@@ -689,19 +677,14 @@ impl MenuBackend for LinuxMenu {
         initial_icon: &[u8],
     ) -> Result<Box<dyn MenuHandle>> {
         self.ensure_gtk_init()?;
-        let icon = decode_tray_icon(initial_icon)?;
-        let mut builder = tray::TrayIconBuilder::new()
-            .with_title(initial_title)
-            // tray-icon's own Linux note: "the icon won't be visible unless
-            // a menu is set. Setting an empty Menu is enough." The real menu
-            // arrives via the first `set_menu` call.
-            .with_menu(Box::new(muda::Menu::new()))
-            .with_icon(icon);
+        let mut tray = Tray::new(decode_tray_icon(initial_icon)).title(initial_title);
         if let Some(theme) = crate::menubar::forced_theme() {
-            builder = builder.with_theme(theme);
+            tray = tray.theme(theme);
         }
-        let tray = builder
-            .build()
+        let mtm = muri::MainThreadMarker::new()
+            .ok_or_else(|| anyhow::anyhow!("the Linux tray must spawn on the main thread"))?;
+        let tray = tray
+            .spawn(mtm)
             .map_err(|e| anyhow::anyhow!("failed to create Linux tray icon: {e}"))?;
         let (tx, rx) = std::sync::mpsc::channel();
         TRAY_STATE.with(|slot| {
@@ -734,7 +717,7 @@ impl MenuBackend for LinuxMenu {
         let click_cb = Arc::clone(&self.click_cb);
         gtk::glib::source::timeout_add_local(std::time::Duration::from_millis(100), move || {
             // Menu-item clicks arrive on tray-icon's own global channel.
-            while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if let Some(cb) = click_cb.lock().unwrap().as_ref() {
                     cb(&event.id.0);
                 }

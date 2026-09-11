@@ -30,8 +30,7 @@ use chrono::{DateTime, Utc};
 #[cfg(target_os = "macos")]
 use {
     block2::RcBlock,
-    muri::compat::tray_icon::menu::MenuEvent,
-    muri::compat::tray_icon::TrayIconBuilder,
+    muri::{MenuEvent, Tray},
     objc2::MainThreadMarker,
     objc2_app_kit::{NSApplication, NSApplicationActivationPolicy},
     objc2_foundation::NSTimer,
@@ -730,32 +729,34 @@ pub fn run() -> Result<()> {
     let start_exe = std::fs::canonicalize(crate::stable_exe_path()).ok();
 
     // Build the tray on the main thread and keep it alive for the app's lifetime.
+    // muri 0.11: the native `Tray` API (customization lives here, not in the
+    // frozen muda-compat facade). `spawn` installs the `NSStatusItem` and
+    // returns a `Clone` `TrayHandle` without blocking, so usagio keeps driving
+    // its own `NSApplication`/`NSTimer` loop below; the status item shows the
+    // agent icon + `%` title side-by-side (muri #58).
     let initial = build_snapshot();
-    let mut builder = TrayIconBuilder::new().with_title(title_for(&initial));
-    if let Some(theme) = forced_theme() {
-        builder = builder.with_theme(theme);
-    }
-    // NOTE: the muri (`muda-compat`) `TrayIconBuilder` has no
-    // `with_menu_on_left_click` (that was a real `tray-icon` control), so the
-    // custom-popup left-click suppression is no longer wired here — and muri
-    // has no `ns_status_item` anchor either, so `build_popover_host` returns
-    // `None` under the muri backend (the experimental, off-by-default popover
-    // is inert until muri exposes an equivalent).
-    // `build()` spawns a live OS tray passively (muri 0.9.2+) — no muri run
-    // loop needed; usagio keeps its own `NSApplication`/`NSTimer` below.
-    let tray = builder
-        .build()
-        .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
-    tray.set_menu(Some(Box::new(crate::platform::render::render_menu(
+    let mut tray = Tray::new(muri::Icon::from_png(
+        crate::icons::usagio_tray_icon().to_vec(),
+    ))
+    .title(title_for(&initial))
+    .tooltip(tooltip_for(&initial))
+    .menu(crate::platform::render::render_menu(
         &cross_platform::menu_tree_from_snapshot(&initial),
-    ))));
-    let _ = tray.set_tooltip(Some(tooltip_for(&initial)));
+    ));
+    if let Some(theme) = forced_theme() {
+        tray = tray.theme(theme);
+    }
+    let muri_mtm = muri::MainThreadMarker::new()
+        .ok_or_else(|| anyhow::anyhow!("the tray must spawn on the main thread"))?;
+    let handle = tray
+        .spawn(muri_mtm)
+        .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
 
     // custom-popup: build the NSPopover host anchored to the status-item button
     // and listen for tray left-clicks to toggle it. `handle_click` is reused
     // verbatim for row actions (same click-id scheme as the native menu).
     #[cfg(feature = "custom-popup")]
-    let popover = build_popover_host(&tray, mtm);
+    let popover = build_popover_host(&handle, mtm);
     #[cfg(feature = "custom-popup")]
     let tray_rx = muri::compat::tray_icon::TrayIconEvent::receiver().clone();
     #[cfg(feature = "custom-popup")]
@@ -793,15 +794,15 @@ pub fn run() -> Result<()> {
             // is the right-click fallback (the popover rebuilds its own content
             // from a fresh snapshot each time it's shown); with it OFF this is
             // the sole UI.
-            tray.set_menu(Some(Box::new(crate::platform::render::render_menu(
+            handle.set_menu(crate::platform::render::render_menu(
                 &cross_platform::menu_tree_from_snapshot(&snap),
-            ))));
-            let _ = tray.set_tooltip(Some(tooltip_for(&snap)));
+            ));
+            handle.set_tooltip(Some(tooltip_for(&snap)));
             *last_sig.borrow_mut() = sig;
         }
         let title = title_for(&snap);
         if *last_title.borrow() != title {
-            tray.set_title(Some(title.clone()));
+            handle.set_title(Some(title.clone()));
             *last_title.borrow_mut() = title;
         }
         // custom-popup: toggle the NSPopover on a tray left-click, and (for the
@@ -844,16 +845,15 @@ pub fn run() -> Result<()> {
 /// still shows, it just won't open a popup).
 #[cfg(all(target_os = "macos", feature = "custom-popup"))]
 fn build_popover_host(
-    tray: &muri::compat::tray_icon::TrayIcon,
+    handle: &muri::TrayHandle,
     mtm: MainThreadMarker,
 ) -> Option<crate::ui::popover::PopoverHost> {
-    // The muri (`muda-compat`) tray does not expose the underlying
-    // `NSStatusItem` (`ns_status_item()` was a real `tray-icon` API), so there
-    // is no button to anchor the NSPopover to under the 0.6.0 muri backend.
-    // The experimental, off-by-default custom-popup is therefore inert until
-    // muri exposes a status-item anchor — return `None` so the tray still shows
-    // (it just opens muri's own menu/popup rather than this NSPopover).
-    let _ = (tray, mtm);
+    // muri's native tray does not (yet) expose the underlying `NSStatusItem`
+    // button as an NSPopover anchor, so there is no button to attach to. The
+    // experimental, off-by-default custom-popup is therefore inert until muri
+    // exposes a status-item anchor — return `None` so the tray still shows (it
+    // just opens muri's own styled popup rather than this NSPopover).
+    let _ = (handle, mtm);
     None
 }
 

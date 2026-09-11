@@ -48,8 +48,7 @@ use std::time::Duration;
 // `tray-icon` does, so these import paths are byte-for-byte the originals with
 // only the crate root retargeted. `Icon` is the same type in both facade
 // modules.
-use muri::compat::tray_icon::menu::{Menu, MenuEvent};
-use muri::compat::tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use muri::{Icon as MuriIcon, Menu, MenuEvent, Tray, TrayHandle};
 
 pub struct WindowsPlatform {
     menu: WindowsMenu,
@@ -127,7 +126,7 @@ const SAME_THREAD_INVARIANT: &str =
 /// assert the invariant at runtime instead of relying on caller discipline
 /// alone.
 struct TrayState {
-    tray: TrayIcon,
+    tray: TrayHandle,
     creation_thread: std::thread::ThreadId,
 }
 
@@ -194,14 +193,11 @@ impl MenuHandle for WindowsMenuHandle {
     }
 }
 
-/// Decode `bytes` (ICO/BMP per the `MenuHandle::set_icon` doc, but PNG works
-/// too — `image::load_from_memory` sniffs the format) into a `tray_icon::Icon`.
-fn decode_icon(bytes: &[u8]) -> Result<Icon> {
-    let img = image::load_from_memory(bytes).context("decoding tray icon bytes")?;
-    let rgba = img.into_rgba8();
-    let (width, height) = rgba.dimensions();
-    Icon::from_rgba(rgba.into_raw(), width, height)
-        .map_err(|e| anyhow::anyhow!("bad tray icon bytes: {e}"))
+/// The tray icon PNG → a native muri `Icon` (muri decodes lazily at paint
+/// time). usagio always ships PNG bytes here, so no `image`-crate sniff is
+/// needed anymore.
+fn decode_icon(bytes: &[u8]) -> MuriIcon {
+    MuriIcon::from_png(bytes.to_vec())
 }
 
 /// Drain the Win32 message queue for the calling thread without blocking.
@@ -257,21 +253,11 @@ fn windows_tooltip(title: &str) -> String {
     }
 }
 
-fn apply_ui_cmd(tray: &TrayIcon, cmd: UiCmd) -> Result<()> {
+fn apply_ui_cmd(tray: &TrayHandle, cmd: UiCmd) -> Result<()> {
     match cmd {
-        UiCmd::SetIcon(bytes) => {
-            let icon = decode_icon(&bytes)?;
-            tray.set_icon(Some(icon))
-                .map_err(|e| anyhow::anyhow!("set_icon: {e}"))?;
-        }
-        UiCmd::SetTitle(title) => {
-            tray.set_tooltip(Some(windows_tooltip(&title)))
-                .map_err(|e| anyhow::anyhow!("set_tooltip: {e}"))?;
-        }
-        UiCmd::SetMenu(tree) => {
-            let native = crate::platform::render::render_menu(&tree);
-            tray.set_menu(Some(Box::new(native)));
-        }
+        UiCmd::SetIcon(bytes) => tray.set_icon(decode_icon(&bytes)),
+        UiCmd::SetTitle(title) => tray.set_tooltip(Some(windows_tooltip(&title))),
+        UiCmd::SetMenu(tree) => tray.set_menu(crate::platform::render::render_menu(&tree)),
     }
     Ok(())
 }
@@ -282,17 +268,16 @@ impl MenuBackend for WindowsMenu {
         initial_title: &str,
         initial_icon: &[u8],
     ) -> Result<Box<dyn MenuHandle>> {
-        let icon = decode_icon(initial_icon)?;
-        let menu = Menu::new();
-        let mut builder = TrayIconBuilder::new()
-            .with_icon(icon)
-            .with_tooltip(windows_tooltip(initial_title))
-            .with_menu(Box::new(menu));
+        let mut tray = Tray::new(decode_icon(initial_icon))
+            .tooltip(windows_tooltip(initial_title))
+            .menu(Menu::new());
         if let Some(theme) = crate::menubar::forced_theme() {
-            builder = builder.with_theme(theme);
+            tray = tray.theme(theme);
         }
-        let tray = builder
-            .build()
+        let mtm = muri::MainThreadMarker::new()
+            .ok_or_else(|| anyhow::anyhow!("the tray must spawn on the main thread"))?;
+        let tray = tray
+            .spawn(mtm)
             .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
 
         let (tx, rx) = mpsc::channel::<UiCmd>();
