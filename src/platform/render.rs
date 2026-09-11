@@ -58,7 +58,15 @@ fn append(menu: Menu, item: &MenuItem) -> Menu {
             checked,
             checkable,
         } => {
-            let mut row = Row::new(id.as_str()).label(label).enabled(*enabled);
+            // A `\t` in the label splits it into a grow label + a right-aligned
+            // value (e.g. `"Quit\tusagio v0.6.1"`) — the same flush-right value
+            // the account rows use, so the version reads at the right edge
+            // rather than mashed onto the label.
+            let base = Row::new(id.as_str()).enabled(*enabled);
+            let mut row = match label.split_once('\t') {
+                Some((l, v)) => base.label_value(l.trim_end(), v.trim_start()),
+                None => base.label(label),
+            };
             // Only checkable rows reserve the check column; a plain action must
             // not (native `checked` marks the row as a checkbox).
             if *checkable {

@@ -1916,6 +1916,29 @@ fn title_for(snap: &Snapshot) -> String {
     }
 }
 
+/// Render the current menu (built from the live/fixture `state.json` the
+/// process's config dir points at) straight to a PNG via muri's headless
+/// offscreen renderer (muri #59, 0.10.9) under a forced OS theme — no tray,
+/// window, display, or TCC/Accessibility. `theme_name` is
+/// `windows|macos|gnome|system`; a forced theme renders that OEM look on ANY
+/// host, so all three OS screenshots come from one runner. Drives the
+/// deterministic website-screenshot pipeline (`usagio __render_shot`) and,
+/// later, cross-OS golden tests.
+///
+/// `render_menu` yields a native `muri::Menu` directly (0.11 migration), so
+/// this goes through the same native paint layer a live popup uses (bold
+/// active row, severity tint) — a faithful capture with no
+/// launch+screencapture+click harness. Renders the TOP-LEVEL menu (submenu
+/// flyouts are a later muri capability).
+pub fn render_menu_png_for_theme(theme_name: &str, scale: f32) -> Vec<u8> {
+    let snap = build_snapshot();
+    let tree = cross_platform::menu_tree_from_snapshot(&snap);
+    let native = crate::platform::render::render_menu(&tree);
+    let theme = theme_from_name(theme_name).unwrap_or_default();
+    let opts = muri::MenuOptions::default().theme(theme);
+    muri::render_menu_to_png(&native, &opts, scale)
+}
+
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn tooltip_for(snap: &Snapshot) -> String {
     match active_account(snap) {
