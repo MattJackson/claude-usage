@@ -677,7 +677,9 @@ impl MenuBackend for LinuxMenu {
         initial_icon: &[u8],
     ) -> Result<Box<dyn MenuHandle>> {
         self.ensure_gtk_init()?;
-        let mut tray = Tray::new(decode_tray_icon(initial_icon)).title(initial_title);
+        let mut tray = Tray::new(decode_tray_icon(initial_icon))
+            .title(initial_title)
+            .options(crate::menubar::tray_options());
         if let Some(theme) = crate::menubar::forced_theme() {
             tray = tray.theme(theme);
         }

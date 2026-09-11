@@ -15,8 +15,8 @@
 //! what crosses any channel; muri is only ever constructed here, on the far
 //! side.
 
-use super::{MenuItem, MenuTree, ValueColor};
-use muri::{Color, Icon, Item, Menu, MenuId, Row};
+use super::{MenuItem, MenuTree, ValueColor, ValueSpan};
+use muri::{Color, Icon, Item, Menu, MenuId, Row, Segment, StyleRun};
 
 /// Map the platform-agnostic [`ValueColor`] (severity band) to muri's `Color`
 /// for `Row::value_color`. Red = "about to hit the wall", Amber = "approaching
@@ -58,7 +58,15 @@ fn append(menu: Menu, item: &MenuItem) -> Menu {
             checked,
             checkable,
         } => {
-            let mut row = Row::new(id.as_str()).label(label).enabled(*enabled);
+            // A `\t` in the label splits it into a grow label + a right-aligned
+            // value (e.g. `"Quit\tusagio v0.6.1"`) — the same flush-right value
+            // the account rows use, so the version reads at the right edge
+            // rather than mashed onto the label.
+            let base = Row::new(id.as_str()).enabled(*enabled);
+            let mut row = match label.split_once('\t') {
+                Some((l, v)) => base.label_value(l.trim_end(), v.trim_start()),
+                None => base.label(label),
+            };
             // Only checkable rows reserve the check column; a plain action must
             // not (native `checked` marks the row as a checkbox).
             if *checkable {
@@ -83,10 +91,10 @@ fn append(menu: Menu, item: &MenuItem) -> Menu {
             label,
             items,
             active,
-            value_color,
+            value_spans,
             ..
         } => {
-            let label_row = submenu_label(label, *active, *value_color);
+            let label_row = submenu_label(label, *active, value_spans);
             menu.submenu(label_row, build_menu(items))
         }
     }
@@ -97,19 +105,29 @@ fn append(menu: Menu, item: &MenuItem) -> Menu {
 /// aligns and can be tinted per severity. The active account renders **bold**
 /// (no checkmark → no leading gutter), and its `S% / W%` value carries the
 /// severity color.
-fn submenu_label(label: &str, active: bool, value_color: Option<ValueColor>) -> Row {
+fn submenu_label(label: &str, active: bool, value_spans: &[ValueSpan]) -> Row {
     // Non-interactive parent row (id = none): the submenu opens the flyout;
     // the actionable rows live inside it.
     let base = Row::new(MenuId::none());
     let mut row = match label.split_once('\t') {
-        Some((name, value)) => base.label_value(name.trim_end(), value.trim_start()),
+        Some((name, value)) => {
+            // `value_spans` offsets are UTF-16, relative to `value` (the text
+            // after the `\t`) — see `menubar::value_spans_of`. Color each span
+            // as its own `StyleRun`, so session and weekly tint independently.
+            let mut vseg = Segment::trailing_value(value);
+            if !value_spans.is_empty() {
+                let runs = value_spans
+                    .iter()
+                    .map(|s| StyleRun::new(s.start, s.len, muri_color(s.color)))
+                    .collect();
+                vseg = vseg.runs(runs);
+            }
+            base.segment(Segment::grow(name)).segment(vseg)
+        }
         None => base.label(label),
     };
     if active {
         row = row.bold();
-    }
-    if let Some(c) = value_color {
-        row = row.value_color(muri_color(c));
     }
     row
 }
