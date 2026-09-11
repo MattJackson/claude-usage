@@ -630,13 +630,11 @@ thread_local! {
     static TRAY_STATE: std::cell::RefCell<Option<TrayState>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Decode the tray icon's PNG into a muri tray `Icon` (raw RGBA). Menu-item
-/// icons and the IR→muri walk both live in the shared
-/// `crate::platform::render` now — this is the one Linux-local decode, for the
-/// tray-icon slot specifically (a distinct `Icon` type from the menu one).
+/// Decode the tray icon's PNG into a muri tray `Icon`. muri owns PNG decoding
+/// (`Icon::from_png`, muri #24), so this is a thin wrapper that just adds
+/// error context for the tray-icon slot.
 fn decode_tray_icon(bytes: &[u8]) -> Result<tray::Icon> {
-    let (rgba, w, h) = crate::platform::render::decode_png_rgba(bytes)?;
-    tray::Icon::from_rgba(rgba, w, h).context("building a tray icon from decoded PNG")
+    tray::Icon::from_png(bytes).context("building a tray icon from PNG")
 }
 
 fn apply_handle_msg(tray: &tray::TrayIcon, msg: HandleMsg) {
@@ -692,13 +690,17 @@ impl MenuBackend for LinuxMenu {
     ) -> Result<Box<dyn MenuHandle>> {
         self.ensure_gtk_init()?;
         let icon = decode_tray_icon(initial_icon)?;
-        let tray = tray::TrayIconBuilder::new()
+        let mut builder = tray::TrayIconBuilder::new()
             .with_title(initial_title)
             // tray-icon's own Linux note: "the icon won't be visible unless
             // a menu is set. Setting an empty Menu is enough." The real menu
             // arrives via the first `set_menu` call.
             .with_menu(Box::new(muda::Menu::new()))
-            .with_icon(icon)
+            .with_icon(icon);
+        if let Some(theme) = crate::menubar::forced_theme() {
+            builder = builder.with_theme(theme);
+        }
+        let tray = builder
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create Linux tray icon: {e}"))?;
         let (tx, rx) = std::sync::mpsc::channel();
