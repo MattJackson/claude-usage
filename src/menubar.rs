@@ -583,21 +583,6 @@ fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
     }
 }
 
-/// The single severity tint for a row's trailing value segment, reduced from
-/// its per-span `colors`. muri's compat `set_value_color` takes ONE color
-/// for the whole `\t` value segment, so usagio's finer per-percentage spans
-/// (session could be amber while weekly is red) collapse to the most severe
-/// band present — the one the user most needs to see. `None` when the row has
-/// no colored spans (a healthy account, or a non-value row).
-fn row_value_severity(style: &RowStyle) -> Option<Severity> {
-    style
-        .colors
-        .iter()
-        .fold(None, |worst, (_, _, sev)| match (worst, sev) {
-            (Some(Severity::Red), _) | (_, Severity::Red) => Some(Severity::Red),
-            _ => Some(Severity::Amber),
-        })
-}
 
 /// The bold provider-group header row that precedes a provider's account rows.
 /// Plain title is just the provider's display name (e.g. "Claude"), bold,
@@ -2519,6 +2504,31 @@ mod cross_platform {
         }
     }
 
+    /// Per-span value tints for an account header row, RELATIVE to the value
+    /// segment (after the `\t`). Native muri colors each span independently, so
+    /// session and weekly can carry DIFFERENT bands (e.g. `85%` amber next to
+    /// `95%` red) instead of the whole value collapsing to the most-severe one
+    /// (which `row_value_severity` did for the old single-color compat API).
+    /// Empty for a healthy/uncolored row.
+    fn value_spans_of(header: &RowStyle) -> Vec<crate::platform::ValueSpan> {
+        let base = header
+            .plain
+            .split_once('\t')
+            .map(|(l, _)| u16len(l) + 1)
+            .unwrap_or(0);
+        header
+            .colors
+            .iter()
+            .filter_map(|&(off, len, sev)| {
+                off.checked_sub(base).map(|start| crate::platform::ValueSpan {
+                    start,
+                    len,
+                    color: value_color_of(sev),
+                })
+            })
+            .collect()
+    }
+
     /// A plain (non-account) submenu: never the active account, no value tint.
     /// Only account header rows carry `active`/`value_color`;
     /// the Settings / Capture / provider-group submenus are structural.
@@ -2528,7 +2538,7 @@ mod cross_platform {
             icon_png: None,
             items,
             active: false,
-            value_color: None,
+            value_spans: Vec::new(),
         }
     }
 
@@ -2621,7 +2631,7 @@ mod cross_platform {
             // `account_header_row` already folds `a.active` into `bold`.
             active: header.bold,
             // Tint the trailing `S% / W%` value segment per severity.
-            value_color: row_value_severity(&header).map(value_color_of),
+            value_spans: value_spans_of(&header),
         }
     }
 
@@ -2646,7 +2656,7 @@ mod cross_platform {
             icon_png,
             items: children,
             active: false,
-            value_color: None,
+            value_spans: Vec::new(),
         }
     }
 

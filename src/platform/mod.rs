@@ -133,11 +133,23 @@ pub enum MenuItem {
         /// `Submenu::set_active` (muri #18). Always `false` for non-account
         /// submenus (provider-group / Settings).
         active: bool,
-        /// Severity tint for the trailing `\t` value segment (the `S% / W%`
-        /// percentages), if any. Maps to muri's `Submenu::set_value_color`
-        /// (muri #19). `None` leaves the value segment the default label color.
-        value_color: Option<ValueColor>,
+        /// Per-span severity tints for the trailing `\t` value segment, each
+        /// `(start, len, color)` in UTF-16 units RELATIVE to the value segment
+        /// (i.e. the text after the `\t`). Native muri renders these as
+        /// per-run `StyleRun` colors, so `session` and `weekly` can carry
+        /// DIFFERENT bands (e.g. `85%` amber next to `95%` red) instead of the
+        /// whole value collapsing to the most-severe one. Empty = no tint.
+        value_spans: Vec<ValueSpan>,
     },
+}
+
+/// One colored span of a submenu row's trailing value segment. `start`/`len`
+/// are UTF-16 offsets into the value text (after the `\t`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueSpan {
+    pub start: usize,
+    pub len: usize,
+    pub color: ValueColor,
 }
 
 /// Severity tint for a submenu row's trailing value segment. Platform-agnostic
