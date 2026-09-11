@@ -119,7 +119,7 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "c
 # the version on merge (the drift that repeatedly re-pinned an OLD muri). Bump
 # the caret to "0.11" deliberately only when muri makes its next MINOR (pre-1.0
 # minors may break per muri's migration guidance §7); patch bumps ride the lock.
-muri = { version = "0.10", features = ["muda-compat"] }
+muri = { version = "0.11", features = ["muda-compat"] }
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status
