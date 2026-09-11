@@ -36,10 +36,16 @@ name: Hero screenshots
 # Settings > Actions > General > Workflow permissions to be set to "Read
 # and write permissions" (one-time repo config, not a code change; see
 # packaging/screenshots/README.md).
+# MANUAL / ARTIFACT-ONLY. This workflow renders the menu headlessly via
+# `__render_shot` and uploads the PNGs as run artifacts for a quick cross-OS
+# look — it does NOT push to `main`. Website screenshots come from the REAL
+# capture pipeline in `packaging/qa-screenshots/` (live app on real desktops /
+# EC2 VMs), which is the single source of truth for `web/public/screenshots/`.
+# An earlier version of this workflow auto-committed these offscreen renders to
+# `main` on every `qa` push / release tag, which repeatedly overwrote the real
+# captures with flat-canvas mock-looking renders — hence triggers + the
+# commit-to-main job were removed. Run it by hand from the Actions tab only.
 on:
-  push:
-    branches: [qa]
-    tags: ["v*.*.*"]
   workflow_dispatch: {}
 
 permissions:
@@ -134,138 +140,3 @@ jobs:
             ${{ runner.temp }}/shots/${{ steps.os_slug.outputs.slug }}-*.png
           if-no-files-found: error
           retention-days: 30
-
-  # Runs once, after all three matrix legs of `capture` have finished
-  # (`needs: capture` on a matrix job waits for every leg, not just one),
-  # and only for real push triggers (qa iteration or a release tag) — not
-  # for a manual `workflow_dispatch` test run, so poking the button doesn't
-  # accidentally redeploy the live site. Downloads all three artifacts (6
-  # variants each = 18 files), copies them into web/public/screenshots/,
-  # and pushes straight to `main` as github-actions[bot] — the branch
-  # pages.yml's `deploy` job is gated on
-  # (`if: github.ref == 'refs/heads/main'`), so this push is what actually
-  # triggers the live site rebuild. Deliberately targets `main` rather than
-  # `qa`: pages.yml only *builds* (no deploy) on `feat/website` and does
-  # nothing at all for pushes to `qa`.
-  commit-screenshots:
-    name: commit screenshots to main
-    needs: capture
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-
-      - name: Download all screenshot artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          pattern: screenshots-*
-          path: /tmp/screenshot-artifacts
-          merge-multiple: false
-
-      - name: Place screenshots into web/public/screenshots
-        run: |
-          set -euo pipefail
-          mkdir -p web/public/screenshots
-          variants="menu-healthy menu-locked menu-session-locked menu-mixed"
-
-          # v0.6.2: capture is now a deterministic headless `__render_shot`
-          # (muri offscreen renderer, issue #59) — one real >20KB PNG per
-          # fixture, no live tray / accessibility / display. The tray and
-          # settings variants were dropped (the site never consumed them and
-          # neither is part of the offscreen top-level render). The two gates
-          # below still stand between a bad capture leg and `main`: MIN_PNG_BYTES
-          # rejects a blank/solid-color frame (any real menu render is >20KB
-          # PNG), and within-OS SHA256 uniqueness rejects the "same frame copied
-          # under N names" class of bug. Better a red CI run than a green run
-          # committing garbage that the site then serves as the hero image.
-          MIN_PNG_BYTES=20000
-
-          fail=0
-          for os in macos linux windows; do
-            declare -A seen_hashes=()
-            for variant in $variants; do
-              src="/tmp/screenshot-artifacts/screenshots-${os}/${os}-${variant}.png"
-              if [[ ! -f "$src" ]]; then
-                echo "::error::expected $src from the screenshots-${os} artifact but it's missing"
-                fail=1
-                continue
-              fi
-              size=$(wc -c < "$src")
-              if (( size < MIN_PNG_BYTES )); then
-                echo "::error::${os}-${variant}.png is only $size bytes (< ${MIN_PNG_BYTES}) — probably a blank/solid-color capture"
-                fail=1
-                continue
-              fi
-              hash=$(sha256sum "$src" | awk '{print $1}')
-              if [[ -n "${seen_hashes[$hash]:-}" ]]; then
-                echo "::error::${os}-${variant}.png is byte-identical to ${os}-${seen_hashes[$hash]}.png (sha256=$hash) — capture loop is emitting the same frame under multiple names"
-                fail=1
-                continue
-              fi
-              seen_hashes[$hash]="$variant"
-              cp "$src" "web/public/screenshots/${os}-${variant}.png"
-            done
-            unset seen_hashes
-          done
-
-          if (( fail != 0 )); then
-            echo "::error::one or more capture legs produced invalid PNGs — refusing to commit"
-            exit 1
-          fi
-
-      - name: Refresh hero-<os>.png from menu-healthy variant
-        # v0.5.4: the site's rotating hero (referenced by web/src/*) reads
-        # web/public/hero-<os>.png. Point it at the OS's `menu-healthy`
-        # capture — the most product-representative variant — so a
-        # successful CI run automatically replaces the placeholder heroes
-        # that shipped before real captures existed. The per-variant files
-        # under web/public/screenshots/ stay in place for FAQ/tour pages.
-        run: |
-          set -euo pipefail
-          for os in macos linux windows; do
-            src="web/public/screenshots/${os}-menu-healthy.png"
-            if [[ -f "$src" ]]; then
-              cp "$src" "web/public/hero-${os}.png"
-            else
-              echo "::warning::no ${os}-menu-healthy.png landed this run; leaving hero-${os}.png untouched"
-            fi
-          done
-
-      - name: Commit and push as github-actions[bot]
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add web/public/screenshots/*.png web/public/hero-*.png
-
-          # Idempotence: skip the commit+push entirely if the captured PNGs
-          # are byte-identical to what's already on `main` (the fixtures
-          # and capture are deterministic enough — aside from the NOW+
-          # countdown fixtures' timestamps, which don't change the rendered
-          # pixels at the second-precision this loop runs at — that this
-          # happens often). Keeps `main`'s history free of no-op noise
-          # commits while still leaving a normal "nothing to do" line in
-          # the Actions log for every run, so the pipeline stays visibly
-          # auditable.
-          if git diff --cached --quiet -- web/public/screenshots web/public/hero-macos.png web/public/hero-linux.png web/public/hero-windows.png; then
-            echo "no image change; skipping commit"
-            exit 0
-          fi
-
-          # Deliberately NOT using a "[skip ci]"/"[ci skip]" marker here:
-          # GitHub's native skip-ci handling suppresses *every* push-triggered
-          # workflow run for a commit carrying that marker, not just this
-          # one — which would also suppress pages.yml's own push-to-main
-          # deploy trigger and silently break the "website updated" leg of
-          # this pipeline. There's no infinite-loop risk to guard against
-          # either way: this job only ever pushes to `main`, and neither
-          # this workflow nor pages.yml re-triggers screenshots.yml (which
-          # only listens for qa pushes / vX.Y.Z tags).
-          git commit \
-            -m "chore(web): refresh screenshots from CI" \
-            -m "Auto-generated by .github/workflows/screenshots.yml from packaging/screenshots/fixtures/*.json. See packaging/screenshots/README.md."
-          git push origin HEAD:main
