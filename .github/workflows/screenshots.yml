@@ -1,15 +1,17 @@
 name: Hero screenshots
 
-# Renders the full set of website screenshots of usagio's real menu bar /
-# tray UI on all three OSes, using fixed mocked account fixtures
-# (packaging/screenshots/fixtures/*.json — 2 Claude + 3-4 Codex accounts per
-# fixture, in various states: healthy, weekly-locked, session-locked,
-# mixed) so the images are reproducible regardless of the developer's real
-# account state and never rely on hand-drawn mockups. 6 variants per OS x 3
-# OSes = 18 screenshots per run: <os>-tray.png, <os>-menu-healthy.png,
-# <os>-menu-locked.png, <os>-menu-session-locked.png, <os>-menu-mixed.png,
-# <os>-settings.png. See packaging/screenshots/fixtures/README.md for what
-# each variant demonstrates and which website surface consumes it.
+# Renders the website screenshots of usagio's real menu UI on all three OSes,
+# using fixed mocked account fixtures (packaging/screenshots/fixtures/*.json —
+# 2 Claude + 3-4 Codex accounts per fixture, in various states: healthy,
+# weekly-locked, session-locked, mixed) so the images are reproducible
+# regardless of the developer's real account state and never rely on
+# hand-drawn mockups. Each OS leg renders the top-level menu headlessly via
+# `usagio __render_shot <theme>` (muri's offscreen renderer, issue #59) — no
+# live tray, accessibility, or display needed — producing 4 menu variants per
+# OS x 3 OSes = 12 screenshots per run: <os>-menu-healthy.png,
+# <os>-menu-locked.png, <os>-menu-session-locked.png, <os>-menu-mixed.png.
+# See packaging/screenshots/fixtures/README.md for what each variant
+# demonstrates and which website surface consumes it.
 #
 # Triggered on every push to `qa` (the pre-release staging branch) and on
 # every `vX.Y.Z` release tag, plus manual dispatch for one-off re-renders
@@ -25,7 +27,7 @@ name: Hero screenshots
 # on each platform.
 #
 # Full pipeline: app updates -> push to qa (iteration) or a vX.Y.Z release
-# tag -> this workflow captures all 18 screenshots -> `commit-screenshots`
+# tag -> this workflow captures all 12 screenshots -> `commit-screenshots`
 # pushes web/public/screenshots/<os>-<variant>.png straight to `main` (the
 # branch .github/workflows/pages.yml actually deploys from — see that
 # file's `deploy` job condition) as github-actions[bot] -> pages.yml's own
@@ -61,16 +63,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Same Linux build deps as ci.yml, plus the capture-time deps
-      # (Xvfb, xdotool, ImageMagick, stalonetray) documented in
-      # packaging/screenshots/README.md.
+      # Same Linux build deps as ci.yml. Capture is now a headless
+      # `__render_shot` (muri offscreen renderer), so the old display/capture
+      # tools (Xvfb, xdotool, ImageMagick, stalonetray) are no longer needed.
       - name: Install Linux system deps
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libssl-dev pkg-config libsecret-1-dev \
-            xvfb xdotool imagemagick stalonetray
+            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libssl-dev pkg-config libsecret-1-dev
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -169,18 +170,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p web/public/screenshots
-          variants="tray menu-healthy menu-locked menu-session-locked menu-mixed settings"
+          variants="menu-healthy menu-locked menu-session-locked menu-mixed"
 
-          # v0.5.4: the previous run committed 5 byte-identical solid-black
-          # macOS PNGs and 6 byte-identical Windows PNGs (headless capture
-          # falling through the accessibility-permission gate, so every
-          # variant rendered the same not-a-menu frame under a different
-          # name). Two strict gates now stand between a bad capture leg and
-          # `main`: MIN_PNG_BYTES rejects a blank/solid-color frame (any
-          # real menu screenshot is >20KB PNG), and within-OS SHA256
-          # uniqueness rejects the "same frame copied under N names" class
-          # of script bug. Better a red CI run than a green run committing
-          # garbage that the site then serves as the hero image.
+          # v0.6.2: capture is now a deterministic headless `__render_shot`
+          # (muri offscreen renderer, issue #59) — one real >20KB PNG per
+          # fixture, no live tray / accessibility / display. The tray and
+          # settings variants were dropped (the site never consumed them and
+          # neither is part of the offscreen top-level render). The two gates
+          # below still stand between a bad capture leg and `main`: MIN_PNG_BYTES
+          # rejects a blank/solid-color frame (any real menu render is >20KB
+          # PNG), and within-OS SHA256 uniqueness rejects the "same frame copied
+          # under N names" class of bug. Better a red CI run than a green run
+          # committing garbage that the site then serves as the hero image.
           MIN_PNG_BYTES=20000
 
           fail=0

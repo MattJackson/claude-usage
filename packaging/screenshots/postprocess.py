@@ -51,12 +51,48 @@ def parse_bg(spec: str) -> tuple[int, int, int]:
     return parts[0], parts[1], parts[2]
 
 
+def frame(src: str, out: str, bg: tuple[int, int, int], margin_frac: float) -> int:
+    """Center a clean, self-contained menu render onto a uniform TARGET canvas.
+
+    Used for the headless `__render_shot` output (issue #59): that PNG is
+    already the finished menu popup (rounded corners, themed background) — not
+    a full-desktop capture — so there is nothing to crop DOWN to. This just
+    centers it on a fixed 1600x900 canvas with a uniform margin and `bg` fill,
+    so every OS/variant image ships at the same dimensions the site declares
+    (and comfortably clears the MIN_PNG_BYTES gate). The menu is scaled down to
+    fit within the margin box if needed, never upscaled past 1:1.
+    """
+    # The offscreen render is RGBA with transparent rounded corners; keep the
+    # alpha so we can composite it onto the canvas through its own mask (a bare
+    # convert("RGB") would flatten the transparent corners to black, leaving
+    # dark notches at the menu's rounded corners).
+    im = Image.open(src).convert("RGBA")
+    src_w, src_h = im.size
+    max_w = int(TARGET_W * (1.0 - 2 * margin_frac))
+    max_h = int(TARGET_H * (1.0 - 2 * margin_frac))
+    scale = min(max_w / src_w, max_h / src_h, 1.0)
+    new_w, new_h = max(int(src_w * scale), 1), max(int(src_h * scale), 1)
+    menu = im.resize((new_w, new_h), Image.LANCZOS) if scale < 1.0 else im
+    canvas = Image.new("RGB", (TARGET_W, TARGET_H), bg)
+    canvas.paste(menu, ((TARGET_W - new_w) // 2, (TARGET_H - new_h) // 2), menu)
+    canvas.save(out)
+    print(f"wrote {out} ({TARGET_W}x{TARGET_H}, framed {src_w}x{src_h} menu render)")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("src")
     parser.add_argument("out")
-    parser.add_argument("--anchor-x", type=float, required=True, help="0.0-1.0 fraction of source width")
-    parser.add_argument("--anchor-y", type=float, required=True, help="0.0-1.0 fraction of source height")
+    parser.add_argument(
+        "--frame",
+        action="store_true",
+        help="center a clean menu render onto the TARGET canvas (headless __render_shot mode) "
+        "instead of cropping down from a full-desktop capture",
+    )
+    parser.add_argument("--margin-frac", type=float, default=0.06, help="uniform margin as a fraction of the canvas (--frame mode)")
+    parser.add_argument("--anchor-x", type=float, help="0.0-1.0 fraction of source width (crop mode)")
+    parser.add_argument("--anchor-y", type=float, help="0.0-1.0 fraction of source height (crop mode)")
     parser.add_argument(
         "--crop-width-frac",
         type=float,
@@ -67,6 +103,13 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     bg = parse_bg(args.bg)
+
+    if args.frame:
+        return frame(args.src, args.out, bg, args.margin_frac)
+
+    if args.anchor_x is None or args.anchor_y is None:
+        parser.error("--anchor-x and --anchor-y are required unless --frame is given")
+
     im = Image.open(args.src).convert("RGB")
     src_w, src_h = im.size
 
