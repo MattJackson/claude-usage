@@ -1706,9 +1706,9 @@ dependencies = [
 
 [[package]]
 name = "muri"
-version = "0.10.7"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0199b3df0233f803aa5b1aa1d017db8f53b6f38eabb08b79b8b9d9a4fb249226"
+checksum = "67bc07596469670206c222dda61b97a79d316b52ac7f570ce07182d8ff78e861"
 dependencies = [
  "block2",
  "crossbeam-channel",
@@ -3131,7 +3131,7 @@ dependencies = [
 
 [[package]]
 name = "usagio"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "assert_cmd",

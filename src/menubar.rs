@@ -30,8 +30,7 @@ use chrono::{DateTime, Utc};
 #[cfg(target_os = "macos")]
 use {
     block2::RcBlock,
-    muri::compat::tray_icon::menu::MenuEvent,
-    muri::compat::tray_icon::TrayIconBuilder,
+    muri::{MenuEvent, Tray},
     objc2::MainThreadMarker,
     objc2_app_kit::{NSApplication, NSApplicationActivationPolicy},
     objc2_foundation::NSTimer,
@@ -82,6 +81,18 @@ fn theme_from_name(name: &str) -> Option<muri::ThemeSource> {
 /// windows-on-mac is meant to match windows-on-windows. `None` = follow host.
 pub(crate) fn forced_theme() -> Option<muri::ThemeSource> {
     FORCED_THEME.get()?.as_deref().and_then(theme_from_name)
+}
+
+/// Shared popup layout for both the live tray and the headless capture, so a
+/// `__render_shot` PNG matches what the menu bar actually draws. usagio's menu
+/// is text-dense (email addresses + `S% / W%` values); the auto-fit width came
+/// out cramped next to a native OEM menu (measured ~244pt vs the Time Machine
+/// menu's ~310pt), so we pin a wider minimum. `min_width` is in logical points;
+/// muri still grows past it for longer rows and clamps the theme/gutter defaults
+/// otherwise. The live tray layers its host/forced `theme` on top via
+/// `Tray::theme` (which only overwrites the theme field, not this width).
+pub(crate) fn tray_options() -> muri::MenuOptions {
+    muri::MenuOptions::default().min_width(300.0)
 }
 
 /// Parse a `menubar --theme <name>` flag (if present) and record it for the
@@ -211,6 +222,10 @@ struct Snapshot {
     threshold: f64,
     /// Settings ▸ Notifications ▸ per-trigger enable checkboxes.
     notification_config: crate::notifications::NotificationConfig,
+    /// Settings ▸ Tray Icon: `None` = "at risk" (the agent closest to its
+    /// limit); `Some(slug)` pins the tray to one provider. Drives
+    /// `tray_target` / `title_for` / `tray_icon_bytes`.
+    tray_icon_mode: Option<String>,
 }
 
 /// How near a limit a percentage is, for at-a-glance coloring.
@@ -584,22 +599,6 @@ fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
     }
 }
 
-/// The single severity tint for a row's trailing value segment, reduced from
-/// its per-span `colors`. muri's compat `set_value_color` takes ONE color
-/// for the whole `\t` value segment, so usagio's finer per-percentage spans
-/// (session could be amber while weekly is red) collapse to the most severe
-/// band present — the one the user most needs to see. `None` when the row has
-/// no colored spans (a healthy account, or a non-value row).
-fn row_value_severity(style: &RowStyle) -> Option<Severity> {
-    style
-        .colors
-        .iter()
-        .fold(None, |worst, (_, _, sev)| match (worst, sev) {
-            (Some(Severity::Red), _) | (_, Severity::Red) => Some(Severity::Red),
-            _ => Some(Severity::Amber),
-        })
-}
-
 /// The bold provider-group header row that precedes a provider's account rows.
 /// Plain title is just the provider's display name (e.g. "Claude"), bold,
 /// disabled (`enabled: false` so it reads as a group heading, not a click
@@ -636,6 +635,62 @@ fn active_account(snap: &Snapshot) -> Option<(&ProviderSection, &AcctView)> {
     None
 }
 
+/// The highest window percentage across an account's windows (how close it is
+/// to *any* of its limits) — the "at risk" score. `None` when the account has
+/// no usage data yet (sorted below any real reading).
+fn acct_max_pct(a: &AcctView) -> Option<f64> {
+    a.windows
+        .iter()
+        .filter_map(|w| w.pct)
+        .fold(None, |acc, p| Some(acc.map_or(p, |m: f64| m.max(p))))
+}
+
+/// The account the tray icon/title should reflect, honoring
+/// `State.tray_icon_mode` (carried on the snapshot):
+///   - `None` — "at risk" (the default): across every provider's ACTIVE
+///     account, the one closest to a limit (highest [`acct_max_pct`]). This is
+///     the actionable signal — "which agent do I need to switch/worry about."
+///   - `Some(slug)` — pin the tray to that provider's active account. Falls
+///     back to "at risk" if the pinned provider has no captured/active account
+///     (e.g. it was removed), so the tray never goes blank on a stale setting.
+fn tray_target<'a>(
+    snap: &'a Snapshot,
+    mode: Option<&str>,
+) -> Option<(&'a ProviderSection, &'a AcctView)> {
+    if let Some(slug) = mode {
+        if let Some(sec) = snap.sections.iter().find(|s| s.provider_id == slug) {
+            if let Some(a) = sec
+                .accounts
+                .iter()
+                .find(|a| a.active)
+                .or_else(|| sec.accounts.first())
+            {
+                return Some((sec, a));
+            }
+        }
+        // Pinned provider absent → fall through to at-risk rather than blank.
+    }
+    snap.sections
+        .iter()
+        .filter_map(|sec| Some((sec, sec.accounts.iter().find(|a| a.active)?)))
+        .max_by(|(_, a), (_, b)| {
+            acct_max_pct(a)
+                .unwrap_or(-1.0)
+                .partial_cmp(&acct_max_pct(b).unwrap_or(-1.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+/// The tray icon bytes for the current [`tray_target`]: the target provider's
+/// 16px brand icon, so the menu bar shows *which* agent the percentage is for.
+/// Falls back to the usagio mark when there's no target or no bundled icon.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn tray_icon_bytes(snap: &Snapshot) -> &'static [u8] {
+    tray_target(snap, snap.tray_icon_mode.as_deref())
+        .and_then(|(sec, _)| crate::icons::png16_for(sec.provider_id))
+        .unwrap_or_else(crate::icons::usagio_tray_icon)
+}
+
 /// Entry point dispatched by `usagio menubar` (see `main.rs`). Every platform
 /// renders the tray menu through the same pipeline
 /// (`cross_platform::menu_tree_from_snapshot` then `platform::render::render_menu`).
@@ -670,32 +725,35 @@ pub fn run() -> Result<()> {
     let start_exe = std::fs::canonicalize(crate::stable_exe_path()).ok();
 
     // Build the tray on the main thread and keep it alive for the app's lifetime.
+    // muri 0.11: the native `Tray` API (customization lives here, not in the
+    // frozen muda-compat facade). `spawn` installs the `NSStatusItem` and
+    // returns a `Clone` `TrayHandle` without blocking, so usagio keeps driving
+    // its own `NSApplication`/`NSTimer` loop below; the status item shows the
+    // agent icon + `%` title side-by-side (muri #58).
     let initial = build_snapshot();
-    let mut builder = TrayIconBuilder::new().with_title(title_for(&initial));
-    if let Some(theme) = forced_theme() {
-        builder = builder.with_theme(theme);
-    }
-    // NOTE: the muri (`muda-compat`) `TrayIconBuilder` has no
-    // `with_menu_on_left_click` (that was a real `tray-icon` control), so the
-    // custom-popup left-click suppression is no longer wired here — and muri
-    // has no `ns_status_item` anchor either, so `build_popover_host` returns
-    // `None` under the muri backend (the experimental, off-by-default popover
-    // is inert until muri exposes an equivalent).
-    // `build()` spawns a live OS tray passively (muri 0.9.2+) — no muri run
-    // loop needed; usagio keeps its own `NSApplication`/`NSTimer` below.
-    let tray = builder
-        .build()
-        .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
-    tray.set_menu(Some(Box::new(crate::platform::render::render_menu(
+    let mut tray = Tray::new(muri::Icon::from_png(
+        crate::icons::usagio_tray_icon().to_vec(),
+    ))
+    .title(title_for(&initial))
+    .tooltip(tooltip_for(&initial))
+    .menu(crate::platform::render::render_menu(
         &cross_platform::menu_tree_from_snapshot(&initial),
-    ))));
-    let _ = tray.set_tooltip(Some(tooltip_for(&initial)));
+    ))
+    .options(tray_options());
+    if let Some(theme) = forced_theme() {
+        tray = tray.theme(theme);
+    }
+    let muri_mtm = muri::MainThreadMarker::new()
+        .ok_or_else(|| anyhow::anyhow!("the tray must spawn on the main thread"))?;
+    let handle = tray
+        .spawn(muri_mtm)
+        .map_err(|e| anyhow::anyhow!("failed to create tray icon: {e}"))?;
 
     // custom-popup: build the NSPopover host anchored to the status-item button
     // and listen for tray left-clicks to toggle it. `handle_click` is reused
     // verbatim for row actions (same click-id scheme as the native menu).
     #[cfg(feature = "custom-popup")]
-    let popover = build_popover_host(&tray, mtm);
+    let popover = build_popover_host(&handle, mtm);
     #[cfg(feature = "custom-popup")]
     let tray_rx = muri::compat::tray_icon::TrayIconEvent::receiver().clone();
     #[cfg(feature = "custom-popup")]
@@ -733,15 +791,15 @@ pub fn run() -> Result<()> {
             // is the right-click fallback (the popover rebuilds its own content
             // from a fresh snapshot each time it's shown); with it OFF this is
             // the sole UI.
-            tray.set_menu(Some(Box::new(crate::platform::render::render_menu(
+            handle.set_menu(crate::platform::render::render_menu(
                 &cross_platform::menu_tree_from_snapshot(&snap),
-            ))));
-            let _ = tray.set_tooltip(Some(tooltip_for(&snap)));
+            ));
+            handle.set_tooltip(Some(tooltip_for(&snap)));
             *last_sig.borrow_mut() = sig;
         }
         let title = title_for(&snap);
         if *last_title.borrow() != title {
-            tray.set_title(Some(title.clone()));
+            handle.set_title(Some(title.clone()));
             *last_title.borrow_mut() = title;
         }
         // custom-popup: toggle the NSPopover on a tray left-click, and (for the
@@ -784,16 +842,15 @@ pub fn run() -> Result<()> {
 /// still shows, it just won't open a popup).
 #[cfg(all(target_os = "macos", feature = "custom-popup"))]
 fn build_popover_host(
-    tray: &muri::compat::tray_icon::TrayIcon,
+    handle: &muri::TrayHandle,
     mtm: MainThreadMarker,
 ) -> Option<crate::ui::popover::PopoverHost> {
-    // The muri (`muda-compat`) tray does not expose the underlying
-    // `NSStatusItem` (`ns_status_item()` was a real `tray-icon` API), so there
-    // is no button to anchor the NSPopover to under the 0.6.0 muri backend.
-    // The experimental, off-by-default custom-popup is therefore inert until
-    // muri exposes a status-item anchor — return `None` so the tray still shows
-    // (it just opens muri's own menu/popup rather than this NSPopover).
-    let _ = (tray, mtm);
+    // muri's native tray does not (yet) expose the underlying `NSStatusItem`
+    // button as an NSPopover anchor, so there is no button to attach to. The
+    // experimental, off-by-default custom-popup is therefore inert until muri
+    // exposes a status-item anchor — return `None` so the tray still shows (it
+    // just opens muri's own styled popup rather than this NSPopover).
+    let _ = (handle, mtm);
     None
 }
 
@@ -1553,6 +1610,7 @@ fn build_snapshot() -> Snapshot {
         autoswap,
         threshold,
         notification_config: st.notification_config.clone(),
+        tray_icon_mode: st.tray_icon_mode.clone(),
     }
 }
 
@@ -1913,7 +1971,7 @@ fn menu_signature(snap: &Snapshot) -> String {
 }
 
 fn title_for(snap: &Snapshot) -> String {
-    match active_account(snap) {
+    match tray_target(snap, snap.tray_icon_mode.as_deref()) {
         // Session (5h) matters most day to day; fall back to weekly. Preserves
         // the v1 tray-title semantics — a full weekly can't silently replace
         // the low session number in the menu bar. Multi-window providers still
@@ -1929,6 +1987,29 @@ fn title_for(snap: &Snapshot) -> String {
         }
         None => "—".to_string(),
     }
+}
+
+/// Render the current menu (built from the live/fixture `state.json` the
+/// process's config dir points at) straight to a PNG via muri's headless
+/// offscreen renderer (muri #59, 0.10.9) under a forced OS theme — no tray,
+/// window, display, or TCC/Accessibility. `theme_name` is
+/// `windows|macos|gnome|system`; a forced theme renders that OEM look on ANY
+/// host, so all three OS screenshots come from one runner. Drives the
+/// deterministic website-screenshot pipeline (`usagio __render_shot`) and,
+/// later, cross-OS golden tests.
+///
+/// `render_menu` yields a native `muri::Menu` directly (0.11 migration), so
+/// this goes through the same native paint layer a live popup uses (bold
+/// active row, severity tint) — a faithful capture with no
+/// launch+screencapture+click harness. Renders the TOP-LEVEL menu (submenu
+/// flyouts are a later muri capability).
+pub fn render_menu_png_for_theme(theme_name: &str, scale: f32) -> Vec<u8> {
+    let snap = build_snapshot();
+    let tree = cross_platform::menu_tree_from_snapshot(&snap);
+    let native = crate::platform::render::render_menu(&tree);
+    let theme = theme_from_name(theme_name).unwrap_or_default();
+    let opts = tray_options().theme(theme);
+    muri::render_menu_to_png(&native, &opts, scale)
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -1996,6 +2077,7 @@ fn handle_click(id: &str) {
         ("notifications", Some(trigger @ ("threshold" | "resetback" | "pace")), None) => {
             toggle_notification_trigger(trigger)
         }
+        ("trayicon", Some(mode), None) => set_tray_icon_mode(mode),
         ("capture", Some(slug), None) => handle_capture(slug),
         ("apikey", Some(slug), None) => handle_apikey_capture(slug),
         ("switch", Some(slug), Some(key)) => handle_switch(slug, key),
@@ -2424,6 +2506,25 @@ fn set_autoswap(enabled: bool) {
     }
 }
 
+/// Settings ▸ Tray Icon selection. `"at-risk"` clears the pin (the default —
+/// tray follows the agent closest to its limit); any other value pins the tray
+/// to that provider slug. Reads-then-writes under the lock so a stale menu
+/// snapshot can't clobber a concurrent change.
+fn set_tray_icon_mode(mode: &str) {
+    let r = with_state_lock(|| {
+        let mut st = State::load()?;
+        st.tray_icon_mode = if mode == "at-risk" {
+            None
+        } else {
+            Some(mode.to_string())
+        };
+        st.save()
+    });
+    if let Err(e) = r {
+        notify(&format!("Could not save tray icon setting: {e}"));
+    }
+}
+
 /// Flip one Settings ▸ Notifications ▸ per-trigger checkbox. `trigger` is one
 /// of "threshold" / "resetback" / "pace" (the three click-id suffixes
 /// `menu_tree_from_snapshot` wires up) — reads-then-flips the on-disk value so a stale
@@ -2519,6 +2620,32 @@ mod cross_platform {
         }
     }
 
+    /// Per-span value tints for an account header row, RELATIVE to the value
+    /// segment (after the `\t`). Native muri colors each span independently, so
+    /// session and weekly can carry DIFFERENT bands (e.g. `85%` amber next to
+    /// `95%` red) instead of the whole value collapsing to the most-severe one
+    /// (which `row_value_severity` did for the old single-color compat API).
+    /// Empty for a healthy/uncolored row.
+    fn value_spans_of(header: &RowStyle) -> Vec<crate::platform::ValueSpan> {
+        let base = header
+            .plain
+            .split_once('\t')
+            .map(|(l, _)| u16len(l) + 1)
+            .unwrap_or(0);
+        header
+            .colors
+            .iter()
+            .filter_map(|&(off, len, sev)| {
+                off.checked_sub(base)
+                    .map(|start| crate::platform::ValueSpan {
+                        start,
+                        len,
+                        color: value_color_of(sev),
+                    })
+            })
+            .collect()
+    }
+
     /// A plain (non-account) submenu: never the active account, no value tint.
     /// Only account header rows carry `active`/`value_color`;
     /// the Settings / Capture / provider-group submenus are structural.
@@ -2528,7 +2655,7 @@ mod cross_platform {
             icon_png: None,
             items,
             active: false,
-            value_color: None,
+            value_spans: Vec::new(),
         }
     }
 
@@ -2621,7 +2748,7 @@ mod cross_platform {
             // `account_header_row` already folds `a.active` into `bold`.
             active: header.bold,
             // Tint the trailing `S% / W%` value segment per severity.
-            value_color: row_value_severity(&header).map(value_color_of),
+            value_spans: value_spans_of(&header),
         }
     }
 
@@ -2646,7 +2773,7 @@ mod cross_platform {
             icon_png,
             items: children,
             active: false,
-            value_color: None,
+            value_spans: Vec::new(),
         }
     }
 
@@ -2750,10 +2877,30 @@ mod cross_platform {
             action("backup:restore", "Restore…", true),
         ];
 
+        // Tray Icon ▸: "At risk" (default) or pin to one captured provider.
+        // `snap.sections` already holds only providers with a captured
+        // account, so the pinned options list exactly the agents the user has.
+        let cur_mode = snap.tray_icon_mode.as_deref();
+        let mut trayicon_items = vec![checkbox(
+            "trayicon:at-risk",
+            "At risk (closest to limit)",
+            true,
+            cur_mode.is_none(),
+        )];
+        for sec in &snap.sections {
+            trayicon_items.push(checkbox(
+                format!("trayicon:{}", sec.provider_id),
+                sec.display_name,
+                true,
+                cur_mode == Some(sec.provider_id),
+            ));
+        }
+
         let settings_items = vec![
             action("refresh:now", "Refresh usage now", true),
             PMenuItem::Separator,
             plain_submenu("Auto-swap", autoswap_items),
+            plain_submenu("Tray Icon", trayicon_items),
             plain_submenu("Backups", backups),
             plain_submenu("Notifications", notifications),
         ];
@@ -2777,12 +2924,14 @@ mod cross_platform {
     /// Claude's (always bundled, regardless of which provider Cargo features
     /// are enabled — see `icons::png16_for`).
     #[cfg(not(target_os = "macos"))]
-    fn initial_icon_bytes(_snap: &Snapshot) -> &'static [u8] {
-        // The tray/notification-area icon is usagio's own brand mark on every
-        // platform that shows an icon here (Windows/Linux). The active account's
-        // PROVIDER icon belongs on the menu's group-header rows, not in the tray
-        // (user decision, v0.5.22) — so this no longer varies by active provider.
-        crate::icons::usagio_tray_icon()
+    fn initial_icon_bytes(snap: &Snapshot) -> &'static [u8] {
+        // The tray icon reflects the current `tray_target` agent (Settings ▸
+        // Tray Icon: "at risk" or a pinned provider), so the menu bar shows
+        // WHICH agent the percentage is for. This reverses the earlier
+        // v0.5.22 "usagio mark only" choice now that multiple agents
+        // (Claude + Codex + …) can be captured and the tray must disambiguate.
+        // Falls back to the usagio mark when there's no target/icon.
+        tray_icon_bytes(snap)
     }
 
     /// Background redraw ticker: rebuilds the tray from cached state and
@@ -2989,7 +3138,93 @@ mod tests {
             autoswap: false,
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
+            tray_icon_mode: None,
         }
+    }
+
+    /// Build a two-provider snapshot for tray-target tests: a Claude section
+    /// and a Codex section, each with a single active account at the given
+    /// max %. `provider_id`/`display_name` are leaked `&'static` fixtures.
+    fn two_section_snap(
+        claude: AcctView,
+        codex_pct: Option<f64>,
+        tray_icon_mode: Option<String>,
+    ) -> Snapshot {
+        let mut codex = acct("cx@x", codex_pct, None, true);
+        codex.provider_id = "codex";
+        let mk = |id: &'static str, name: &'static str, a: AcctView| ProviderSection {
+            provider_id: id,
+            display_name: name,
+            supports_switching: true,
+            supports_usage: true,
+            supports_launch: false,
+            supports_remove: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![a],
+        };
+        Snapshot {
+            sections: vec![
+                mk(CLAUDE_SLUG, "Claude", claude),
+                mk("codex", "Codex", codex),
+            ],
+            account_order: vec![(0, 0), (1, 0)],
+            capture_creds: Vec::new(),
+            capture_api_key: Vec::new(),
+            autoswap: false,
+            threshold: 95.0,
+            notification_config: crate::notifications::NotificationConfig::default(),
+            tray_icon_mode,
+        }
+    }
+
+    #[test]
+    fn tray_target_at_risk_picks_highest_pct_agent() {
+        // Claude at 40%, Codex at 90% → at-risk picks Codex.
+        let snap = two_section_snap(acct("c@x", Some(40.0), Some(30.0), true), Some(90.0), None);
+        let (sec, _) = tray_target(&snap, None).expect("a target");
+        assert_eq!(sec.provider_id, "codex");
+        // Flip it: Claude 99% beats Codex 10%.
+        let snap = two_section_snap(acct("c@x", Some(99.0), Some(20.0), true), Some(10.0), None);
+        let (sec, _) = tray_target(&snap, None).expect("a target");
+        assert_eq!(sec.provider_id, CLAUDE_SLUG);
+    }
+
+    #[test]
+    fn tray_target_pinned_provider_wins_over_at_risk() {
+        // Codex is far more at-risk, but the tray is pinned to Claude.
+        let snap = two_section_snap(
+            acct("c@x", Some(10.0), Some(10.0), true),
+            Some(99.0),
+            Some("claude".to_string()),
+        );
+        let (sec, _) = tray_target(&snap, snap.tray_icon_mode.as_deref()).expect("a target");
+        assert_eq!(sec.provider_id, CLAUDE_SLUG);
+    }
+
+    #[test]
+    fn tray_target_pinned_missing_provider_falls_back_to_at_risk() {
+        // Pinned to a provider that isn't captured → fall back to at-risk (Codex).
+        let snap = two_section_snap(
+            acct("c@x", Some(10.0), Some(10.0), true),
+            Some(88.0),
+            Some("gemini-cli".to_string()),
+        );
+        let (sec, _) = tray_target(&snap, snap.tray_icon_mode.as_deref()).expect("a target");
+        assert_eq!(sec.provider_id, "codex");
+    }
+
+    #[test]
+    fn acct_max_pct_is_the_window_max() {
+        assert_eq!(
+            acct_max_pct(&acct("a", Some(40.0), Some(75.0), true)),
+            Some(75.0)
+        );
+        assert_eq!(
+            acct_max_pct(&acct("a", Some(80.0), Some(12.0), true)),
+            Some(80.0)
+        );
+        assert_eq!(acct_max_pct(&acct("a", None, None, true)), None);
     }
 
     #[test]
@@ -3461,6 +3696,7 @@ mod tests {
             autoswap: false,
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
+            tray_icon_mode: None,
         };
         let (sec, acc) = active_account(&snap).expect("active row found");
         assert_eq!(sec.provider_id, "codex");
@@ -4042,6 +4278,7 @@ mod tests {
             autoswap: false,
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
+            tray_icon_mode: None,
         };
         let groups = provider_grouped_order(&snap);
         assert_eq!(groups.len(), 2, "one entry per provider");

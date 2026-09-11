@@ -1,34 +1,26 @@
 //! The single IR→muri translator, shared by every platform.
 //!
-//! Before muri, macOS rendered a native `NSMenu` (with a bespoke
-//! attributed-string styler) while Windows/Linux went through `muda`, so the
-//! menu was described and translated separately per platform. muri now renders
-//! on all three through one cross-platform compat API, so there is exactly one
-//! way to turn the generic [`MenuTree`] (built once by
-//! `menubar::menu_tree_from_snapshot`) into a live `muri::compat` menu.
+//! usagio builds the tray menu once as a generic, `Send`-able [`MenuTree`]
+//! (`menubar::menu_tree_from_snapshot`) and this turns it into a live
+//! **native** `muri::Menu` on the platform's UI thread. As of muri 0.11 the
+//! `muda-compat` facade is a frozen, pure `muda`/`tray-icon` drop-in with NO
+//! muri-only styling (bold, per-severity value colors, icons) — all of that
+//! lives in the native API (`muri::menu::{Menu, Row, Item, Icon}` +
+//! `Row::bold`/`Row::value_color`), which usagio now targets directly. The
+//! resulting `Menu` is fed to a native `muri::Tray` and to the headless
+//! offscreen renderer (`muri::render_menu_to_png`) alike.
 //!
-//! Threading: the returned `Menu` is `Rc`-backed (`!Send`), so it MUST be
-//! built on the platform's UI thread — macOS's main thread, the GTK thread on
-//! Linux, the tray UI thread on Windows. The Send-able `MenuTree` is what
-//! crosses any channel; muri is only ever constructed here, on the far side.
+//! Threading: build on the platform's UI thread (macOS main thread, the GTK
+//! thread on Linux, the tray UI thread on Windows). The `Send` [`MenuTree`] is
+//! what crosses any channel; muri is only ever constructed here, on the far
+//! side.
 
-use super::{MenuItem, MenuTree, ValueColor};
-use muri::compat::tray_icon::menu::{
-    CheckMenuItem, Color, Icon, IconMenuItem, IsMenuItem, Menu, MenuItem as NativeMenuItem,
-    PredefinedMenuItem, Submenu,
-};
-
-/// A bundled provider PNG → a muri menu-item `Icon`. muri owns PNG decoding now
-/// (`Icon::from_png`, muri #24) — usagio no longer hand-rolls a `png`-crate
-/// decode. Best-effort: an undecodable/unsupported PNG yields `None` and the
-/// row falls back to text-only.
-fn decode_menu_icon(bytes: &[u8]) -> Option<Icon> {
-    Icon::from_png(bytes).ok()
-}
+use super::{MenuItem, MenuTree, ValueColor, ValueSpan};
+use muri::{Color, Icon, Item, Menu, MenuId, Row, Segment, StyleRun};
 
 /// Map the platform-agnostic [`ValueColor`] (severity band) to muri's `Color`
-/// for `Submenu::set_value_color`. Red = "about to hit the wall", Amber =
-/// "approaching it".
+/// for `Row::value_color`. Red = "about to hit the wall", Amber = "approaching
+/// it".
 fn muri_color(c: ValueColor) -> Color {
     match c {
         ValueColor::Red => Color::SystemRed,
@@ -36,104 +28,106 @@ fn muri_color(c: ValueColor) -> Color {
     }
 }
 
-/// `Menu` and `Submenu` both expose an inherent `append(&dyn IsMenuItem)` but
-/// share no common trait for it, so this bridges the two for the recursive
-/// walk below.
-trait Container {
-    fn append_item(&self, item: &dyn IsMenuItem);
-}
-impl Container for Menu {
-    fn append_item(&self, item: &dyn IsMenuItem) {
-        let _ = self.append(item);
-    }
-}
-impl Container for Submenu {
-    fn append_item(&self, item: &dyn IsMenuItem) {
-        let _ = self.append(item);
-    }
+/// A bundled provider PNG → a native muri `Icon`. muri owns PNG decoding
+/// (lazy, at paint time); this is just a wrapper.
+fn menu_icon(bytes: &[u8]) -> Icon {
+    Icon::from_png(bytes.to_vec())
 }
 
-/// Translate the generic [`MenuTree`] into a live muri (`muda-compat`) menu.
+/// Translate the generic [`MenuTree`] into a live **native** `muri::Menu`.
 /// Call on the platform's UI thread (see the module doc).
 pub(crate) fn render_menu(tree: &MenuTree) -> Menu {
-    let menu = Menu::new();
-    append_children(&menu, &tree.items);
+    build_menu(&tree.items)
+}
+
+fn build_menu(items: &[MenuItem]) -> Menu {
+    let mut menu = Menu::new();
+    for item in items {
+        menu = append(menu, item);
+    }
     menu
 }
 
-fn append_children(container: &dyn Container, items: &[MenuItem]) {
-    for item in items {
-        match item {
-            MenuItem::Action {
-                id,
-                label,
-                icon_png,
-                enabled,
-                checked,
-                checkable,
-            } => {
-                if *checkable {
-                    container.append_item(&CheckMenuItem::with_id(
-                        id.as_str(),
-                        label,
-                        *enabled,
-                        *checked,
-                        None,
-                    ));
-                } else if let Some(icon) = icon_png.as_deref().and_then(decode_menu_icon) {
-                    container.append_item(&IconMenuItem::with_id(
-                        id.as_str(),
-                        label,
-                        *enabled,
-                        Some(icon),
-                        None,
-                    ));
-                } else {
-                    container.append_item(&NativeMenuItem::with_id(
-                        id.as_str(),
-                        label,
-                        *enabled,
-                        None,
-                    ));
-                }
+fn append(menu: Menu, item: &MenuItem) -> Menu {
+    match item {
+        MenuItem::Action {
+            id,
+            label,
+            icon_png,
+            enabled,
+            checked,
+            checkable,
+        } => {
+            // A `\t` in the label splits it into a grow label + a right-aligned
+            // value (e.g. `"Quit\tusagio v0.6.1"`) — the same flush-right value
+            // the account rows use, so the version reads at the right edge
+            // rather than mashed onto the label.
+            let base = Row::new(id.as_str()).enabled(*enabled);
+            let mut row = match label.split_once('\t') {
+                Some((l, v)) => base.label_value(l.trim_end(), v.trim_start()),
+                None => base.label(label),
+            };
+            // Only checkable rows reserve the check column; a plain action must
+            // not (native `checked` marks the row as a checkbox).
+            if *checkable {
+                row = row.checked(*checked);
             }
-            MenuItem::Static { label, icon_png } => {
-                // Disabled label row; if it carries an icon (provider-group
-                // header) render it as a disabled IconMenuItem so the provider
-                // mark shows next to the name.
-                if let Some(icon) = icon_png.as_deref().and_then(decode_menu_icon) {
-                    container.append_item(&IconMenuItem::with_id(
-                        "noop",
-                        label,
-                        false,
-                        Some(icon),
-                        None,
-                    ));
-                } else {
-                    container.append_item(&NativeMenuItem::with_id("noop", label, false, None));
-                }
+            if let Some(png) = icon_png {
+                row = row.leading(menu_icon(png));
             }
-            MenuItem::Separator => {
-                container.append_item(&PredefinedMenuItem::separator());
+            menu.item(Item::Row(row))
+        }
+        MenuItem::Static { label, icon_png } => {
+            // A non-interactive header row (the per-provider "Claude"/"Codex"
+            // group header, drawn dimmed) — carries the provider mark when set.
+            let mut row = Row::label_only(label);
+            if let Some(png) = icon_png {
+                row = row.leading(menu_icon(png));
             }
-            MenuItem::Submenu {
-                label,
-                items,
-                active,
-                value_color,
-                ..
-            } => {
-                let sub = Submenu::new(label, true);
-                // The active account renders bold (no checkmark, so no leading
-                // gutter/indent — muri's `GutterPolicy::Auto` drops the gutter
-                // on a surface with no checkmarks), and its trailing `S% / W%`
-                // value segment is tinted per severity, driven off usagio's
-                // `RowStyle`.
-                sub.set_bold(*active);
-                sub.set_value_color((*value_color).map(muri_color));
-                append_children(&sub, items);
-                container.append_item(&sub);
-            }
+            menu.section_header(row)
+        }
+        MenuItem::Separator => menu.separator(),
+        MenuItem::Submenu {
+            label,
+            items,
+            active,
+            value_spans,
+            ..
+        } => {
+            let label_row = submenu_label(label, *active, value_spans);
+            menu.submenu(label_row, build_menu(items))
         }
     }
+}
+
+/// Build a submenu's parent row. usagio's account label is `"name\tvalue"`; the
+/// tab splits it into a grow label + a right-aligned value segment so the value
+/// aligns and can be tinted per severity. The active account renders **bold**
+/// (no checkmark → no leading gutter), and its `S% / W%` value carries the
+/// severity color.
+fn submenu_label(label: &str, active: bool, value_spans: &[ValueSpan]) -> Row {
+    // Non-interactive parent row (id = none): the submenu opens the flyout;
+    // the actionable rows live inside it.
+    let base = Row::new(MenuId::none());
+    let mut row = match label.split_once('\t') {
+        Some((name, value)) => {
+            // `value_spans` offsets are UTF-16, relative to `value` (the text
+            // after the `\t`) — see `menubar::value_spans_of`. Color each span
+            // as its own `StyleRun`, so session and weekly tint independently.
+            let mut vseg = Segment::trailing_value(value);
+            if !value_spans.is_empty() {
+                let runs = value_spans
+                    .iter()
+                    .map(|s| StyleRun::new(s.start, s.len, muri_color(s.color)))
+                    .collect();
+                vseg = vseg.runs(runs);
+            }
+            base.segment(Segment::grow(name)).segment(vseg)
+        }
+        None => base.label(label),
+    };
+    if active {
+        row = row.bold();
+    }
+    row
 }

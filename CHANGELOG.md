@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-11
+
+### Changed
+- **macOS tray menu migrated to muri's native API (muri 0.11).** usagio builds
+  one generic, `Send` menu tree and renders it to a native `muri::Menu` on each
+  platform's UI thread — off the frozen `muda-compat` facade and onto the native
+  styling API (bold, per-severity value colors, leading icons, forced/host
+  themes). The same native menu feeds both the live `muri::Tray` and the
+  offscreen renderer, so a captured PNG matches what the menu bar draws.
+- **OEM fidelity pass (native look), verified against a real NSMenu reference.**
+  Bold now renders only on the active account row (muri #56/#63); the live menu
+  uses the real SF menu font with native tracking (#57) and native row pitch
+  (#63); and the live macOS popup now shows the `NSVisualEffectView`
+  `Material::Menu` vibrancy instead of a flat ~0.80-alpha fill masking it
+  (muri #64). The popup also pins a 300pt minimum width so the dense
+  account/`S% / W%` rows are no longer cramped.
+
+### Added
+- **Per-window value colors.** Each account row tints its session and weekly
+  percentages independently — amber at 80–89%, red at 90%+ — so a hot weekly
+  window stands out even while the session window is healthy.
+- **Agent-aware tray icon.** The status item can show an "at risk" indicator by
+  default, or a specific registered agent (Claude / Codex), selectable in
+  Settings.
+- **Headless screenshot rendering.** `usagio __render_shot <theme> <out.png>
+  <scale>` rasterizes the top-level menu for the current `state.json` via muri's
+  offscreen renderer (muri #59) — no display, tray, or accessibility needed. The
+  website screenshot pipeline now uses it for deterministic, real per-fixture
+  captures on all three OSes.
+
+## [0.6.1] - 2026-09-11
+
+### Fixed
+- **Codex works end-to-end** — capture, `list`, and usage parsing now handle the
+  live `rate_limit`/`primary_window` response shape, and the CLI mirrors the
+  menu's per-provider sections.
+- **Poll loop is robust under lockout and sleep.** usagio skips refreshing an
+  account that is locked until its reset (fixing a 429 storm that left the menu
+  showing stale usage), and its bounded sleep is suspend-aware so a laptop that
+  slept/among battery-out recovers its schedule instead of hanging.
+- **Crate version drift** — muri is caret-pinned so a stale lockfile can't hold
+  usagio on an old backend.
+
+### Changed
+- Tray menu backend on muri 0.10.7 (forced-OEM `--theme <os>` switcher for
+  auditing all three looks from one host).
+
 ## [0.6.0] - 2026-09-10
 
 ### Changed
