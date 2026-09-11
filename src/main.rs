@@ -39,7 +39,7 @@ use providers::claude::{oauth, usage};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 
-use providers::trait_def::TokenGrant;
+use providers::trait_def::{TokenGrant, UsageSnapshot};
 use providers::Provider;
 use store::{Account, CachedUsage, ProviderAccount, State};
 
@@ -525,19 +525,53 @@ fn cmd_list(args: &[String]) -> Result<()> {
     if refresh {
         refresh_usage_cache();
     }
+    providers::init();
     let state = State::load()?;
-    if state.accounts.is_empty() {
-        println!("No accounts yet. Log into one with `claude`, then: usagio capture");
+    let no_claude = state.accounts.is_empty();
+    let no_providers = state.providers.values().all(|p| p.accounts.is_empty());
+    if no_claude && no_providers {
+        println!("No accounts yet. Log into one with `claude` (or `codex`), then: usagio capture");
         return Ok(());
     }
-    let mut rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
-    // Order by the same auto-pick priority the menu uses (best switch target
-    // first, maxed/no-data accounts sinking) instead of raw insertion order,
-    // so `usagio list` and the menu bar agree on account order (user report:
-    // "account ordering seems off" — the CLI was the only surface still in
-    // insertion order).
-    rows.sort_by(menu_order);
-    render_table(&rows, state.active.as_deref());
+
+    // Claude accounts (state v1 `accounts` bucket). Order by the same auto-pick
+    // priority the menu uses (best switch target first, maxed/no-data accounts
+    // sinking) instead of raw insertion order, so `usagio list` and the menu
+    // bar agree on account order (user report: "account ordering seems off").
+    if !no_claude {
+        let mut rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
+        rows.sort_by(menu_order);
+        render_table(&rows, state.active.as_deref());
+    }
+
+    // Every other registered provider's captured accounts (state v2
+    // `providers[slug]` slots), one section per provider in `providers::all()`
+    // order — mirroring the menu-bar's per-provider sections so `usagio list`
+    // and the menu agree (the CLI used to be Claude-only, so a captured Codex
+    // account showed in the menu but never in `list`). A provider's own
+    // `active` key marks its active row (keys can collide across providers —
+    // e.g. the same email is both a Claude account and a Codex key — so each
+    // section must be marked independently, not by a single global active).
+    for provider in providers::all() {
+        let slug = provider.provider_id();
+        if slug == CLAUDE_SLUG {
+            continue;
+        }
+        let Some(pa) = state.providers.get(slug) else {
+            continue;
+        };
+        if pa.accounts.is_empty() {
+            continue;
+        }
+        let mut rows: Vec<Row> = pa
+            .accounts
+            .iter()
+            .map(|a| row_from_provider_account(slug, a))
+            .collect();
+        rows.sort_by(menu_order);
+        println!("\n{}:", provider.display_name());
+        render_table(&rows, pa.active.as_deref());
+    }
     Ok(())
 }
 
@@ -2371,8 +2405,136 @@ fn refresh_usage_cache() -> RefreshOutcome {
     if let Err(e) = merged {
         logging::log(&format!("poll: saving refreshed cache failed: {e:#}"));
     }
+    // Refresh non-Claude provider accounts (state v2 `providers[slug]`) too.
+    // Claude lives in `state.accounts` and is handled above; every other
+    // captured provider (Codex, …) needs its own usage fetch or it stays
+    // "no data yet" forever — captured and shown in the menu/list but inert.
+    refresh_provider_usage_caches();
     logging::log("poll: done");
     RefreshOutcome { rate_limited }
+}
+
+/// Map a provider [`UsageSnapshot`] into the stored [`CachedUsage`] shape the
+/// menu/list render from: the first window (`primary`) is the session window,
+/// the second (`secondary`) is the weekly one — matching every provider's
+/// `window_order` and how `row_from_provider_account` reads the cache.
+fn cached_from_usage_snapshot(snap: &UsageSnapshot) -> CachedUsage {
+    let mut cu = CachedUsage {
+        session_pct: None,
+        weekly_pct: None,
+        session_reset: None,
+        weekly_reset: None,
+        opus_pct: None,
+        opus_reset: None,
+        fetched_at: snap.fetched_at.timestamp(),
+    };
+    for w in &snap.windows {
+        let reset = w.resets_at.map(|dt| dt.to_rfc3339());
+        match w.id.as_str() {
+            "primary" | "session" => {
+                cu.session_pct = w.utilization;
+                cu.session_reset = reset;
+            }
+            "secondary" | "weekly" => {
+                cu.weekly_pct = w.utilization;
+                cu.weekly_reset = reset;
+            }
+            _ => {}
+        }
+    }
+    cu
+}
+
+/// Fetch usage for every captured non-Claude provider account and persist it
+/// into `state.providers[slug]`. The counterpart to the Claude loop in
+/// `refresh_usage_cache` — without it, a captured Codex/etc. account renders
+/// "no data yet" forever because `Provider::fetch_usage` is otherwise never
+/// called. Best-effort throughout: a token-refresh or usage error keeps the
+/// existing cache and moves on (never panics the poll loop). Applies the same
+/// locked-until-reset skip so a maxed provider account doesn't burn requests.
+fn refresh_provider_usage_caches() {
+    let state = match State::load() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for provider in providers::all() {
+        let slug = provider.provider_id();
+        if slug == CLAUDE_SLUG {
+            continue;
+        }
+        let Some(pa) = state.providers.get(slug) else {
+            continue;
+        };
+        let keys: Vec<String> = pa.accounts.iter().map(|a| a.key.clone()).collect();
+        for key in keys {
+            let Some(acct) = state.find_provider_account(slug, &key).cloned() else {
+                continue;
+            };
+            if acct.needs_relogin {
+                continue;
+            }
+            // Locked accounts don't change until reset — skip (same guard as
+            // the Claude path; the reset-boundary wake brings us back).
+            if let Some(cu) = &acct.cached_usage {
+                if countdown::is_locked_until_reset(&cached_to_account_usage(cu), Utc::now()) {
+                    continue;
+                }
+            }
+            // Refresh the token if it's at/near expiry and we have a refresh
+            // token; on failure keep the cache and try again next cycle.
+            let mut access = acct.access_token.clone();
+            let mut refreshed: Option<(String, String, i64)> = None;
+            if acct.expires_at <= Utc::now().timestamp() + REFRESH_SKEW_SECS
+                && !acct.refresh_token.is_empty()
+            {
+                match provider.refresh_token(&acct.refresh_token) {
+                    Ok(grant) => {
+                        access = grant.access.clone();
+                        let expires_at = Utc::now().timestamp() + grant.expires_in_secs;
+                        let refresh = grant.refresh.unwrap_or_else(|| acct.refresh_token.clone());
+                        refreshed = Some((grant.access, refresh, expires_at));
+                    }
+                    Err(e) => {
+                        logging::log(&format!(
+                            "provider refresh failed for {slug}/{key}: {e} (keeping cache)"
+                        ));
+                        continue;
+                    }
+                }
+            }
+            let cu = match provider.fetch_usage(&access) {
+                Ok(snap) => Some(cached_from_usage_snapshot(&snap)),
+                Err(e) => {
+                    logging::log(&format!(
+                        "provider usage error for {slug}/{key}: {e}; keeping cache"
+                    ));
+                    None
+                }
+            };
+            // Persist tokens + usage under the lock with a fresh reload so a
+            // concurrent capture/switch isn't clobbered.
+            let _ = with_state_lock(|| {
+                let mut st = State::load()?;
+                if let Some(a) = st.find_provider_account_mut(slug, &key) {
+                    if let Some((at, rt, exp)) = &refreshed {
+                        a.access_token = at.clone();
+                        a.refresh_token = rt.clone();
+                        a.expires_at = *exp;
+                    }
+                    if let Some(cu) = &cu {
+                        a.cached_usage = Some(cu.clone());
+                    }
+                }
+                st.save()?;
+                Ok(())
+            });
+            if cu.is_some() {
+                logging::log(&format!(
+                    "event=provider_usage_refreshed provider={slug} account={key}"
+                ));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
