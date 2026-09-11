@@ -295,7 +295,7 @@ pub trait Provider: Send + Sync + 'static {
     fn severity_bands(&self) -> SeverityBands {
         SeverityBands {
             amber: 80.0,
-            red: 95.0,
+            red: 90.0,
         }
     }
 

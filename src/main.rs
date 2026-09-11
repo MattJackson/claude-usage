@@ -264,6 +264,8 @@ fn run() -> Result<()> {
         Some("rm") | Some("remove") => cmd_rm(args.get(1).map(String::as_str)),
         // Internal, undocumented — see `cmd_secrets_selftest` doc comment.
         Some("__secrets_selftest") => cmd_secrets_selftest(&args[1..]),
+        // Internal, undocumented — headless screenshot renderer (see cmd doc).
+        Some("__render_shot") => cmd_render_shot(&args[1..]),
         Some("-h") | Some("--help") | Some("help") => {
             print_help();
             Ok(())
@@ -1688,6 +1690,31 @@ fn keychain_write(blob: &str) -> Result<()> {
 /// exactly which step diverged.
 ///
 /// Usage: `usagio __secrets_selftest <service> <account> <secret>`
+/// Headless website-screenshot renderer. Builds the menu from the state.json
+/// this process's config dir points at (a fixture, in the capture pipeline)
+/// and renders it to a PNG under a forced OS theme via muri's offscreen
+/// renderer — no tray/window/display/TCC. Deliberately not in `print_help`;
+/// it's a build-pipeline seam, not a user feature.
+///
+/// Usage: `usagio __render_shot <windows|macos|gnome|system> <out.png> [scale]`
+/// (default scale 2.0). A forced theme renders that OEM look on any host, so
+/// all three OS shots can be produced from a single runner.
+fn cmd_render_shot(args: &[String]) -> Result<()> {
+    let theme = args.first().map(String::as_str).unwrap_or("system");
+    let out = args
+        .get(1)
+        .ok_or_else(|| anyhow!("usage: __render_shot <theme> <out.png> [scale]"))?;
+    let scale: f32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2.0);
+    providers::init();
+    let png = menubar::render_menu_png_for_theme(theme, scale);
+    std::fs::write(out, &png).with_context(|| format!("writing {out}"))?;
+    println!(
+        "wrote {} bytes to {out} (theme={theme}, scale={scale})",
+        png.len()
+    );
+    Ok(())
+}
+
 fn cmd_secrets_selftest(args: &[String]) -> Result<()> {
     let (service, account, secret) = match args {
         [service, account, secret] => (service.as_str(), account.as_str(), secret.as_str()),

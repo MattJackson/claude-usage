@@ -333,6 +333,13 @@ pub struct State {
     /// Menu-bar: swap trigger threshold percent (defaults to 95).
     #[serde(default)]
     pub trigger_pct: Option<f64>,
+    /// Menu-bar: what the tray icon/title reflects. `None` (the default) =
+    /// "at risk" — the captured agent closest to its limit across every
+    /// provider. `Some(slug)` pins the tray to one registered provider's
+    /// active account (e.g. `"claude"`, `"codex"`). Set from Settings ▸ Tray
+    /// Icon; read by `menubar::tray_target`/`title_for`.
+    #[serde(default)]
+    pub tray_icon_mode: Option<String>,
     /// Menu-bar: Settings ▸ Notifications ▸ per-trigger enable checkboxes
     /// (threshold crossings / reset-back / weekly-pace projection). Read by
     /// `watch_cycle` on every poll so a menu toggle takes effect on the next
@@ -589,6 +596,10 @@ impl State {
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
             trigger_pct: v.get("trigger_pct").and_then(|x| x.as_f64()),
+            tray_icon_mode: v
+                .get("tray_icon_mode")
+                .and_then(|x| x.as_str())
+                .map(String::from),
             notification_config: v
                 .get("notification_config")
                 .and_then(|x| match serde_json::from_value(x.clone()) {
@@ -1141,6 +1152,7 @@ pub(crate) fn redact_state_for_dump(state: &State) -> serde_json::Value {
         "providers": providers,
         "autoswap_disabled": state.autoswap_disabled,
         "trigger_pct": state.trigger_pct,
+        "tray_icon_mode": state.tray_icon_mode,
         "pending_removals": state.pending_removals.iter().collect::<Vec<_>>(),
         "pending_provider_removals": state
             .pending_provider_removals
