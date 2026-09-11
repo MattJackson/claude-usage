@@ -83,6 +83,18 @@ pub(crate) fn forced_theme() -> Option<muri::ThemeSource> {
     FORCED_THEME.get()?.as_deref().and_then(theme_from_name)
 }
 
+/// Shared popup layout for both the live tray and the headless capture, so a
+/// `__render_shot` PNG matches what the menu bar actually draws. usagio's menu
+/// is text-dense (email addresses + `S% / W%` values); the auto-fit width came
+/// out cramped next to a native OEM menu (measured ~244pt vs the Time Machine
+/// menu's ~310pt), so we pin a wider minimum. `min_width` is in logical points;
+/// muri still grows past it for longer rows and clamps the theme/gutter defaults
+/// otherwise. The live tray layers its host/forced `theme` on top via
+/// `Tray::theme` (which only overwrites the theme field, not this width).
+pub(crate) fn tray_options() -> muri::MenuOptions {
+    muri::MenuOptions::default().min_width(300.0)
+}
+
 /// Parse a `menubar --theme <name>` flag (if present) and record it for the
 /// tray builders. Called once from `main`, before any tray thread spawns. An
 /// unknown name is reported and ignored (falls through to the host theme).
@@ -587,7 +599,6 @@ fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
     }
 }
 
-
 /// The bold provider-group header row that precedes a provider's account rows.
 /// Plain title is just the provider's display name (e.g. "Claude"), bold,
 /// disabled (`enabled: false` so it reads as a group heading, not a click
@@ -727,7 +738,8 @@ pub fn run() -> Result<()> {
     .tooltip(tooltip_for(&initial))
     .menu(crate::platform::render::render_menu(
         &cross_platform::menu_tree_from_snapshot(&initial),
-    ));
+    ))
+    .options(tray_options());
     if let Some(theme) = forced_theme() {
         tray = tray.theme(theme);
     }
@@ -1996,7 +2008,7 @@ pub fn render_menu_png_for_theme(theme_name: &str, scale: f32) -> Vec<u8> {
     let tree = cross_platform::menu_tree_from_snapshot(&snap);
     let native = crate::platform::render::render_menu(&tree);
     let theme = theme_from_name(theme_name).unwrap_or_default();
-    let opts = muri::MenuOptions::default().theme(theme);
+    let opts = tray_options().theme(theme);
     muri::render_menu_to_png(&native, &opts, scale)
 }
 
@@ -2624,11 +2636,12 @@ mod cross_platform {
             .colors
             .iter()
             .filter_map(|&(off, len, sev)| {
-                off.checked_sub(base).map(|start| crate::platform::ValueSpan {
-                    start,
-                    len,
-                    color: value_color_of(sev),
-                })
+                off.checked_sub(base)
+                    .map(|start| crate::platform::ValueSpan {
+                        start,
+                        len,
+                        color: value_color_of(sev),
+                    })
             })
             .collect()
     }

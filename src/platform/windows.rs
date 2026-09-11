@@ -270,7 +270,8 @@ impl MenuBackend for WindowsMenu {
     ) -> Result<Box<dyn MenuHandle>> {
         let mut tray = Tray::new(decode_icon(initial_icon))
             .tooltip(windows_tooltip(initial_title))
-            .menu(Menu::new());
+            .menu(Menu::new())
+            .options(crate::menubar::tray_options());
         if let Some(theme) = crate::menubar::forced_theme() {
             tray = tray.theme(theme);
         }
